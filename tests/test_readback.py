@@ -492,6 +492,18 @@ def test_declared_unverified_asset_that_is_missing_fails(read):
     assert "FAIL accept  notes-1.2.3.txt (declared unverified) is on the release" in out
 
 
+@pytest.mark.parametrize(
+    ("name", "role"),
+    [(SBOM, "listed in the checksums"), (SUMS, "the checksums"), (BUNDLE, "the signature")],
+)
+def test_declared_unverified_asset_that_is_verified_fails(read, name, role):
+    """A stale declaration: the note would call a verified file not verified."""
+    code, out, _ = read(World(), f'unverified = ["{name}"]\n' + PARAMS)
+    assert code == 1
+    assert f"FAIL accept  {name} (declared unverified) is not {role}" in out
+    assert f"PASS accept  {SBOM} matches its listed digest" in out
+
+
 def test_asset_beside_images_alone_fails(read):
     code, out, _ = read(World(), HEAD + IMAGES)
     assert code == 1

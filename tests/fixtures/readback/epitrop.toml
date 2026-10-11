@@ -2,11 +2,9 @@
 # SPDX-License-Identifier: EUPL-1.2
 #
 # Archives with a signed checksums file; the signer is called by release.yml.
-# The schema file is on the release page and in no checksums line.
 repository = "tekmora/epitrop"
 signer = ".github/workflows/release-binaries.yml"
 other_workflows = [".github/workflows/release.yml"]
-unverified = ["snapshot.schema.json"]
 
 [blobs]
 checksums = "checksums.txt"

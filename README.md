@@ -269,7 +269,9 @@ the tag without a leading `v`. `python3 tools/readback.py check --params
 release.toml` reads the file and makes no request.
 
 - **Blobs.** The release holds exactly the checksums, their signature, the
-  listed files and the files declared `unverified`. Each listed file matches
+  listed files and the files declared `unverified`. A file that is declared
+  `unverified` and listed in the checksums fails: the declaration is out of
+  date and has to go. Each listed file matches
   its digest, the signature verifies the checksums, and for each listed file
   the forge serves a provenance attestation that verifies it.
 - **Images.** The signature verifies the reference, and the provenance

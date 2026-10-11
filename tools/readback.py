@@ -27,7 +27,8 @@ names `blobs`, `images` or both.
 
 Blobs. The assets of the release are exactly the checksums file, its
 signature, the files the checksums list and the files declared `unverified`;
-one more or one less is a failure. Every listed file matches its digest. The
+one more or one less is a failure, and so is a declared file that the
+checksums list. Every listed file matches its digest. The
 signature (a bundle in the new format) verifies the checksums. For every
 listed file the forge serves a provenance attestation that names its digest,
 and that attestation verifies the file.
@@ -553,7 +554,10 @@ def _blobs(report: Report, world, params: Params, tag: str, claim: Claim, assets
     listed = _listed(report, folder / blobs.checksums) if blobs.checksums in head else None
     expected = dict.fromkeys(listed or {}, "listed in the checksums")
     expected |= {blobs.checksums: "the checksums", blobs.signature: "the signature"}
-    expected |= {_fill(name, tag): "declared unverified" for name in params.unverified}
+    declared = [_fill(name, tag) for name in params.unverified]
+    for name in sorted(set(declared) & set(expected)):
+        report.accept(f"{name} (declared unverified) is not {expected[name]}", False)
+    expected |= dict.fromkeys(declared, "declared unverified")
     _name_set(report, assets, expected)
     if listed is None:
         return
