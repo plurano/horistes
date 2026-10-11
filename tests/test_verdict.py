@@ -199,6 +199,7 @@ def test_p1_ten_equal_rows_with_both_planted_cases_pass(tree):
         "invalid": 0,
         "draft": 0,
         "flaky": 0,
+        "outside": 0,
         "unmapped": 0,
     }
     assert "PASS | equal 10" in done.stdout
@@ -817,3 +818,130 @@ def test_job_is_found_under_the_name_the_forge_reports():
     assert verdict._job(doc, "Build on ubuntu-24.04", "x.yml") is doc["jobs"]["named"]
     with pytest.raises(ciwf.ReadError):
         verdict._job(doc, "Unit", "x.yml")
+
+
+def outside(number, old="success", new=None, gone=(CALLER_FILE,), commit=None):
+    """A push on which one job ran alone; `gone` are the files recorded as not in its tree."""
+    return {
+        **subject(number, old, new, commit),
+        "event": "push",
+        "ref": "main",
+        "not_in_tree": gone if isinstance(gone, str) else list(gone),
+    }
+
+
+def test_o1_push_before_the_caller_came_is_outside_the_trial(tree):
+    done = run(tree, [*passing(), *(outside(number) for number in range(11, 20))])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.counts["outside"] == 9 and done.counts["equal"] == 10
+    assert done.counts["invalid"] == 0
+    assert "| PASS | ABSENT | outside | - |" in done.stdout
+    assert "absent while its counterpart ran" not in done.stdout
+    assert "report: 9 row(s) outside the trial" in done.stdout
+
+
+def test_o2_push_after_the_old_job_left_is_outside_too(tree):
+    done = run(tree, [*passing(), outside(11, None, "success", gone=(OLD_FILE,))])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.counts["outside"] == 1
+    assert "| ABSENT | PASS | outside | - |" in done.stdout
+
+
+@pytest.mark.parametrize(
+    "gone",
+    [(), (OLD_FILE,), (".github/workflows/ci.yml",), CALLER_FILE],
+    ids=["no file", "the file of the job that ran", "another file", "a text, not a list"],
+)
+def test_o3_absent_job_whose_file_the_commit_holds_stays_an_error(tree, gone):
+    done = run(tree, [*passing(), outside(11, gone=gone)])
+    assert done.returncode == 3
+    assert f"check '{NEW}' is absent while its counterpart ran" in done.stdout
+    assert done.counts["outside"] == 0 and done.counts["invalid"] == 1
+
+
+def test_o4_file_recorded_as_not_in_the_tree_while_its_check_ran(tree):
+    done = run(tree, [*passing(), outside(11, "success", "success")])
+    assert done.returncode == 3
+    assert (
+        f"{CALLER_FILE} is recorded as not in the commit's tree, yet check '{NEW}' of it ran"
+        in done.stdout
+    )
+
+
+@pytest.mark.parametrize("gone", [CALLER_FILE, [7], {CALLER_FILE: True}])
+def test_o5_unreadable_record_of_the_tree_is_an_error(tree, gone):
+    done = run(tree, [*passing(), {**outside(11), "not_in_tree": gone}])
+    assert done.returncode == 3
+    assert "`not_in_tree` must list workflow files" in done.stdout
+
+
+def test_o6_rows_outside_the_trial_count_for_nothing(tree):
+    subjects = [*passing()[1:], *(outside(number) for number in range(11, 20))]
+    done = run(tree, subjects)
+    assert done.returncode == 2
+    assert done.counts["outside"] == 9 and done.counts["equal"] == 9
+    assert "9 equal rows on distinct subjects, 10 needed" in done.stdout
+
+
+def test_o7_planted_commit_outside_the_trial_does_not_show_its_case(tree):
+    subjects = passing()
+    subjects[9] = outside(10, "failure", commit=MUST_FAIL)
+    done = run(tree, [*subjects, subject(11)])
+    assert done.returncode == 2
+    assert f"planted case {MUST_FAIL[:12]} has no equal row where both fail" in done.stdout
+
+
+def pushes_before_the_caller(held: object) -> dict:
+    """P1 from the forge, and one push to main on which the old job ran alone."""
+    answers = forge_answers("fixture/consumer", live_runs())
+    commit = "b" * 40
+    alone = forge_run(
+        50,
+        OLD_FILE,
+        commit,
+        "2026-10-10T23:00:00Z",
+        [forge_job(5000, OLD, "success")],
+        event="push",
+        head_branch="main",
+    )
+    on_main = forge_answers("fixture/consumer", [alone])
+    listing = f"repos/fixture/consumer/actions/runs?branch=trial%2Flicence&{PAGE}"
+    on_main[listing.replace("trial%2Flicence", "main")] = on_main.pop(listing)
+    answers.update(on_main)
+    if held is not None:
+        answers[f"repos/fixture/consumer/contents/.github/workflows?ref={commit}"] = held
+    return answers
+
+
+TWO_BRANCHES = MAP.replace('branches = ["trial/licence"]', 'branches = ["trial/licence", "main"]')
+
+
+def test_o8_push_before_the_caller_read_from_the_forge_and_judged_again(tree):
+    held = [{"path": OLD_FILE, "type": "file"}]
+    done = live(tree, pushes_before_the_caller(held), TWO_BRANCHES)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "equal 10" in done.stdout and "outside 1" in done.stdout
+    again = tree.tool(
+        "verdict.py",
+        "--map",
+        str(tree.root / "trial.toml"),
+        "--runs",
+        str(tree.root / "recorded.json"),
+    )
+    assert again.returncode == 0
+    assert again.stdout.splitlines()[:-1] == done.stdout.splitlines()[:-1]
+
+
+@pytest.mark.parametrize(
+    ("held", "code", "line"),
+    [
+        ([{"path": OLD_FILE}, {"path": CALLER_FILE}], 3, "is absent while its counterpart ran"),
+        (None, 3, "gh: Not Found (HTTP 404)"),
+    ],
+    ids=["the commit holds the caller", "the forge does not list the folder"],
+)
+def test_o9_push_on_which_the_caller_is_lost_stays_an_error(tree, held, code, line):
+    done = live(tree, pushes_before_the_caller(held), TWO_BRANCHES)
+    assert done.returncode == code
+    assert line in done.stdout
+    assert "outside 0" in done.stdout + done.stderr

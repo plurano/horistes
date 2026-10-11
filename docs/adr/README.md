@@ -19,3 +19,4 @@ record that supersedes it.
 | [0009](0009-caller-templates-in-the-engines-syntax.md) | 2026-10-11 | Caller templates are written in the engine's syntax and rendered here until the engine does | Accepted |
 | [0010](0010-one-longest-time-for-every-exception.md) | 2026-10-11 | A dated host runs no longer than any other exception | Accepted |
 | [0011](0011-uploaded-result-of-a-job-that-always-passes.md) | 2026-10-11 | A job that passes whatever it finds is compared by the result it uploads | Accepted |
+| [0012](0012-row-outside-the-trial.md) | 2026-10-11 | A push whose commit does not hold a job's workflow file lies outside the trial | Accepted |

@@ -12,6 +12,7 @@ Shape of the result:
 
     {"source": "live forge", "repository": "owner/name", "errors": [],
      "subjects": [{"commit": ..., "event": ..., "ref": ..., "occurrence": 1,
+                   "not_in_tree": [".github/workflows/..."],
                    "checks": [{"name": ..., "workflow": ...,
                                "attempts": [{"attempt": 1, "status": ...,
                                              "conclusion": ..., "failed_steps": [],
@@ -31,6 +32,15 @@ branch, and where one workflow ran several times for such a group (a draft
 marked ready, a reopened pull request) its n-th run in time belongs to the
 n-th subject.
 
+`not_in_tree` names the watched workflow files that did not run on a push
+and that the pushed commit does not hold; the key is left out when there is
+none. The forge starts a run from the workflow files of the commit the
+event names, and for a push that is the commit the run names. The reader
+asks for the listing of .github/workflows at that commit: a file is named
+only when that listing came, is complete, holds every watched workflow that
+did run, and does not hold the file. A pull request runs the files of its
+merge commit, which a run does not name, so no file is named there.
+
 A request that fails is recorded under "errors" and ends the reading; the
 caller must treat a result with errors as unusable.
 """
@@ -39,6 +49,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import shlex
 import subprocess
 import time
@@ -52,6 +63,12 @@ MAX_PAGES = 10
 RETRIES = 4
 WAIT_SECONDS = 20
 DEADLINE_SECONDS = 60
+WORKFLOW_FOLDER = ".github/workflows"
+# The forge's listing of a folder holds at most this many entries (REST reference,
+# "Get repository content"); a listing that long may be cut.
+FOLDER_LIMIT = 1000
+# Events whose run names the commit its workflow files were read from.
+READ_AT_COMMIT = ("push",)
 HEADERS = (
     "-H",
     "Accept: application/vnd.github+json",
@@ -207,6 +224,23 @@ def _groups(runs: list[dict]) -> list[tuple[dict, list[dict]]]:
     return subjects
 
 
+def _not_in_tree(repository: str, subject: dict, ran: set[str], workflows: set[str]) -> list[str]:
+    """The watched workflow files without a run that the commit of a push does not hold."""
+    silent = sorted(p for p in workflows - ran if posixpath.dirname(p) == WORKFLOW_FOLDER)
+    if subject["event"] not in READ_AT_COMMIT or not silent:
+        return []
+    commit = quote(str(subject["commit"]), safe="")
+    path = f"repos/{repository}/contents/{WORKFLOW_FOLDER}?ref={commit}"
+    listing = api(path)
+    if not isinstance(listing, list) or len(listing) >= FOLDER_LIMIT:
+        raise ForgeError(f"GET {path}: no complete listing of the folder")
+    held = {str(entry.get("path")) for entry in listing if isinstance(entry, dict)}
+    lost = sorted(ran - held)
+    if lost:
+        raise ForgeError(f"GET {path}: the listing lacks {lost[0]}, whose run this commit started")
+    return [path for path in silent if path not in held]
+
+
 def collect(
     repository: str,
     branches: list[str],
@@ -229,6 +263,10 @@ def collect(
             subject["checks"] = []
             for run in members:
                 subject["checks"].extend(_checks(repository, run, artifacts or {}))
+            ran = {str(run.get("path")) for run in members}
+            gone = _not_in_tree(repository, subject, ran, workflows)
+            if gone:
+                subject["not_in_tree"] = gone
             data["subjects"].append(subject)
     except ForgeError as err:
         data["errors"].append(str(err))

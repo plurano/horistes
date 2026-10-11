@@ -19,6 +19,14 @@ per subject and pair:
     invalid       a check was cancelled, is still running or is absent
     draft         both stopped on a draft pull request
     flaky         attempts of one check on one subject disagree
+    outside       only one ran, on a commit that does not hold the workflow
+                  file of the other (a push before the caller came, or after
+                  the old job left); the row counts for nothing
+
+A check that is absent while its counterpart ran is an error, unless the
+run data names its workflow file as not in the commit's tree (`not_in_tree`
+of the subject, which tools/forge.py reads from the forge for a push). A
+file the commit holds whose job did not report stays an error.
 
 The trial passes when no row differs, no check of a watched workflow is
 left unnamed, every pair has 10 equal rows with an ordinary pass among
@@ -56,8 +64,9 @@ are judged by tools/hosts.py in this repository's gate.
 
 Exit codes: 0 pass; 1 a verdict, a reason or a side condition differs;
 2 evidence insufficient; 3 input or data error (unnamed check, absent
-check, unknown conclusion, unreadable map, forge error, a result that is
-unreadable or not recorded). An error is never read as equal.
+check whose workflow file the commit holds, unknown conclusion, unreadable
+map, forge error, a result that is unreadable or not recorded). An error is
+never read as equal.
 """
 
 from __future__ import annotations
@@ -96,7 +105,16 @@ EXPECTED = {"R": ("FAIL", "PASS"), "U": ("FINDING", "CLEAN")}
 WORDS = {"FAIL": "fail", "PASS": "pass", "FINDING": "show the finding", "CLEAN": "stay clean"}
 MIN_EQUAL = 10
 MAX_FLAKY = 2
-STATES = ("equal", "differ", "wrong-reason", "no-evidence", "invalid", "draft", "flaky")
+STATES = (
+    "equal",
+    "differ",
+    "wrong-reason",
+    "no-evidence",
+    "invalid",
+    "draft",
+    "flaky",
+    "outside",
+)
 RESULT = {
     0: "PASS",
     1: "FAIL: a verdict, a reason or a side condition differs",
@@ -359,19 +377,48 @@ def _case(pair: Pair, subject: dict, trial: Trial) -> Planted | None:
     return next(cases, None)
 
 
+def _tree(subject: dict, errors: list[str]) -> None:
+    """Refuses a record of the commit's tree that is unreadable or that its own checks deny."""
+    gone = subject.get("not_in_tree", [])
+    if not isinstance(gone, list) or not all(isinstance(path, str) for path in gone):
+        errors.append(f"{_key(subject)}: `not_in_tree` must list workflow files")
+        return
+    for check in subject.get("checks") or []:
+        if check.get("workflow") in gone:
+            errors.append(
+                f"{_key(subject)}: {check.get('workflow')} is recorded as not in the "
+                f"commit's tree, yet check {str(check.get('name'))!r} of it ran"
+            )
+
+
+def _outside(subject: dict, pair: Pair, found: dict, errors: list[str]) -> bool:
+    """Whether the commit does not hold the workflow file of the pair's absent check.
+
+    Any other absent check is an error: its file is there and its job did not report.
+    """
+    gone = subject.get("not_in_tree")
+    outside = False
+    for name, path in ((pair.old, pair.old_workflow), (pair.new, pair.new_workflow)):
+        if found[name] is not None:
+            continue
+        if isinstance(gone, list) and path in gone:
+            outside = True
+        else:
+            errors.append(f"{_key(subject)}: check {name!r} is absent while its counterpart ran")
+    return outside
+
+
 def _row(subject: dict, pair: Pair, checks: dict, trial: Trial, errors: list[str]) -> dict | None:
     """The row of one pair on one subject; no row when neither check is recorded."""
     key = _key(subject)
     found = {name: checks.get(name) for name in (pair.old, pair.new)}
     if found[pair.old] is None and found[pair.new] is None:
         return None
-    for name, check in found.items():
-        if check is None:
-            errors.append(f"{key}: check {name!r} is absent while its counterpart ran")
+    outside = _outside(subject, pair, found, errors)
     case = _case(pair, subject, trial)
     old = _side(found[pair.old], f"{key}: {pair.old}", errors)
     new = _side(found[pair.new], f"{key}: {pair.new}", errors)
-    state, marker = _state(old, new, pair, case)
+    state, marker = ("outside", "-") if outside else _state(old, new, pair, case)
     note = ""
     if pair.kind == "U" and state == "equal":
         state, marker, note = _uploaded(old, new, case, f"{key}: {pair.new}", errors)
@@ -403,6 +450,7 @@ def judge(trial: Trial, data: object) -> tuple[list[dict], list[str], list[str]]
     for subject in data["subjects"]:
         if not isinstance(subject, dict):
             raise ciwf.ReadError("run data: a subject is not a record")
+        _tree(subject, errors)
         checks: dict[str, dict] = {}
         for check in subject.get("checks") or []:
             name = str(check.get("name"))
@@ -703,6 +751,12 @@ def main() -> int:
         if row["state"] in ("differ", "wrong-reason")
     ]
     found["gap"] = [g for pair in trial.pairs for g in evidence_gaps(pair, rows, trial)]
+    outside = sum(1 for row in rows if row["state"] == "outside")
+    if outside:
+        found["report"].append(
+            f"{outside} row(s) outside the trial: the commit does not hold "
+            "the workflow file of the absent job"
+        )
     return _report(args, source, rows, found)
 
 

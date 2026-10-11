@@ -151,6 +151,12 @@ commit = "<full id of a commit both jobs must pass>"
 expect = "PASS"
 ```
 
+`branches` may name the branch the switch is made on from its start. A push
+whose commit does not yet hold the caller's workflow file lies outside the
+trial and counts for nothing; a job that is absent although the commit holds
+its workflow file ends the check with exit code 3
+([ADR-0012](docs/adr/0012-row-outside-the-trial.md)).
+
 A planted case can also be a fixture: a folder of the repository both forms
 of the job are run on, in jobs of their own that exist only on the trial's
 branch. Such a pair must reach the named verdict on every subject and counts as

@@ -37,6 +37,13 @@ WATCHED = {OLD_FILE, NEW_FILE}
 DRAFT = "Stop on a draft pull request"
 COMMIT = "bfe95b5170e7e5e1e9681ea4d766c14d55e28851"
 LISTING = f"repos/{REPOSITORY}/actions/runs?branch=trial%2Flicence&{PAGE}"
+FOLDER = ".github/workflows"
+HELD = f"repos/{REPOSITORY}/contents/{FOLDER}?ref={COMMIT}"
+
+
+def entry(path: str) -> dict:
+    """One file as the forge lists it in a folder."""
+    return {"name": path.rsplit("/", 1)[-1], "path": path, "type": "file"}
 
 
 def draft_then_ready() -> list[dict]:
@@ -157,6 +164,7 @@ def test_runs_of_two_branches_and_two_events_stay_apart(tree, client):
     ]
     answers = forge_answers(REPOSITORY, runs)
     answers[LISTING.replace("trial%2Flicence", "main")] = {"workflow_runs": []}
+    answers[HELD] = [entry(OLD_FILE), entry(NEW_FILE)]
     client(answers)
     data = forge.collect(REPOSITORY, ["trial/licence", "main"], WATCHED)
     assert data["errors"] == []
@@ -423,3 +431,83 @@ def test_archive_that_cannot_be_fetched_is_an_error(tree, client):
 
     data = uploaded(client, score_run([held]), change)
     assert data["errors"] == [f"GET {archive_of(901)}: gh: Gone (HTTP 410)"]
+
+
+def pushed(client, held: object, files: tuple = (OLD_FILE,), event: str = "push") -> dict:
+    """What the reader gives for one event on main where only `files` ran; `held` is the folder."""
+    names = {OLD_FILE: "REUSE lint", NEW_FILE: "Licence / REUSE lint"}
+    runs = [
+        forge_run(
+            70 + number,
+            path,
+            COMMIT,
+            "03:00:00",
+            [forge_job(700 + number, names[path], "success")],
+            event=event,
+            head_branch="main",
+        )
+        for number, path in enumerate(files)
+    ]
+    answers = forge_answers(REPOSITORY, runs)
+    answers[LISTING.replace("trial%2Flicence", "main")] = answers.pop(LISTING)
+    if held is not None:
+        answers[HELD] = held
+    client(answers)
+    return forge.collect(REPOSITORY, ["main"], WATCHED)
+
+
+def test_push_names_the_watched_file_its_commit_does_not_hold(tree, client):
+    data = pushed(client, [entry(OLD_FILE), entry(f"{FOLDER}/ci.yml")])
+    assert data["errors"] == []
+    (subject,) = data["subjects"]
+    assert subject["not_in_tree"] == [NEW_FILE]
+    assert tree.forge_calls().count(HELD) == 1
+
+
+def test_file_the_commit_holds_is_not_named_whatever_kind_of_entry_it_is(tree, client):
+    for kind in ("file", "symlink", "dir"):
+        data = pushed(client, [entry(OLD_FILE), {**entry(NEW_FILE), "type": kind}])
+        assert data["errors"] == []
+        assert "not_in_tree" not in data["subjects"][0], kind
+
+
+def test_folder_is_not_asked_when_every_watched_workflow_ran(tree, client):
+    data = pushed(client, None, files=(OLD_FILE, NEW_FILE))
+    assert data["errors"] == []
+    assert "not_in_tree" not in data["subjects"][0]
+    assert HELD not in tree.forge_calls()
+
+
+def test_pull_request_is_asked_for_no_folder_its_merge_commit_is_not_named(tree, client):
+    data = pushed(client, [entry(OLD_FILE)], event="pull_request")
+    assert data["errors"] == []
+    assert "not_in_tree" not in data["subjects"][0]
+    assert HELD not in tree.forge_calls()
+
+
+def test_folder_that_is_not_answered_is_an_error_not_a_missing_file(tree, client):
+    data = pushed(client, None)
+    assert data["errors"] == [f"GET {HELD}: gh: Not Found (HTTP 404)"]
+    assert data["subjects"] == []
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        entry(OLD_FILE),
+        [entry(f"{FOLDER}/{number}.yml") for number in range(999)] + [entry(OLD_FILE)],
+    ],
+    ids=["a file, not a folder", "as many entries as the forge lists at most"],
+)
+def test_listing_that_may_be_cut_or_is_no_listing_is_an_error(tree, client, held):
+    data = pushed(client, held)
+    assert data["errors"] == [f"GET {HELD}: no complete listing of the folder"]
+    assert data["subjects"] == []
+
+
+def test_listing_without_the_workflow_that_ran_is_no_evidence(tree, client):
+    data = pushed(client, [entry(f"{FOLDER}/ci.yml")])
+    assert data["errors"] == [
+        f"GET {HELD}: the listing lacks {OLD_FILE}, whose run this commit started"
+    ]
+    assert data["subjects"] == []
