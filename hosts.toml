@@ -25,8 +25,6 @@ forge = [
 # Takes the toolchain from the runner's cache or the forge-hosted manifest;
 # when both miss it downloads from the Go distribution site, which redirects.
 "actions/setup-go" = ["go.dev", "dl.google.com"]
-# A container action: its image is built from the licence tool's public image.
-"fsfe/reuse-action" = ["docker.io"]
 
 # This repository's own gate. It is no reusable workflow, so no input switches
 # these hosts off; each is named with what needs it.
@@ -48,9 +46,10 @@ reason = "index of the hash-pinned tools in requirements/tools.txt, installed by
 [files.".github/workflows/ci.yml"."files.pythonhosted.org"]
 reason = "files of those tools"
 
-# The shared licence workflow runs the tool the way the job it replaced did. The host has no
-# off switch: it is an exception with a day it ends (decision record 0005), and
-# it leaves when a pinned image of the licence tool is on the forge's registry.
+# The shared licence workflow runs the licence tool's public image, named by
+# digest (decision record 0008). The host has no off switch: it is an exception
+# with a day it ends (decision record 0005), and it leaves when a pinned image
+# of the licence tool is on the forge's registry.
 [files.".github/workflows/licence.yml"."docker.io"]
-reason = "image of the licence tool behind fsfe/reuse-action; no pinned copy on the forge's registry yet"
+reason = "image of the licence tool, named by digest; no pinned copy on the forge's registry yet"
 expires = 2026-12-31

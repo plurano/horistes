@@ -18,6 +18,9 @@ UNPINNED = REUSABLE.replace(CHECKOUT, "actions/checkout@v7")
 INJECTION = REUSABLE.replace('test -d "$TARGET"', 'echo "${{ github.event.pull_request.title }}"')
 CREDENTIALS = REUSABLE.replace("        with:\n          persist-credentials: false\n", "")
 NO_JOB = REUSABLE.replace("    runs-on: ubuntu-24.04\n", "")
+IMAGE = "docker://docker.io/library/alpine"
+BY_DIGEST = f"{REUSABLE}      - name: Tool\n        uses: {IMAGE}@sha256:{'0123456789abcdef' * 4}\n"
+BY_TAG = f"{REUSABLE}      - name: Tool\n        uses: {IMAGE}:3\n"
 
 
 def actionlint(tree):
@@ -42,7 +45,7 @@ def zizmor(tree):
 
 
 def test_planted_fixtures_differ_from_the_good_one():
-    assert len({REUSABLE, UNPINNED, INJECTION, CREDENTIALS, NO_JOB}) == 5
+    assert len({REUSABLE, UNPINNED, INJECTION, CREDENTIALS, NO_JOB, BY_DIGEST, BY_TAG}) == 7
 
 
 def test_good_workflow_and_action_pass_both_linters(tree):
@@ -53,10 +56,23 @@ def test_good_workflow_and_action_pass_both_linters(tree):
     assert "No findings to report" in done.stdout
 
 
+def test_image_named_by_digest_passes_both_linters(tree):
+    tree.write({WORKFLOW: BY_DIGEST})
+    assert actionlint(tree).returncode == 0, actionlint(tree).stdout
+    done = zizmor(tree)
+    assert done.returncode == 0, done.stdout
+    assert "No findings to report" in done.stdout
+
+
 @pytest.mark.parametrize(
     ("workflow", "finding"),
-    [(UNPINNED, "unpinned-uses"), (INJECTION, "template-injection"), (CREDENTIALS, "artipacked")],
-    ids=["tag-pinned-action", "script-injection", "persisted-credentials"],
+    [
+        (UNPINNED, "unpinned-uses"),
+        (INJECTION, "template-injection"),
+        (CREDENTIALS, "artipacked"),
+        (BY_TAG, "unpinned-images"),
+    ],
+    ids=["tag-pinned-action", "script-injection", "persisted-credentials", "tag-pinned-image"],
 )
 def test_zizmor_refuses(tree, workflow, finding):
     done = zizmor(tree.write({WORKFLOW: workflow}))

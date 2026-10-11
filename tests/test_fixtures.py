@@ -11,6 +11,7 @@ fixture folder as `root`, must fail on it; given the licensed fixture, pass.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,13 @@ LICENSED = "tests/fixtures/licensed"
 PLANTED = f"{UNLICENSED}/planted.py"
 GUARD = "Refuse a root that is no plain relative path"
 TOOL = "reuse lint"
+IMAGE = re.compile(r"docker://docker\.io/fsfe/reuse@sha256:[0-9a-f]{64}")
+# Git reads these as one setting of the command scope, where `safe.directory` counts.
+TRUSTED_CHECKOUT = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.directory",
+    "GIT_CONFIG_VALUE_0": "/github/workspace",
+}
 
 
 def lint(root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -111,6 +119,16 @@ def test_workflow_passes_the_root_to_the_tool_and_guards_it_first():
     assert tool["with"] == {"args": expression}
     guard = steps()[names.index(GUARD)]
     assert guard["env"]["ROOT"] == "${{ inputs.root }}"
+
+
+def test_workflow_runs_the_tool_from_an_image_named_by_digest():
+    tool = next(step for step in steps() if step.get("name") == TOOL)
+    assert IMAGE.fullmatch(tool["uses"]), tool["uses"]
+
+
+def test_workflow_lets_git_trust_the_checkout_the_tool_reads():
+    tool = next(step for step in steps() if step.get("name") == TOOL)
+    assert tool["env"] == TRUSTED_CHECKOUT
 
 
 ROOTS = [

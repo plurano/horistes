@@ -6,9 +6,9 @@
 # the contents and no secret. Its check is reported as
 # "<name of the calling job> / REUSE lint".
 #
-# The licence tool runs from the image behind fsfe/reuse-action, which the
-# runner pulls from a public registry. That host has no off switch yet: it is
-# a dated exception in hosts.toml (decision record 0005).
+# The licence tool runs from its own public image, named by digest (decision
+# record 0008). The registry it is pulled from has no off switch yet: it is a
+# dated exception in hosts.toml (decision record 0005).
 name: Licence
 
 on:
@@ -73,10 +73,17 @@ jobs:
               ;;
           esac
 
-      # At the default root the tool is called exactly as the job this
-      # workflow replaces calls it.
+      # The image's entry point is the tool, so the arguments are the ones the
+      # job this workflow replaces passes. The tool runs as root on a checkout
+      # that belongs to the runner's user; without the setting below git
+      # refuses the checkout, and the tool then reads every file in the
+      # folder, the ones git ignores too. The digest is release 6.2.0.
       - name: reuse lint
         if: github.event.pull_request.draft != true
-        uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6
+        uses: docker://docker.io/fsfe/reuse@sha256:85462a75c0f8efda09ddd190b92816b70e7662577c8427429e11e1b9f25a992e
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: /github/workspace
         with:
           args: ${{ inputs.root == '.' && 'lint' || format('--root {0} lint', inputs.root) }}
