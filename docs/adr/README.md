@@ -14,3 +14,4 @@ record that supersedes it.
 | [0004](0004-same-verdict-before-a-switch.md) | 2026-10-11 | A consumer switches only after the same verdict is shown | Accepted |
 | [0005](0005-host-exception-with-an-end.md) | 2026-10-11 | A host without a switch is an exception with a day it ends | Accepted |
 | [0006](0006-planted-case-as-a-fixture.md) | 2026-10-11 | A planted case may be a fixture in the tree | Accepted |
+| [0007](0007-one-own-exception-list.md) | 2026-10-11 | Exceptions the engine's list cannot carry live in one own list | Accepted |

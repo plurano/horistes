@@ -5,9 +5,6 @@
 # file and carries its expiry and reason on the same line; tools/exceptions.py
 # fails the gate on an entry without them and on an expired one.
 rules:
-  concurrency-limits:
-    ignore:
-      - reuse.yml # expires 2026-12-31: engine-written; replaced by the shared licence workflow
   # The forge's `$/` form for a call inside the repository: actionlint 1.7.12,
   # the newest release, refuses it (upstream issues 711 and 732).
   self-repository:

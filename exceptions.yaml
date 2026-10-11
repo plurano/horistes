@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Exceptions to rules that neither the engine's list in .standards.yaml nor a
+# linter's configuration can carry. One entry is one rule in one file, with the
+# issue that tracks its cause, a reason and a day it ends, at most 90 days
+# ahead. tools/exceptions.py is the only reader and fails the gate on an entry
+# that is incomplete, expired or longer.
+exceptions:
+  - rule: required-check-is-reported
+    path: .github/rulesets/main.json
+    issue: cordanaLLM/praetor#1212
+    reason: >-
+      the engine declares the required check of a job that calls a reusable
+      workflow under the calling job's own name (`Licence`), which no run
+      reports; the reported name is `Licence / REUSE lint`. No rule set is live
+      on this repository. Before it goes public or a rule set goes live, the
+      issue is fixed or no `praetorctl sync --remote` runs. The entry leaves
+      when the engine declares the reported name.
+    expires: "2026-12-31"

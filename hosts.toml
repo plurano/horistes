@@ -48,11 +48,7 @@ reason = "index of the hash-pinned tools in requirements/tools.txt, installed by
 [files.".github/workflows/ci.yml"."files.pythonhosted.org"]
 reason = "files of those tools"
 
-# Written by the engine; leaves when the shared licence workflow replaces it.
-[files.".github/workflows/reuse.yml"."docker.io"]
-reason = "image of the licence tool behind fsfe/reuse-action"
-
-# The shared licence workflow runs the same tool the same way. The host has no
+# The shared licence workflow runs the tool the way the job it replaced did. The host has no
 # off switch: it is an exception with a day it ends (decision record 0005), and
 # it leaves when a pinned image of the licence tool is on the forge's registry.
 [files.".github/workflows/licence.yml"."docker.io"]

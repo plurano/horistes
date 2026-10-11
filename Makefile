@@ -65,7 +65,8 @@ check-interface:
 check-hosts:
 	$(PYTHON) -B tools/hosts.py check
 
-# An accepted linter finding names one file, a reason and a day it ends.
+# An accepted linter finding and an entry of exceptions.yaml name one file, a
+# reason and a day it ends, at most 90 days ahead.
 check-exceptions:
 	$(PYTHON) -B tools/exceptions.py check
 

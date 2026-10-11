@@ -36,7 +36,8 @@ release.
 
 Private; nothing is released yet. The repository has its own gate and the
 checks every workflow added here must pass. The first reusable workflow is the
-licence check; this repository is its first caller.
+licence check; this repository is its first caller and no longer keeps a
+licence job of its own.
 
 ## Workflows
 
@@ -61,6 +62,7 @@ before the tool runs.
 | `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)) |
 | `interface.lock.json` | recorded interface of every workflow and action |
 | `hosts.toml` | hosts and outside actions the workflows may reach |
+| `exceptions.yaml` | exceptions to rules no other list can carry, each with its issue and a day it ends ([ADR-0007](docs/adr/0007-one-own-exception-list.md)) |
 | `docs/adr/` | decision records |
 
 ## Gate
@@ -71,7 +73,7 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
 
 - `make verify` runs this repository's own checks without the engine: YAML and
   Python lint, actionlint and zizmor, the interface record, the host scan, the
-  accepted findings, the tests and the licence headers.
+  accepted findings and exceptions, the tests and the licence headers.
 - `make interface-snapshot` rewrites `interface.lock.json` after an interface
   change. A change that breaks a caller also needs `interface_major` raised.
 
