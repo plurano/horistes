@@ -75,7 +75,7 @@ interface-snapshot:
 # The tests plant one defect per rule; the two outside linters are run on a
 # planted workflow as well, so a linter that stopped refusing fails here.
 test: tools
-	ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" $(BIN)/python -B -m pytest
+	ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" $(BIN)/python -B -m pytest
 
 # Every file carries its licence header or is named in REUSE.toml.
 verify-reuse: tools

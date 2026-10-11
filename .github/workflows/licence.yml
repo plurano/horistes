@@ -19,6 +19,14 @@ on:
         type: string
         required: false
         default: ubuntu-26.04
+      root:
+        description: >-
+          Directory checked as the project root, relative to the root of the
+          calling repository. Letters, digits, dot, underscore, hyphen and
+          slash only.
+        type: string
+        required: false
+        default: .
 
 permissions: {}
 
@@ -49,6 +57,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # The root reaches the tool as an argument, so anything but a plain
+      # relative path is refused before the tool runs.
+      - name: Refuse a root that is no plain relative path
+        if: github.event.pull_request.draft != true
+        shell: bash
+        env:
+          LC_ALL: C
+          ROOT: ${{ inputs.root }}
+        run: |
+          case "$ROOT" in
+            '' | /* | -* | *..* | *[!A-Za-z0-9._/-]*)
+              echo "::error title=Root refused::root must be a plain relative path, got '$ROOT'"
+              exit 1
+              ;;
+          esac
+
+      # At the default root the tool is called exactly as the job this
+      # workflow replaces calls it.
       - name: reuse lint
         if: github.event.pull_request.draft != true
         uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6
+        with:
+          args: ${{ inputs.root == '.' && 'lint' || format('--root {0} lint', inputs.root) }}

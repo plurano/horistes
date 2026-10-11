@@ -42,11 +42,13 @@ licence check; this repository is its first caller.
 
 | File | Purpose | Inputs | Check | Hosts beyond the forge |
 | :--- | :--- | :--- | :--- | :--- |
-| `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-26.04`, the newest working image) | `<calling job> / REUSE lint` | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)) |
+| `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-26.04`, the newest working image); `root` (directory checked as the project root, default `.`) | `<calling job> / REUSE lint` | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)) |
 
 The job reads the contents and takes no secret; the caller grants
 `contents: read` and nothing else. On a draft pull request the job stops with
-an error instead of running.
+an error instead of running. `root` must be a plain relative path (letters,
+digits, dot, underscore, hyphen, slash; no `..`); anything else stops the job
+before the tool runs.
 
 ## Layout
 
@@ -56,6 +58,7 @@ an error instead of running.
 | `actions/<name>/` | composite steps |
 | `tools/` | the checks of the gate, and the same-verdict check for a switch |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
+| `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)) |
 | `interface.lock.json` | recorded interface of every workflow and action |
 | `hosts.toml` | hosts and outside actions the workflows may reach |
 | `docs/adr/` | decision records |
@@ -109,6 +112,26 @@ marker = "reuse lint"
 family = "licence check"
 commit = "<full id of a commit both jobs must pass>"
 expect = "PASS"
+```
+
+A planted case can also be a fixture: a folder of the repository both forms
+of the job are run on, in jobs of their own that exist only on the trial's
+branch. Such a pair must reach the named verdict on every subject and counts as
+a planted case of its family
+([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)):
+
+```toml
+[[fixture]]
+family = "licence check"
+class = "R"
+old = "Old form, unlicensed fixture"
+new = "New form, unlicensed fixture / REUSE lint"
+old_workflow = ".github/workflows/trial-old.yml"
+new_workflow = ".github/workflows/trial-new.yml"
+called_workflow = ".github/workflows/licence.yml"
+draft_stop = "Stop on a draft pull request"
+expect = "FAIL"
+marker = "reuse lint"
 ```
 
 `--root` is the consumer's checkout and `--called-root` the checkout of this

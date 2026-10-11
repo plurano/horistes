@@ -520,6 +520,193 @@ INPUT_ERRORS = [
 ]
 
 
+F_OLD_FILE = ".github/workflows/trial-old.yml"
+F_NEW_FILE = ".github/workflows/trial-new.yml"
+BARE = "Old form, unlicensed fixture", "New form, unlicensed fixture / REUSE lint"
+CONTROL = "Old form, licensed fixture", "New form, licensed fixture / REUSE lint"
+FIXTURE_OLD = f"""\
+---
+name: Trial, old form
+{EVENTS}permissions:
+  contents: read
+jobs:
+  unlicensed:
+    name: {BARE[0]}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+{STEPS}  licensed:
+    name: {CONTROL[0]}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+{STEPS}"""
+FIXTURE_NEW = f"""\
+---
+name: Trial, new form
+{EVENTS}permissions: {{}}
+jobs:
+  unlicensed:
+    name: New form, unlicensed fixture
+    permissions:
+      contents: read
+    uses: ./{CALLED_FILE}
+  licensed:
+    name: New form, licensed fixture
+    permissions:
+      contents: read
+    uses: ./{CALLED_FILE}
+"""
+
+
+def fixture(names, expect, marker='marker = "reuse lint"'):
+    return f"""
+[[fixture]]
+family = "licence check"
+class = "R"
+old = "{names[0]}"
+new = "{names[1]}"
+old_workflow = "{F_OLD_FILE}"
+new_workflow = "{F_NEW_FILE}"
+called_workflow = "{CALLED_FILE}"
+draft_stop = "{DRAFT}"
+expect = "{expect}"
+{marker if expect == "FAIL" else ""}
+"""
+
+
+FIXTURES = PAIR + fixture(BARE, "FAIL") + fixture(CONTROL, "PASS")
+
+
+def planted(bare=("failure", "failure"), control=("success", "success")):
+    """The four checks of the two fixtures; a side is a conclusion, a ready check or None."""
+    sides = zip((*BARE, *CONTROL), (F_OLD_FILE, F_NEW_FILE) * 2, (*bare, *control), strict=True)
+    made = [g if isinstance(g, dict) else check(n, w, g) for n, w, g in sides if g is not None]
+    return made
+
+
+def trial(tree, fixtures, mapping=FIXTURES, new=FIXTURE_NEW, ordinary=10):
+    """Ordinary subjects where the pair passes; subject n also carries fixtures[n] when given."""
+    subjects = [subject(number) for number in range(1, ordinary + 1)]
+    for one, checks in zip(subjects, fixtures, strict=False):
+        one["checks"] += checks
+    tree.write({F_OLD_FILE: FIXTURE_OLD, F_NEW_FILE: new})
+    return run(tree, subjects, mapping=mapping)
+
+
+def test_f1_fixtures_stand_for_the_planted_commits(tree):
+    done = trial(tree, [planted()] * 10)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.counts["equal"] == 30
+    assert f"{BARE[0]} -> {BARE[1]} | FAIL | FAIL | equal | yes |" in done.stdout
+    assert "fixture, both must fail on every subject" in done.stdout
+
+
+def test_f1_one_subject_is_enough_for_a_fixture(tree):
+    done = trial(tree, [planted()])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.counts["equal"] == 12
+
+
+def test_f2_new_form_passes_the_unlicensed_fixture(tree):
+    done = trial(tree, [planted(bare=("failure", "success"))])
+    assert done.returncode == 1
+    assert f"{BARE[0]} -> {BARE[1]} is differ (FAIL against PASS)" in done.stdout
+
+
+def test_f3_new_form_fails_the_unlicensed_fixture_for_another_reason(tree):
+    other = check(BARE[1], F_NEW_FILE, "failure", steps=("Check out",))
+    done = trial(tree, [planted(bare=("failure", other))])
+    assert done.returncode == 1
+    assert "is wrong-reason (FAIL against FAIL)" in done.stdout
+
+
+def test_f4_both_forms_pass_the_unlicensed_fixture(tree):
+    done = trial(tree, [planted(bare=("success", "success"))])
+    assert done.returncode == 2
+    assert "the fixture has no equal row where both fail" in done.stdout
+    assert "1 equal row(s) where both do not fail" in done.stdout
+
+
+def test_f5_both_forms_fail_the_licensed_fixture(tree):
+    done = trial(tree, [planted(control=("failure", "failure"))])
+    assert done.returncode == 2
+    assert "the fixture has no equal row where both pass" in done.stdout
+
+
+def test_f6_one_row_against_the_fixture_is_not_outvoted(tree):
+    done = trial(tree, [planted()] * 9 + [planted(bare=("success", "success"))])
+    assert done.returncode == 2
+    assert "1 equal row(s) where both do not fail" in done.stdout
+    assert "has no equal row" not in done.stdout
+
+
+def test_f7_fixture_jobs_never_ran(tree):
+    done = trial(tree, [])
+    assert done.returncode == 2
+    assert done.stdout.count("the fixture has no equal row where both") == 2
+
+
+def test_f8_one_form_of_a_fixture_is_absent(tree):
+    done = trial(tree, [planted(bare=("failure", None))])
+    assert done.returncode == 3
+    assert f"check {BARE[1]!r} is absent while its counterpart ran" in done.stdout + done.stderr
+
+
+def test_f9_fixture_fails_then_passes(tree):
+    flaky = check(BARE[1], F_NEW_FILE, "failure", "success")
+    done = trial(tree, [planted(), planted(bare=("failure", flaky))])
+    assert done.returncode == 2
+    assert "a planted case is flaky" in done.stdout
+
+
+@pytest.mark.parametrize(
+    ("mapping", "missing"),
+    [(PAIR + fixture(BARE, "FAIL"), "pass"), (PAIR + fixture(CONTROL, "PASS"), "fail")],
+)
+def test_f10_map_with_a_fixture_of_one_kind_only(tree, mapping, missing):
+    done = trial(tree, [planted()], mapping=mapping)
+    assert done.returncode == 3
+    done = trial(tree, [[c for c in planted() if c["name"] in mapping]], mapping=mapping)
+    assert done.returncode == 2
+    assert f"the map holds no planted case that must {missing}" in done.stdout
+
+
+def test_f11_fixture_and_planted_commit_together_give_both_kinds(tree):
+    mapping = PAIR + fixture(BARE, "FAIL") + PLANTED_PASS
+    subjects = [*(subject(number) for number in range(1, 10)), subject(10, commit=MUST_PASS)]
+    subjects[0]["checks"] += [c for c in planted() if c["name"] in BARE]
+    tree.write({F_OLD_FILE: FIXTURE_OLD, F_NEW_FILE: FIXTURE_NEW})
+    done = run(tree, subjects, mapping=mapping)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_f12_side_conditions_hold_for_a_fixture_too(tree):
+    wider = FIXTURE_NEW.replace("contents: read", "contents: write", 1)
+    done = trial(tree, [planted()], new=wider)
+    assert done.returncode == 1
+    assert "the new job asks to write contents, the old one did not" in done.stdout
+
+
+@pytest.mark.parametrize(
+    ("mapping", "message"),
+    [
+        (PAIR + fixture(BARE, "FAIL", marker=""), "`marker` must be a non-empty string"),
+        (PAIR + fixture(BARE, "FAIL", marker='marker = "("'), "`marker` is no pattern"),
+        (PAIR + fixture(BARE, "MAYBE"), "`expect` is PASS or FAIL"),
+        (PAIR + fixture((OLD, "another"), "PASS"), "a check name stands in two places"),
+        (
+            PAIR + fixture(BARE, "PASS").replace('family = "licence check"', 'family = "other"'),
+            "planted case for family 'other' has no pair",
+        ),
+        (PAIR + fixture(BARE, "PASS").replace('class = "R"', 'class = "W"'), "is not judged here"),
+    ],
+    ids=["no marker", "bad marker", "bad expect", "name clash", "family", "class"],
+)
+def test_unclear_fixture_is_an_input_error(tree, mapping, message):
+    done = trial(tree, [planted()], mapping=mapping)
+    assert done.returncode == 3
+    assert message in done.stderr
+
+
 @pytest.mark.parametrize(("mapping", "message"), INPUT_ERRORS, ids=[e[1] for e in INPUT_ERRORS])
 def test_unclear_map_is_an_input_error(tree, mapping, message):
     done = run(tree, passing(), mapping)

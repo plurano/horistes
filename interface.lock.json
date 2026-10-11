@@ -4,6 +4,11 @@
   "workflows": {
     ".github/workflows/licence.yml": {
       "inputs": {
+        "root": {
+          "default": ".",
+          "required": false,
+          "type": "string"
+        },
         "runner": {
           "default": "ubuntu-26.04",
           "required": false,

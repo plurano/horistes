@@ -66,3 +66,12 @@ path = [
 precedence = "closest"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@proton.me>"
 SPDX-License-Identifier = "EUPL-1.2"
+
+# Planted for the proof of the licence check: one file that must stay without
+# licence information. At the repository root the check passes over it; given
+# the fixture folder as root (tests/fixtures/unlicensed), it refuses it.
+[[annotations]]
+path = ["tests/fixtures/unlicensed/planted.py"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Lusoris <lusoris@proton.me>"
+SPDX-License-Identifier = "EUPL-1.2"
