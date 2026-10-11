@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release, no merge by the bot, and no proposal for the machine a job runs on."
+  ],
+  "extends": [
+    "config:recommended",
+    ":gitSignOff"
+  ],
+  "minimumReleaseAge": "3 days",
+  "automerge": false,
+  "packageRules": [
+    {
+      "description": "Which release of a hosted machine a job runs on is decided in the repository, not proposed.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "github-runner"
+      ],
+      "enabled": false
+    }
+  ]
+}

@@ -27,3 +27,4 @@ record that supersedes it.
 | [0017](0017-pin-check-as-its-own-job-outside-the-gate.md) | 2026-10-11 | The pin check runs as its own job, on workflow changes, weekly and by hand, outside the gate | Accepted |
 | [0018](0018-floating-runner-labels-refused-by-the-pin-tool.md) | 2026-10-11 | A floating label of a hosted machine is refused by the pin tool, without an exception list for now | Accepted |
 | [0019](0019-update-proposals-from-renovate-configured-here.md) | 2026-10-11 | Updates are proposed by Renovate from a configuration in this repository | Accepted |
+| [0020](0020-shared-update-bot-values-as-a-preset.md) | 2026-10-12 | The update bot's shared values are a preset file here, and this repository extends it | Accepted |

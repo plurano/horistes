@@ -373,8 +373,9 @@ finding is fixed.
 ## Updates
 
 Newer releases are proposed by Renovate (the update bot; the English verb)
-from `renovate.json`
-([ADR-0019](docs/adr/0019-update-proposals-from-renovate-configured-here.md)).
+from `renovate.json` and the preset it extends, `default.json`
+([ADR-0019](docs/adr/0019-update-proposals-from-renovate-configured-here.md),
+[ADR-0020](docs/adr/0020-shared-update-bot-values-as-a-preset.md)).
 A proposal waits three days after the release, is never merged by the bot and
 has to pass the gate like any other pull request.
 
@@ -391,6 +392,69 @@ the machine of a job, and the actionlint version with its checksum in the
 `make requirements` recompiles the tool pins by hand with the same command.
 Keep the header and the comment above the image line: `tests/test_update_bot.py`
 fails when the bot could no longer read one of them.
+
+### The preset other repositories extend
+
+`default.json` holds what is the same in every repository
+([ADR-0020](docs/adr/0020-shared-update-bot-values-as-a-preset.md)):
+
+| Value | Setting |
+| :--- | :--- |
+| base | `config:recommended` |
+| commits of the bot | carry the sign-off line (`:gitSignOff`) |
+| waiting time after a release | three days |
+| merge by the bot | never |
+| the machine a job runs on | not proposed |
+
+A repository extends it by reference and keeps only what is its own (which
+managers run, which files they read):
+
+```json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github><owner>/<this repository>"]
+}
+```
+
+Without a file name Renovate reads `default.json` of the named repository;
+in this family the reference is `github>plurano/shared-ci`. This
+repository's own `renovate.json` extends the preset the same way and repeats
+none of its values.
+
+- While this repository is private, only private repositories of the same
+  owner can extend the preset. A public repository waits until this one is
+  public.
+- From the first release on, a consumer names the release
+  (`github><owner>/<this repository>#1.0.0`) and adds `renovate-config` to
+  its `enabledManagers`: Renovate then proposes the next release of the
+  preset like any other update. A reference without a release follows the
+  default branch.
+- A repository that lints with REUSE names the configuration in its
+  `REUSE.toml`, because JSON carries no comment for a header:
+
+  ```toml
+  [[annotations]]
+  path = ["renovate.json"]
+  precedence = "aggregate"
+  SPDX-FileCopyrightText = "<year> <holder>"
+  SPDX-License-Identifier = "<licence of the repository>"
+  ```
+
+  If the repository already has an `aggregate` table for files without a
+  header, add `"renovate.json"` to its `path` list instead.
+
+Check a changed preset before it is merged, with the validator that ships in
+the Renovate image:
+
+```sh
+docker run --rm --network=none -v "$PWD:/data:ro" -w /data \
+  --entrypoint renovate-config-validator renovate/renovate:<release> \
+  --strict --no-global default.json renovate.json
+```
+
+`--no-global` makes it read the files as repository configuration. The
+planted file `tests/fixtures/update-bot/planted-preset.json` must fail the
+same command.
 
 ## Licence
 

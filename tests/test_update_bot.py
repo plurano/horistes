@@ -5,12 +5,17 @@
 Renovate reads three things here, and each can stop matching without any
 error: the command in the header of `requirements/tools.txt`, the comment
 above the image line of the licence workflow, and the list of managers that
-keeps it away from the files the Praetor engine writes. No test asks a forge
-or starts the bot; a planted case shows what each check refuses.
+keeps it away from the files the Praetor engine writes.
+
+`default.json` is the preset other repositories extend. It holds what is the
+same in every repository, `renovate.json` extends it and holds the rest, and
+no value stands in both. No test asks a forge or starts the bot; a planted
+case shows what each check refuses.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import shlex
@@ -19,6 +24,19 @@ import pytest
 from conftest import ROOT
 
 CONFIG = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+PRESET = json.loads((ROOT / "default.json").read_text(encoding="utf-8"))
+PLANTED_PRESET = "tests/fixtures/update-bot/planted-preset.json"
+# Without a file name Renovate reads `default.json` of the named repository.
+REFERENCE = "github>plurano/shared-ci"
+
+# What the preset may hold, and what one of its rules may hold. Allow-lists on
+# purpose: a key that names a manager, a file or a package of one repository
+# fails here before it reaches every repository that extends the preset.
+SHARED = {"$schema", "description", "extends", "minimumReleaseAge", "automerge", "packageRules"}
+RULE = {"description", "matchManagers", "matchDepTypes", "enabled"}
+# The keys both files may hold: Renovate appends these lists, the repository's
+# entries behind the preset's.
+APPENDED = {"$schema", "extends", "packageRules"}
 TOOLS = "requirements/tools.txt"
 LICENCE = ".github/workflows/licence.yml"
 
@@ -76,6 +94,23 @@ def refused(argv: list[str]) -> list[str]:
     return out
 
 
+def outside_the_preset(preset: dict) -> list[str]:
+    """The keys of a preset that belong to one repository."""
+    out = sorted(set(preset) - SHARED)
+    for number, rule in enumerate(preset.get("packageRules", [])):
+        out += [f"packageRules[{number}].{key}" for key in sorted(set(rule) - RULE)]
+    return out
+
+
+def said_twice(config: dict, preset: dict) -> list[str]:
+    """The keys a repository's own file repeats from the preset it extends."""
+    return sorted((set(config) & set(preset)) - APPENDED)
+
+
+def rules() -> list[dict]:
+    return PRESET["packageRules"] + CONFIG["packageRules"]
+
+
 def python_pattern(pattern: str) -> re.Pattern:
     return re.compile(pattern.replace("(?<", "(?P<"))
 
@@ -109,13 +144,62 @@ def test_only_the_three_managers_run():
 
 
 def test_waiting_time_is_three_days_and_nothing_merges_itself():
-    assert CONFIG["minimumReleaseAge"] == "3 days"
-    assert CONFIG["automerge"] is False
-    assert all("automerge" not in rule for rule in CONFIG["packageRules"])
+    assert PRESET["minimumReleaseAge"] == "3 days"
+    assert PRESET["automerge"] is False
+    assert all("automerge" not in rule for rule in rules())
 
 
 def test_commits_of_the_bot_carry_the_sign_off_the_gate_asks_for():
-    assert ":gitSignOff" in CONFIG["extends"]
+    assert PRESET["extends"] == ["config:recommended", ":gitSignOff"]
+
+
+def test_this_repository_extends_the_preset_and_nothing_else():
+    assert CONFIG["extends"] == [REFERENCE]
+    assert (ROOT / "default.json").is_file()
+
+
+def test_preset_holds_only_what_is_the_same_in_every_repository():
+    assert outside_the_preset(PRESET) == []
+
+
+def test_no_value_stands_in_both_files():
+    assert said_twice(CONFIG, PRESET) == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("enabledManagers", ["github-actions"]),
+        ("pip-compile", {"managerFilePatterns": ["/^requirements/tools\\.txt$/"]}),
+        ("customManagers", []),
+        ("ignorePaths", [".devcontainer/**"]),
+        ("minimumReleaseAgee", "3 days"),
+    ],
+)
+def test_planted_key_of_one_repository_is_refused_in_the_preset(key, value):
+    preset = {**PRESET, key: value}
+    assert outside_the_preset(preset) == [key]
+
+
+@pytest.mark.parametrize("key", ["matchFileNames", "matchPackageNames", "automerge"])
+def test_planted_rule_for_one_repository_is_refused_in_the_preset(key):
+    preset = copy.deepcopy(PRESET)
+    preset["packageRules"][0][key] = ["x"]
+    assert outside_the_preset(preset) == [f"packageRules[0].{key}"]
+
+
+def test_planted_preset_file_is_refused():
+    planted = json.loads((ROOT / PLANTED_PRESET).read_text(encoding="utf-8"))
+    assert outside_the_preset(planted) == ["minimumReleaseAgee"]
+    assert planted["automerge"] != PRESET["automerge"]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("minimumReleaseAge", "3 days"), ("automerge", False), ("description", ["x"])],
+)
+def test_planted_repeat_of_a_preset_value_is_refused(key, value):
+    assert said_twice({**CONFIG, key: value}, PRESET) == [key]
 
 
 def test_the_compiled_file_is_the_one_the_bot_is_pointed_at():
@@ -217,5 +301,5 @@ def test_planted_image_in_another_workflow_is_not_read():
 @pytest.mark.parametrize("kind", ["docker", "github-runner"])
 def test_actions_manager_proposes_no_image_and_no_machine(kind):
     rule = {"matchManagers": ["github-actions"], "matchDepTypes": [kind], "enabled": False}
-    kept = [{key: entry[key] for key in rule if key in entry} for entry in CONFIG["packageRules"]]
+    kept = [{key: entry[key] for key in rule if key in entry} for entry in rules()]
     assert rule in kept
