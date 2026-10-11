@@ -51,3 +51,10 @@ reason = "files of those tools"
 # Written by the engine; leaves when the shared licence workflow replaces it.
 [files.".github/workflows/reuse.yml"."docker.io"]
 reason = "image of the licence tool behind fsfe/reuse-action"
+
+# The shared licence workflow runs the same tool the same way. The host has no
+# off switch: it is an exception with a day it ends (decision record 0005), and
+# it leaves when a pinned image of the licence tool is on the forge's registry.
+[files.".github/workflows/licence.yml"."docker.io"]
+reason = "image of the licence tool behind fsfe/reuse-action; no pinned copy on the forge's registry yet"
+expires = 2026-12-31

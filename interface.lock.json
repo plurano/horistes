@@ -1,5 +1,21 @@
 {
   "actions": {},
   "interface_major": 0,
-  "workflows": {}
+  "workflows": {
+    ".github/workflows/licence.yml": {
+      "inputs": {
+        "runner": {
+          "default": "ubuntu-24.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "reuse": "REUSE lint"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": []
+    }
+  }
 }

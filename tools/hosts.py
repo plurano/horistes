@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Host scan: every host a workflow or action names is declared in hosts.toml.
 
-    hosts.py check [--root DIR]
+    hosts.py check [--root DIR] [--today YYYY-MM-DD]
     hosts.py list [--root DIR]
 
 A file may reach the forge's own hosts without declaration. Every other
@@ -11,6 +11,10 @@ also names the boolean input, off by default, that switches it on. An
 outside action must be in the list of allowed actions, which records the
 hosts the action reaches by itself. A declared host that is no longer
 found fails too, so the list cannot go stale.
+
+A reusable workflow that cannot yet put a host behind a switch declares
+it with `expires = YYYY-MM-DD` in place of `input`: an exception for one
+host in one file, which fails from the day after that date.
 
 What the scan reads: URLs and registry paths in every string of the file,
 container and service images, and the registries that package commands
@@ -23,6 +27,7 @@ Exit codes: 0 pass, 1 undeclared or stale host, 3 input error.
 from __future__ import annotations
 
 import argparse
+import datetime
 import re
 import sys
 import tomllib
@@ -33,6 +38,8 @@ import ciwf
 
 DECLARATION = "hosts.toml"
 DYNAMIC = "<dynamic>"
+# A file of the same repository: the workspace-relative form and the forge's self-repository form.
+LOCAL = ("./", "$/")
 
 EXPRESSION = re.compile(r"\$\{\{.*?\}\}", re.S)
 URL = re.compile(r"\b(?:https?|git|ssh|oci|docker)://([^\s/'\"`)<>]*)")
@@ -133,7 +140,7 @@ def found_hosts(doc: dict, actions: dict, makefile: str = "") -> tuple[dict[str,
             if isinstance(image, str):
                 hosts.setdefault(_image_host(image), "container image")
     for uses in _uses(doc):
-        if uses.startswith("./"):
+        if uses.startswith(LOCAL):
             continue
         if uses.startswith("docker://"):
             hosts.setdefault(_image_host(uses[len("docker://") :]), "docker action")
@@ -159,7 +166,26 @@ def declaration(root: Path) -> dict:
     return data
 
 
-def _declared_problems(path: str, doc: dict, reusable: bool, entry: dict, outside: dict) -> list:
+def _switch_problem(spec: dict, inputs: dict, today: datetime.date) -> str:
+    """Why a host of a reusable workflow has neither an off switch nor a valid exception."""
+    if "expires" not in spec:
+        switch = inputs.get(spec.get("input")) or {}
+        if switch.get("type") != "boolean" or switch.get("default") is not False:
+            return "needs `input` naming a boolean input that defaults to false"
+        return ""
+    expires = spec["expires"]
+    if "input" in spec:
+        return "names both `input` and `expires`: an exception has no switch"
+    if type(expires) is not datetime.date:
+        return "has an `expires` that is no date (unquoted YYYY-MM-DD)"
+    if expires < today:
+        return f"is an exception that expired on {expires}"
+    return ""
+
+
+def _declared_problems(
+    path: str, doc: dict, reusable: bool, entry: dict, outside: dict, today: datetime.date
+) -> list:
     """What is wrong with the hosts declared for one file."""
     problems = []
     inputs = (ciwf.triggers(doc).get("workflow_call") or {}).get("inputs") or {} if reusable else {}
@@ -170,12 +196,13 @@ def _declared_problems(path: str, doc: dict, reusable: bool, entry: dict, outsid
             problems.append(f"{path}: host {host} is declared without a reason")
             continue
         if reusable:
-            switch = inputs.get(spec.get("input")) or {}
-            if switch.get("type") != "boolean" or switch.get("default") is not False:
-                problems.append(
-                    f"{path}: host {host} needs `input` naming a boolean input "
-                    "that defaults to false"
-                )
+            problem = _switch_problem(spec, inputs, today)
+        elif "expires" in spec:
+            problem = "has an `expires`, which only a reusable workflow takes"
+        else:
+            problem = ""
+        if problem:
+            problems.append(f"{path}: host {host} {problem}")
     return problems
 
 
@@ -196,12 +223,20 @@ def _file_problems(path: str, kind: str, doc: dict, declared: dict, show: bool) 
         if host not in entry:
             problems.append(f"{path}: host {host} ({why}) is not declared")
     reusable = kind == "workflow" and "workflow_call" in ciwf.triggers(doc)
-    return problems + _declared_problems(path, doc, reusable, entry, outside)
+    today = declared["<today>"]
+    return problems + _declared_problems(path, doc, reusable, entry, outside, today)
 
 
-def check(root: Path, show: bool) -> int:
+def _dated(declared: dict) -> int:
+    """How many declared hosts are exceptions with a day they end."""
+    entries = [spec for hosts in declared.get("files", {}).values() for spec in hosts.values()]
+    return sum(1 for spec in entries if isinstance(spec, dict) and "expires" in spec)
+
+
+def check(root: Path, show: bool, today: datetime.date) -> int:
     try:
         declared = declaration(root)
+        declared["<today>"] = today
         documents = ciwf.files(root)
         makefile = root / "Makefile"
         declared["<makefile>"] = makefile.read_text(encoding="utf-8") if makefile.exists() else ""
@@ -212,7 +247,7 @@ def check(root: Path, show: bool) -> int:
     used_actions = set()
     for path, kind, doc in documents:
         used_actions.update(
-            u.split("@", 1)[0] for u in _uses(doc) if not u.startswith(("./", "docker://"))
+            u.split("@", 1)[0] for u in _uses(doc) if not u.startswith((*LOCAL, "docker://"))
         )
         problems += _file_problems(path, kind, doc, declared, show)
     known_paths = {path for path, _, _ in documents}
@@ -227,7 +262,8 @@ def check(root: Path, show: bool) -> int:
     if problems:
         return 1
     ciwf.say(
-        f"PASS: {len(documents)} files, {len(used_actions)} outside actions, every host declared"
+        f"PASS: {len(documents)} files, {len(used_actions)} outside actions, every host declared, "
+        f"{_dated(declared)} dated exception(s)"
     )
     return 0
 
@@ -236,8 +272,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("command", choices=("check", "list"))
     parser.add_argument("--root", type=Path, default=Path("."))
+    parser.add_argument("--today", type=datetime.date.fromisoformat, default=datetime.date.today())
     args = parser.parse_args()
-    return check(args.root, show=args.command == "list")
+    return check(args.root, show=args.command == "list", today=args.today)
 
 
 if __name__ == "__main__":

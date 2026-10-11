@@ -16,9 +16,9 @@ DECLARED = (
 )
 
 
-def scan(tree, workflow=REUSABLE, hosts=HOSTS):
-    tree.write({WORKFLOW: workflow, "actions/draft-stop/action.yml": ACTION, "hosts.toml": hosts})
-    return tree.tool("hosts.py", "check")
+def scan(tree, workflow=REUSABLE, hosts=HOSTS, *args, action=ACTION):
+    tree.write({WORKFLOW: workflow, "actions/draft-stop/action.yml": action, "hosts.toml": hosts})
+    return tree.tool("hosts.py", "check", *args)
 
 
 def planted(line):
@@ -205,3 +205,94 @@ def test_action_used_twice_is_reported_once(tree):
     done = scan(tree, REUSABLE.replace(step, again), HOSTS.replace('"actions/checkout" = []\n', ""))
     assert done.returncode == 1
     assert done.stderr.count("action actions/checkout is not in the allowed list") == 1
+
+
+LOG = "curl -fsSL https://rekor.sigstore.dev/api/v1/log"
+EXPIRES = "expires = 2026-12-31\n"
+DATED = DECLARED.replace('input = "publish"\n', EXPIRES)
+
+
+def test_dated_exception_passes_up_to_its_day(tree):
+    assert EXPIRES in DATED
+    done = scan(tree, planted(LOG), DATED, "--today", "2026-12-31")
+    assert done.returncode == 0, done.stderr
+    assert "1 dated exception(s)" in done.stdout
+
+
+def test_expired_exception_fails(tree):
+    done = scan(tree, planted(LOG), DATED, "--today", "2027-01-01")
+    assert done.returncode == 1, done.stdout
+    assert "host rekor.sigstore.dev is an exception that expired on 2026-12-31" in done.stderr
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [
+        ('expires = "2026-12-31"\n', "has an `expires` that is no date"),
+        ("expires = 2026-12-31T00:00:00\n", "has an `expires` that is no date"),
+        ("expires = true\n", "has an `expires` that is no date"),
+        (EXPIRES + 'input = "publish"\n', "names both `input` and `expires`"),
+    ],
+    ids=["text", "date-with-time", "boolean", "switch-and-exception"],
+)
+def test_malformed_exception_fails(tree, entry, message):
+    done = scan(tree, planted(LOG), DATED.replace(EXPIRES, entry), "--today", "2026-10-11")
+    assert done.returncode == 1, done.stdout
+    assert message in done.stderr
+
+
+def test_exception_with_a_day_that_does_not_exist_is_an_error(tree):
+    hosts = DATED.replace(EXPIRES, "expires = 2026-02-30\n")
+    assert scan(tree, planted(LOG), hosts, "--today", "2026-10-11").returncode == 3
+
+
+def test_stale_exception_fails(tree):
+    done = scan(tree, REUSABLE, DATED, "--today", "2026-10-11")
+    assert done.returncode == 1
+    assert "declared host rekor.sigstore.dev is not found in the file any more" in done.stderr
+
+
+STEP_FILE = "actions/draft-stop/action.yml"
+STEP_HOST = f'\n[files."{STEP_FILE}"."rekor.sigstore.dev"]\nreason = "public transparency log"\n'
+
+
+def with_download():
+    line = '        echo "$MESSAGE"\n'
+    assert line in ACTION
+    return ACTION.replace(line, line + f"        {LOG}\n")
+
+
+def test_host_of_a_file_that_is_no_reusable_workflow_needs_a_reason_only(tree):
+    done = scan(tree, REUSABLE, HOSTS + STEP_HOST, action=with_download())
+    assert done.returncode == 0, done.stderr
+
+
+def test_exception_outside_a_reusable_workflow_fails(tree):
+    done = scan(
+        tree, REUSABLE, HOSTS + STEP_HOST + EXPIRES, "--today", "2026-10-11", action=with_download()
+    )
+    assert done.returncode == 1, done.stdout
+    assert "has an `expires`, which only a reusable workflow takes" in done.stderr
+
+
+CALLER = """\
+---
+name: Licence check
+on: pull_request
+permissions: {}
+jobs:
+  licence:
+    name: Licence
+    permissions:
+      contents: read
+    uses: ./.github/workflows/licence.yml
+"""
+
+
+@pytest.mark.parametrize("form", ["./", "$/"])
+def test_call_inside_the_repository_is_no_outside_action(tree, form):
+    caller = CALLER.replace("uses: ./", f"uses: {form}")
+    assert f"uses: {form}.github" in caller
+    done = scan(tree.write({".github/workflows/licence-check.yml": caller}))
+    assert done.returncode == 0, done.stderr
+    assert "3 files, 1 outside actions" in done.stdout

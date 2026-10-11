@@ -40,6 +40,9 @@
             "context": "Verification gate"
           },
           {
+            "context": "Licence"
+          },
+          {
             "context": "REUSE lint"
           }
         ],

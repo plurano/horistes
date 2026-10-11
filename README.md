@@ -35,13 +35,24 @@ release.
 ## Status
 
 Private; nothing is released yet. The repository has its own gate and the
-checks every workflow added here must pass. No reusable workflow exists yet.
+checks every workflow added here must pass. The first reusable workflow is the
+licence check; this repository is its first caller.
+
+## Workflows
+
+| File | Purpose | Inputs | Check | Hosts beyond the forge |
+| :--- | :--- | :--- | :--- | :--- |
+| `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-24.04`) | `<calling job> / REUSE lint` | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)) |
+
+The job reads the contents and takes no secret; the caller grants
+`contents: read` and nothing else. On a draft pull request the job stops with
+an error instead of running.
 
 ## Layout
 
 | Path | Content |
 | :--- | :--- |
-| `.github/workflows/` | reusable workflows, and this repository's own gate (`ci.yml`) |
+| `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`) and its callers (`licence-check.yml`) |
 | `actions/<name>/` | composite steps |
 | `tools/` | the checks of the gate, and the same-verdict check for a switch |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
