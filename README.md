@@ -93,6 +93,13 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
   Python lint, actionlint and zizmor, the interface record, the host scan, the
   accepted findings and exceptions, the caller templates, the Scorecard
   service's rules, the runner labels, the tests and the licence headers.
+- The tests read the message of every commit between the base of the change
+  and `HEAD` (`tests/test_commit_messages.py`). A message fails when it credits
+  a tool or a model: a trailer whose key is not `Signed-off-by` or `Migration`,
+  a co-author line, or a line that opens with "generated with". The engine's
+  own message check passes such a message; this test retires when the pinned
+  engine refuses it. The message of a squash merge is written on the forge, so
+  it is read only afterwards, on the run of `main`.
 - `make interface-snapshot` rewrites `interface.lock.json` after an interface
   change. A change that breaks a caller also needs `interface_major` raised.
 
