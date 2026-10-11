@@ -24,5 +24,3 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/licence.yml
-    with:
-      runner: ubuntu-26.04
