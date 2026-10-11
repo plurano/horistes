@@ -41,6 +41,12 @@ licence job of its own. The second is the scorecard run; it has no caller
 yet, because a repository can call it only once this one is public. The caller
 a consumer keeps exists as a template for both.
 
+Consumers call this repository directly; no copy per owner is built. It turns
+public after its name is chosen, its history is shown to hold no private
+content and the first release exists. Until then only private repositories of
+the same owner can call it
+([ADR-0022](docs/adr/0022-public-consumers-call-this-repository-directly.md)).
+
 ## Workflows
 
 | File | Purpose | Inputs | Check | Hosts beyond the forge |
