@@ -133,6 +133,20 @@ def _own(root: Path, today: datetime.date) -> tuple[list[str], int]:
     return found, len(entries)
 
 
+def issues(root: Path, rule: str) -> list[str]:
+    """Issues the repository's own list names for one rule, for a text that must name them."""
+    path = root / OWN
+    entries = ciwf.load(path).get("exceptions") if path.exists() else None
+    if not isinstance(entries, list):
+        return []
+    named = {
+        entry.get("issue")
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("rule") == rule
+    }
+    return sorted(issue for issue in named if isinstance(issue, str))
+
+
 def problems(root: Path, today: datetime.date) -> tuple[list[str], int, int]:
     """What is wrong in both places, and how many entries each holds."""
     findings, accepted = _findings(root, today)

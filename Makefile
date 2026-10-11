@@ -15,7 +15,7 @@ ACTIONLINT_VERSION := 1.7.12
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
 .PHONY: verify verify-all tools requirements lint-yaml lint-python lint-workflows \
-	check-interface check-hosts check-exceptions test verify-reuse interface-snapshot
+	check-interface check-hosts check-exceptions check-templates test verify-reuse interface-snapshot
 
 # The one gate is `make verify-all`: CI runs exactly that target, so a local
 # green run and a green status check mean the same thing. This repository's own
@@ -26,8 +26,9 @@ verify-all: verify
 	@$(PRAETORCTL) audit
 
 # This repository's own checks; they need no engine.
-verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-exceptions test verify-reuse
-	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, tests and licence headers.'
+verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-exceptions check-templates \
+	test verify-reuse
+	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, tests and licence headers.'
 
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.
@@ -69,6 +70,11 @@ check-hosts:
 # reason and a day it ends, at most 90 days ahead.
 check-exceptions:
 	$(PYTHON) -B tools/exceptions.py check
+
+# Every caller template renders into a caller of a workflow kept here, by
+# commit, with inputs that workflow declares.
+check-templates:
+	$(PYTHON) -B tools/render.py check
 
 interface-snapshot:
 	$(PYTHON) -B tools/interface.py snapshot

@@ -1,0 +1,48 @@
+<%- /*
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+SPDX-License-Identifier: EUPL-1.2
+
+Caller of the shared licence check, as a consumer keeps it in
+.github/workflows/licence-check.yml. The rendered file is the whole of the
+consumer's licence job: the steps live in .github/workflows/licence.yml of the
+shared repository, named here by commit with the version as a comment.
+
+Required check: the forge reports the job as "Licence / REUSE lint". The engine
+declares it under the calling job's own name, "Licence", which no run reports
+(cordanaLLM/praetor#1212). Until that issue is fixed the calling job stays out
+of the consumer's required checks, or the switch waits.
+
+Fields: .Shared.Repository, .Shared.Commit and .Shared.Version are working
+names until the engine renders caller templates (cordanaLLM/praetor#1211);
+.RunnerTag is the engine's own. The trigger is spelled out for the same reason:
+with the engine it becomes the hosted gate's trigger function.
+
+Concurrency is set here and not in the shared workflow, so a consumer's group
+never collides with another caller's.
+*/ -%>
+---
+# Licence check: every file carries its licence information. The job is the
+# shared workflow of <% .Shared.Repository %>, named by commit.
+name: Licence check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: licence-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  licence:
+    name: Licence
+    permissions:
+      contents: read
+    uses: <% .Shared.Repository %>/.github/workflows/licence.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      runner: <% .RunnerTag %>

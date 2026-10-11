@@ -37,7 +37,7 @@ release.
 Private; nothing is released yet. The repository has its own gate and the
 checks every workflow added here must pass. The first reusable workflow is the
 licence check; this repository is its first caller and no longer keeps a
-licence job of its own.
+licence job of its own. The caller a consumer keeps exists as a template.
 
 ## Workflows
 
@@ -57,7 +57,8 @@ before the tool runs.
 | :--- | :--- |
 | `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`) and its callers (`licence-check.yml`) |
 | `actions/<name>/` | composite steps |
-| `tools/` | the checks of the gate, and the same-verdict check for a switch |
+| `templates/callers/` | the caller a consumer keeps, one template per shared workflow ([ADR-0009](docs/adr/0009-caller-templates-in-the-engines-syntax.md)) |
+| `tools/` | the checks of the gate, the same-verdict check for a switch, and the renderer of the caller templates |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
 | `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)) |
 | `interface.lock.json` | recorded interface of every workflow and action |
@@ -73,9 +74,43 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
 
 - `make verify` runs this repository's own checks without the engine: YAML and
   Python lint, actionlint and zizmor, the interface record, the host scan, the
-  accepted findings and exceptions, the tests and the licence headers.
+  accepted findings and exceptions, the caller templates, the tests and the
+  licence headers.
 - `make interface-snapshot` rewrites `interface.lock.json` after an interface
   change. A change that breaks a caller also needs `interface_major` raised.
+
+## Caller templates
+
+A consumer's caller is rendered from `templates/callers/<name>.yml.tmpl`:
+
+```sh
+python3 tools/render.py render --template templates/callers/licence.yml.tmpl --context context.toml \
+  > .github/workflows/licence-check.yml
+```
+
+`context.toml` holds the values of the template's fields:
+
+```toml
+RunnerTag = "ubuntu-26.04"
+
+[Shared]
+Repository = "owner/name"
+Commit = "<full id of the commit of this repository the caller names>"
+Version = "<the version that commit carries, written as a comment>"
+```
+
+The templates are written for the engine (Go `text/template` with the
+delimiters `<%` and `%>`). The engine does not render them yet
+(cordanaLLM/praetor issue 1211), so `tools/render.py` reads the part a caller
+needs: a field, a maintainer note and the trim markers. It refuses anything
+else, and a field the context does not hold; exit code 3.
+
+`make check-templates`, part of the gate, renders every template with sample
+values and fails unless the result calls a workflow file of this repository by
+commit, with inputs that workflow declares, no write scope and no secret.
+
+Until cordanaLLM/praetor issue 1212 is fixed, the calling job stays out of the
+consumer's required checks; each template's note says why.
 
 ## Switching a consumer
 
