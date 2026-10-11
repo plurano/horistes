@@ -23,3 +23,4 @@ record that supersedes it.
 | [0013](0013-scorecard-behind-a-switch.md) | 2026-10-11 | The scorecard run sits behind a switch that a caller sets by the repository's visibility | Accepted |
 | [0014](0014-release-read-back-without-credentials.md) | 2026-10-11 | A release is read back without credentials, by one tool and a parameter file per repository | Accepted |
 | [0015](0015-refusal-outside-a-public-repository-is-a-failed-job.md) | 2026-10-11 | A workflow with an input for public repositories only refuses another repository with a failed job | Accepted |
+| [0016](0016-action-pins-checked-with-zizmor-behind-three-guards.md) | 2026-10-11 | Action pins are listed, written and checked by zizmor behind three guards, and `with` keys are read here | Accepted |

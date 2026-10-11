@@ -75,7 +75,7 @@ rules.
 | `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`) and its callers (`licence-check.yml`) |
 | `actions/<name>/` | composite steps |
 | `templates/callers/` | the caller a consumer keeps, one template per shared workflow ([ADR-0009](docs/adr/0009-caller-templates-in-the-engines-syntax.md)) |
-| `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, and the release read-back |
+| `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, the release read-back, and the check of action pins |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
 | `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)); `readback` holds the parameter files of three read releases |
 | `interface.lock.json` | recorded interface of every workflow and action |
@@ -291,6 +291,46 @@ be read. The forge's API answers 60 requests an hour per address without
 credentials; a release costs one request and one more for each attestation
 the listed files need. The parameter files of the releases the tool was
 accepted on are kept in `tests/fixtures/readback/`.
+
+## Action pins
+
+Every outside action and called workflow is named by a commit with its
+release in a comment. One tool lists, writes and checks those lines for any
+checkout
+([ADR-0016](docs/adr/0016-action-pins-checked-with-zizmor-behind-three-guards.md)):
+
+```sh
+make list-pins  PINS_ROOT=../other   # uses on a tag or a branch; asks no host
+make check-pins PINS_ROOT=../other   # fails on any line below
+make pin        PINS_ROOT=../other   # writes what can be fixed, then checks
+```
+
+`PINS_ROOT` defaults to this repository. The tool reads
+`.github/workflows/*.yml` and `actions/*/action.yml` of the checkout and runs
+with the tools of this repository (`.venv`), never with a zizmor of the
+checkout.
+
+| `FAIL` line | Meaning | `pin` |
+| :--- | :--- | :--- |
+| `action is not pinned to a hash` | the use is on a tag or a branch | writes the commit the name stands for today and its release as the comment |
+| `is pointed to by tag vX` | the comment names another release than the commit | corrects the comment, keeps the commit |
+| `missing version comment` | a commit without a comment | adds the release |
+| `comment does not contain a version`, `points to unknown ref`, `branch points to commit ...` | the comment is no release of that repository, or holds more than the release | left for a person |
+| ``input `x` is not declared at that ref`` | a `with:` key the action or the called workflow does not have; the runner would ignore it | left for a person |
+| `no action.yml or action.yaml at that ref, or not readable` | the forge does not serve the metadata to this token | left for a person |
+
+`pin` moves no pin to a newer release; updates come from Renovate. The
+comment has to be the release alone (`# v4.2.2`). A commit that no release
+names is not judged.
+
+`check-pins` and `pin` need a token in `GH_TOKEN`, `GITHUB_TOKEN` or
+`ZIZMOR_GITHUB_TOKEN`, or a logged-in `gh`. Exit code 0 means every line
+passed, 1 a finding, 3 that the check could not be made: no token, a zizmor
+that did not report the planted case of the run, a finding of an audit the
+tool does not switch off, or an answer of the forge that cannot be read. The
+last line of a pass names the zizmor version and the numbers of files, uses
+and keys read. Neither target is part of `make verify-all`, which asks no
+host.
 
 ## Licence
 

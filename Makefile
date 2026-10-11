@@ -16,7 +16,7 @@ PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsc
 
 .PHONY: verify verify-all tools requirements lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
-	interface-snapshot
+	interface-snapshot list-pins check-pins pin
 
 # The one gate is `make verify-all`: CI runs exactly that target, so a local
 # green run and a green status check mean the same thing. This repository's own
@@ -86,6 +86,13 @@ check-scorecard:
 
 interface-snapshot:
 	$(PYTHON) -B tools/interface.py snapshot
+
+# Action pins (ADR-0016). `list-pins` asks no host. `check-pins` and `pin` ask
+# the forge and the repository of every action, so they are no part of the
+# gate; they need a token. PINS_ROOT is the checkout that is read.
+PINS_ROOT ?= .
+list-pins check-pins pin: tools
+	ZIZMOR="$(BIN)/zizmor" $(BIN)/python -B tools/pins.py $(patsubst %-pins,%,$@) --root "$(PINS_ROOT)"
 
 # The tests plant one defect per rule; the two outside linters are run on a
 # planted workflow as well, so a linter that stopped refusing fails here.
