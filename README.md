@@ -43,7 +43,7 @@ checks every workflow added here must pass. No reusable workflow exists yet.
 | :--- | :--- |
 | `.github/workflows/` | reusable workflows, and this repository's own gate (`ci.yml`) |
 | `actions/<name>/` | composite steps |
-| `tools/` | the checks of the gate |
+| `tools/` | the checks of the gate, and the same-verdict check for a switch |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
 | `interface.lock.json` | recorded interface of every workflow and action |
 | `hosts.toml` | hosts and outside actions the workflows may reach |
@@ -60,6 +60,49 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
   accepted findings, the tests and the licence headers.
 - `make interface-snapshot` rewrites `interface.lock.json` after an interface
   change. A change that breaks a caller also needs `interface_major` raised.
+
+## Switching a consumer
+
+A repository replaces its own job by a shared workflow only after both ran
+side by side and decided the same
+([ADR-0004](docs/adr/0004-same-verdict-before-a-switch.md)):
+
+```sh
+python3 tools/verdict.py --map trial.toml --live --record runs.json --markdown verdict.md
+```
+
+`trial.toml` names the repository, the trial's branches, each pair of old and
+new check with their workflow files, and the planted commits:
+
+```toml
+repository = "owner/name"
+branches = ["trial/licence"]
+
+[[pair]]
+family = "licence check"
+class = "R"
+old = "REUSE lint"
+new = "Licence / REUSE lint"
+old_workflow = ".github/workflows/reuse.yml"
+new_workflow = ".github/workflows/licence-check.yml"
+called_workflow = ".github/workflows/licence.yml"
+draft_stop = "Stop on a draft pull request"
+
+[[planted]]
+family = "licence check"
+commit = "<full id of a commit both jobs must fail>"
+expect = "FAIL"
+marker = "reuse lint"
+
+[[planted]]
+family = "licence check"
+commit = "<full id of a commit both jobs must pass>"
+expect = "PASS"
+```
+
+`--root` is the consumer's checkout and `--called-root` the checkout of this
+repository when the two differ. `--runs FILE` judges a recorded file instead of
+the forge. Exit code 0 allows the switch; 1, 2 and 3 do not.
 
 ## Licence
 

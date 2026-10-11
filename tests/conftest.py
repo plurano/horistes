@@ -9,6 +9,7 @@ fixture, so each test shows the one line that makes the tool refuse.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -100,6 +101,85 @@ forge = ["github.com", "api.github.com", "ghcr.io"]
 "actions/checkout" = []
 """
 
+# A stand-in for the forge's command-line client. It answers GET requests from
+# a file of canned answers, records every call, and serves nothing else.
+FAKE_CLIENT = """\
+import json
+import os
+import sys
+
+HEAD = ["api", "-H", "Accept: application/vnd.github+json"]
+HEAD += ["-H", "X-GitHub-Api-Version: 2022-11-28"]
+args = sys.argv[1:]
+with open(os.environ["FAKE_FORGE_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[:5] != HEAD or len(args) != 6:
+    sys.stderr.write("fake forge: only GET requests through `api` are served\\n")
+    sys.exit(2)
+with open(os.environ["FAKE_FORGE"], encoding="utf-8") as source:
+    answer = json.load(source).get(args[5])
+if answer is None:
+    sys.stderr.write("gh: Not Found (HTTP 404)\\n")
+    sys.exit(1)
+if isinstance(answer, dict) and list(answer) == ["fail"]:
+    sys.stderr.write(answer["fail"] + "\\n")
+    sys.exit(1)
+sys.stdout.write(answer["raw"] if isinstance(answer, dict) and list(answer) == ["raw"]
+                 else json.dumps(answer))
+"""
+PAGE = "per_page=100&page=1"
+
+
+def forge_job(number: int, name: str, conclusion: str | None, failed: str = "", note: str = ""):
+    """One job as the forge lists it; `failed` names the step that failed, `note` its annotation."""
+    steps = [{"name": "Set up job", "status": "completed", "conclusion": "success", "number": 1}]
+    if failed:
+        steps.append({"name": failed, "status": "completed", "conclusion": "failure", "number": 2})
+    return {
+        "id": number,
+        "name": name,
+        "status": "completed" if conclusion else "in_progress",
+        "conclusion": conclusion,
+        "started_at": "2026-10-11T01:28:40Z",
+        "completed_at": "2026-10-11T01:29:01Z" if conclusion else None,
+        "steps": steps,
+        "note": note,
+    }
+
+
+def forge_run(number: int, path: str, commit: str, created: str, *attempts: list, **fields):
+    """One workflow run with the jobs of each of its attempts."""
+    return {
+        "id": number,
+        "path": path,
+        "head_sha": commit,
+        "event": "pull_request",
+        "head_branch": "trial/licence",
+        "created_at": created,
+        "run_attempt": len(attempts),
+        "attempts": list(attempts),
+        **fields,
+    }
+
+
+def forge_answers(repository: str, runs: list[dict]) -> dict[str, object]:
+    """The canned answers for a listing of runs on the branch trial/licence."""
+    listing = [{k: v for k, v in run.items() if k != "attempts"} for run in runs]
+    answers: dict[str, object] = {
+        f"repos/{repository}/actions/runs?branch=trial%2Flicence&{PAGE}": {
+            "total_count": len(listing),
+            "workflow_runs": listing,
+        }
+    }
+    for run in runs:
+        for number, jobs in enumerate(run["attempts"], 1):
+            path = f"repos/{repository}/actions/runs/{run['id']}/attempts/{number}/jobs?{PAGE}"
+            answers[path] = {"total_count": len(jobs), "jobs": jobs}
+            for job in jobs:
+                notes = [{"annotation_level": "failure", "title": "", "message": job["note"]}]
+                answers[f"repos/{repository}/check-runs/{job['id']}/annotations?{PAGE}"] = notes
+    return answers
+
 
 class Tree:
     """A directory of fixture files and the tools run inside it."""
@@ -114,7 +194,9 @@ class Tree:
             path.write_text(text, encoding="utf-8")
         return self
 
-    def tool(self, name: str, *args: str) -> subprocess.CompletedProcess:
+    def tool(
+        self, name: str, *args: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess:
         command = [
             sys.executable,
             "-B",
@@ -123,7 +205,25 @@ class Tree:
             "--root",
             str(self.root),
         ]
-        return subprocess.run(command, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            command, capture_output=True, text=True, check=False, env={**os.environ, **(env or {})}
+        )
+
+    def forge(self, answers: dict[str, object]) -> dict[str, str]:
+        """Environment that puts the stand-in client with these answers in the forge's place."""
+        self.write({"fake_gh.py": FAKE_CLIENT, "forge.json": json.dumps(answers)})
+        return {
+            "GH": shlex.join([sys.executable, "-B", str(self.root / "fake_gh.py")]),
+            "FAKE_FORGE": str(self.root / "forge.json"),
+            "FAKE_FORGE_LOG": str(self.root / "forge.log"),
+        }
+
+    def forge_calls(self) -> list[str]:
+        """The path of every request the stand-in client received; anything but a GET fails."""
+        log = self.root / "forge.log"
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        assert all(len(call) == 6 and call[0] == "api" for call in calls), calls
+        return [call[5] for call in calls]
 
     def git(self, *args: str) -> str:
         identity = [

@@ -78,19 +78,6 @@ def _image_host(image: str) -> str:
     )
 
 
-def _strings(node: object):
-    """Every string below a node, without recursion: the depth of a document is not bounded."""
-    pending = [node]
-    while pending:
-        item = pending.pop()
-        if isinstance(item, str):
-            yield item
-        elif isinstance(item, dict):
-            pending.extend(item.values())
-        elif isinstance(item, list):
-            pending.extend(item)
-
-
 def _uses(doc: dict):
     """Every `uses:` of a workflow or composite action: job-level calls and steps."""
     jobs = doc.get("jobs") or {}
@@ -132,7 +119,7 @@ def found_hosts(doc: dict, actions: dict, makefile: str = "") -> tuple[dict[str,
     hosts: dict[str, str] = {}
     unknown = []
     runs_make = False
-    for text in _strings(doc):
+    for text in ciwf.strings(doc):
         _text_hosts(text, "", hosts)
         runs_make = runs_make or bool(MAKE.search(EXPRESSION.sub("", text)))
     if runs_make and makefile:
@@ -161,7 +148,7 @@ def found_hosts(doc: dict, actions: dict, makefile: str = "") -> tuple[dict[str,
     return hosts, unknown
 
 
-def _declaration(root: Path) -> dict:
+def declaration(root: Path) -> dict:
     path = root / DECLARATION
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -214,7 +201,7 @@ def _file_problems(path: str, kind: str, doc: dict, declared: dict, show: bool) 
 
 def check(root: Path, show: bool) -> int:
     try:
-        declared = _declaration(root)
+        declared = declaration(root)
         documents = ciwf.files(root)
         makefile = root / "Makefile"
         declared["<makefile>"] = makefile.read_text(encoding="utf-8") if makefile.exists() else ""

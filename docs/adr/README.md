@@ -11,3 +11,4 @@ record that supersedes it.
 | [0001](0001-three-layers.md) | 2026-10-11 | One source, a copy per owner, thin callers | Accepted |
 | [0002](0002-versioning-and-pinning.md) | 2026-10-11 | Versions, pins and the recorded interface | Accepted |
 | [0003](0003-declared-hosts.md) | 2026-10-11 | Every host a workflow reaches is declared | Accepted |
+| [0004](0004-same-verdict-before-a-switch.md) | 2026-10-11 | A consumer switches only after the same verdict is shown | Accepted |

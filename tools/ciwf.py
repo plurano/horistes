@@ -87,6 +87,19 @@ def files(root: Path) -> list[tuple[str, str, dict]]:
     return found
 
 
+def strings(node: object):
+    """Every string below a node, without recursion: the depth of a document is not bounded."""
+    pending = [node]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+
+
 def triggers(doc: dict) -> dict:
     """The `on` block as a mapping from event name to its settings."""
     on = doc.get("on")
