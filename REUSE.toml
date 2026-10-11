@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 #
 # Only files that cannot carry a header are named here, and the files the
@@ -16,7 +16,7 @@ path = [
     "requirements/tools.txt",
 ]
 precedence = "aggregate"
-SPDX-FileCopyrightText = "2026 Lusoris <lusoris@proton.me>"
+SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
 SPDX-License-Identifier = "EUPL-1.2"
 
 # Written by `praetorctl adopt` and held in step by `praetorctl audit`.
@@ -63,7 +63,7 @@ path = [
     "standards.sublime-project",
 ]
 precedence = "closest"
-SPDX-FileCopyrightText = "2026 Lusoris <lusoris@proton.me>"
+SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
 SPDX-License-Identifier = "EUPL-1.2"
 
 # Planted for the proof of the licence check: one file that must stay without
@@ -72,5 +72,5 @@ SPDX-License-Identifier = "EUPL-1.2"
 [[annotations]]
 path = ["tests/fixtures/unlicensed/planted.py"]
 precedence = "override"
-SPDX-FileCopyrightText = "2026 Lusoris <lusoris@proton.me>"
+SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
 SPDX-License-Identifier = "EUPL-1.2"

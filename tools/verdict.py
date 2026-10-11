@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 """Same-verdict check: the caller of a shared workflow judges like the job it replaces.
 

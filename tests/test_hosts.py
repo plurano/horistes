@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 """Host scan: an undeclared host, an action outside the list and a stale declaration all fail."""
 

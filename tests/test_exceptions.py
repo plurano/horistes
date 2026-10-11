@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 """Exceptions: an incomplete entry, an expired or too long one and a disabled rule all fail."""
 
