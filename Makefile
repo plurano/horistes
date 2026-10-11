@@ -39,11 +39,13 @@ $(VENV)/.stamp: requirements/tools.txt
 	$(BIN)/python -m pip install --quiet --disable-pip-version-check --require-hashes -r requirements/tools.txt
 	@touch $@
 
-# Recompile the pins; a release younger than three days is left out.
+# Recompile the pins; a release younger than three days is left out. The
+# header of the output records this command and Renovate reruns it from there,
+# so every option is one Renovate accepts and each value is joined with `=`
+# (tests/test_update_bot.py holds the two in step).
 requirements:
-	uv pip compile --quiet --universal --python-version 3.12 --generate-hashes --no-header --no-annotate \
-		--exclude-newer "$$(date -u -d '3 days ago' +%Y-%m-%dT00:00:00Z)" \
-		requirements/tools.in -o requirements/tools.txt
+	uv pip compile --quiet --universal --python-version=3.12 --generate-hashes --exclude-newer=P3D \
+		requirements/tools.in --output-file=requirements/tools.txt
 
 lint-yaml: tools
 	$(BIN)/yamllint --strict .

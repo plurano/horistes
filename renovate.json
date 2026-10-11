@@ -1,0 +1,54 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":gitSignOff"
+  ],
+  "minimumReleaseAge": "3 days",
+  "automerge": false,
+  "enabledManagers": [
+    "github-actions",
+    "pip-compile",
+    "custom.regex"
+  ],
+  "pip-compile": {
+    "managerFilePatterns": [
+      "/^requirements/tools\\.txt$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The licence tool image: release in the comment above, digest in the line.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/licence\\.yml$/"
+      ],
+      "matchStrings": [
+        "# release (?<currentValue>\\S+)\\n\\s+uses: docker://(?<depName>docker\\.io/fsfe/reuse)@(?<currentDigest>sha256:[0-9a-f]{64})\\n"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "The image of a `uses: docker://` line belongs to the custom manager above.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "docker"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Which release of a hosted machine a job runs on is decided in the repository, not proposed.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "github-runner"
+      ],
+      "enabled": false
+    }
+  ]
+}

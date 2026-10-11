@@ -370,6 +370,28 @@ read. `check-pins` and `pin` run the check as well; `pin` rewrites no label.
 The check is part of `make verify-all`. It has no exception list yet: a
 finding is fixed.
 
+## Updates
+
+Newer releases are proposed by Renovate (the update bot; the English verb)
+from `renovate.json`
+([ADR-0019](docs/adr/0019-update-proposals-from-renovate-configured-here.md)).
+A proposal waits three days after the release, is never merged by the bot and
+has to pass the gate like any other pull request.
+
+| Read by the bot | Where | How it finds the release |
+| :--- | :--- | :--- |
+| outside actions | `.github/workflows/` | the commit and the release in the comment behind it |
+| tools of the gate | `requirements/tools.txt` | the compile command in the header of the file, which it reruns |
+| the licence tool's image | `.github/workflows/licence.yml` | the comment `# release X.Y.Z` on the line above `uses:` and the digest in it |
+
+Not read: the files the Praetor engine writes (`.devcontainer/` among them),
+the machine of a job, and the actionlint version with its checksum in the
+`Makefile` and the gate workflow.
+
+`make requirements` recompiles the tool pins by hand with the same command.
+Keep the header and the comment above the image line: `tests/test_update_bot.py`
+fails when the bot could no longer read one of them.
+
 ## Licence
 
 EUPL-1.2, see [LICENSE](LICENSE).
