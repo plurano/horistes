@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Two images and a chart in the registry; the assets of the release page are
+# copies nothing signs.
+repository = "lusoris/SnatchArr"
+signer = ".github/workflows/release.yml"
+unverified = [
+    "snatcharr-{version}.tgz",
+    "snatcharr-api-{version}.spdx.json",
+    "snatcharr-worker-{version}.spdx.json",
+]
+images = [
+    "ghcr.io/lusoris/snatcharr-api:{version}",
+    "ghcr.io/lusoris/snatcharr-worker:{version}",
+    "ghcr.io/lusoris/charts/snatcharr:{version}",
+]

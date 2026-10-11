@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# One image; the signer is called by release.yml on a signed tag.
+repository = "tekmora/diallak"
+signer = ".github/workflows/release-image.yml"
+other_workflows = [".github/workflows/release.yml"]
+unverified = [
+    "diallak-{version}-linux-amd64.spdx.json",
+    "diallak-{version}-linux-arm64.spdx.json",
+]
+images = ["ghcr.io/tekmora/diallak:{version}"]

@@ -70,9 +70,9 @@ rules.
 | `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`) and its callers (`licence-check.yml`) |
 | `actions/<name>/` | composite steps |
 | `templates/callers/` | the caller a consumer keeps, one template per shared workflow ([ADR-0009](docs/adr/0009-caller-templates-in-the-engines-syntax.md)) |
-| `tools/` | the checks of the gate, the same-verdict check for a switch, and the renderer of the caller templates |
+| `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, and the release read-back |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
-| `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)) |
+| `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)); `readback` holds the parameter files of three read releases |
 | `interface.lock.json` | recorded interface of every workflow and action |
 | `hosts.toml` | hosts and outside actions the workflows may reach; a host without a switch has a day it ends, at most 90 days ahead ([ADR-0010](docs/adr/0010-one-longest-time-for-every-exception.md)); a host for public repositories only is marked ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
 | `exceptions.yaml` | exceptions to rules no other list can carry, each with its issue and a day it ends ([ADR-0007](docs/adr/0007-one-own-exception-list.md)) |
@@ -232,6 +232,58 @@ file, so `--runs` judges them again after the artifacts expired.
 `--root` is the consumer's checkout and `--called-root` the checkout of this
 repository when the two differ. `--runs FILE` judges a recorded file instead of
 the forge. Exit code 0 allows the switch; 1, 2 and 3 do not.
+
+## Reading a release back
+
+A published release is verified the way a stranger does it: with no login,
+no token and an empty home folder
+([ADR-0014](docs/adr/0014-release-read-back-without-credentials.md)):
+
+```sh
+python3 tools/readback.py verify --params release.toml --tag v1.2.3
+```
+
+The tool needs Python 3.12, `git` and `cosign` (read with v2.6.3) and
+nothing else from this repository than `tools/readback.py` and
+`tools/stranger.py`. A repository writes one parameter file and no script:
+
+```toml
+repository = "owner/name"
+signer = ".github/workflows/release.yml"      # the workflow that signs
+other_workflows = [".github/workflows/ci.yml"]  # must not pass in its place
+unverified = ["notes-{version}.txt"]           # assets nothing here verifies
+images = ["ghcr.io/owner/name:{version}"]
+
+[blobs]
+checksums = "checksums.txt"
+signature = "checksums.txt.sigstore.json"
+```
+
+A file names `blobs`, `images` or both; `{tag}` is the tag and `{version}`
+the tag without a leading `v`. `python3 tools/readback.py check --params
+release.toml` reads the file and makes no request.
+
+- **Blobs.** The release holds exactly the checksums, their signature, the
+  listed files and the files declared `unverified`. Each listed file matches
+  its digest, the signature verifies the checksums, and for each listed file
+  the forge serves a provenance attestation that verifies it.
+- **Images.** The signature verifies the reference, and the provenance
+  attestation verifies the image by the digest the signature named.
+- **Identity.** Every signature and attestation must come from the `signer`
+  workflow of the repository, run on the tag, at the commit `git ls-remote`
+  gives for the tag.
+- **Controls.** Each accepted check is asked again with one expectation
+  changed (another tag, the branch `main`, another repository, another
+  commit, another issuer, another workflow, an altered file), and each of
+  those calls must be refused. A control that gets no answer fails.
+
+The lines read `PASS accept`, `PASS refuse`, `FAIL ...` and `NOTE ...`. Exit
+code 0 means every line passed, 1 that a check failed or a control was
+accepted, 3 that the parameters, the tag or an answer of the forge could not
+be read. The forge's API answers 60 requests an hour per address without
+credentials; a release costs one request and one more for each attestation
+the listed files need. The parameter files of the releases the tool was
+accepted on are kept in `tests/fixtures/readback/`.
 
 ## Licence
 
