@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Hosts the workflows and actions of this repository may reach, read by
+# tools/hosts.py. A host missing here fails the gate, and so does a host
+# declared here that no file names any more.
+
+# The forge itself: reachable from every file without a declaration.
+forge = [
+    "github.com",
+    "api.github.com",
+    "uploads.github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "token.actions.githubusercontent.com",
+    "ghcr.io",
+]
+
+# The outside actions a file here may use, each with the hosts it reaches by
+# itself beyond the forge. An action missing here fails the gate.
+[actions]
+"actions/checkout" = []
+# Takes the toolchain from the runner's cache or the forge-hosted manifest;
+# when both miss it downloads from the Go distribution site, which redirects.
+"actions/setup-go" = ["go.dev", "dl.google.com"]
+# A container action: its image is built from the licence tool's public image.
+"fsfe/reuse-action" = ["docker.io"]
+
+# This repository's own gate. It is no reusable workflow, so no input switches
+# these hosts off; each is named with what needs it.
+[files.".github/workflows/ci.yml"."go.dev"]
+reason = "Go toolchain for the engine build, when the runner's cache and the forge manifest miss"
+
+[files.".github/workflows/ci.yml"."dl.google.com"]
+reason = "target of the Go distribution site's download redirect"
+
+[files.".github/workflows/ci.yml"."proxy.golang.org"]
+reason = "modules of the pinned engine commit"
+
+[files.".github/workflows/ci.yml"."sum.golang.org"]
+reason = "checksum database for those modules"
+
+[files.".github/workflows/ci.yml"."pypi.org"]
+reason = "index of the hash-pinned tools in requirements/tools.txt, installed by `make tools`"
+
+[files.".github/workflows/ci.yml"."files.pythonhosted.org"]
+reason = "files of those tools"
+
+# Written by the engine; leaves when the shared licence workflow replaces it.
+[files.".github/workflows/reuse.yml"."docker.io"]
+reason = "image of the licence tool behind fsfe/reuse-action"

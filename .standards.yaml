@@ -1,0 +1,46 @@
+---
+version: 1
+repository:
+  owner: plurano
+  name: shared-ci
+  visibility: private
+  description: "Reusable CI workflows and templates of the Plurano family (working name)."
+  homepage: ""
+  topics: []
+profiles:
+  - framework
+facets:
+  - security:high
+  - api:public-contract
+  - agent:sandboxed
+# The engine has no flavor for a repository of workflow files, nor a library
+# flavor (cordanaLLM/praetor#67). Until it does, the Python check tooling under
+# tools/ is audited as python-ml, the only Python flavor; nothing here is a
+# machine-learning pipeline.
+flavors:
+  - name: python-ml
+register:
+  sources:
+    expected: 13
+    sha256:
+      sha256:21731aeac3c2442a4eb28abd0593ab59cb453db34c8937c0b268c70d219141aa
+    inputs:
+      - path: .paperclip/harness.json
+        surface: prompts
+        kind: message
+        format: json
+        selector: operating_contract.*
+      - path: .paperclip/harness.json
+        surface: prompts
+        kind: message
+        format: json
+        selector: invariants.*
+exceptions:
+  - rule: HISS-11
+    path: .github/workflows/release.yml
+    reason: >-
+      adoption found the release workflows short of the declared supply chain (SLSA Build Level 3
+      declared, Level 0 measured; enforce_cosign without a cosign signing step; require_sbom without
+      an SBOM step); raise them as docs/guides/releasing.md in Praetor describes, then remove this
+      entry
+    expires: "2027-01-09"

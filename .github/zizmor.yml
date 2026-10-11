@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Findings of zizmor that are accepted for a time. One entry is one rule in one
+# file and carries its expiry and reason on the same line; tools/exceptions.py
+# fails the gate on an entry without them and on an expired one.
+rules:
+  concurrency-limits:
+    ignore:
+      - reuse.yml # expires 2026-12-31: engine-written; replaced by the shared licence workflow

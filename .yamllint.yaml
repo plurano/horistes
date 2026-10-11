@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+extends: default
+
+ignore: |
+  .venv/
+  .workingdir/
+
+rules:
+  line-length:
+    max: 120
+  # `on:` is a workflow key, not a boolean.
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1

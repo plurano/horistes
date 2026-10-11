@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Verification gate: runs `make verify-all`, the same target a contributor runs
+# locally, with the tools requirements/tools.txt pins and the engine built from
+# the pinned Praetor commit.
+name: Verification gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  # SHA-256 of actionlint_1.7.12_linux_amd64.tar.gz, from the release's checksum file.
+  ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+  # Published Praetor commit that builds the praetorctl this gate pins.
+  PRAETOR_COMMIT: "bd40beae2969386ac33b446b8191ba760102e14c"
+
+jobs:
+  verify:
+    name: Verification gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      # Full history: the interface check reads the base of the change and the
+      # sign-off step reads every commit of the pull request.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out pinned Praetor source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cordanaLLM/praetor
+          ref: ${{ env.PRAETOR_COMMIT }}
+          path: praetor-src
+          persist-credentials: false
+
+      - name: Set up the Go toolchain declared by Praetor
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: praetor-src/go.mod
+          cache: false
+
+      - name: Build pinned praetorctl from the published Praetor commit
+        env:
+          GOTOOLCHAIN: local
+          CGO_ENABLED: "0"
+          GOFLAGS: -mod=readonly
+        run: |
+          test "$(git -C praetor-src rev-parse HEAD)" = "$PRAETOR_COMMIT"
+          mkdir -p "$RUNNER_TEMP/bin"
+          # go vet first: the Go compiler has no warnings, so vet is the
+          # warnings-as-errors form for the one Go build this gate runs.
+          ( cd praetor-src && go mod download && go mod verify \
+            && go vet ./... \
+            && go build -trimpath -buildvcs=false \
+              -o "$RUNNER_TEMP/bin/praetorctl" ./cmd/standardsctl )
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          # The Praetor checkout is a build input only; the audit and the
+          # licence check must not read it as content of this repository.
+          rm -rf praetor-src
+
+      - name: Install the pinned actionlint
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --silent --show-error --location --max-time 120 --retry 2 \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" actionlint
+
+      # The interface is compared with the commit the change starts from.
+      - name: Verification gate
+        env:
+          BASE_REF: >-
+            ${{ github.event.pull_request.base.sha
+            || github.event.merge_group.base_sha
+            || github.event.before }}
+        run: make verify-all BASE_REF="$BASE_REF"
+
+      - name: Sign-off on pull request commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for sha in $(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA"); do
+            if ! git log -1 --format=%B "$sha" | grep -q '^Signed-off-by: '; then
+              echo "::error::commit $sha lacks a Signed-off-by trailer"
+              missing=1
+            fi
+          done
+          exit "$missing"

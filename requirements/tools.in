@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# The tools of the local gate and of CI, one version for both. Compile with
+# `make requirements`; it leaves out every release younger than three days.
+pytest
+pyyaml
+reuse
+ruff
+yamllint
+zizmor

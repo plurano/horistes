@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@proton.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# Rule set of the engine's Python template. The target is 3.12, not the
+# template's 3.14: CI runs the checks on the Python of the hosted runner image.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "T20", "SIM"]
+ignore = []
