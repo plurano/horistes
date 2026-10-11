@@ -36,7 +36,8 @@
         }
       },
       "jobs": {
-        "analysis": "Analysis"
+        "analysis": "Analysis",
+        "visibility": "Public repository"
       },
       "outputs": [],
       "secrets": {},

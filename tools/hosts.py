@@ -20,6 +20,10 @@ ahead than the longest time an exception may run (exceptions.py) fails too.
 A host that is asked with the name of the calling repository carries
 `public_only = true` beside its `input`. render.py then refuses a caller
 template that passes that input as anything but the repository's visibility.
+A caller written by hand can still pass true, so a workflow with such an
+input also refuses for itself: its job `visibility` runs when one of those
+inputs is true and reads the visibility the event names, and every other job
+needs it. A job that is skipped reads as a pass; a job that failed does not.
 
 What the scan reads: URLs and registry paths in every string of the file,
 container and service images, and the registries that package commands
@@ -77,6 +81,13 @@ IMPLIED = (
 
 # A step that runs make: the Makefile at the root is then part of what the file reaches.
 MAKE = re.compile(r"(?:^|[\s;&|(])make\s+[\w-]", re.M)
+
+# The job that refuses a repository that is not public, and what it reads.
+GUARD = "visibility"
+VISIBILITY = "${{ github.event.repository.visibility }}"
+# A condition with one of these runs a job although a job it needs failed.
+CONTINUES = re.compile(r"\b(?:always|failure|cancelled)\s*\(")
+LENIENT = "continue-on-error"
 
 
 def _image_host(image: str) -> str:
@@ -209,6 +220,62 @@ def public_inputs(declared: dict, path: str) -> set[str]:
     }
 
 
+def _condition(job: dict) -> str:
+    """The `if` of a job, without the braces of an expression."""
+    text = str(job.get("if", "")).strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2]
+    return text.strip()
+
+
+def _reads_visibility(step: object) -> bool:
+    """Whether a step runs a command that is given the visibility the event names."""
+    if not isinstance(step, dict) or not isinstance(step.get("run"), str):
+        return False
+    env = step.get("env")
+    return isinstance(env, dict) and VISIBILITY in env.values()
+
+
+def _guard_job_problems(guard: dict, public: set[str]) -> list[str]:
+    """What keeps the guard from failing in a repository that is not public."""
+    problems = []
+    wanted = sorted(f"inputs.{name}" for name in public)
+    if sorted(part.strip() for part in _condition(guard).split("||")) != wanted:
+        problems.append(f"does not run exactly when `{' || '.join(wanted)}`")
+    steps = guard.get("steps") if isinstance(guard.get("steps"), list) else []
+    if not any(_reads_visibility(step) for step in steps):
+        problems.append(f"has no step that runs a command on `{VISIBILITY}`")
+    if any(isinstance(holder, dict) and LENIENT in holder for holder in [guard, *steps]):
+        problems.append(f"sets `{LENIENT}`, so its failure would not count")
+    if guard.get("needs"):
+        problems.append("needs another job, so it can be skipped")
+    return problems
+
+
+def _guard_problems(path: str, doc: dict, public: set[str]) -> list[str]:
+    """Why a workflow with an input for public repositories only does not refuse for itself."""
+    if not public:
+        return []
+    jobs = {str(n): j for n, j in (doc.get("jobs") or {}).items() if isinstance(j, dict)}
+    if GUARD not in jobs:
+        return [
+            f"{path}: an input is for public repositories only and no job `{GUARD}` "
+            "refuses another repository"
+        ]
+    problems = [
+        f"{path}: job `{GUARD}` {problem}" for problem in _guard_job_problems(jobs[GUARD], public)
+    ]
+    for name, job in sorted(jobs.items()):
+        needs = job.get("needs") or []
+        if name == GUARD:
+            continue
+        if GUARD not in ([needs] if isinstance(needs, str) else needs):
+            problems.append(f"{path}: job `{name}` does not need job `{GUARD}`")
+        elif CONTINUES.search(_condition(job)):
+            problems.append(f"{path}: job `{name}` runs although job `{GUARD}` failed")
+    return problems
+
+
 def _declared_problems(
     path: str, doc: dict, reusable: bool, entry: dict, outside: dict, today: datetime.date
 ) -> list:
@@ -249,7 +316,9 @@ def _file_problems(path: str, kind: str, doc: dict, declared: dict, show: bool) 
             problems.append(f"{path}: host {host} ({why}) is not declared")
     reusable = kind == "workflow" and "workflow_call" in ciwf.triggers(doc)
     today = declared["<today>"]
-    return problems + _declared_problems(path, doc, reusable, entry, outside, today)
+    problems += _declared_problems(path, doc, reusable, entry, outside, today)
+    public = public_inputs(declared, path) if reusable else set()
+    return problems + _guard_problems(path, doc, public)
 
 
 def _dated(declared: dict) -> int:

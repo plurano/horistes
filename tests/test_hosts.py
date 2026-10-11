@@ -289,13 +289,8 @@ def test_exception_outside_a_reusable_workflow_fails(tree):
     assert "has `expires`, which only a reusable workflow takes" in done.stderr
 
 
+# A well-formed mark passes with the job that refuses another repository: test_guard.py.
 PUBLIC_ONLY = "public_only = true\n"
-MARKED = DECLARED + PUBLIC_ONLY
-
-
-def test_host_marked_for_public_repositories_passes(tree):
-    done = scan(tree, planted(LOG), MARKED)
-    assert done.returncode == 0, done.stderr
 
 
 @pytest.mark.parametrize(
