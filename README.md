@@ -171,6 +171,41 @@ expect = "FAIL"
 marker = "reuse lint"
 ```
 
+A job that passes whatever it finds, such as a scorecard run, is a pair of
+class U. Where both jobs pass, the checks and findings of the SARIF result
+each uploaded are compared, and the planted commits name a finding that must
+show in both results and a commit where it must show in neither
+([ADR-0011](docs/adr/0011-uploaded-result-of-a-job-that-always-passes.md)):
+
+```toml
+[[pair]]
+family = "scorecard"
+class = "U"
+old = "Scorecard analysis"
+new = "Scorecard / Analysis"
+old_workflow = ".github/workflows/scorecard-old.yml"
+new_workflow = ".github/workflows/scorecard-check.yml"
+called_workflow = ".github/workflows/scorecard.yml"
+old_artifact = "scorecard-old"
+new_artifact = "scorecard-new"
+
+[[planted]]
+family = "scorecard"
+commit = "<full id of a commit with the planted finding>"
+expect = "FINDING"
+marker = '^PinnedDependenciesID \| \.github/workflows/planted\.yml:7 '
+
+[[planted]]
+family = "scorecard"
+commit = "<full id of a commit without it>"
+expect = "CLEAN"
+marker = '^PinnedDependenciesID \| \.github/workflows/planted\.yml:7 '
+```
+
+A finding is one line: its rule, its places, the first line of its message
+and a digest of the other lines. `--record` keeps the results in the recorded
+file, so `--runs` judges them again after the artifacts expired.
+
 `--root` is the consumer's checkout and `--called-root` the checkout of this
 repository when the two differ. `--runs FILE` judges a recorded file instead of
 the forge. Exit code 0 allows the switch; 1, 2 and 3 do not.

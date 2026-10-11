@@ -9,6 +9,7 @@ failing script step leaves only its exit code as annotation.
 
 from __future__ import annotations
 
+import hashlib
 import shlex
 import subprocess
 import sys
@@ -16,7 +17,16 @@ import time
 import types
 
 import pytest
-from conftest import PAGE, ROOT, forge_answers, forge_job, forge_run
+from conftest import (
+    PAGE,
+    ROOT,
+    archive,
+    forge_answers,
+    forge_artifact,
+    forge_job,
+    forge_run,
+    sarif_log,
+)
 
 sys.path.insert(0, str(ROOT / "tools"))
 import forge
@@ -239,3 +249,177 @@ def test_request_other_than_a_get_is_refused_by_the_stand_in(tree):
     command = [*shlex.split(env["GH"]), "api", "-X", "DELETE", "repos/x/y"]
     done = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
     assert done.returncode == 2
+
+
+SCORE_FILE = ".github/workflows/scorecard.yml"
+SCORE_JOB, SCORE_ARTIFACT = "Scorecard / Analysis", "scorecard-new"
+UPLOADS = {SCORE_JOB: SCORE_ARTIFACT}
+SCORE_RULES = ("TokenPermissionsID", "VulnerabilitiesID")
+WRITES = ("TokenPermissionsID", ".github/workflows/ci.yml", 1, "score is 9: one workflow writes")
+SCORE_TEXT = sarif_log((WRITES,), SCORE_RULES)
+SARIF = archive({"results.sarif": SCORE_TEXT})
+LIMIT = len(SCORE_TEXT)
+ARTIFACTS = f"repos/{REPOSITORY}/actions/runs/61/artifacts?name={SCORE_ARTIFACT}&{PAGE}"
+LATER = "2026-10-11T01:40:00Z"
+
+
+def archive_of(number: int) -> str:
+    return f"repos/{REPOSITORY}/actions/artifacts/{number}/zip"
+
+
+def score_run(artifacts: list, *attempts: list) -> dict:
+    """One run of the scorecard workflow that holds these artifacts; one passing job by default."""
+    jobs = attempts or ([forge_job(601, SCORE_JOB, "success")],)
+    return forge_run(61, SCORE_FILE, COMMIT, "02:20:00", *jobs, artifacts=artifacts)
+
+
+def uploaded(client, run: dict, change=None) -> dict:
+    """What the reader gives for this run; `change` alters the canned answers first."""
+    answers = forge_answers(REPOSITORY, [run], (SCORE_ARTIFACT,))
+    if change:
+        change(answers)
+    client(answers)
+    return forge.collect(REPOSITORY, ["trial/licence"], {SCORE_FILE}, UPLOADS)
+
+
+def result_of(data: dict) -> dict:
+    assert data["errors"] == []
+    (check,) = data["subjects"][0]["checks"]
+    return check["result"]
+
+
+def test_result_of_a_passing_job_is_read_from_its_artifact(tree, client):
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF)
+    data = uploaded(client, score_run([held]))
+    assert result_of(data) == {
+        "state": "read",
+        "artifact": SCORE_ARTIFACT,
+        "sha256": held["digest"].removeprefix("sha256:"),
+        "tools": ["Scorecard v5.5.0"],
+        "checks": list(SCORE_RULES),
+        "findings": [
+            "TokenPermissionsID | .github/workflows/ci.yml:1 | score is 9: one workflow writes | "
+            "e3b0c44298fc"
+        ],
+    }
+    assert tree.forge_calls()[-2:] == [ARTIFACTS, archive_of(901)]
+
+
+def test_job_that_is_not_named_as_uploading_is_asked_for_nothing(tree, client):
+    run = score_run([forge_artifact(901, SCORE_ARTIFACT, SARIF)])
+    client(forge_answers(REPOSITORY, [run], (SCORE_ARTIFACT,)))
+    for named in (None, {}, {"Another job": SCORE_ARTIFACT}):
+        data = forge.collect(REPOSITORY, ["trial/licence"], {SCORE_FILE}, named)
+        assert data["errors"] == []
+        assert "result" not in data["subjects"][0]["checks"][0]
+    assert not any("artifacts" in call for call in tree.forge_calls())
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", None])
+def test_job_that_did_not_pass_is_asked_for_no_result(tree, client, conclusion):
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF)
+    data = uploaded(client, score_run([held], [forge_job(601, SCORE_JOB, conclusion)]))
+    assert data["errors"] == []
+    assert "result" not in data["subjects"][0]["checks"][0]
+    assert not any("artifacts" in call for call in tree.forge_calls())
+
+
+def test_run_without_the_artifact_gives_no_result(tree, client):
+    other = forge_artifact(902, "coverage", SARIF)
+    assert result_of(uploaded(client, score_run([other]))) == {
+        "state": "none",
+        "artifact": SCORE_ARTIFACT,
+    }
+    assert archive_of(902) not in tree.forge_calls()
+
+
+def test_artifact_of_another_name_in_the_answer_is_not_taken(tree, client):
+    other = {k: v for k, v in forge_artifact(902, "scorecard-new-2", SARIF).items() if k != "data"}
+
+    def change(answers: dict) -> None:
+        answers[ARTIFACTS] = {"total_count": 1, "artifacts": [other]}
+
+    assert result_of(uploaded(client, score_run([]), change))["state"] == "none"
+
+
+def test_expired_artifact_is_recorded_and_not_fetched(tree, client):
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF, expired=True)
+    assert result_of(uploaded(client, score_run([held]))) == {
+        "state": "expired",
+        "artifact": SCORE_ARTIFACT,
+    }
+    assert archive_of(901) not in tree.forge_calls()
+
+
+def test_artifact_of_an_earlier_attempt_is_not_the_result_of_the_last(tree, client):
+    """A re-run that uploads nothing leaves the first attempt's artifact in the listing."""
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF)
+    first = [forge_job(601, SCORE_JOB, "success")]
+    again = [{**forge_job(602, SCORE_JOB, "success"), "started_at": LATER}]
+    assert result_of(uploaded(client, score_run([held], first)))["state"] == "read"
+    assert result_of(uploaded(client, score_run([held], first, again))) == {
+        "state": "none",
+        "artifact": SCORE_ARTIFACT,
+    }
+
+
+def test_newest_of_two_artifacts_of_the_name_is_the_result(tree, client):
+    newer = archive({"results.sarif": sarif_log((), SCORE_RULES)})
+    held = [
+        forge_artifact(902, SCORE_ARTIFACT, newer, created_at="2026-10-11T01:40:20Z"),
+        forge_artifact(901, SCORE_ARTIFACT, SARIF),
+    ]
+    read = result_of(uploaded(client, score_run(held)))
+    assert (read["state"], read["findings"]) == ("read", [])
+    assert read["sha256"] == held[0]["digest"].removeprefix("sha256:")
+    assert archive_of(901) not in tree.forge_calls()
+
+
+def test_archive_that_is_not_the_one_listed_is_unreadable(tree, client):
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF, digest="sha256:" + "0" * 64)
+    read = result_of(uploaded(client, score_run([held])))
+    assert (read["state"], read["artifact"]) == ("unreadable", SCORE_ARTIFACT)
+    found = hashlib.sha256(SARIF).hexdigest()[:12]
+    assert read["detail"] == f"archive is sha256:{found}, the forge lists sha256:000000000000"
+    assert set(read) == {"state", "artifact", "detail"}
+
+
+@pytest.mark.parametrize("size", [LIMIT + 1, None, "small"])
+def test_archive_over_the_limit_is_unreadable_and_not_fetched(tree, client, monkeypatch, size):
+    monkeypatch.setattr(forge.results, "MAX_BYTES", LIMIT)
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF, size_in_bytes=LIMIT)
+    assert result_of(uploaded(client, score_run([held])))["state"] == "read"
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF, size_in_bytes=size)
+    assert result_of(uploaded(client, score_run([held]))) == {
+        "state": "unreadable",
+        "artifact": SCORE_ARTIFACT,
+        "detail": f"archive of {size} bytes, at most {LIMIT} are read",
+    }
+    assert tree.forge_calls().count(archive_of(901)) == 1
+
+
+@pytest.mark.parametrize("missing", ["created_at", "started_at"])
+def test_artifact_without_a_time_is_an_error_not_a_guess(tree, client, missing):
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF)
+    job = forge_job(601, SCORE_JOB, "success")
+    if missing == "created_at":
+        held[missing] = None
+    else:
+        job[missing] = "soon"
+    data = uploaded(client, score_run([held], [job]))
+    assert data["errors"] == [
+        f"GET {ARTIFACTS.removesuffix('&' + PAGE)}: "
+        f"no time to tell the attempts of {SCORE_ARTIFACT!r} apart"
+    ]
+    assert data["subjects"] == []
+    assert archive_of(901) not in tree.forge_calls()
+
+
+def test_archive_that_cannot_be_fetched_is_an_error(tree, client):
+    held = forge_artifact(901, SCORE_ARTIFACT, SARIF)
+
+    def change(answers: dict) -> None:
+        answers[archive_of(901)] = {"fail": "gh: Gone (HTTP 410)"}
+
+    data = uploaded(client, score_run([held]), change)
+    assert data["errors"] == [f"GET {archive_of(901)}: gh: Gone (HTTP 410)"]

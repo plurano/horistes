@@ -3,8 +3,10 @@
 """Reads the runs of a trial from the forge into the shape verdict.py judges.
 
 Every request is a GET through the forge's command-line client (`gh api`),
-so the reader contacts no host but the forge and changes nothing there. The
-client is taken from the environment variable GH when it is set.
+so the reader changes nothing on the forge. It asks no host but the forge;
+the download of an artifact is answered with a redirect to the forge's
+artifact storage, which the client follows. The client is taken from the
+environment variable GH when it is set.
 
 Shape of the result:
 
@@ -13,7 +15,15 @@ Shape of the result:
                    "checks": [{"name": ..., "workflow": ...,
                                "attempts": [{"attempt": 1, "status": ...,
                                              "conclusion": ..., "failed_steps": [],
-                                             "annotations": [], "seconds": 12.0}]}]}]}
+                                             "annotations": [], "seconds": 12.0}],
+                               "result": {...}}]}]}
+
+A check named in `artifacts` (check name to artifact name) carries the result
+its latest attempt uploaded under that name, in the record tools/results.py
+describes. It is read only for an attempt that concluded success. Of the
+artifacts of that name only those created since the attempt started count:
+after a re-run that uploads nothing, the artifact of the earlier attempt is
+not taken for it.
 
 A subject is one triggering event on one commit. The forge gives the runs
 of one event no shared identifier, so runs are grouped by commit, event and
@@ -35,6 +45,8 @@ import time
 from datetime import datetime
 from urllib.parse import quote
 
+import results
+
 PER_PAGE = 100
 MAX_PAGES = 10
 RETRIES = 4
@@ -52,26 +64,32 @@ class ForgeError(Exception):
     """A request the forge did not answer with readable data."""
 
 
-def api(path: str) -> object:
-    """The decoded answer of one GET; a rate limit is waited out a few times."""
+def download(path: str) -> bytes:
+    """The body of one GET as it came; a rate limit is waited out a few times."""
     command = [*shlex.split(os.environ.get("GH", "gh")), "api", *HEADERS, path]
     for attempt in range(RETRIES):
         try:
             done = subprocess.run(
-                command, capture_output=True, text=True, check=False, timeout=DEADLINE_SECONDS
+                command, capture_output=True, check=False, timeout=DEADLINE_SECONDS
             )
         except (OSError, subprocess.TimeoutExpired) as err:
             raise ForgeError(f"GET {path}: {err}") from err
         if done.returncode == 0:
-            try:
-                return json.loads(done.stdout)
-            except ValueError as err:
-                raise ForgeError(f"GET {path}: answer is not JSON ({err})") from err
-        if "rate limit" not in done.stderr.lower():
-            raise ForgeError(f"GET {path}: {done.stderr.strip()[:300] or done.returncode}")
+            return done.stdout
+        complaint = done.stderr.decode("utf-8", "replace")
+        if "rate limit" not in complaint.lower():
+            raise ForgeError(f"GET {path}: {complaint.strip()[:300] or done.returncode}")
         if attempt + 1 < RETRIES:
             time.sleep(WAIT_SECONDS * (attempt + 1))
     raise ForgeError(f"GET {path}: rate limit, {RETRIES} attempts used")
+
+
+def api(path: str) -> object:
+    """The decoded answer of one GET."""
+    try:
+        return json.loads(download(path))
+    except ValueError as err:
+        raise ForgeError(f"GET {path}: answer is not JSON ({err})") from err
 
 
 def paged(path: str, key: str | None) -> list[dict]:
@@ -92,13 +110,46 @@ def paged(path: str, key: str | None) -> list[dict]:
     raise ForgeError(f"GET {path}: more than {MAX_PAGES * PER_PAGE} entries")
 
 
-def _seconds(job: dict) -> float | None:
+def _time(value: object) -> datetime | None:
     try:
-        started = datetime.fromisoformat(str(job.get("started_at")).replace("Z", "+00:00"))
-        ended = datetime.fromisoformat(str(job.get("completed_at")).replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _seconds(job: dict) -> float | None:
+    started, ended = _time(job.get("started_at")), _time(job.get("completed_at"))
+    if started is None or ended is None:
+        return None
     return max(0.0, (ended - started).total_seconds())
+
+
+def _result(repository: str, run: object, name: str, started: object) -> dict:
+    """What a job that started at `started` uploaded as the artifact `name` of its run."""
+    since = _time(started)
+    listing = f"repos/{repository}/actions/runs/{run}/artifacts?name={quote(name, safe='')}"
+    mine = []
+    for artifact in paged(listing, "artifacts"):
+        created = _time(artifact.get("created_at"))
+        if since is None or created is None:
+            raise ForgeError(f"GET {listing}: no time to tell the attempts of {name!r} apart")
+        if artifact.get("name") == name and created >= since:
+            mine.append((created, artifact))
+    if not mine:
+        return {"state": "none", "artifact": name}
+    newest = max(mine, key=lambda entry: entry[0])[1]
+    if newest.get("expired"):
+        return {"state": "expired", "artifact": name}
+    size = newest.get("size_in_bytes")
+    if not isinstance(size, int) or size > results.MAX_BYTES:
+        detail = f"archive of {size} bytes, at most {results.MAX_BYTES} are read"
+        return {"state": "unreadable", "artifact": name, "detail": detail}
+    data = download(f"repos/{repository}/actions/artifacts/{newest.get('id')}/zip")
+    try:
+        read = results.from_archive(data, str(newest.get("digest") or ""))
+    except results.ResultError as err:
+        return {"state": "unreadable", "artifact": name, "detail": str(err)}
+    return {"state": "read", "artifact": name, **read}
 
 
 def _attempt(repository: str, number: int, job: dict) -> dict:
@@ -122,9 +173,10 @@ def _attempt(repository: str, number: int, job: dict) -> dict:
     }
 
 
-def _checks(repository: str, run: dict) -> list[dict]:
-    """The jobs of one run as checks, each with every attempt of the run."""
+def _checks(repository: str, run: dict, artifacts: dict[str, str]) -> list[dict]:
+    """The jobs of one run as checks, each with every attempt of the run and its result."""
     checks: dict[str, dict] = {}
+    started: dict[str, object] = {}
     for number in range(1, int(run.get("run_attempt") or 1) + 1):
         path = f"repos/{repository}/actions/runs/{run['id']}/attempts/{number}/jobs"
         for job in paged(path, "jobs"):
@@ -133,6 +185,10 @@ def _checks(repository: str, run: dict) -> list[dict]:
                 name, {"name": name, "workflow": run.get("path"), "attempts": []}
             )
             check["attempts"].append(_attempt(repository, number, job))
+            started[name] = job.get("started_at")
+    for name, check in checks.items():
+        if name in artifacts and check["attempts"][-1]["conclusion"] == "success":
+            check["result"] = _result(repository, run["id"], artifacts[name], started[name])
     return list(checks.values())
 
 
@@ -151,8 +207,16 @@ def _groups(runs: list[dict]) -> list[tuple[dict, list[dict]]]:
     return subjects
 
 
-def collect(repository: str, branches: list[str], workflows: set[str]) -> dict:
-    """The runs of the named workflow files on the named branches, as subjects with checks."""
+def collect(
+    repository: str,
+    branches: list[str],
+    workflows: set[str],
+    artifacts: dict[str, str] | None = None,
+) -> dict:
+    """The runs of the named workflow files on the named branches, as subjects with checks.
+
+    `artifacts` names, per check that uploads a result, the artifact that holds it.
+    """
     data = {"source": "live forge", "repository": repository, "errors": [], "subjects": []}
     try:
         runs = {}
@@ -164,7 +228,7 @@ def collect(repository: str, branches: list[str], workflows: set[str]) -> dict:
         for subject, members in _groups(list(runs.values())):
             subject["checks"] = []
             for run in members:
-                subject["checks"].extend(_checks(repository, run))
+                subject["checks"].extend(_checks(repository, run, artifacts or {}))
             data["subjects"].append(subject)
     except ForgeError as err:
         data["errors"].append(str(err))

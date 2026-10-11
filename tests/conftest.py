@@ -9,12 +9,16 @@ fixture, so each test shows the one line that makes the tool refuse.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import shlex
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -102,7 +106,8 @@ forge = ["github.com", "api.github.com", "ghcr.io"]
 """
 
 # A stand-in for the forge's command-line client. It answers GET requests from
-# a file of canned answers, records every call, and serves nothing else.
+# a file of canned answers, records every call, and serves nothing else. An
+# answer {"hex": ...} is served as those bytes, the way an archive comes.
 FAKE_CLIENT = """\
 import json
 import os
@@ -124,6 +129,9 @@ if answer is None:
 if isinstance(answer, dict) and list(answer) == ["fail"]:
     sys.stderr.write(answer["fail"] + "\\n")
     sys.exit(1)
+if isinstance(answer, dict) and list(answer) == ["hex"]:
+    sys.stdout.buffer.write(bytes.fromhex(answer["hex"]))
+    sys.exit(0)
 sys.stdout.write(answer["raw"] if isinstance(answer, dict) and list(answer) == ["raw"]
                  else json.dumps(answer))
 """
@@ -162,9 +170,86 @@ def forge_run(number: int, path: str, commit: str, created: str, *attempts: list
     }
 
 
-def forge_answers(repository: str, runs: list[dict]) -> dict[str, object]:
-    """The canned answers for a listing of runs on the branch trial/licence."""
-    listing = [{k: v for k, v in run.items() if k != "attempts"} for run in runs]
+def sarif_log(findings: tuple = (), rules: tuple = (), version: str = "v5.5.0") -> str:
+    """A result file as a scorecard run writes it: its rules, and one result per finding.
+
+    A finding is (rule, file, line, message).
+    """
+    results = [
+        {
+            "ruleId": rule,
+            "ruleIndex": 0,
+            "message": {"text": text},
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": uri},
+                        "region": {"startLine": line},
+                    }
+                }
+            ],
+        }
+        for rule, uri, line, text in findings
+    ]
+    driver = {"name": "Scorecard", "semanticVersion": version, "rules": [{"id": r} for r in rules]}
+    run = {
+        "automationDetails": {"id": "supply-chain/local/0000-11 Oct 26 01:28 +0000"},
+        "tool": {"driver": driver},
+        "results": results,
+    }
+    return json.dumps({"version": "2.1.0", "runs": [run]})
+
+
+def archive(members: dict[str, str]) -> bytes:
+    """A zip archive with these members, as the forge serves an artifact."""
+    packed = io.BytesIO()
+    with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as made:
+        for name, text in members.items():
+            made.writestr(name, text)
+    return packed.getvalue()
+
+
+def forge_artifact(number: int, name: str, data: bytes, **fields) -> dict:
+    """One artifact as the forge lists it; `data` is the archive its download gives."""
+    return {
+        "id": number,
+        "name": name,
+        "expired": False,
+        "size_in_bytes": len(data),
+        "created_at": "2026-10-11T01:28:55Z",
+        "digest": f"sha256:{hashlib.sha256(data).hexdigest()}",
+        "data": data.hex(),
+        **fields,
+    }
+
+
+def _artifact_answers(repository: str, run: dict, names: tuple[str, ...]) -> dict[str, object]:
+    """The listing of a run's artifacts per asked name, and the download of each."""
+    answers: dict[str, object] = {}
+    held = run.get("artifacts") or []
+    for name in {*names, *(artifact["name"] for artifact in held)}:
+        listed = [
+            {k: v for k, v in artifact.items() if k != "data"}
+            for artifact in held
+            if artifact["name"] == name
+        ]
+        asked = f"name={quote(name, safe='')}&{PAGE}"
+        path = f"repos/{repository}/actions/runs/{run['id']}/artifacts?{asked}"
+        answers[path] = {"total_count": len(listed), "artifacts": listed}
+    for artifact in held:
+        answers[f"repos/{repository}/actions/artifacts/{artifact['id']}/zip"] = {
+            "hex": artifact["data"]
+        }
+    return answers
+
+
+def forge_answers(repository: str, runs: list[dict], names: tuple[str, ...] = ()) -> dict:
+    """The canned answers for a listing of runs on the branch trial/licence.
+
+    A run may carry `artifacts`; `names` are artifact names every run is asked for.
+    """
+    hidden = ("attempts", "artifacts")
+    listing = [{k: v for k, v in run.items() if k not in hidden} for run in runs]
     answers: dict[str, object] = {
         f"repos/{repository}/actions/runs?branch=trial%2Flicence&{PAGE}": {
             "total_count": len(listing),
@@ -172,6 +257,7 @@ def forge_answers(repository: str, runs: list[dict]) -> dict[str, object]:
         }
     }
     for run in runs:
+        answers.update(_artifact_answers(repository, run, names))
         for number, jobs in enumerate(run["attempts"], 1):
             path = f"repos/{repository}/actions/runs/{run['id']}/attempts/{number}/jobs?{PAGE}"
             answers[path] = {"total_count": len(jobs), "jobs": jobs}

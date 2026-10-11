@@ -33,6 +33,20 @@ the repository, and must fail, or pass, on every subject). A fixture needs
 one equal row with the verdict it names and none against it; the 10 rows
 and the ordinary pass are asked of the family's pair, not of the fixture.
 
+A pair of class R is judged by its verdicts alone. A pair of class U is
+a job that passes whatever it finds and says it in a result file it uploads
+(a scorecard run): where both jobs pass, the checks and findings of the two
+files are compared (tools/results.py), and a row is
+
+    equal         both results hold the same checks and the same findings
+    differ        they do not, or only one job uploaded a result
+    no-evidence   neither uploaded one, both hold no check, or both failed
+    invalid       a result has expired on the forge
+
+Its planted cases are commits: one where a finding must show in both
+results (expect FINDING), one where it must show in neither (expect
+CLEAN), each with a marker that is searched in the findings.
+
 What the side conditions read: the old workflow and the new caller below
 --root, the called workflow below --called-root (this repository, whose
 hosts.toml gives the forge's hosts and the allowed actions). Triggers are
@@ -42,8 +56,8 @@ are judged by tools/hosts.py in this repository's gate.
 
 Exit codes: 0 pass; 1 a verdict, a reason or a side condition differs;
 2 evidence insufficient; 3 input or data error (unnamed check, absent
-check, unknown conclusion, unreadable map, forge error). An error is never
-read as equal.
+check, unknown conclusion, unreadable map, forge error, a result that is
+unreadable or not recorded). An error is never read as equal.
 """
 
 from __future__ import annotations
@@ -61,6 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ciwf
 import forge
 import hosts
+import results
 
 # Conclusions of a job, from the forge's REST reference (version 2022-11-28),
 # plus `stale`, which a check run can carry. Any other value is an error.
@@ -76,6 +91,9 @@ VERDICTS = {
 }
 RUNNING = ("queued", "in_progress", "waiting", "requested", "pending")
 DECIDED = ("PASS", "FAIL")
+# Per class of a pair: what a planted case may ask for, and the words of the report.
+EXPECTED = {"R": ("FAIL", "PASS"), "U": ("FINDING", "CLEAN")}
+WORDS = {"FAIL": "fail", "PASS": "pass", "FINDING": "show the finding", "CLEAN": "stay clean"}
 MIN_EQUAL = 10
 MAX_FLAKY = 2
 STATES = ("equal", "differ", "wrong-reason", "no-evidence", "invalid", "draft", "flaky")
@@ -107,6 +125,10 @@ class Pair:
     # Set on a fixture only: the verdict both jobs must reach on every subject.
     expect: str = ""
     marker: re.Pattern | None = None
+    # Class U names the artifact each job uploads its result as.
+    kind: str = "R"
+    old_artifact: str = ""
+    new_artifact: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,6 +156,7 @@ class Side:
     failed_steps: tuple[str, ...] = ()
     text: str = ""
     seconds: float | None = None
+    result: object = None
 
 
 def _text(table: dict, key: str, where: str, default: str | None = None) -> str:
@@ -146,15 +169,20 @@ def _text(table: dict, key: str, where: str, default: str | None = None) -> str:
 def _pair(entry: object, where: str) -> Pair:
     if not isinstance(entry, dict):
         raise ciwf.ReadError(f"{where}: not a table")
-    if entry.get("class") != "R":
+    kind = entry.get("class")
+    if kind not in EXPECTED:
         raise ciwf.ReadError(
-            f"{where}: class {entry.get('class')!r} is not judged here; "
-            "only class R (read-only verdict) is"
+            f"{where}: class {kind!r} is not judged here; "
+            "only class R (read-only verdict) and class U (uploaded result) are"
         )
     runner = _text(entry, "runner", where, "")
     if runner not in ("", "hosted", "self-hosted"):
         raise ciwf.ReadError(f"{where}: `runner` is hosted or self-hosted")
+    uploads = None if kind == "U" else ""
     return Pair(
+        kind=kind,
+        old_artifact=_text(entry, "old_artifact", where, uploads),
+        new_artifact=_text(entry, "new_artifact", where, uploads),
         family=_text(entry, "family", where),
         old=_text(entry, "old", where),
         new=_text(entry, "new", where),
@@ -166,11 +194,12 @@ def _pair(entry: object, where: str) -> Pair:
     )
 
 
-def _expectation(entry: dict, where: str) -> tuple[str, re.Pattern | None]:
-    """The verdict a planted case must reach, and the reason marker of a failure."""
+def _expectation(entry: dict, where: str, kind: str) -> tuple[str, re.Pattern | None]:
+    """What a planted case must show, and the marker of a failure's reason or of a finding."""
     expect = entry.get("expect")
-    if expect not in DECIDED:
-        raise ciwf.ReadError(f"{where}: `expect` is PASS or FAIL")
+    if expect not in EXPECTED[kind]:
+        allowed = " or ".join(sorted(EXPECTED[kind], reverse=True))
+        raise ciwf.ReadError(f"{where}: `expect` is {allowed} in class {kind}")
     if expect == "PASS":
         return expect, None
     try:
@@ -179,21 +208,35 @@ def _expectation(entry: dict, where: str) -> tuple[str, re.Pattern | None]:
         raise ciwf.ReadError(f"{where}: `marker` is no pattern: {err}") from err
 
 
-def _planted(entry: object, where: str) -> Planted:
+def _planted(entry: object, where: str, kinds: dict[str, str]) -> Planted:
     if not isinstance(entry, dict):
         raise ciwf.ReadError(f"{where}: not a table")
     commit = _text(entry, "commit", where)
     if not COMMIT.match(commit):
         raise ciwf.ReadError(f"{where}: `commit` must be a full commit id")
-    expect, marker = _expectation(entry, where)
-    return Planted(_text(entry, "family", where), commit, expect, marker)
+    family = _text(entry, "family", where)
+    if family not in kinds:
+        raise ciwf.ReadError(f"{where}: planted case for family {family!r} has no pair")
+    expect, marker = _expectation(entry, where, kinds[family])
+    return Planted(family, commit, expect, marker)
 
 
 def _fixture(entry: object, where: str) -> Pair:
     """A pair of jobs that run on a planted folder, with the verdict both must reach."""
     pair = _pair(entry, where)
-    expect, marker = _expectation(entry, where)
+    if pair.kind != "R":
+        raise ciwf.ReadError(f"{where}: a fixture is judged in class R only")
+    expect, marker = _expectation(entry, where, pair.kind)
     return replace(pair, expect=expect, marker=marker)
+
+
+def _kinds(pairs: tuple[Pair, ...], path: Path) -> dict[str, str]:
+    """The class of every family; a family holds pairs of one class."""
+    kinds: dict[str, str] = {}
+    for pair in pairs:
+        if kinds.setdefault(pair.family, pair.kind) != pair.kind:
+            raise ciwf.ReadError(f"{path}: family {pair.family!r} holds pairs of two classes")
+    return kinds
 
 
 def read_map(path: Path) -> Trial:
@@ -211,12 +254,13 @@ def read_map(path: Path) -> Trial:
     names = [name for pair in pairs + fixtures for name in (pair.old, pair.new)]
     if len(set(names)) != len(names):
         raise ciwf.ReadError(f"{path}: a check name stands in two places")
+    kinds = _kinds(pairs, path)
     planted = tuple(
-        _planted(e, f"{path}: planted {i}") for i, e in enumerate(data.get("planted") or [], 1)
+        _planted(e, f"{path}: planted {i}", kinds)
+        for i, e in enumerate(data.get("planted") or [], 1)
     )
-    families = {pair.family for pair in pairs}
-    for case in planted + fixtures:
-        if case.family not in families:
+    for case in fixtures:
+        if case.family not in kinds:
             raise ciwf.ReadError(f"{path}: planted case for family {case.family!r} has no pair")
     branches = data.get("branches") or []
     if not isinstance(branches, list) or not all(isinstance(b, str) and b for b in branches):
@@ -262,6 +306,7 @@ def _side(check: dict | None, where: str, errors: list[str]) -> Side:
         steps,
         "\n".join([*steps, *notes]),
         float(seconds) if isinstance(seconds, int | float) else None,
+        check.get("result"),
     )
 
 
@@ -278,11 +323,26 @@ def _state(old: Side, new: Side, pair: Pair, case: Planted | None) -> tuple[str,
         return "differ", "-"
     if old.verdict == "NOT-RUN":
         return "no-evidence", "-"
-    if old.verdict == "FAIL" and case is not None and case.marker is not None:
+    if old.verdict == "FAIL" and case is not None and case.expect == "FAIL":
         if all(case.marker.search(side.text) for side in (old, new)):
             return "equal", "yes"
         return "wrong-reason", "no"
     return "equal", "-"
+
+
+def _uploaded(
+    old: Side, new: Side, case: Planted | None, where: str, errors: list[str]
+) -> tuple[str, str, str]:
+    """Class U, both jobs decided the same: state, marker and note from their results."""
+    if old.verdict != "PASS":
+        return "no-evidence", "-", "both jobs failed, no result is compared"
+    told = [
+        (side, results.problem(given)) for side, given in (("old", old.result), ("new", new.result))
+    ]
+    if any(reason for _, reason in told):
+        errors.extend(f"{where}: {side} job: {reason}" for side, reason in told if reason)
+        return "invalid", "-", ""
+    return results.compare(old.result, new.result, case.marker if case else None)
 
 
 def _key(subject: dict) -> str:
@@ -312,6 +372,9 @@ def _row(subject: dict, pair: Pair, checks: dict, trial: Trial, errors: list[str
     old = _side(found[pair.old], f"{key}: {pair.old}", errors)
     new = _side(found[pair.new], f"{key}: {pair.new}", errors)
     state, marker = _state(old, new, pair, case)
+    note = ""
+    if pair.kind == "U" and state == "equal":
+        state, marker, note = _uploaded(old, new, case, f"{key}: {pair.new}", errors)
     return {
         "subject": key,
         "id": [subject.get(part) for part in ("commit", "event", "ref", "occurrence")],
@@ -324,6 +387,7 @@ def _row(subject: dict, pair: Pair, checks: dict, trial: Trial, errors: list[str
         "planted": case.expect if case else "",
         "old_seconds": old.seconds,
         "new_seconds": new.seconds,
+        "note": note,
     }
 
 
@@ -369,6 +433,13 @@ def _fixture_gaps(pair: Pair, name: str, mine: list[dict], equal: list[dict]) ->
     return gaps
 
 
+def _shown(row: dict, case: Planted) -> bool:
+    """Whether an equal row shows a planted case as planted."""
+    if case.expect in DECIDED:
+        return row["old"] == case.expect
+    return row["marker"] == ("yes" if case.expect == "FINDING" else "no")
+
+
 def evidence_gaps(pair: Pair, rows: list[dict], trial: Trial) -> list[str]:
     """What is missing before the rows of one pair carry the switch (rules 3 to 5)."""
     name = f"{pair.old} -> {pair.new}"
@@ -384,15 +455,14 @@ def evidence_gaps(pair: Pair, rows: list[dict], trial: Trial) -> list[str]:
         gaps.append(f"{name}: no equal row where both pass on a subject that is not planted")
     cases = [case for case in trial.planted if case.family == pair.family]
     fixtures = [other for other in trial.pairs if other.family == pair.family and other.expect]
-    for expect in ("FAIL", "PASS"):
+    for expect in EXPECTED[pair.kind]:
         if not any(case.expect == expect for case in cases + fixtures):
-            gaps.append(f"{name}: the map holds no planted case that must {expect.lower()}")
+            gaps.append(f"{name}: the map holds no planted case that must {WORDS[expect]}")
     for case in cases:
-        shown = [row for row in equal if row["commit"] == case.commit and row["old"] == case.expect]
-        if not shown:
+        if not any(row["commit"] == case.commit and _shown(row, case) for row in equal):
             gaps.append(
                 f"{name}: planted case {case.commit[:12]} has no equal row "
-                f"where both {case.expect.lower()}"
+                f"where both {WORDS[case.expect]}"
             )
     flaky = [row for row in mine if row["state"] == "flaky"]
     if len(flaky) > MAX_FLAKY:
@@ -505,7 +575,13 @@ def side_conditions(pair: Pair, root: Path, called_root: Path) -> tuple[list[str
             )
     if pair.expect:
         return problems, [f"{name}: fixture, both must {pair.expect.lower()} on every subject"]
-    return problems, [f"{name}: required check moves from {pair.old!r} to {pair.new!r}"]
+    told = [f"{name}: required check moves from {pair.old!r} to {pair.new!r}"]
+    if pair.kind == "U":
+        told.append(
+            f"{name}: results compared, artifact {pair.old_artifact!r} "
+            f"against {pair.new_artifact!r}"
+        )
+    return problems, told
 
 
 def wall_time(pair: Pair, rows: list[dict]) -> str:
@@ -560,7 +636,13 @@ def _run_data(args: argparse.Namespace, trial: Trial) -> tuple[object, str]:
     if not trial.branches:
         raise ciwf.ReadError("--live needs `branches` in the map")
     watched = {path for pair in trial.pairs for path in (pair.old_workflow, pair.new_workflow)}
-    data = forge.collect(trial.repository, list(trial.branches), watched)
+    uploads = {
+        name: artifact
+        for pair in trial.pairs
+        if pair.kind == "U"
+        for name, artifact in ((pair.old, pair.old_artifact), (pair.new, pair.new_artifact))
+    }
+    data = forge.collect(trial.repository, list(trial.branches), watched, uploads)
     if args.record:
         args.record.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
     return data, f"live forge, {trial.repository}, branches {', '.join(trial.branches)}"
@@ -616,6 +698,7 @@ def main() -> int:
         return 3
     found["differs"] += [
         f"{row['subject']}: {row['pair']} is {row['state']} ({row['old']} against {row['new']})"
+        + (f": {row['note']}" if row["note"] else "")
         for row in rows
         if row["state"] in ("differ", "wrong-reason")
     ]

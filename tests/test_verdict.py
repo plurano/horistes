@@ -503,7 +503,9 @@ def test_default_of_the_called_workflow_gives_the_runner(tree):
 
 
 INPUT_ERRORS = [
-    (MAP.replace('class = "R"', 'class = "U"'), "class 'U' is not judged here"),
+    (MAP.replace('class = "R"', 'class = "W"'), "class 'W' is not judged here"),
+    (MAP.replace('class = "R"\n', ""), "class None is not judged here"),
+    (MAP.replace('expect = "FAIL"', 'expect = "FINDING"'), "`expect` is PASS or FAIL in class R"),
     (MAP.replace(f'old = "{OLD}"\n', ""), "`old` must be a non-empty string"),
     (MAP.replace(f'new = "{NEW}"', f'new = "{OLD}"'), "a check name stands in two places"),
     (MAP.replace(MUST_FAIL, "abc123"), "`commit` must be a full commit id"),
