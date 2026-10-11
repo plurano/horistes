@@ -9,8 +9,10 @@ keeps it away from the files the Praetor engine writes.
 
 `default.json` is the preset other repositories extend. It holds what is the
 same in every repository, `renovate.json` extends it and holds the rest, and
-no value stands in both. No test asks a forge or starts the bot; a planted
-case shows what each check refuses.
+no value stands in both. `settings-sync.json` is a second preset, for a
+repository whose toolchain file is held equal to a source elsewhere: it
+switches the managers of such files off and holds nothing else. No test asks a
+forge or starts the bot; a planted case shows what each check refuses.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ from conftest import ROOT
 CONFIG = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
 PRESET = json.loads((ROOT / "default.json").read_text(encoding="utf-8"))
 PLANTED_PRESET = "tests/fixtures/update-bot/planted-preset.json"
+SYNCED = json.loads((ROOT / "settings-sync.json").read_text(encoding="utf-8"))
+PLANTED_SYNCED = "tests/fixtures/update-bot/planted-settings-sync.json"
 # Without a file name Renovate reads `default.json` of the named repository.
 REFERENCE = "github>plurano/shared-ci"
 
@@ -37,6 +41,11 @@ RULE = {"description", "matchManagers", "matchDepTypes", "enabled"}
 # The keys both files may hold: Renovate appends these lists, the repository's
 # entries behind the preset's.
 APPENDED = {"$schema", "extends", "packageRules"}
+# The settings-sync preset: the managers it switches off, and the one block
+# such a manager may hold. Allow-lists again: a misspelt manager is an unknown
+# key here, and a block that does more than switch off is refused.
+HELD = {"rust-toolchain"}
+SWITCH = {"enabled": False}
 TOOLS = "requirements/tools.txt"
 LICENCE = ".github/workflows/licence.yml"
 
@@ -107,6 +116,12 @@ def said_twice(config: dict, preset: dict) -> list[str]:
     return sorted((set(config) & set(preset)) - APPENDED)
 
 
+def outside_settings_sync(preset: dict) -> list[str]:
+    """What a settings-sync preset holds beyond switching a listed manager off."""
+    unknown = sorted(set(preset) - HELD - {"$schema", "description"})
+    return unknown + sorted(f"{key} block" for key in HELD & set(preset) if preset[key] != SWITCH)
+
+
 def rules() -> list[dict]:
     return PRESET["packageRules"] + CONFIG["packageRules"]
 
@@ -174,6 +189,7 @@ def test_no_value_stands_in_both_files():
         ("customManagers", []),
         ("ignorePaths", [".devcontainer/**"]),
         ("minimumReleaseAgee", "3 days"),
+        ("rust-toolchain", SWITCH),
     ],
 )
 def test_planted_key_of_one_repository_is_refused_in_the_preset(key, value):
@@ -200,6 +216,50 @@ def test_planted_preset_file_is_refused():
 )
 def test_planted_repeat_of_a_preset_value_is_refused(key, value):
     assert said_twice({**CONFIG, key: value}, PRESET) == [key]
+
+
+def test_settings_sync_preset_switches_the_toolchain_manager_off_and_nothing_else():
+    assert outside_settings_sync(SYNCED) == []
+    assert {key: SYNCED[key] for key in HELD} == {"rust-toolchain": SWITCH}
+    assert all(isinstance(line, str) and line for line in SYNCED["description"])
+
+
+def test_no_preset_and_no_file_here_extends_the_settings_sync_preset():
+    assert "extends" not in SYNCED
+    assert not [
+        entry for entry in PRESET["extends"] + CONFIG["extends"] if "settings-sync" in entry
+    ]
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "found"),
+    [
+        ("rust-toolchainn", SWITCH, ["rust-toolchainn"]),
+        ("cargo", SWITCH, ["cargo"]),
+        ("enabledManagers", ["cargo"], ["enabledManagers"]),
+        ("extends", [REFERENCE], ["extends"]),
+        (
+            "packageRules",
+            [{"matchManagers": ["rust-toolchain"], "enabled": False}],
+            ["packageRules"],
+        ),
+        ("rust-toolchain", {"enabled": True}, ["rust-toolchain block"]),
+        ("rust-toolchain", {}, ["rust-toolchain block"]),
+        (
+            "rust-toolchain",
+            {**SWITCH, "managerFilePatterns": ["/^rust-toolchain$/"]},
+            ["rust-toolchain block"],
+        ),
+    ],
+)
+def test_planted_change_of_the_settings_sync_preset_is_refused(key, value, found):
+    assert outside_settings_sync({**SYNCED, key: value}) == found
+
+
+def test_planted_settings_sync_file_is_refused():
+    planted = json.loads((ROOT / PLANTED_SYNCED).read_text(encoding="utf-8"))
+    assert outside_settings_sync(planted) == ["rust-toolchainn"]
+    assert not HELD & set(planted)
 
 
 def test_the_compiled_file_is_the_one_the_bot_is_pointed_at():

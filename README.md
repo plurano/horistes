@@ -450,17 +450,45 @@ none of its values.
   If the repository already has an `aggregate` table for files without a
   header, add `"renovate.json"` to its `path` list instead.
 
+### The preset for a repository under settings sync
+
+`settings-sync.json` is for a repository that holds its Rust toolchain file
+equal to a source in another repository and compares it in its gate
+([ADR-0021](docs/adr/0021-settings-sync-preset-switches-the-toolchain-manager-off.md)).
+There a toolchain proposal of the bot changes the copy and can never pass, so
+the preset switches the manager `rust-toolchain` off and does nothing else.
+Such a repository names both presets:
+
+```json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github><owner>/<this repository>",
+    "github><owner>/<this repository>:settings-sync"
+  ]
+}
+```
+
+- A repository that cannot extend the preset yet (see above) writes the one
+  key into its own file, in the same form as the preset holds it:
+  `"rust-toolchain": { "enabled": false }`.
+- A repository that names its managers in `enabledManagers` and leaves
+  `rust-toolchain` out needs neither.
+- A repository that owns its toolchain file does not extend this preset: it
+  would receive no toolchain proposal, and nothing reports that.
+
 Check a changed preset before it is merged, with the validator that ships in
 the Renovate image:
 
 ```sh
 docker run --rm --network=none -v "$PWD:/data:ro" -w /data \
   --entrypoint renovate-config-validator renovate/renovate:<release> \
-  --strict --no-global default.json renovate.json
+  --strict --no-global default.json settings-sync.json renovate.json
 ```
 
 `--no-global` makes it read the files as repository configuration. The
-planted file `tests/fixtures/update-bot/planted-preset.json` must fail the
+planted files `tests/fixtures/update-bot/planted-preset.json` and
+`tests/fixtures/update-bot/planted-settings-sync.json` must each fail the
 same command.
 
 ## Licence

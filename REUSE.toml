@@ -16,6 +16,7 @@ path = [
     "interface.lock.json",
     "renovate.json",
     "requirements/tools.txt",
+    "settings-sync.json",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"

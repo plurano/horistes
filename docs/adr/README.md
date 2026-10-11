@@ -28,3 +28,4 @@ record that supersedes it.
 | [0018](0018-floating-runner-labels-refused-by-the-pin-tool.md) | 2026-10-11 | A floating label of a hosted machine is refused by the pin tool, without an exception list for now | Accepted |
 | [0019](0019-update-proposals-from-renovate-configured-here.md) | 2026-10-11 | Updates are proposed by Renovate from a configuration in this repository | Accepted |
 | [0020](0020-shared-update-bot-values-as-a-preset.md) | 2026-10-12 | The update bot's shared values are a preset file here, and this repository extends it | Accepted |
+| [0021](0021-settings-sync-preset-switches-the-toolchain-manager-off.md) | 2026-10-12 | A second preset switches the toolchain manager off in a repository under settings sync | Accepted |

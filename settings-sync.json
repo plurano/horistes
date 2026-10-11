@@ -1,0 +1,9 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "For a repository whose Rust toolchain file is a copy held equal to a source in another repository: the bot proposes no other toolchain here, the change comes from the source."
+  ],
+  "rust-toolchain": {
+    "enabled": false
+  }
+}
