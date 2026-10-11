@@ -1,0 +1,67 @@
+<%- /*
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+
+Caller of the shared scorecard run, as a consumer keeps it in
+.github/workflows/scorecard-check.yml. The rendered file is the whole of the
+consumer's scorecard job: the steps live in .github/workflows/scorecard.yml of
+the shared repository, named here by commit with the version as a comment.
+
+Public repositories only: the action asks the best-practices badge service
+and the dependency insight service with the name of the repository. The
+switch is therefore the repository's visibility, read on every run: in a
+private or internal repository the job is skipped, and it starts to run by
+itself on the day the repository becomes public. A caller that passes a plain
+true is refused by tools/render.py (decision record 0013).
+
+Not passed: `publish`. The Scorecard service reads the called workflow file
+from the shared repository before it takes a result, which it can do only
+once that repository is public.
+
+Scopes: the job grants what the called job asks for and nothing else.
+security-events write puts the findings into the forge's code scanning,
+id-token write is used only when the result is published.
+
+Required check: none. The job runs on a push to the default branch and on a
+schedule, never on a pull request, and passes whatever it finds; the forge
+reports it as "Scorecard / Analysis". The engine declares a calling job under
+its own name, which no run reports (cordanaLLM/praetor#1212), so the job stays
+out of the consumer's required checks.
+
+Fields: .Shared.Repository, .Shared.Commit and .Shared.Version are working
+names until the engine renders caller templates (cordanaLLM/praetor#1211).
+The trigger is spelled out for the same reason. The runner is no field: the
+Scorecard service takes a result only from a job whose runner label is
+written out, so the called workflow names it.
+
+Concurrency is set here and not in the shared workflow, so a consumer's group
+never collides with another caller's.
+*/ -%>
+---
+# Scorecard: the supply-chain checks of this repository, reported to code
+# scanning. The job is the shared workflow of <% .Shared.Repository %>, named
+# by commit. It runs in a public repository only.
+name: Scorecard check
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 2"
+
+permissions: {}
+
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scorecard:
+    name: Scorecard
+    permissions:
+      contents: read
+      security-events: write # the findings go to the forge's code scanning
+      id-token: write # asked for by the called job; used only for a publication
+    uses: <% .Shared.Repository %>/.github/workflows/scorecard.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      outside_hosts: ${{ github.event.repository.visibility == 'public' }}

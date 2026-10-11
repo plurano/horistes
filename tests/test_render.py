@@ -28,6 +28,7 @@ CONTEXT = {
 }
 COMMIT = render.SAMPLE["Shared"]["Commit"]
 REAL = "templates/callers/licence.yml.tmpl"
+REAL_SCORECARD = "templates/callers/scorecard.yml.tmpl"
 TEMPLATE = "templates/callers/licence.yml.tmpl"
 CALLED = ".github/workflows/licence.yml"
 ISSUE = "cordanaLLM/praetor#1212"
@@ -89,10 +90,44 @@ jobs:
 """
 
 
-def check(tree, template=GOOD, called=REUSABLE, exceptions=EXCEPTIONS):
+RENDERED_SCORECARD = f"""\
+---
+# Scorecard: the supply-chain checks of this repository, reported to code
+# scanning. The job is the shared workflow of owner/shared, named
+# by commit. It runs in a public repository only.
+name: Scorecard check
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 2"
+
+permissions: {{}}
+
+concurrency:
+  group: scorecard-${{{{ github.ref }}}}
+  cancel-in-progress: true
+
+jobs:
+  scorecard:
+    name: Scorecard
+    permissions:
+      contents: read
+      security-events: write # the findings go to the forge's code scanning
+      id-token: write # asked for by the called job; used only for a publication
+    uses: owner/shared/.github/workflows/scorecard.yml@{COMMIT} # v1.2.3
+    with:
+      outside_hosts: {render.PUBLIC}
+"""
+
+
+def check(tree, template=GOOD, called=REUSABLE, exceptions=EXCEPTIONS, hosts=""):
     files = {TEMPLATE: template, CALLED: called}
     if exceptions:
         files["exceptions.yaml"] = exceptions
+    if hosts:
+        files["hosts.toml"] = hosts
     return tree.write(files).tool("render.py", "check")
 
 
@@ -168,17 +203,28 @@ def test_value_is_not_read_as_template_text():
     assert render.render("<% .Value %>", {"Value": "<% .Other %> %>"}, "t") == "<% .Other %> %>"
 
 
-def rendered_real_template():
-    return render.render((ROOT / REAL).read_text(encoding="utf-8"), render.SAMPLE, REAL)
+def rendered_real_template(template=REAL):
+    return render.render((ROOT / template).read_text(encoding="utf-8"), render.SAMPLE, template)
 
 
 def test_licence_template_renders_into_the_recorded_caller():
     assert rendered_real_template() == RENDERED
 
 
-def test_rendered_licence_caller_passes_both_linters(tree):
-    name = ".github/workflows/licence-check.yml"
-    tree.write({name: rendered_real_template()})
+def test_scorecard_template_renders_into_the_recorded_caller():
+    assert rendered_real_template(REAL_SCORECARD) == RENDERED_SCORECARD
+
+
+@pytest.mark.parametrize(
+    ("template", "name"),
+    [
+        (REAL, ".github/workflows/licence-check.yml"),
+        (REAL_SCORECARD, ".github/workflows/scorecard-check.yml"),
+    ],
+    ids=["licence", "scorecard"],
+)
+def test_rendered_caller_passes_both_linters(tree, template, name):
+    tree.write({name: rendered_real_template(template)})
     done = subprocess.run(
         [*external("ACTIONLINT", "actionlint"), str(tree.root / name)],
         capture_output=True,
@@ -203,7 +249,7 @@ def test_good_template_passes(tree):
 
 
 def test_planted_templates_differ_from_the_good_one():
-    planted = [case.values[0] for case in (*PLANTED, *PLANTED_CALLED)]
+    planted = [case.values[0] for case in (*PLANTED, *PLANTED_CALLED, *PLANTED_PUBLIC)]
     assert len({GOOD, REUSABLE, *planted}) == len(planted) + 2
 
 
@@ -240,15 +286,35 @@ PLANTED = [
     ),
     pytest.param(
         GOOD.replace("contents: read", "contents: write"),
-        "permissions allow writing: contents",
+        f"the job grants `contents: write`, which {CALLED} does not ask for",
         id="write-scope",
+    ),
+    pytest.param(
+        GOOD.replace("      contents: read\n", "      contents: read\n      actions: read\n"),
+        f"the job grants `actions: read`, which {CALLED} does not ask for",
+        id="scope-not-asked-for",
+    ),
+    pytest.param(
+        GOOD.replace("    permissions:\n      contents: read\n", "    permissions: {}\n"),
+        f"the job does not grant `contents: read`, which {CALLED} asks for",
+        id="scope-not-granted",
+    ),
+    pytest.param(
+        GOOD.replace("    permissions:\n      contents: read\n", ""),
+        f"the job does not grant `contents: read`, which {CALLED} asks for",
+        id="grant-left-to-the-empty-workflow-level",
     ),
     pytest.param(
         GOOD.replace("permissions: {}\n", "").replace(
             "    permissions:\n      contents: read\n", ""
         ),
-        "permissions allow writing: <unset>",
+        "the job's permissions name no scopes: <unset>",
         id="no-permissions",
+    ),
+    pytest.param(
+        GOOD.replace("    permissions:\n      contents: read\n", "    permissions: read-all\n"),
+        "the job's permissions name no scopes: read-all",
+        id="permissions-by-word",
     ),
     pytest.param(
         GOOD.replace("    with:\n", "    secrets: inherit\n    with:\n"),
@@ -320,6 +386,23 @@ PLANTED_CALLED = [
         "passes `path`, which .github/workflows/licence.yml does not declare",
         id="input-renamed-in-the-called-workflow",
     ),
+    pytest.param(
+        REUSABLE.replace("  contents: read\njobs:", "  contents: read\n  id-token: write\njobs:"),
+        f"the job does not grant `id-token: write`, which {CALLED} asks for",
+        id="called-workflow-asks-for-more",
+    ),
+    pytest.param(
+        REUSABLE.replace(
+            "    timeout-minutes: 5\n", "    timeout-minutes: 5\n    permissions: {}\n"
+        ),
+        f"the job grants `contents: read`, which {CALLED} does not ask for",
+        id="called-job-asks-for-less-than-its-workflow",
+    ),
+    pytest.param(
+        REUSABLE.replace("permissions:\n  contents: read\njobs:", "jobs:"),
+        f"a job of {CALLED} names no scopes, so the grant cannot be compared",
+        id="called-workflow-without-scopes",
+    ),
 ]
 
 
@@ -328,6 +411,101 @@ def test_template_fails_on_a_changed_called_workflow(tree, called, message):
     done = check(tree, called=called)
     assert done.returncode == 1, done.stdout
     assert message in done.stderr
+
+
+def other_job(name, level):
+    head = f"  {name}:\n    name: {name}\n    runs-on: ubuntu-24.04\n    permissions:\n"
+    return head + f"      contents: read\n      checks: {level}\n    steps:\n      - run: exit 0\n"
+
+
+def test_grant_is_the_highest_level_over_the_called_jobs(tree):
+    called = REUSABLE + other_job("report", "write") + other_job("last", "read")
+    done = check(tree, called=called)
+    assert done.returncode == 1, done.stdout
+    assert f"the job does not grant `checks: write`, which {CALLED} asks for" in done.stderr
+    lower = GOOD.replace("      contents: read\n", "      contents: read\n      checks: read\n")
+    assert check(tree, lower, called=called).returncode == 1
+    template = GOOD.replace("      contents: read\n", "      contents: read\n      checks: write\n")
+    assert check(tree, template, called=called).returncode == 0
+
+
+MARKED = f"""\
+forge = ["github.com"]
+
+[actions]
+"actions/checkout" = []
+
+[files."{CALLED}"."rekor.sigstore.dev"]
+reason = "public transparency log"
+input = "publish"
+public_only = true
+"""
+PASSED = "      path: docs\n"
+REFUSED = "it switches on a host for public repositories only and is passed as"
+PLANTED_PUBLIC = [
+    pytest.param(GOOD.replace(PASSED, PASSED + "      publish: true\n"), "true", id="true"),
+    pytest.param(GOOD.replace(PASSED, PASSED + '      publish: "true"\n'), "true", id="text"),
+    pytest.param(
+        GOOD.replace(PASSED, PASSED + "      publish: ${{ true }}\n"),
+        "${{ true }}",
+        id="expression-that-is-always-true",
+    ),
+    pytest.param(
+        GOOD.replace(PASSED, PASSED + "      publish: ${{ !github.event.repository.private }}\n"),
+        "${{ !github.event.repository.private }}",
+        id="expression-that-is-on-where-the-event-names-no-repository",
+    ),
+    pytest.param(
+        GOOD.replace(PASSED, PASSED + f"      publish: {render.PUBLIC.replace('==', '!=')}\n"),
+        "${{ github.event.repository.visibility != 'public' }}",
+        id="expression-turned-round",
+    ),
+]
+
+
+@pytest.mark.parametrize(("template", "written"), PLANTED_PUBLIC)
+def test_switch_for_public_repositories_is_not_passed_as_anything_else(tree, template, written):
+    done = check(tree, template, hosts=MARKED)
+    assert done.returncode == 1, done.stdout
+    assert f"the job passes `publish` as `{written}`; {REFUSED}" in done.stderr
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["", "      publish: false\n", f"      publish: {render.PUBLIC}\n"],
+    ids=["not-passed", "false", "visibility"],
+)
+def test_switch_for_public_repositories_is_passed_off_or_by_visibility(tree, line):
+    done = check(tree, GOOD.replace(PASSED, PASSED + line), hosts=MARKED)
+    assert done.returncode == 0, done.stderr
+
+
+def test_switch_without_the_public_mark_takes_a_plain_true(tree):
+    template = GOOD.replace(PASSED, PASSED + "      publish: true\n")
+    done = check(tree, template, hosts=MARKED.replace("public_only = true\n", ""))
+    assert done.returncode == 0, done.stderr
+    assert check(tree, template).returncode == 0
+
+
+def test_real_scorecard_caller_in_a_private_repository_cannot_pass_true(tree):
+    """The ruled plant: a caller switches the outside hosts on without asking the visibility."""
+    called = ".github/workflows/scorecard.yml"
+    source = (ROOT / REAL_SCORECARD).read_text(encoding="utf-8")
+    assert f"outside_hosts: {render.PUBLIC}\n" in source
+    files = {name: (ROOT / name).read_text(encoding="utf-8") for name in (called, "hosts.toml")}
+    tree.write({**files, "exceptions.yaml": EXCEPTIONS, "templates/callers/s.yml.tmpl": source})
+    done = tree.tool("render.py", "check")
+    assert done.returncode == 0, done.stderr
+    planted = source.replace(f"outside_hosts: {render.PUBLIC}\n", "outside_hosts: true\n")
+    tree.write({"templates/callers/s.yml.tmpl": planted})
+    done = tree.tool("render.py", "check")
+    assert done.returncode == 1, done.stdout
+    assert f"the job passes `outside_hosts` as `true`; {REFUSED}" in done.stderr
+    publish = source + "      publish: true\n"
+    tree.write({"templates/callers/s.yml.tmpl": publish})
+    done = tree.tool("render.py", "check")
+    assert done.returncode == 1, done.stdout
+    assert f"the job passes `publish` as `true`; {REFUSED}" in done.stderr
 
 
 def test_note_need_not_name_an_issue_that_is_not_open(tree):

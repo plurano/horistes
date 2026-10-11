@@ -15,6 +15,12 @@ forge = [
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
     "token.actions.githubusercontent.com",
+    # Where job summaries, logs, artifacts and caches are stored (GitHub Docs,
+    # "Self-hosted runners reference", essential communications; read
+    # 2026-10-11). The storage accounts are numbered, so the forge names them
+    # by pattern only.
+    "results-receiver.actions.githubusercontent.com",
+    "*.blob.core.windows.net",
     "ghcr.io",
 ]
 
@@ -25,6 +31,26 @@ forge = [
 # Takes the toolchain from the runner's cache or the forge-hosted manifest;
 # when both miss it downloads from the Go distribution site, which redirects.
 "actions/setup-go" = ["go.dev", "dl.google.com"]
+# Uploads to the forge's artifact storage.
+"actions/upload-artifact" = [
+    "results-receiver.actions.githubusercontent.com",
+    "*.blob.core.windows.net",
+]
+# Uploads to the forge's code scanning through its API.
+"github/codeql-action/upload-sarif" = []
+# Runs from its image on the forge's registry. The first four hosts are asked
+# on every run, the last four only when the result is published (sources in
+# decision record 0013).
+"ossf/scorecard-action" = [
+    "www.bestpractices.dev",
+    "api.deps.dev",
+    "api.osv.dev",
+    "oss-fuzz-build-logs.storage.googleapis.com",
+    "api.scorecard.dev",
+    "fulcio.sigstore.dev",
+    "rekor.sigstore.dev",
+    "tuf-repo-cdn.sigstore.dev",
+]
 
 # This repository's own gate. It is no reusable workflow, so no input switches
 # these hosts off; each is named with what needs it.
@@ -53,3 +79,45 @@ reason = "files of those tools"
 [files.".github/workflows/licence.yml"."docker.io"]
 reason = "image of the licence tool, named by digest; no pinned copy on the forge's registry yet"
 expires = 2026-12-31
+
+# The shared scorecard workflow. The action has no switch for the hosts it
+# asks, so `outside_hosts` gates the whole job. A host that is asked with the
+# name of the calling repository is for public repositories only (decision
+# record 0013).
+[files.".github/workflows/scorecard.yml"."www.bestpractices.dev"]
+reason = "best-practices badge of the repository, asked by its name"
+input = "outside_hosts"
+public_only = true
+
+[files.".github/workflows/scorecard.yml"."api.deps.dev"]
+reason = "dependency insight for the repository, asked by its name"
+input = "outside_hosts"
+public_only = true
+
+[files.".github/workflows/scorecard.yml"."api.osv.dev"]
+reason = "known vulnerabilities of the dependencies found in the checkout"
+input = "outside_hosts"
+
+[files.".github/workflows/scorecard.yml"."oss-fuzz-build-logs.storage.googleapis.com"]
+reason = "list of the projects the public fuzzing service builds"
+input = "outside_hosts"
+
+[files.".github/workflows/scorecard.yml"."api.scorecard.dev"]
+reason = "publication of the result under the repository's name"
+input = "publish"
+public_only = true
+
+[files.".github/workflows/scorecard.yml"."fulcio.sigstore.dev"]
+reason = "signing certificate for the published result"
+input = "publish"
+public_only = true
+
+[files.".github/workflows/scorecard.yml"."rekor.sigstore.dev"]
+reason = "transparency log entry for the published result"
+input = "publish"
+public_only = true
+
+[files.".github/workflows/scorecard.yml"."tuf-repo-cdn.sigstore.dev"]
+reason = "trust root of the signing service"
+input = "publish"
+public_only = true

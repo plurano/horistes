@@ -21,6 +21,29 @@
       "outputs": [],
       "secrets": {},
       "write_scopes": []
+    },
+    ".github/workflows/scorecard.yml": {
+      "inputs": {
+        "outside_hosts": {
+          "default": false,
+          "required": false,
+          "type": "boolean"
+        },
+        "publish": {
+          "default": false,
+          "required": false,
+          "type": "boolean"
+        }
+      },
+      "jobs": {
+        "analysis": "Analysis"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": [
+        "id-token",
+        "security-events"
+      ]
     }
   }
 }

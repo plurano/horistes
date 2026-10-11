@@ -15,7 +15,8 @@ ACTIONLINT_VERSION := 1.7.12
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
 .PHONY: verify verify-all tools requirements lint-yaml lint-python lint-workflows \
-	check-interface check-hosts check-exceptions check-templates test verify-reuse interface-snapshot
+	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
+	interface-snapshot
 
 # The one gate is `make verify-all`: CI runs exactly that target, so a local
 # green run and a green status check mean the same thing. This repository's own
@@ -27,8 +28,8 @@ verify-all: verify
 
 # This repository's own checks; they need no engine.
 verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-exceptions check-templates \
-	test verify-reuse
-	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, tests and licence headers.'
+	check-scorecard test verify-reuse
+	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, tests and licence headers.'
 
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.
@@ -77,6 +78,11 @@ check-exceptions:
 # commit, with inputs that workflow declares.
 check-templates:
 	$(PYTHON) -B tools/render.py check
+
+# A workflow that runs the Scorecard action keeps to the rules the Scorecard
+# service puts on it before it takes a published result.
+check-scorecard:
+	$(PYTHON) -B tools/scorecard.py check
 
 interface-snapshot:
 	$(PYTHON) -B tools/interface.py snapshot

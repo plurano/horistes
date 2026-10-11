@@ -286,7 +286,41 @@ def test_exception_outside_a_reusable_workflow_fails(tree):
         tree, REUSABLE, HOSTS + STEP_HOST + EXPIRES, "--today", "2026-10-11", action=with_download()
     )
     assert done.returncode == 1, done.stdout
-    assert "has an `expires`, which only a reusable workflow takes" in done.stderr
+    assert "has `expires`, which only a reusable workflow takes" in done.stderr
+
+
+PUBLIC_ONLY = "public_only = true\n"
+MARKED = DECLARED + PUBLIC_ONLY
+
+
+def test_host_marked_for_public_repositories_passes(tree):
+    done = scan(tree, planted(LOG), MARKED)
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize(
+    ("hosts", "message"),
+    [
+        (DECLARED + "public_only = false\n", "has a `public_only` that is not `true`"),
+        (DECLARED + 'public_only = "true"\n', "has a `public_only` that is not `true`"),
+        (DECLARED + "public_only = 1\n", "has a `public_only` that is not `true`"),
+        (
+            DATED + PUBLIC_ONLY,
+            "is marked `public_only` without the `input` a caller sets by visibility",
+        ),
+    ],
+    ids=["false", "text", "number", "dated-exception"],
+)
+def test_malformed_public_mark_fails(tree, hosts, message):
+    done = scan(tree, planted(LOG), hosts, "--today", "2026-10-11")
+    assert done.returncode == 1, done.stdout
+    assert f"host rekor.sigstore.dev {message}" in done.stderr
+
+
+def test_public_mark_outside_a_reusable_workflow_fails(tree):
+    done = scan(tree, REUSABLE, HOSTS + STEP_HOST + PUBLIC_ONLY, action=with_download())
+    assert done.returncode == 1, done.stdout
+    assert "has `public_only`, which only a reusable workflow takes" in done.stderr
 
 
 CALLER = """\

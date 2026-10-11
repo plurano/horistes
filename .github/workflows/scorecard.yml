@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Scorecard (reusable): the supply-chain checks of the calling repository, as
+# the OpenSSF Scorecard action reads them. The result goes to the forge's code
+# scanning and is kept as an artifact for five days. Its check is reported as
+# "<name of the calling job> / Analysis"; the job passes whatever it finds.
+#
+# With default inputs the job does not run: the action asks four outside
+# hosts on every run and has no switch of its own, so `outside_hosts` gates
+# the whole job. Two of those hosts are asked with the name of the calling
+# repository, which is why a caller switches the job on in a public repository
+# only (decision record 0013).
+#
+# The job is written to the rules the Scorecard service puts on a workflow
+# before it takes a published result: one literal runner label, no `run` step,
+# no `env`, no `defaults`, no container, and only steps that use an action of
+# the service's list. tools/scorecard.py holds the file to them. That is why
+# the runner is no input here.
+#
+# The caller grants what the job asks: contents read, security-events write
+# (code scanning) and id-token write (the signed publication; the action asks
+# for the token only when `publish` is true).
+name: Scorecard
+
+on:
+  workflow_call:
+    inputs:
+      outside_hosts:
+        description: >-
+          Run the analysis. The action then asks the best-practices badge
+          service and the dependency insight service with the name of the
+          calling repository, and the vulnerability database and the fuzzing
+          build logs without it. Pass true in a public repository only.
+        type: boolean
+        required: false
+        default: false
+      publish:
+        description: >-
+          Publish the result under the name of the calling repository at the
+          Scorecard service, signed through the public signing service and
+          transparency log. The action never publishes for a private
+          repository.
+        type: boolean
+        required: false
+        default: false
+
+permissions: {}
+
+jobs:
+  analysis:
+    name: Analysis
+    if: inputs.outside_hosts
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # the findings go to the forge's code scanning
+      id-token: write # signs the publication; asked for only when `publish` is true
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: ${{ inputs.publish }}
+
+      - name: Keep the result file
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard-result
+          path: results.sarif
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Report the findings to code scanning
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: results.sarif

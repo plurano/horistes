@@ -20,8 +20,11 @@ is a TOML file; `check` renders every template with the sample context below.
 
 `check` then reads the result as a workflow: its one job must call a workflow
 file of this repository by a full commit id, pass only inputs that workflow
-declares, and write to nothing. While exceptions.yaml holds an entry on the
-required check's name, the note of every template must name that entry's issue.
+declares, and grant the scopes that workflow's jobs ask for, no more and no
+fewer. An input that switches on a host hosts.toml marks `public_only` is
+passed as the repository's visibility (PUBLIC below) or as false. While
+exceptions.yaml holds an entry on the required check's name, the note of every
+template must name that entry's issue.
 
 Exit codes: 0 pass, 1 a template fails the check, 3 input error.
 """
@@ -39,6 +42,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ciwf
 import exceptions
+import hosts
 
 TEMPLATES = "templates/callers"
 SUFFIX = ".tmpl"
@@ -50,6 +54,10 @@ FIELD = re.compile(r"\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 CALL = re.compile(
     r"(?P<repository>[\w.-]+/[\w.-]+)/(?P<path>\.github/workflows/[\w.-]+)@(?P<ref>.+)"
 )
+LEVELS = {"none": 0, "read": 1, "write": 2}
+# True in a public repository and false in any other, and false too where the
+# event names no repository: the switch fails towards off.
+PUBLIC = "${{ github.event.repository.visibility == 'public' }}"
 SAMPLE = {
     "RunnerTag": "ubuntu-26.04",
     "Shared": {
@@ -132,14 +140,77 @@ def render(text: str, context: dict, name: str) -> str:
     return "".join(parts)
 
 
-def _inputs(root: Path, path: str) -> dict | None:
-    """Inputs the called workflow declares; None when it is no reusable workflow kept here."""
+def _called(root: Path, path: str) -> dict | None:
+    """The called workflow; None when it is no reusable workflow kept here."""
     if not (root / path).is_file():
         return None
-    events = ciwf.triggers(ciwf.load(root / path))
-    if "workflow_call" not in events:
-        return None
-    return events["workflow_call"].get("inputs") or {}
+    doc = ciwf.load(root / path)
+    return doc if "workflow_call" in ciwf.triggers(doc) else None
+
+
+def _public_inputs(root: Path, path: str) -> set[str]:
+    """Inputs of the called workflow that switch on a host for public repositories only."""
+    if not (root / hosts.DECLARATION).is_file():
+        return set()
+    return hosts.public_inputs(hosts.declaration(root), path)
+
+
+def _with_problems(job: dict, called: dict, path: str, public: set[str]) -> list[str]:
+    """What is wrong with the inputs a caller's job passes."""
+    inputs = ciwf.triggers(called)["workflow_call"].get("inputs") or {}
+    passed = job.get("with") or {}
+    problems = [
+        f"the job passes `{key}`, which {path} does not declare"
+        for key in sorted(set(passed) - set(inputs))
+    ]
+    for key, spec in sorted(inputs.items()):
+        if (spec or {}).get("required") and key not in passed:
+            problems.append(f"the job does not pass `{key}`, which {path} requires")
+    for key in sorted(public & set(passed)):
+        if passed[key] is not False and passed[key] != PUBLIC:
+            written = "true" if passed[key] is True else passed[key]
+            problems.append(
+                f"the job passes `{key}` as `{written}`; it switches on a host for public "
+                f"repositories only and is passed as `{PUBLIC}` or as false"
+            )
+    return problems
+
+
+def _asked(doc: dict) -> dict[str, str] | None:
+    """Each scope with the highest level a job of the workflow asks for; None without scopes."""
+    asked: dict[str, str] = {}
+    for job in (doc.get("jobs") or {}).values():
+        block = job.get("permissions", doc.get("permissions")) if isinstance(job, dict) else None
+        if not isinstance(block, dict):
+            return None
+        for scope, level in block.items():
+            if LEVELS.get(str(level), 0) > LEVELS.get(asked.get(str(scope), "none"), 0):
+                asked[str(scope)] = str(level)
+    return asked
+
+
+def _grant_problems(job: dict, doc: dict, called: dict, path: str) -> list[str]:
+    """Where the scopes a caller's job grants differ from what the called workflow asks for.
+
+    A scope that is asked for and not granted stops the run before it starts;
+    a scope that is granted and not asked for is access nothing needs.
+    """
+    granted = job.get("permissions", doc.get("permissions"))
+    if not isinstance(granted, dict):
+        return [
+            f"the job's permissions name no scopes: {'<unset>' if granted is None else granted}"
+        ]
+    asked = _asked(called)
+    if asked is None:
+        return [f"a job of {path} names no scopes, so the grant cannot be compared"]
+    problems = []
+    for scope in sorted({*map(str, granted), *asked}):
+        have, want = str(granted.get(scope, "none")), asked.get(scope, "none")
+        if LEVELS.get(have, 0) > LEVELS.get(want, 0):
+            problems.append(f"the job grants `{scope}: {have}`, which {path} does not ask for")
+        if LEVELS.get(have, 0) < LEVELS.get(want, 0):
+            problems.append(f"the job does not grant `{scope}: {want}`, which {path} asks for")
+    return problems
 
 
 def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
@@ -152,16 +223,12 @@ def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
         problems.append(f"the job calls {call['repository']}, not the shared repository's field")
     if call["ref"] != SAMPLE["Shared"]["Commit"]:
         problems.append("the called workflow is not named by the commit field alone")
-    inputs = _inputs(root, call["path"])
-    if inputs is None:
-        return [*problems, f"{call['path']} is no reusable workflow of this repository"]
-    for key in sorted(set(job.get("with") or {}) - set(inputs)):
-        problems.append(f"the job passes `{key}`, which {call['path']} does not declare")
-    for key, spec in sorted(inputs.items()):
-        if (spec or {}).get("required") and key not in (job.get("with") or {}):
-            problems.append(f"the job does not pass `{key}`, which {call['path']} requires")
-    for scope in ciwf.write_scopes(job.get("permissions", doc.get("permissions"))):
-        problems.append(f"the job's permissions allow writing: {scope}")
+    path = call["path"]
+    called = _called(root, path)
+    if called is None:
+        return [*problems, f"{path} is no reusable workflow of this repository"]
+    problems += _with_problems(job, called, path, _public_inputs(root, path))
+    problems += _grant_problems(job, doc, called, path)
     if "secrets" in job:
         problems.append("the job passes secrets")
     return problems

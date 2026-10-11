@@ -17,6 +17,10 @@ it with `expires = YYYY-MM-DD` in place of `input`: an exception for one
 host in one file, which fails from the day after that date. A date further
 ahead than the longest time an exception may run (exceptions.py) fails too.
 
+A host that is asked with the name of the calling repository carries
+`public_only = true` beside its `input`. render.py then refuses a caller
+template that passes that input as anything but the repository's visibility.
+
 What the scan reads: URLs and registry paths in every string of the file,
 container and service images, and the registries that package commands
 contact without naming them (IMPLIED below). What it cannot see: a host a
@@ -184,6 +188,27 @@ def _switch_problem(spec: dict, inputs: dict, today: datetime.date) -> str:
     return f"is an exception that {problem}" if problem else ""
 
 
+def _public_problem(spec: dict) -> str:
+    """Why a host's mark for public repositories only cannot be read."""
+    if "public_only" not in spec:
+        return ""
+    if spec["public_only"] is not True:
+        return "has a `public_only` that is not `true`"
+    if "input" not in spec:
+        return "is marked `public_only` without the `input` a caller sets by visibility"
+    return ""
+
+
+def public_inputs(declared: dict, path: str) -> set[str]:
+    """Inputs of one file that switch on a host for public repositories only."""
+    entry = declared.get("files", {}).get(path, {})
+    return {
+        str(spec.get("input"))
+        for spec in entry.values()
+        if isinstance(spec, dict) and spec.get("public_only") is True
+    }
+
+
 def _declared_problems(
     path: str, doc: dict, reusable: bool, entry: dict, outside: dict, today: datetime.date
 ) -> list:
@@ -197,11 +222,10 @@ def _declared_problems(
             problems.append(f"{path}: host {host} is declared without a reason")
             continue
         if reusable:
-            problem = _switch_problem(spec, inputs, today)
-        elif "expires" in spec:
-            problem = "has an `expires`, which only a reusable workflow takes"
+            problem = _switch_problem(spec, inputs, today) or _public_problem(spec)
         else:
-            problem = ""
+            keys = [key for key in ("expires", "public_only") if key in spec]
+            problem = f"has `{keys[0]}`, which only a reusable workflow takes" if keys else ""
         if problem:
             problems.append(f"{path}: host {host} {problem}")
     return problems
