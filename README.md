@@ -62,7 +62,7 @@ before the tool runs.
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
 | `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)) |
 | `interface.lock.json` | recorded interface of every workflow and action |
-| `hosts.toml` | hosts and outside actions the workflows may reach |
+| `hosts.toml` | hosts and outside actions the workflows may reach; a host without a switch has a day it ends, at most 90 days ahead ([ADR-0010](docs/adr/0010-one-longest-time-for-every-exception.md)) |
 | `exceptions.yaml` | exceptions to rules no other list can carry, each with its issue and a day it ends ([ADR-0007](docs/adr/0007-one-own-exception-list.md)) |
 | `docs/adr/` | decision records |
 

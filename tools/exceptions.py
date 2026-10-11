@@ -52,8 +52,8 @@ ENTRY = re.compile(
 ISSUE = re.compile(r"^[\w.-]+/[\w.-]+#[1-9]\d*$")
 
 
-def _day_problem(day: datetime.date, today: datetime.date) -> str:
-    """Why a day an exception ends on is refused; empty when it holds."""
+def day_problem(day: datetime.date, today: datetime.date) -> str:
+    """Why a day an exception ends on is refused, in every list; empty when it holds."""
     if day < today:
         return f"expired on {day}"
     if day - today > LONGEST:
@@ -83,7 +83,7 @@ def _findings(root: Path, today: datetime.date) -> tuple[list[str], int]:
         if entry not in stated:
             found.append(f"{CONFIG}: {rule} for {entry} has no `# expires YYYY-MM-DD: reason`")
             continue
-        problem = _day_problem(stated[entry], today)
+        problem = day_problem(stated[entry], today)
         if problem:
             found.append(f"{CONFIG}: {rule} for {entry} {problem}")
     return found, len(wanted)
@@ -101,7 +101,7 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
     if "path" not in empty and not _tracked_file(root, entry["path"]):
         found.append(f"names `{entry['path']}`, which is no file of the repository")
     if "expires" not in empty:
-        problem = _day_problem(datetime.date.fromisoformat(entry["expires"]), today)
+        problem = day_problem(datetime.date.fromisoformat(entry["expires"]), today)
         found += [problem] if problem else []
     return found
 

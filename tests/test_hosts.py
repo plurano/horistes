@@ -225,6 +225,20 @@ def test_expired_exception_fails(tree):
     assert "host rekor.sigstore.dev is an exception that expired on 2026-12-31" in done.stderr
 
 
+def test_exception_that_ends_on_the_last_allowed_day_passes(tree):
+    done = scan(tree, planted(LOG), DATED, "--today", "2026-10-02")
+    assert done.returncode == 0, done.stderr
+
+
+def test_exception_that_ends_later_than_the_longest_time_fails(tree):
+    done = scan(tree, planted(LOG), DATED, "--today", "2026-10-01")
+    assert done.returncode == 1, done.stdout
+    assert (
+        "host rekor.sigstore.dev is an exception that ends on 2026-12-31, more than 90 days ahead"
+        in done.stderr
+    )
+
+
 @pytest.mark.parametrize(
     ("entry", "message"),
     [

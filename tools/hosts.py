@@ -14,7 +14,8 @@ found fails too, so the list cannot go stale.
 
 A reusable workflow that cannot yet put a host behind a switch declares
 it with `expires = YYYY-MM-DD` in place of `input`: an exception for one
-host in one file, which fails from the day after that date.
+host in one file, which fails from the day after that date. A date further
+ahead than the longest time an exception may run (exceptions.py) fails too.
 
 What the scan reads: URLs and registry paths in every string of the file,
 container and service images, and the registries that package commands
@@ -35,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ciwf
+import exceptions
 
 DECLARATION = "hosts.toml"
 DYNAMIC = "<dynamic>"
@@ -178,9 +180,8 @@ def _switch_problem(spec: dict, inputs: dict, today: datetime.date) -> str:
         return "names both `input` and `expires`: an exception has no switch"
     if type(expires) is not datetime.date:
         return "has an `expires` that is no date (unquoted YYYY-MM-DD)"
-    if expires < today:
-        return f"is an exception that expired on {expires}"
-    return ""
+    problem = exceptions.day_problem(expires, today)
+    return f"is an exception that {problem}" if problem else ""
 
 
 def _declared_problems(

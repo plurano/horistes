@@ -63,6 +63,8 @@ lint-workflows: tools
 check-interface:
 	$(PYTHON) -B tools/interface.py check --base-ref $(BASE_REF)
 
+# A host declared with a day it ends takes the same longest time as the
+# exceptions below.
 check-hosts:
 	$(PYTHON) -B tools/hosts.py check
 

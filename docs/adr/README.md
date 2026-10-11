@@ -17,3 +17,4 @@ record that supersedes it.
 | [0007](0007-one-own-exception-list.md) | 2026-10-11 | Exceptions the engine's list cannot carry live in one own list | Accepted |
 | [0008](0008-licence-tool-image-by-digest.md) | 2026-10-11 | The licence tool's image is named by digest | Accepted |
 | [0009](0009-caller-templates-in-the-engines-syntax.md) | 2026-10-11 | Caller templates are written in the engine's syntax and rendered here until the engine does | Accepted |
+| [0010](0010-one-longest-time-for-every-exception.md) | 2026-10-11 | A dated host runs no longer than any other exception | Accepted |
