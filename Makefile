@@ -16,7 +16,7 @@ PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsc
 
 .PHONY: verify verify-all tools requirements lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
-	interface-snapshot list-pins check-pins pin
+	interface-snapshot list-pins check-pins pin check-runners
 
 # The one gate is `make verify-all`: CI runs exactly that target, so a local
 # green run and a green status check mean the same thing. This repository's own
@@ -28,8 +28,8 @@ verify-all: verify
 
 # This repository's own checks; they need no engine.
 verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-exceptions check-templates \
-	check-scorecard test verify-reuse
-	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, tests and licence headers.'
+	check-scorecard check-runners test verify-reuse
+	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, runner labels, tests and licence headers.'
 
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.
@@ -93,6 +93,12 @@ interface-snapshot:
 PINS_ROOT ?= .
 list-pins check-pins pin: tools
 	ZIZMOR="$(BIN)/zizmor" $(BIN)/python -B tools/pins.py $(patsubst %-pins,%,$@) --root "$(PINS_ROOT)"
+
+# Runner labels (ADR-0018): no workflow names a floating label of a hosted
+# machine. The check asks no host and needs no token, so it is part of the
+# gate here; another repository is read with PINS_ROOT.
+check-runners: tools
+	$(BIN)/python -B tools/pins.py runners --root "$(PINS_ROOT)"
 
 # The tests plant one defect per rule; the two outside linters are run on a
 # planted workflow as well, so a linter that stopped refusing fails here.

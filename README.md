@@ -75,7 +75,7 @@ rules.
 | `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`) and its callers (`licence-check.yml`) |
 | `actions/<name>/` | composite steps |
 | `templates/callers/` | the caller a consumer keeps, one template per shared workflow ([ADR-0009](docs/adr/0009-caller-templates-in-the-engines-syntax.md)) |
-| `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, the release read-back, and the check of action pins |
+| `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, the release read-back, and the check of action pins and runner labels |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
 | `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)); `readback` holds the parameter files of three read releases |
 | `interface.lock.json` | recorded interface of every workflow and action |
@@ -92,7 +92,7 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
 - `make verify` runs this repository's own checks without the engine: YAML and
   Python lint, actionlint and zizmor, the interface record, the host scan, the
   accepted findings and exceptions, the caller templates, the Scorecard
-  service's rules, the tests and the licence headers.
+  service's rules, the runner labels, the tests and the licence headers.
 - `make interface-snapshot` rewrites `interface.lock.json` after an interface
   change. A change that breaks a caller also needs `interface_major` raised.
 
@@ -339,6 +339,36 @@ tools, once a week, and by hand
 is no required check. The summary of each run names the forge requests the
 check took. Other repositories run the three targets from a checkout of this
 one until a reusable workflow exists.
+
+### Runner labels
+
+The same tool refuses a floating label of a hosted machine
+([ADR-0018](docs/adr/0018-floating-runner-labels-refused-by-the-pin-tool.md)):
+
+```sh
+make check-runners PINS_ROOT=../other   # asks no host, needs no token
+```
+
+```text
+FAIL: .github/workflows/build.yml:46: `runs-on` of job `build`: `ubuntu-latest` is a floating runner label; name the release it stands for
+```
+
+The labels are `ubuntu-latest`, `windows-latest`, `macos-latest`,
+`macos-latest-large` and `macos-latest-xlarge`, as a whole word and without
+regard to case: `ubuntu-latest-xl` is a label of its own and passes.
+
+| Read | Not read |
+| :--- | :--- |
+| `runs-on` of a job: a text, a list, `group` with `labels`, the text of an expression | a name, a description, a command, a variable, a comment |
+| every value under `strategy` of a job | a repository variable (`vars`) or an output of an earlier job (`needs`) |
+| every value a job hands to a called workflow under `with` | a label put together from parts (`ubuntu-${{ inputs.release }}`) |
+| `default` and `options` of an input of `workflow_call` and `workflow_dispatch` | an action file |
+
+The last line of a pass counts the jobs that take their label from an
+expression. Exit code 0 is a pass, 1 a finding, 3 a workflow that cannot be
+read. `check-pins` and `pin` run the check as well; `pin` rewrites no label.
+The check is part of `make verify-all`. It has no exception list yet: a
+finding is fixed.
 
 ## Licence
 

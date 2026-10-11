@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Action pins: every outside use is on a commit, its comment names it, its inputs exist.
 
-    pins.py list  [--root DIR]
-    pins.py check [--root DIR]
-    pins.py pin   [--root DIR]
+    pins.py list    [--root DIR]
+    pins.py check   [--root DIR]
+    pins.py pin     [--root DIR]
+    pins.py runners [--root DIR]
 
 `list` prints every use of an outside action or workflow that is on a tag or
 a branch; it asks no host. `check` fails on such a use, on a commit whose
@@ -39,6 +40,19 @@ are not read; actionlint reads the first.
 The token for zizmor is GH_TOKEN, GITHUB_TOKEN or ZIZMOR_GITHUB_TOKEN, else
 the one the forge's client holds. zizmor is taken from ZIZMOR.
 
+`runners` fails on a workflow that names a floating label of a hosted machine
+(`ubuntu-latest`, `windows-latest`, `macos-latest` and its two larger sizes):
+the machine behind such a label moves to the next system release on a day the
+forge chooses, without a commit here (ADR-0018). It asks no host, needs no
+token and does not start zizmor; `check` and `pin` run it as well. The label
+is read where a workflow can choose a machine: `runs-on` of a job as a text, a
+list, the `group` and `labels` form or an expression; every value under
+`strategy`; every value a job hands to a called workflow under `with`; and
+`default` and `options` of an input of `workflow_call` and
+`workflow_dispatch`. A label that exists only while the workflow runs (a
+repository variable, an output of an earlier job, a text put together from
+parts) is not read.
+
 Exit codes: 0 pass, 1 a finding, 3 the check could not be made.
 """
 
@@ -49,6 +63,7 @@ import base64
 import difflib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -127,6 +142,15 @@ CLIENT_SECONDS = 60
 LOCAL = ("./", "../", "docker://")
 WORKFLOW_FOLDER = ".github/workflows/"
 IMAGE_KEYS = ("args", "entrypoint")
+# The labels that stand for the newest release of a hosted machine (docs.github.com, GitHub-hosted
+# runners and larger runners, read 2026-10-11), as whole words: `ubuntu-latest-xl` and
+# `team-ubuntu-latest` are names an organisation gives a machine of its own.
+FLOATING = re.compile(
+    r"(?<![\w.-])(?:ubuntu|windows|macos)-latest(?:-x?large)?(?![\w.-])", re.IGNORECASE
+)
+INPUT_EVENTS = ("workflow_call", "workflow_dispatch")
+INPUT_KEYS = ("default", "options")
+JOB_KEYS = ("runs-on", "strategy", "with")
 
 
 class PinError(Exception):
@@ -288,12 +312,17 @@ def _steps(pairs: dict) -> list[dict]:
     return [_pairs(step) for step in steps.value] if isinstance(steps, yaml.SequenceNode) else []
 
 
-def _calls(path: Path, kind: str) -> list[Call]:
-    """Every `uses` of a workflow or an action file, with the line of each `with` key."""
+def _composed(path: Path) -> dict[str, tuple[yaml.Node, yaml.Node]]:
+    """The top mapping of a file as nodes, which keep the line of every key and value."""
     try:
-        root = _pairs(yaml.compose(path.read_text(encoding="utf-8"), Loader=ciwf.StrictLoader))
+        return _pairs(yaml.compose(path.read_text(encoding="utf-8"), Loader=ciwf.StrictLoader))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as err:
         raise PinError(f"{path}: {err}") from err
+
+
+def _calls(path: Path, kind: str) -> list[Call]:
+    """Every `uses` of a workflow or an action file, with the line of each `with` key."""
+    root = _composed(path)
     if kind == "action":
         found = [_call(step, False) for step in _steps(_pairs(root.get("runs", (None, None))[1]))]
         return [call for call in found if call]
@@ -372,6 +401,64 @@ def _inputs(root: Path, documents: list) -> tuple[list[Finding], int, int]:
     return findings, uses, keys
 
 
+def _texts(node: yaml.Node) -> list[tuple[int, str]]:
+    """Every value below a node with the line it begins on; a mapping gives no key.
+
+    Without recursion, and each node once: an alias may name a node that holds itself.
+    """
+    found, pending, seen = [], [node], set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, yaml.ScalarNode):
+            found.append((item.start_mark.line + 1, item.value))
+        elif isinstance(item, yaml.MappingNode):
+            pending.extend(value for _, value in item.value)
+        elif isinstance(item, yaml.SequenceNode):
+            pending.extend(item.value)
+    return found
+
+
+def _below(pairs: dict, key: str) -> dict[str, tuple[yaml.Node, yaml.Node]]:
+    """The mapping under one key of a mapping; empty when the key is absent or holds none."""
+    return _pairs(pairs[key][1]) if key in pairs else {}
+
+
+def _label_places(top: dict) -> list[tuple[str, str, yaml.Node]]:
+    """Where a workflow can choose a machine: the key, whose it is, and the node under it.
+
+    An action file has neither `on` nor `jobs`, so it gives no place.
+    """
+    places = []
+    for event, (_, node) in _below(top, "on").items():
+        inputs = _below(_pairs(node), "inputs") if event in INPUT_EVENTS else {}
+        for name, (_, given) in inputs.items():
+            spec = _pairs(given)
+            owner = f"input `{name}` of {event}"
+            places += [(key, owner, spec[key][1]) for key in INPUT_KEYS if key in spec]
+    for name, (_, node) in _below(top, "jobs").items():
+        job = _pairs(node)
+        places += [(key, f"job `{name}`", job[key][1]) for key in JOB_KEYS if key in job]
+    return places
+
+
+def _labels(root: Path, documents: list) -> tuple[list[Finding], int, int]:
+    """Findings on runner labels, the jobs with a `runs-on`, and those with an expression in it."""
+    findings, jobs, late = [], 0, 0
+    for path, _, _ in documents:
+        for key, owner, node in _label_places(_composed(root / path)):
+            texts = _texts(node)
+            jobs += key == "runs-on"
+            late += key == "runs-on" and any("${{" in text for _, text in texts)
+            for line, text in texts:
+                for label in sorted({found.group(0).lower() for found in FLOATING.finditer(text)}):
+                    said = f"`{key}` of {owner}: `{label}` is a floating runner label; "
+                    findings.append(Finding(path, line, said + "name the release it stands for"))
+    return findings, jobs, late
+
+
 def _tree(root: Path) -> tuple[list, dict[str, str]]:
     documents = ciwf.files(root)
     if not documents:
@@ -396,27 +483,45 @@ def check(root: Path, work: Path, rewrite: bool) -> int:
         _engine_run(work, list(named), token, fix=True)
         found = _scan(work, named, token)
     late, uses, keys = _inputs(root, documents)
-    problems = sorted([*found[UNPINNED], *found[COMMENT], *late])
+    floating, jobs, _ = _labels(root, documents)
+    problems = sorted([*found[UNPINNED], *found[COMMENT], *late, *floating])
     for finding in problems:
         ciwf.complain(f"FAIL: {finding.path}:{finding.line}: {finding.text}")
     if problems:
         return 1
     ciwf.say(
         f"PASS: {len(named)} file(s), {uses} outside use(s) on a commit, no comment refuted, "
-        f"{keys} `with` key(s) declared; {_version()}, online"
+        f"{keys} `with` key(s) declared, {jobs} job(s) on no floating runner label; "
+        f"{_version()}, online"
+    )
+    return 0
+
+
+def runners(root: Path) -> int:
+    documents, named = _tree(root)
+    found, jobs, late = _labels(root, documents)
+    for finding in sorted(found):
+        ciwf.complain(f"FAIL: {finding.path}:{finding.line}: {finding.text}")
+    if found:
+        return 1
+    ciwf.say(
+        f"PASS: {len(named)} file(s), {jobs} job(s) with a `runs-on`, no floating runner label; "
+        f"{late} of them take(s) the label from an expression"
     )
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("command", choices=("list", "check", "pin"))
+    parser.add_argument("command", choices=("list", "check", "pin", "runners"))
     parser.add_argument("--root", type=Path, default=Path("."))
     args = parser.parse_args()
     try:
         with tempfile.TemporaryDirectory() as work:
             if args.command == "list":
                 return listing(args.root, Path(work))
+            if args.command == "runners":
+                return runners(args.root)
             return check(args.root, Path(work), rewrite=args.command == "pin")
     except (PinError, ciwf.ReadError) as err:
         ciwf.complain(f"ERROR: {err}")

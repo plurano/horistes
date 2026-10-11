@@ -25,3 +25,4 @@ record that supersedes it.
 | [0015](0015-refusal-outside-a-public-repository-is-a-failed-job.md) | 2026-10-11 | A workflow with an input for public repositories only refuses another repository with a failed job | Accepted |
 | [0016](0016-action-pins-checked-with-zizmor-behind-three-guards.md) | 2026-10-11 | Action pins are listed, written and checked by zizmor behind three guards, and `with` keys are read here | Accepted |
 | [0017](0017-pin-check-as-its-own-job-outside-the-gate.md) | 2026-10-11 | The pin check runs as its own job, on workflow changes, weekly and by hand, outside the gate | Accepted |
+| [0018](0018-floating-runner-labels-refused-by-the-pin-tool.md) | 2026-10-11 | A floating label of a hosted machine is refused by the pin tool, without an exception list for now | Accepted |

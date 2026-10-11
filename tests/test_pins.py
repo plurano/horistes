@@ -207,7 +207,7 @@ def test_tree_on_commits_with_right_comments_and_declared_keys_passes(tree):
     done = run(tree)
     assert done.returncode == 0, done.stderr
     assert done.stdout.startswith("PASS: 1 file(s), 3 outside use(s)")
-    assert "3 `with` key(s) declared" in done.stdout
+    assert "3 `with` key(s) declared, 1 job(s) on no floating runner label" in done.stdout
     assert sorted(tree.forge_calls()) == sorted(ANSWERS)
     assert [call["token"] for call in engine_calls(tree)] == ["a-token-for-the-stand-in"]
 
@@ -242,6 +242,18 @@ def test_use_that_is_not_a_commit_under_its_release_fails(tree, old, new, line, 
     (failure,) = [text for text in done.stderr.splitlines() if text.startswith("FAIL")]
     assert failure.startswith(f"FAIL: {WORKFLOW}:{line}: ")
     assert message in failure
+
+
+@pytest.mark.parametrize("command", ["check", "pin"])
+def test_floating_runner_label_fails_the_check_and_is_not_rewritten(tree, command):
+    floating = planted("runs-on: ubuntu-24.04", "runs-on: ubuntu-latest")
+    done = run(tree, command, workflow=floating)
+    assert done.returncode == 1, done.stdout
+    assert done.stderr == (
+        f"FAIL: {WORKFLOW}:7: `runs-on` of job `build`: `ubuntu-latest` is a floating runner "
+        "label; name the release it stands for\n"
+    )
+    assert (tree.root / WORKFLOW).read_text() == floating
 
 
 def test_misspelled_key_of_an_outside_action_fails_with_its_line(tree):
