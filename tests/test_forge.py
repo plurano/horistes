@@ -12,6 +12,8 @@ from __future__ import annotations
 import shlex
 import subprocess
 import sys
+import time
+import types
 
 import pytest
 from conftest import PAGE, ROOT, forge_answers, forge_job, forge_run
@@ -59,8 +61,10 @@ def client(tree, monkeypatch):
         for name, value in tree.forge(answers).items():
             monkeypatch.setenv(name, value)
 
-    monkeypatch.setattr(forge.time, "sleep", lambda seconds: serve.waits.append(seconds))
+    # The reader's name `time` alone is replaced: the interpreter's own module also
+    # paces its wait for a child process, and those steps are not the reader's waits.
     serve.waits = []
+    monkeypatch.setattr(forge, "time", types.SimpleNamespace(sleep=serve.waits.append))
     return serve
 
 
@@ -201,6 +205,12 @@ def test_rate_limit_is_waited_out_and_then_given_up(tree, client):
         forge.api(LISTING)
     assert client.waits == [20, 40, 60]
     assert tree.forge_calls() == 4 * [LISTING]
+
+
+def test_only_the_readers_own_waits_are_recorded(client):
+    """The interpreter waits for a child process in steps of its own; those are not the reader's."""
+    time.sleep(0.001)
+    assert client.waits == []
 
 
 def test_listing_is_read_page_by_page(monkeypatch):
