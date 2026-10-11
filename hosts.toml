@@ -72,6 +72,15 @@ reason = "index of the hash-pinned tools in requirements/tools.txt, installed by
 [files.".github/workflows/ci.yml"."files.pythonhosted.org"]
 reason = "files of those tools"
 
+# The pin check of this repository's own workflows (decision record 0017). It
+# is no reusable workflow, so no input switches these hosts off. zizmor and the
+# tool ask only the forge.
+[files.".github/workflows/pins.yml"."pypi.org"]
+reason = "index of the hash-pinned tools in requirements/tools.txt, installed by `make tools`"
+
+[files.".github/workflows/pins.yml"."files.pythonhosted.org"]
+reason = "files of those tools"
+
 # The shared licence workflow runs the licence tool's public image, named by
 # digest (decision record 0008). The host has no off switch: it is an exception
 # with a day it ends (decision record 0005), and it leaves when a pinned image

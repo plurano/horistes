@@ -332,6 +332,14 @@ last line of a pass names the zizmor version and the numbers of files, uses
 and keys read. Neither target is part of `make verify-all`, which asks no
 host.
 
+For this repository the check runs by itself: `.github/workflows/pins.yml`
+starts it on a pull request that changes a workflow, the tool or the pinned
+tools, once a week, and by hand
+([ADR-0017](docs/adr/0017-pin-check-as-its-own-job-outside-the-gate.md)). It
+is no required check. The summary of each run names the forge requests the
+check took. Other repositories run the three targets from a checkout of this
+one until a reusable workflow exists.
+
 ## Licence
 
 EUPL-1.2, see [LICENSE](LICENSE).

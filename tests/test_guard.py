@@ -48,6 +48,7 @@ GUARDED = UNGUARDED.replace("jobs:\n" + JOB, "jobs:\n" + GUARD + JOB + NEEDS)
 REAL = (
     ".github/workflows/ci.yml",
     ".github/workflows/licence-check.yml",
+    ".github/workflows/pins.yml",
     WORKFLOW,
     SCORECARD,
     "hosts.toml",
