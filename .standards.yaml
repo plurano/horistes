@@ -19,6 +19,16 @@ facets:
 # machine-learning pipeline.
 flavors:
   - name: python-ml
+# Agent clients and editors installed on the maintainer's workstation; the engine writes and
+# verifies the files of these only. opencode reads AGENTS.md itself and has no id here.
+agent_clients:
+  - claude
+  - codex
+  - gemini
+editors:
+  - universal
+  - vscode
+  - antigravity
 register:
   sources:
     expected: 13
