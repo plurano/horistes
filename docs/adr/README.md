@@ -31,3 +31,4 @@ record that supersedes it.
 | [0021](0021-settings-sync-preset-switches-the-toolchain-manager-off.md) | 2026-10-12 | A second preset switches the toolchain manager off in a repository under settings sync | Accepted |
 | [0022](0022-public-consumers-call-this-repository-directly.md) | 2026-10-12 | Public consumers call this repository directly; the copy per owner is not built | Accepted |
 | [0023](0023-the-name-is-horistes.md) | 2026-10-12 | The repository is named Horistes, and the rename comes before the first release | Accepted |
+| [0024](0024-public-before-the-first-release.md) | 2026-10-12 | The repository turns public before its first release | Accepted |

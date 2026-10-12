@@ -49,10 +49,11 @@ yet, because a repository can call it only once this one is public. The caller
 a consumer keeps exists as a template for both.
 
 Consumers call this repository directly; no copy per owner is built. Its name
-is chosen. It turns public after its history is shown to hold no private
-content and the first release exists. Until then only private repositories of
-the same owner can call it
-([ADR-0022](docs/adr/0022-public-consumers-call-this-repository-directly.md)).
+is chosen. It turns public now that its history is shown to hold no private
+content; the first release follows later. Until then only private repositories
+of the same owner can call it
+([ADR-0022](docs/adr/0022-public-consumers-call-this-repository-directly.md),
+[ADR-0024](docs/adr/0024-public-before-the-first-release.md)).
 
 ## Workflows
 
