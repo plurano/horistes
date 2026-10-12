@@ -108,7 +108,8 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
   accepted findings and exceptions, the caller templates, the Scorecard
   service's rules, the runner labels, the tests and the licence headers.
 - The tests read the message of every commit between the base of the change
-  and `HEAD` (`tests/test_commit_messages.py`). A message fails when it credits
+  and `HEAD` (`tests/test_commit_messages.py`), on every run of the gate. A
+  message fails without a `Signed-off-by` trailer, and when it credits
   a tool or a model: a trailer whose key is not `Signed-off-by` or `Migration`,
   a co-author line, or a line that opens with "generated with". The engine's
   own message check passes such a message; this test retires when the pinned

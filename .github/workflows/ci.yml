@@ -47,8 +47,8 @@ jobs:
           echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
-      # Full history: the interface check reads the base of the change and the
-      # sign-off step reads every commit of the pull request.
+      # Full history: the interface check reads the base of the change, and the
+      # commit-message test reads every commit since it (sign-off included).
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -105,18 +105,3 @@ jobs:
             || github.event.merge_group.base_sha
             || github.event.before }}
         run: make verify-all BASE_REF="$BASE_REF"
-
-      - name: Sign-off on pull request commits
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          missing=0
-          for sha in $(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA"); do
-            if ! git log -1 --format=%B "$sha" | grep -q '^Signed-off-by: '; then
-              echo "::error::commit $sha lacks a Signed-off-by trailer"
-              missing=1
-            fi
-          done
-          exit "$missing"
