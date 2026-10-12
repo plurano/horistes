@@ -86,6 +86,9 @@ ends with this record; everything else in it stands.
   requests that touch workflows and weekly, with the repository's token and
   outside the gate; a reusable workflow follows after one green week with the
   forge request count measured.
+- The runs named below ran in this repository before it moved to a new
+  history; they stay readable in the private archive
+  `plurano/horistes-archive`.
 - The job was seen to refuse on 2026-10-11. A commit of the pull request that
   brought this record commented the checkout of the gate as `v7.0.0` on the
   commit of `v7.0.1`; run 38147757680 failed with

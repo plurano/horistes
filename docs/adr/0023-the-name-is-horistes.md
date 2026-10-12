@@ -22,7 +22,8 @@ The operator chose the name on 2026-10-12 from a screened list in the style of
 the family: a Greek or Latin word for an impartial office or an exact
 instrument.
 
-Where the working name stood on that day (commit `9193f1d`):
+Where the working name stood on that day (commit `9193f1d` of the private
+archive `plurano/horistes-archive`; the same tree is commit `1bbad79` here):
 
 | Kind | Places | Treated as |
 | :--- | :--- | :--- |
