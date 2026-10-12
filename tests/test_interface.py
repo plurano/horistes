@@ -131,6 +131,26 @@ def test_unknown_base_ref_is_an_error_not_a_pass(released):
     assert "is not a commit here" in done.stderr
 
 
+def test_null_base_of_a_new_branch_counts_every_entry_as_new(released):
+    done = released.tool("interface.py", "check", "--base-ref", "0" * 40)
+    assert done.returncode == 0, done.stderr
+    assert "is the null commit" in done.stdout
+
+
+def test_null_base_with_a_stale_lock_still_fails(released):
+    text = (released.root / WORKFLOW).read_text(encoding="utf-8")
+    released.write({WORKFLOW: text.replace("      path:\n", "      directory:\n")})
+    done = released.tool("interface.py", "check", "--base-ref", "0" * 40)
+    assert done.returncode == 1
+    assert "does not describe the tree" in done.stderr
+
+
+def test_base_one_digit_short_of_null_is_an_error(released):
+    done = released.tool("interface.py", "check", "--base-ref", "0" * 39)
+    assert done.returncode == 3
+    assert "is not a commit here" in done.stderr
+
+
 def test_base_without_lock_counts_every_entry_as_new(tree):
     tree.write({"README.md": "start\n"})
     tree.git("init", "-q", "-b", "main")

@@ -27,6 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ciwf
 
 LOCK = "interface.lock.json"
+# The forge sends the null commit as the state before a push that creates the
+# branch, as on the first push to a new repository; SHA-1 and SHA-256 forms.
+NULL_IDS = frozenset({"0" * 40, "0" * 64})
 
 
 def _inputs(block: object) -> dict:
@@ -147,6 +150,12 @@ def _base_lock(root: Path, ref: str) -> dict:
             ["git", "-C", str(root), *args], capture_output=True, text=True, check=False
         )
 
+    if ref in NULL_IDS:
+        ciwf.say(
+            f"base {ref} is the null commit (a push that creates the branch):"
+            " every entry counts as new"
+        )
+        return {"interface_major": -1, "workflows": {}, "actions": {}}
     if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode != 0:
         raise ciwf.ReadError(f"base ref {ref} is not a commit here")
     prefix = git("rev-parse", "--show-prefix").stdout.strip()
