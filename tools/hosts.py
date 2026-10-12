@@ -21,9 +21,12 @@ A host that is asked with the name of the calling repository carries
 `public_only = true` beside its `input`. render.py then refuses a caller
 template that passes that input as anything but the repository's visibility.
 A caller written by hand can still pass true, so a workflow with such an
-input also refuses for itself: its job `visibility` runs when one of those
-inputs is true and reads the visibility the event names, and every other job
+input also refuses for itself: its job `visibility` runs on every call, is
+given those inputs and the visibility the event names, and refuses when one
+of the inputs is true in a repository that is not public. Every other job
 needs it. A job that is skipped reads as a pass; a job that failed does not.
+Because the guard is never skipped, a job that needs it can refuse a call
+with every input off (decision record 0026).
 
 What the scan reads: URLs and registry paths in every string of the file,
 container and service images, and the registries that package commands
@@ -228,23 +231,24 @@ def _condition(job: dict) -> str:
     return text.strip()
 
 
-def _reads_visibility(step: object) -> bool:
-    """Whether a step runs a command that is given the visibility the event names."""
+def _given(step: object) -> set[str]:
+    """The values a step that runs a command is given in its environment."""
     if not isinstance(step, dict) or not isinstance(step.get("run"), str):
-        return False
+        return set()
     env = step.get("env")
-    return isinstance(env, dict) and VISIBILITY in env.values()
+    return {str(value) for value in env.values()} if isinstance(env, dict) else set()
 
 
 def _guard_job_problems(guard: dict, public: set[str]) -> list[str]:
     """What keeps the guard from failing in a repository that is not public."""
     problems = []
-    wanted = sorted(f"inputs.{name}" for name in public)
-    if sorted(part.strip() for part in _condition(guard).split("||")) != wanted:
-        problems.append(f"does not run exactly when `{' || '.join(wanted)}`")
+    if _condition(guard):
+        problems.append("has a condition, so it can be skipped")
+    wanted = [VISIBILITY, *sorted(f"${{{{ inputs.{name} }}}}" for name in public)]
     steps = guard.get("steps") if isinstance(guard.get("steps"), list) else []
-    if not any(_reads_visibility(step) for step in steps):
-        problems.append(f"has no step that runs a command on `{VISIBILITY}`")
+    if not any(set(wanted) <= _given(step) for step in steps):
+        given = " and ".join(f"`{value}`" for value in wanted)
+        problems.append(f"has no step that runs a command on {given}")
     if any(isinstance(holder, dict) and LENIENT in holder for holder in [guard, *steps]):
         problems.append(f"sets `{LENIENT}`, so its failure would not count")
     if guard.get("needs"):

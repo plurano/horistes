@@ -28,18 +28,18 @@ MARKED = (
     + f'\n[files."{WORKFLOW}"."rekor.sigstore.dev"]\n'
     + 'reason = "public transparency log"\ninput = "publish"\npublic_only = true\n'
 )
-CONDITION = "    if: inputs.publish\n"
+RUNS = "    runs-on: ubuntu-24.04\n"
 READS = "          VISIBILITY: ${{ github.event.repository.visibility }}\n"
+GIVEN = "          PUBLISH: ${{ inputs.publish }}\n"
 STEP = "      - name: Refuse a repository that is not public\n"
 COMMAND = '        run: |\n          test "$VISIBILITY" = public\n'
 GUARD = f"""\
   visibility:
     name: Public repository
-{CONDITION}    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+{RUNS}    timeout-minutes: 5
     steps:
 {STEP}        env:
-{READS}{COMMAND}"""
+{READS}{GIVEN}{COMMAND}"""
 JOB = "  check:\n    name: Licence check\n"
 NEEDS = "    needs: visibility\n"
 UNGUARDED = REUSABLE.replace(RUN, RUN + LOG)
@@ -79,11 +79,11 @@ def test_workflow_without_a_guard_fails(tree):
 @pytest.mark.parametrize(
     ("old", "new"),
     [
-        (CONDITION, "    if: ${{ inputs.publish }}\n"),
+        (GIVEN, "          SWITCH: ${{ inputs.publish }}\n"),
         (NEEDS, "    needs: [visibility]\n"),
         (NEEDS, NEEDS + "    if: inputs.publish && github.event_name == 'push'\n"),
     ],
-    ids=["braces", "needs-list", "condition-without-status"],
+    ids=["other-variable", "needs-list", "condition-without-status"],
 )
 def test_other_spelling_of_the_guard_passes(tree, old, new):
     assert GUARDED.count(old) == 1
@@ -92,18 +92,31 @@ def test_other_spelling_of_the_guard_passes(tree, old, new):
 
 
 PLANTED = [
-    pytest.param(CONDITION, "", "does not run exactly when `inputs.publish`", id="no-condition"),
     pytest.param(
-        CONDITION,
-        "    if: inputs.path\n",
-        "does not run exactly when `inputs.publish`",
-        id="other-input",
+        RUNS,
+        "    if: inputs.publish\n" + RUNS,
+        "has a condition, so it can be skipped",
+        id="condition",
     ),
     pytest.param(
-        CONDITION,
-        "    if: inputs.publish && github.event_name == 'push'\n",
-        "does not run exactly when `inputs.publish`",
-        id="narrowed-condition",
+        RUNS,
+        "    if: ${{ github.event_name == 'push' }}\n" + RUNS,
+        "has a condition, so it can be skipped",
+        id="other-condition",
+    ),
+    pytest.param(
+        GIVEN,
+        "",
+        "has no step that runs a command on `${{ github.event.repository.visibility }}` "
+        "and `${{ inputs.publish }}`",
+        id="input-not-given",
+    ),
+    pytest.param(
+        GIVEN,
+        "          PUBLISH: ${{ inputs.path }}\n",
+        "has no step that runs a command on `${{ github.event.repository.visibility }}` "
+        "and `${{ inputs.publish }}`",
+        id="other-input-given",
     ),
     pytest.param(
         READS,
@@ -118,8 +131,8 @@ PLANTED = [
         id="no-command",
     ),
     pytest.param(
-        CONDITION,
-        CONDITION + "    continue-on-error: true\n",
+        RUNS,
+        RUNS + "    continue-on-error: true\n",
         "sets `continue-on-error`, so its failure would not count",
         id="lenient-job",
     ),
@@ -130,8 +143,8 @@ PLANTED = [
         id="lenient-step",
     ),
     pytest.param(
-        CONDITION,
-        CONDITION + "    needs: check\n",
+        RUNS,
+        RUNS + "    needs: check\n",
         "needs another job, so it can be skipped",
         id="guard-needs-a-job",
     ),
@@ -184,14 +197,28 @@ def test_scorecard_workflow_of_this_repository_is_guarded(tree):
     ("old", "new", "message"),
     [
         (
-            "    if: inputs.outside_hosts || inputs.publish\n",
-            "    if: inputs.outside_hosts\n",
-            "does not run exactly when `inputs.outside_hosts || inputs.publish`",
+            "    name: Public repository\n",
+            "    name: Public repository\n    if: inputs.outside_hosts || inputs.publish\n",
+            "job `visibility` has a condition, so it can be skipped",
         ),
-        ("    needs: visibility\n", "", "job `analysis` does not need job `visibility`"),
+        (
+            "          PUBLISH: ${{ inputs.publish }}\n",
+            "",
+            "job `visibility` has no step that runs a command on",
+        ),
+        (
+            "    needs: visibility\n    if: inputs.outside_hosts\n",
+            "    if: inputs.outside_hosts\n",
+            "job `analysis` does not need job `visibility`",
+        ),
+        (
+            "    needs: visibility\n    if: ${{ !inputs.outside_hosts }}\n",
+            "    if: ${{ !inputs.outside_hosts }}\n",
+            "job `switched_off` does not need job `visibility`",
+        ),
         ("  visibility:\n", "  public:\n", "no job `visibility` refuses another repository"),
     ],
-    ids=["one-input", "no-needs", "renamed"],
+    ids=["condition", "one-input", "no-needs", "refusal-without-needs", "renamed"],
 )
 def test_scorecard_workflow_with_a_weakened_guard_fails(tree, old, new, message):
     done = real(tree, old, new)
@@ -199,18 +226,26 @@ def test_scorecard_workflow_with_a_weakened_guard_fails(tree, old, new, message)
     assert message in done.stderr
 
 
-def refuse(tmp_path, visibility):
+def refuse(tmp_path, visibility, outside_hosts="true", publish="false"):
     """Run the command of the real guard the way the forge runs a bash step."""
     guard = ciwf.load(ROOT / SCORECARD)["jobs"]["visibility"]
     (step,) = guard["steps"]
     assert step["shell"] == "bash"
     assert step["env"]["VISIBILITY"] == "${{ github.event.repository.visibility }}"
+    assert step["env"]["OUTSIDE_HOSTS"] == "${{ inputs.outside_hosts }}"
+    assert step["env"]["PUBLISH"] == "${{ inputs.publish }}"
     assert "${{" not in step["run"]
     bash = shutil.which("bash")
     assert bash, "the guard is a bash step; bash is needed to run it"
     summary = tmp_path / "summary.md"
     summary.write_text("", encoding="utf-8")
-    env = {**step["env"], "VISIBILITY": visibility, "GITHUB_STEP_SUMMARY": str(summary)}
+    env = {
+        **step["env"],
+        "VISIBILITY": visibility,
+        "OUTSIDE_HOSTS": outside_hosts,
+        "PUBLISH": publish,
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
     done = subprocess.run(
         [bash, "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
         capture_output=True,
@@ -237,3 +272,20 @@ def test_guard_fails_with_its_reason_anywhere_else(tmp_path, visibility):
     assert f"visibility as '{visibility}'." in line
     assert "\n" not in line
     assert summary.strip() == line.split("::", 2)[2]
+
+
+@pytest.mark.parametrize("visibility", ["public", "private", ""])
+def test_guard_passes_anywhere_with_every_input_off(tmp_path, visibility):
+    done, summary = refuse(tmp_path, visibility, outside_hosts="false", publish="false")
+    assert done.returncode == 0, done.stderr
+    assert (done.stdout, summary) == ("", "")
+
+
+@pytest.mark.parametrize(
+    ("outside_hosts", "publish"),
+    [("false", "true"), ("true", "true"), ("", "false"), ("False", "false")],
+)
+def test_guard_refuses_any_input_that_is_not_off(tmp_path, outside_hosts, publish):
+    done, _ = refuse(tmp_path, "private", outside_hosts=outside_hosts, publish=publish)
+    assert done.returncode == 1, done.stdout
+    assert "visibility as 'private'." in done.stdout
