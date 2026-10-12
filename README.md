@@ -60,7 +60,7 @@ of the same owner can call it
 | File | Purpose | Inputs | Check | Hosts beyond the forge |
 | :--- | :--- | :--- | :--- | :--- |
 | `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-26.04`, the newest working image); `root` (directory checked as the project root, default `.`) | `<calling job> / REUSE lint` | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)); the image is named by digest ([ADR-0008](docs/adr/0008-licence-tool-image-by-digest.md)) |
-| `.github/workflows/scorecard.yml` | the supply-chain checks of the OpenSSF Scorecard action, reported to code scanning and kept as the artifact `scorecard-result` | `outside_hosts` (boolean, default false: no job runs); `publish` (boolean, default false) | `<calling job> / Public repository`, `<calling job> / Analysis` | with `outside_hosts`: `www.bestpractices.dev`, `api.deps.dev`, `api.osv.dev`, `oss-fuzz-build-logs.storage.googleapis.com`; with `publish`: `api.scorecard.dev`, `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
+| `.github/workflows/scorecard.yml` | the supply-chain checks of the OpenSSF Scorecard action, reported to code scanning and kept as the artifact `scorecard-result` | `outside_hosts` (boolean, default false: the run fails, [ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)); `publish` (boolean, default false) | `<calling job> / Public repository`, `<calling job> / Analysis`; with `outside_hosts` false, `Analysis` is the failed refusal and the analysis job reports as `Analysis (not started)` | with `outside_hosts`: `www.bestpractices.dev`, `api.deps.dev`, `api.osv.dev`, `oss-fuzz-build-logs.storage.googleapis.com`; with `publish`: `api.scorecard.dev`, `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
 
 The licence job reads the contents and takes no secret; the caller grants
 `contents: read` and nothing else. On a draft pull request the job stops with
@@ -71,8 +71,11 @@ before the tool runs.
 The scorecard job passes whatever it finds and takes no secret. The caller
 grants `contents: read`, `security-events: write` and `id-token: write`. Two
 of its hosts are asked with the repository's name, so a caller switches the
-job on by the repository's visibility and never with a plain `true`; in a
-private repository both jobs are skipped. A caller that passes `true` for
+job on by the repository's visibility and never with a plain `true`, and the
+caller is kept in a public repository only. A run that analyses nothing
+fails: with `outside_hosts` false, `<calling job> / Analysis` is a failed job
+with the reason in its text, because a skipped analysis would read as a pass
+([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)). A caller that passes `true` for
 either input in a repository that is not public gets a failed check,
 `<calling job> / Public repository`, with the reason in its text, and the
 analysis does not start
@@ -93,7 +96,7 @@ rules.
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
 | `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)); `readback` holds the parameter files of three read releases |
 | `interface.lock.json` | recorded interface of every workflow and action |
-| `hosts.toml` | hosts and outside actions the workflows may reach; a host without a switch has a day it ends, at most 90 days ahead ([ADR-0010](docs/adr/0010-one-longest-time-for-every-exception.md)); a host for public repositories only is marked ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)), and its workflow refuses another repository in a job of its own ([ADR-0015](docs/adr/0015-refusal-outside-a-public-repository-is-a-failed-job.md)) |
+| `hosts.toml` | hosts and outside actions the workflows may reach; a host without a switch has a day it ends, at most 90 days ahead ([ADR-0010](docs/adr/0010-one-longest-time-for-every-exception.md)); a host for public repositories only is marked ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)), and its workflow refuses another repository in a job of its own ([ADR-0015](docs/adr/0015-refusal-outside-a-public-repository-is-a-failed-job.md)) that runs on every call and is given the visibility and every such input ([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)) |
 | `exceptions.yaml` | exceptions to rules no other list can carry, each with its issue and a day it ends ([ADR-0007](docs/adr/0007-one-own-exception-list.md)) |
 | `docs/adr/` | decision records |
 
@@ -120,7 +123,9 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
   accepted records keep it and are named in the test
   ([ADR-0023](docs/adr/0023-the-name-is-horistes.md)).
 - `make interface-snapshot` rewrites `interface.lock.json` after an interface
-  change. A change that breaks a caller also needs `interface_major` raised.
+  change. A change that breaks a caller also raises the recorded version:
+  `interface_minor` while `interface_major` is 0, `interface_major` from 1 on
+  ([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)).
 
 ## Caller templates
 
@@ -155,7 +160,9 @@ exactly the scopes the called workflow's jobs ask for, and an input that
 switches on a host for public repositories only is passed as
 `${{ github.event.repository.visibility == 'public' }}` or as false
 ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)). The scorecard
-template takes no `RunnerTag`.
+template is rendered in public repositories only: elsewhere, and with false,
+its `Analysis` check fails ([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)). It takes no
+`RunnerTag`.
 
 Until cordanaLLM/praetor issue 1212 is fixed, the calling job stays out of the
 consumer's required checks; each template's note says why.

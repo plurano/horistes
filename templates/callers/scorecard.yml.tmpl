@@ -9,10 +9,12 @@ the shared repository, named here by commit with the version as a comment.
 
 Public repositories only: the action asks the best-practices badge service
 and the dependency insight service with the name of the repository. The
-switch is therefore the repository's visibility, read on every run: in a
-private or internal repository the job is skipped, and it starts to run by
-itself on the day the repository becomes public. A caller that passes a plain
-true is refused by tools/render.py (decision record 0013).
+switch is therefore the repository's visibility, read on every run, and a
+caller that passes a plain true is refused by tools/render.py (decision
+record 0013). Render this file in a public repository only: in a private or
+internal repository the switch is off, and a run that analyses nothing
+fails, so "Scorecard / Analysis" is red with the reason in its text
+(decision record 0026).
 
 Not passed: `publish`. The Scorecard service reads the called workflow file
 from the shared repository before it takes a result, which it can do only
@@ -25,7 +27,9 @@ id-token write is used only when the result is published.
 Required check: none. The job runs on a push to the default branch and on a
 schedule, never on a pull request, and passes whatever it finds; the forge
 reports it as "Scorecard / Public repository" and "Scorecard / Analysis" (the
-first refuses a repository that is not public, decision record 0015). The engine declares a calling job under
+first refuses a repository that is not public, decision record 0015; the
+second fails when the switch is off, and the analysis job then reports as
+"Scorecard / Analysis (not started)", decision record 0026). The engine declares a calling job under
 its own name, which no run reports (cordanaLLM/praetor#1212), so the job stays
 out of the consumer's required checks.
 

@@ -9,7 +9,9 @@ The lock (interface.lock.json) records what a caller depends on: inputs,
 secrets, outputs, the names of the jobs (the forge reports a check under
 them) and the scopes a workflow asks to write. `check` fails when the lock
 does not describe the tree, and, with --base-ref, when the tree breaks the
-interface recorded at that ref without a higher `interface_major`.
+interface recorded at that ref without a higher `interface_major`. While
+`interface_major` is 0 the interface is not finished, and a higher
+`interface_minor` declares the break instead (decision record 0026).
 
 Exit codes: 0 pass, 1 the lock is out of date or a break is undeclared,
 3 input error (unreadable file, unknown base ref).
@@ -139,7 +141,21 @@ def _read_lock(root: Path) -> dict:
         raise ciwf.ReadError(f"{path}: {err}") from err
     if not isinstance(lock, dict) or not isinstance(lock.get("interface_major"), int):
         raise ciwf.ReadError(f"{path}: no integer interface_major")
+    if not isinstance(lock.get("interface_minor", 0), int):
+        raise ciwf.ReadError(f"{path}: interface_minor is not an integer")
     return lock
+
+
+def declared(base: dict, lock: dict) -> bool:
+    """Whether the lock raises the version a break needs against the base.
+
+    A higher major declares a break. While both majors are 0 the interface is
+    unfinished, and a higher minor declares it.
+    """
+    major, was = lock["interface_major"], base.get("interface_major", -1)
+    if major > was:
+        return True
+    return major == was == 0 and lock.get("interface_minor", 0) > base.get("interface_minor", 0)
 
 
 def _base_lock(root: Path, ref: str) -> dict:
@@ -180,10 +196,12 @@ def main() -> int:
     try:
         current = describe(args.root)
         if args.command == "snapshot":
-            major = _read_lock(args.root)["interface_major"] if (args.root / LOCK).exists() else 0
-            text = (
-                json.dumps({"interface_major": major, **current}, indent=2, sort_keys=True) + "\n"
-            )
+            old = _read_lock(args.root) if (args.root / LOCK).exists() else {}
+            version = {
+                "interface_major": old.get("interface_major", 0),
+                "interface_minor": old.get("interface_minor", 0),
+            }
+            text = json.dumps({**version, **current}, indent=2, sort_keys=True) + "\n"
             (args.root / LOCK).write_text(text, encoding="utf-8")
             ciwf.say(
                 f"wrote {LOCK}: {len(current['workflows'])} reusable workflows, "
@@ -208,17 +226,19 @@ def main() -> int:
         )
         return 0
     broken = breaks(base, lock)
-    if broken and lock["interface_major"] <= base.get("interface_major", -1):
+    version = f"{lock['interface_major']}.{lock.get('interface_minor', 0)}"
+    if broken and not declared(base, lock):
         for line in broken:
             ciwf.complain(f"BREAK: {line}")
+        raise_what = "interface_minor" if lock["interface_major"] == 0 else "interface_major"
         ciwf.complain(
             f"FAIL: {len(broken)} break(s) against {args.base_ref} "
-            f"with interface_major still {lock['interface_major']}; raise it"
+            f"with the interface still at {version}; raise {raise_what}"
         )
         return 1
     ciwf.say(
         f"PASS: {LOCK} describes the tree ({counts}); {len(broken)} break(s) "
-        f"against {args.base_ref}, interface_major {lock['interface_major']}"
+        f"against {args.base_ref}, interface {version}"
     )
     return 0
 

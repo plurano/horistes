@@ -1,6 +1,7 @@
 {
   "actions": {},
   "interface_major": 0,
+  "interface_minor": 1,
   "workflows": {
     ".github/workflows/licence.yml": {
       "inputs": {
@@ -36,7 +37,8 @@
         }
       },
       "jobs": {
-        "analysis": "Analysis",
+        "analysis": "${{ inputs.outside_hosts && 'Analysis' || 'Analysis (not started)' }}",
+        "switched_off": "${{ inputs.outside_hosts && 'Analysis (switched on)' || 'Analysis' }}",
         "visibility": "Public repository"
       },
       "outputs": [],

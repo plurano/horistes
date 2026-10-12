@@ -6,22 +6,28 @@
 # scanning and is kept as an artifact for five days. Its check is reported as
 # "<name of the calling job> / Analysis"; the job passes whatever it finds.
 #
-# With default inputs no job runs: the action asks four outside hosts on
-# every run and has no switch of its own, so `outside_hosts` gates the whole
-# analysis. Two of those hosts are asked with the name of the calling
-# repository, which is why a caller switches the analysis on in a public
-# repository only (decision record 0013).
+# The action asks four outside hosts on every run and has no switch of its
+# own, so `outside_hosts`, off by default, gates the whole analysis. Two of
+# those hosts are asked with the name of the calling repository, which is why
+# a caller switches the analysis on in a public repository only (decision
+# record 0013).
+#
+# A run that analyses nothing fails: with `outside_hosts` false the check
+# "<name of the calling job> / Analysis" is a failed job with the reason in
+# its text, and the skipped analysis job is reported as "Analysis (not
+# started)" (decision record 0026). A skipped job would read as a pass.
 #
 # A caller that switches it on in a repository that is not public gets a
 # failed check, "<name of the calling job> / Public repository", with the
 # reason in its text, and the analysis does not start (decision record 0015).
-# A skipped job would read as a pass.
+# That job runs on every call, so the jobs that need it are never skipped
+# for want of it.
 #
 # The analysis job is written to the rules the Scorecard service puts on a
 # workflow before it takes a published result: one literal runner label, no
 # `run` step, no `env`, no `defaults`, no container, and only steps that use
 # an action of the service's list. tools/scorecard.py holds the file to them.
-# That is why the runner is no input here, and why the refusal is a job of
+# That is why the runner is no input here, and why each refusal is a job of
 # its own.
 #
 # The caller grants what the job asks: contents read, security-events write
@@ -56,7 +62,6 @@ permissions: {}
 jobs:
   visibility:
     name: Public repository
-    if: inputs.outside_hosts || inputs.publish
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions: {}
@@ -65,12 +70,17 @@ jobs:
         shell: bash
         env:
           VISIBILITY: ${{ github.event.repository.visibility }}
+          OUTSIDE_HOSTS: ${{ inputs.outside_hosts }}
+          PUBLISH: ${{ inputs.publish }}
           TITLE: Repository is not public
           MESSAGE: >-
             The analysis did not run. An input that is for public
             repositories only was passed as true, and the event of this run
             gives the repository's visibility as
         run: |
+          if [ "$OUTSIDE_HOSTS" = false ] && [ "$PUBLISH" = false ]; then
+            exit 0
+          fi
           if [ "$VISIBILITY" = public ]; then
             exit 0
           fi
@@ -79,8 +89,32 @@ jobs:
           echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
+  switched_off:
+    # Named "Analysis" when it runs, so the check of a run that analyses
+    # nothing is a failure, not a skipped job.
+    name: ${{ inputs.outside_hosts && 'Analysis (switched on)' || 'Analysis' }}
+    needs: visibility
+    if: ${{ !inputs.outside_hosts }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Refuse a run that analyses nothing
+        shell: bash
+        env:
+          TITLE: Analysis switched off
+          MESSAGE: >-
+            The analysis did not run: the input outside_hosts is false, and a
+            skipped analysis would read as a pass. Call this workflow from a
+            public repository only, with outside_hosts passed as the
+            repository's visibility.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
   analysis:
-    name: Analysis
+    name: ${{ inputs.outside_hosts && 'Analysis' || 'Analysis (not started)' }}
     needs: visibility
     if: inputs.outside_hosts
     runs-on: ubuntu-26.04
