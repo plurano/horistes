@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Commit messages of a change: no line that credits a tool or a model.
+"""Commit messages of a change: a sign-off, and no line that credits a tool or a model.
 
 The engine's `forge check-message` reads the subject and the migration footer
 and passes a message that names a tool as co-author. Until the engine refuses
 such a message itself, this test reads every commit between the base of the
-change and HEAD. It retires with that engine release.
+change and HEAD. The credit rules retire with that engine release.
 
-Two rules, on one message each:
+The sign-off is read here too, so it is checked on every run of the gate:
+pull request, merge queue and push alike. A message without a
+`Signed-off-by` trailer is refused.
+
+Two credit rules, on one message each:
 
 - Trailers are read by git (`git interpret-trailers --parse`), and their keys
   are held against `TRAILERS`. A key that is not listed is refused, so a new
@@ -63,10 +67,15 @@ def git(repo: Path, *arguments: str, text: str | None = None, env: dict | None =
     return done.stdout
 
 
+def trailer_keys(message: str) -> list[str]:
+    """Keys of the trailer block of one message, as git reads it."""
+    parsed = git(ROOT, "interpret-trailers", "--parse", text=message, env=ALONE)
+    return [line.split(":", 1)[0].strip() for line in parsed.splitlines() if ":" in line]
+
+
 def credited(message: str) -> list[str]:
     """What one message holds that credits a tool: trailer keys, then footer lines."""
-    parsed = git(ROOT, "interpret-trailers", "--parse", text=message, env=ALONE)
-    keys = [line.split(":", 1)[0].strip() for line in parsed.splitlines() if ":" in line]
+    keys = trailer_keys(message)
     lines = [line.strip() for line in message.splitlines() if FOOTER.match(line)]
     loose = [line for line in lines if line.split(":", 1)[0] not in keys]
     return [f"trailer {key}" for key in keys if key.lower() not in TRAILERS] + [
@@ -74,13 +83,20 @@ def credited(message: str) -> list[str]:
     ]
 
 
+def unsigned(message: str) -> list[str]:
+    """The finding of a message that has no `Signed-off-by` trailer."""
+    keys = {key.lower() for key in trailer_keys(message)}
+    return [] if "signed-off-by" in keys else ["no trailer Signed-off-by"]
+
+
 def refused(repo: Path, base: str) -> dict[str, list[str]]:
-    """Commits between the base and HEAD whose message credits a tool."""
+    """Commits between the base and HEAD without a sign-off or with a credit line."""
     git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
     listed = git(repo, "rev-list", "--no-merges", f"--max-count={MAX_COMMITS + 1}", f"{base}..HEAD")
     commits = listed.split()
     assert len(commits) <= MAX_COMMITS, f"more than {MAX_COMMITS} commits since {base}"
-    found = {sha: credited(git(repo, "log", "-1", "--format=%B", sha)) for sha in commits}
+    messages = {sha: git(repo, "log", "-1", "--format=%B", sha) for sha in commits}
+    found = {sha: unsigned(text) + credited(text) for sha, text in messages.items()}
     return {sha: lines for sha, lines in found.items() if lines}
 
 
@@ -121,6 +137,29 @@ def test_planted_credit_is_refused(planted, found):
     assert credited(GOOD.replace(SIGN_OFF, planted)) == found
 
 
+@pytest.mark.parametrize(
+    "message",
+    [GOOD, GOOD.replace(SIGN_OFF, f"Migration: rename the input.\n{SIGN_OFF}")],
+    ids=["sign-off alone", "sign-off after a footer"],
+)
+def test_message_with_sign_off_passes(message):
+    assert unsigned(message) == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "feat(x): add a thing\n",
+        GOOD.replace(SIGN_OFF, "Migration: rename the input."),
+        f"feat(x): add a thing\n\n{SIGN_OFF}\n\nThe body comes after it.\n",
+        GOOD.replace("Signed-off-by:", "Signed-off-by"),
+    ],
+    ids=["subject alone", "other trailer only", "sign-off above the body", "no colon"],
+)
+def test_planted_message_without_sign_off_is_refused(message):
+    assert unsigned(message) == ["no trailer Signed-off-by"]
+
+
 def test_planted_co_author_outside_the_trailer_block_is_refused():
     line = "Co-authored-by: Some Model <m@example.org>"
     assert credited(GOOD.replace("\n\nThe header", f"\n\n{line}\n\nThe header")) == [f"line {line}"]
@@ -142,6 +181,14 @@ def test_planted_commit_is_refused_and_the_commits_around_it_pass(tmp_path):
     commit(tmp_path, GOOD.replace("add a thing", "add a third"))
     assert refused(tmp_path, base) == {bad: ["trailer Co-Authored-By"]}
     assert refused(tmp_path, "HEAD") == {}
+
+
+def test_planted_commit_without_sign_off_is_refused(tmp_path):
+    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
+    base = commit(tmp_path, GOOD)
+    bad = commit(tmp_path, "fix(x): change a thing\n\nNo sign-off here.\n")
+    commit(tmp_path, GOOD.replace("add a thing", "add another"))
+    assert refused(tmp_path, base) == {bad: ["no trailer Signed-off-by"]}
 
 
 def test_base_that_names_no_commit_fails(tmp_path):
