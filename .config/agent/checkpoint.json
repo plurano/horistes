@@ -7,7 +7,7 @@
   "publish": false,
   "remote": "origin",
   "base": "main",
-  "repository": "plurano/shared-ci",
+  "repository": "plurano/horistes",
   "branch_prefixes": [
     "checkpoint/",
     "audit/",

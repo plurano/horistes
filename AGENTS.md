@@ -1,5 +1,5 @@
 <!-- markdownlint-disable MD013 -->
-# plurano/shared-ci Agent Operating Harness
+# plurano/horistes Agent Operating Harness
 
 <!-- praetor:head -->
 

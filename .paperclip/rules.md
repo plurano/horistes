@@ -1,4 +1,4 @@
-# Paperclip Operating Rules (plurano/shared-ci)
+# Paperclip Operating Rules (plurano/horistes)
 
 ## Operating Contract
 

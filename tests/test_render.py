@@ -265,8 +265,8 @@ PLANTED = [
         id="named-by-branch",
     ),
     pytest.param(
-        GOOD.replace("<% .Shared.Repository %>", "plurano/shared-ci"),
-        "calls plurano/shared-ci, not the shared repository's field",
+        GOOD.replace("<% .Shared.Repository %>", "plurano/horistes"),
+        "calls plurano/horistes, not the shared repository's field",
         id="repository-written-out",
     ),
     pytest.param(

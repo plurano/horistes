@@ -1,5 +1,5 @@
 {
-  "name": "plurano/shared-ci",
+  "name": "plurano/horistes",
   "build": {
     "dockerfile": "Dockerfile.praetor",
     "context": "."

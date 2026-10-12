@@ -1,5 +1,5 @@
 <!-- markdownlint-disable MD013 -->
-# plurano/shared-ci Agent Operating Harness
+# plurano/horistes Agent Operating Harness
 
 Run read-only: file edits, state mutations, commits prohibited. Mutating steps dropped; prohibitions kept.
 

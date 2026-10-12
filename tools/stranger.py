@@ -22,7 +22,7 @@ DEADLINE_SECONDS = 60
 COMMAND_SECONDS = 240
 CHUNK = 1 << 20
 MAX_BYTES = 2 << 30
-AGENT = "plurano-shared-ci-readback"
+AGENT = "plurano-horistes-readback"
 PASSED = ("PATH", "SYSTEMROOT", "TEMP", "TMP")
 LIMIT_HEADERS = ("x-ratelimit-remaining", "x-ratelimit-reset")
 

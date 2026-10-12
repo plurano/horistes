@@ -31,7 +31,7 @@ PLANTED_PRESET = "tests/fixtures/update-bot/planted-preset.json"
 SYNCED = json.loads((ROOT / "settings-sync.json").read_text(encoding="utf-8"))
 PLANTED_SYNCED = "tests/fixtures/update-bot/planted-settings-sync.json"
 # Without a file name Renovate reads `default.json` of the named repository.
-REFERENCE = "github>plurano/shared-ci"
+REFERENCE = "github>plurano/horistes"
 
 # What the preset may hold, and what one of its rules may hold. Allow-lists on
 # purpose: a key that names a manager, a file or a package of one repository

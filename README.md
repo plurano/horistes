@@ -1,4 +1,4 @@
-# Plurano shared CI (working name)
+# Horistes
 
 <!-- praetor:readme-governance:start -->
 [![HISS Adopted][praetor-hiss-badge]][praetor-hiss-agents]
@@ -19,18 +19,25 @@ generated agent context against `AGENTS.md`.
 0 recorded infractions; audit forbids growth.
 
 [praetor-hiss-badge]: https://img.shields.io/badge/Standards-HISS%20Adopted-blue
-[praetor-hiss-agents]: https://github.com/plurano/shared-ci/blob/HEAD/AGENTS.md
+[praetor-hiss-agents]: https://github.com/plurano/horistes/blob/HEAD/AGENTS.md
 <!-- praetor:readme-governance:end -->
 
-Reusable workflows and templates for the repositories of the family: the jobs
+Reusable workflows and templates for the repositories of the Plurano framework
+family: the jobs
 every repository runs (build, test, lint, security scans, release, landing) are
 kept once here and called from thin callers, instead of each repository keeping
 its own copy.
 
 ## Name
 
-`shared-ci` is a working name. The real name is chosen before the first
-release.
+Greek *horistes*, the boundary commissioner who fixes limits. Pronounced
+ho-RIS-tees.
+
+The repository is `plurano/horistes`. The name is final with the first
+release: callers and preset references carry it, and the forge does not
+redirect a call after a rename
+([ADR-0023](docs/adr/0023-the-name-is-horistes.md)). Records written before
+2026-10-12 keep the working name `shared-ci`.
 
 ## Status
 
@@ -41,8 +48,8 @@ licence job of its own. The second is the scorecard run; it has no caller
 yet, because a repository can call it only once this one is public. The caller
 a consumer keeps exists as a template for both.
 
-Consumers call this repository directly; no copy per owner is built. It turns
-public after its name is chosen, its history is shown to hold no private
+Consumers call this repository directly; no copy per owner is built. Its name
+is chosen. It turns public after its history is shown to hold no private
 content and the first release exists. Until then only private repositories of
 the same owner can call it
 ([ADR-0022](docs/adr/0022-public-consumers-call-this-repository-directly.md)).
@@ -106,6 +113,10 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
   own message check passes such a message; this test retires when the pinned
   engine refuses it. The message of a squash merge is written on the forge, so
   it is read only afterwards, on the run of `main`.
+- No tracked file holds the address this repository had under its working name
+  (`tests/test_name.py`): the forge does not redirect a call to it. Two
+  accepted records keep it and are named in the test
+  ([ADR-0023](docs/adr/0023-the-name-is-horistes.md)).
 - `make interface-snapshot` rewrites `interface.lock.json` after an interface
   change. A change that breaks a caller also needs `interface_major` raised.
 
@@ -430,7 +441,7 @@ managers run, which files they read):
 ```
 
 Without a file name Renovate reads `default.json` of the named repository;
-in this family the reference is `github>plurano/shared-ci`. This
+in this family the reference is `github>plurano/horistes`. This
 repository's own `renovate.json` extends the preset the same way and repeats
 none of its values.
 

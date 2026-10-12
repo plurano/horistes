@@ -2,9 +2,9 @@
 version: 1
 repository:
   owner: plurano
-  name: shared-ci
+  name: horistes
   visibility: private
-  description: "Reusable CI workflows and templates of the Plurano family (working name)."
+  description: "Reusable CI workflows and templates of the Plurano family."
   homepage: ""
   topics: []
 profiles:
