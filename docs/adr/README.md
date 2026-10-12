@@ -32,3 +32,4 @@ record that supersedes it.
 | [0022](0022-public-consumers-call-this-repository-directly.md) | 2026-10-12 | Public consumers call this repository directly; the copy per owner is not built | Accepted |
 | [0023](0023-the-name-is-horistes.md) | 2026-10-12 | The repository is named Horistes, and the rename comes before the first release | Accepted |
 | [0024](0024-public-before-the-first-release.md) | 2026-10-12 | The repository turns public before its first release | Accepted |
+| [0025](0025-the-rule-set-goes-live-before-the-engine-fix.md) | 2026-10-12 | The rule set goes live before the engine names the licence check right | Accepted |

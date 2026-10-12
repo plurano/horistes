@@ -13,8 +13,9 @@ exceptions:
     reason: >-
       the engine declares the required check of a job that calls a reusable
       workflow under the calling job's own name (`Licence`), which no run
-      reports; the reported name is `Licence / REUSE lint`. No rule set is live
-      on this repository. Before it goes public or a rule set goes live, the
-      issue is fixed or no `praetorctl sync --remote` runs. The entry leaves
-      when the engine declares the reported name.
+      reports; the reported name is `Licence / REUSE lint`. The rule set is
+      live on the public repository (ADR-0025): until the engine declares the
+      reported name, a pull request whose `Licence` check never reports merges
+      through the maintainer's pull-request bypass. The entry leaves when the
+      engine declares the reported name.
     expires: "2026-12-31"
