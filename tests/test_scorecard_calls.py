@@ -22,42 +22,12 @@ from conftest import ROOT
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
+from expressions import evaluate
 
 SCORECARD = ROOT / ".github/workflows/scorecard.yml"
 VISIBILITY = "${{ github.event.repository.visibility }}"
-BRACES = re.compile(r"^\$\{\{(.*)\}\}$", re.DOTALL)
 INPUT = re.compile(r"^\$\{\{\s*inputs\.(\w+)\s*\}\}$")
 DEFAULTS = {"outside_hosts": False, "publish": False}
-
-
-def _atom(text: str, inputs: dict) -> object:
-    """One operand: an input or a quoted literal, with any leading `!`."""
-    text = text.strip()
-    negations = len(text) - len(text.lstrip("!"))
-    text = text.lstrip("!").strip()
-    if text.startswith("'") and text.endswith("'"):
-        value: object = text[1:-1]
-    elif text.startswith("inputs."):
-        value = inputs[text.removeprefix("inputs.")]
-    else:
-        raise ValueError(f"expression part not read here: {text!r}")
-    for _ in range(negations):
-        value = not value
-    return value
-
-
-def evaluate(text: str, inputs: dict) -> object:
-    """An expression of the forms the workflow uses: inputs, literals, `!`, `&&`, `||`."""
-    match = BRACES.match(text.strip())
-    value: object = False
-    for alternative in (match.group(1) if match else text).split("||"):
-        for part in alternative.split("&&"):
-            value = _atom(part, inputs)
-            if not value:
-                break
-        if value:
-            return value
-    return value
 
 
 def _environment(env: dict, inputs: dict, visibility: str) -> dict[str, str]:
@@ -148,22 +118,3 @@ def test_without_the_refusal_job_a_default_call_reads_green(tmp_path):
     checks = play(doc, DEFAULTS, "public", tmp_path)
     assert all(result != "failure" for result, _ in checks.values()), checks
     assert checks["Analysis (not started)"][0] == "skipped"
-
-
-@pytest.mark.parametrize(
-    ("text", "inputs", "value"),
-    [
-        ("inputs.outside_hosts", {"outside_hosts": True}, True),
-        ("${{ !inputs.outside_hosts }}", {"outside_hosts": True}, False),
-        ("${{ inputs.a && 'A' || 'B' }}", {"a": False}, "B"),
-        ("${{ inputs.a && 'A' || 'B' }}", {"a": True}, "A"),
-        ("inputs.a || inputs.b", {"a": False, "b": False}, False),
-    ],
-)
-def test_expression_reader(text, inputs, value):
-    assert evaluate(text, inputs) == value
-
-
-def test_expression_reader_refuses_what_it_does_not_read():
-    with pytest.raises(ValueError, match="not read here"):
-        evaluate("github.event_name == 'push'", {})

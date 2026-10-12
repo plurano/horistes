@@ -59,14 +59,17 @@ of the same owner can call it
 
 | File | Purpose | Inputs | Check | Hosts beyond the forge |
 | :--- | :--- | :--- | :--- | :--- |
-| `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-26.04`, the newest working image); `root` (directory checked as the project root, default `.`) | `<calling job> / REUSE lint` | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)); the image is named by digest ([ADR-0008](docs/adr/0008-licence-tool-image-by-digest.md)) |
+| `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-26.04`, the newest working image); `root` (directory checked as the project root, default `.`) | `<calling job> / REUSE lint`; with another `root`, `<calling job> / REUSE lint (<root>)` ([ADR-0027](docs/adr/0027-a-narrowed-licence-run-is-named-for-its-folder.md)) | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)); the image is named by digest ([ADR-0008](docs/adr/0008-licence-tool-image-by-digest.md)) |
 | `.github/workflows/scorecard.yml` | the supply-chain checks of the OpenSSF Scorecard action, reported to code scanning and kept as the artifact `scorecard-result` | `outside_hosts` (boolean, default false: the run fails, [ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)); `publish` (boolean, default false) | `<calling job> / Public repository`, `<calling job> / Analysis`; with `outside_hosts` false, `Analysis` is the failed refusal and the analysis job reports as `Analysis (not started)` | with `outside_hosts`: `www.bestpractices.dev`, `api.deps.dev`, `api.osv.dev`, `oss-fuzz-build-logs.storage.googleapis.com`; with `publish`: `api.scorecard.dev`, `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
 
 The licence job reads the contents and takes no secret; the caller grants
 `contents: read` and nothing else. On a draft pull request the job stops with
 an error instead of running. `root` must be a plain relative path (letters,
 digits, dot, underscore, hyphen, slash; no `..`); anything else stops the job
-before the tool runs.
+before the tool runs. A run with another `root` than `.` checks that folder
+only: its check carries the folder in its name, so it never satisfies a
+required `REUSE lint`, and its summary says that files outside it were not
+checked ([ADR-0027](docs/adr/0027-a-narrowed-licence-run-is-named-for-its-folder.md)).
 
 The scorecard job passes whatever it finds and takes no secret. The caller
 grants `contents: read`, `security-events: write` and `id-token: write`. Two
@@ -223,7 +226,7 @@ a planted case of its family
 family = "licence check"
 class = "R"
 old = "Old form, unlicensed fixture"
-new = "New form, unlicensed fixture / REUSE lint"
+new = "New form, unlicensed fixture / REUSE lint (tests/fixtures/unlicensed)"
 old_workflow = ".github/workflows/trial-old.yml"
 new_workflow = ".github/workflows/trial-new.yml"
 called_workflow = ".github/workflows/licence.yml"
