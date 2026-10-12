@@ -34,3 +34,4 @@ record that supersedes it.
 | [0024](0024-public-before-the-first-release.md) | 2026-10-12 | The repository turns public before its first release | Accepted |
 | [0025](0025-the-rule-set-goes-live-before-the-engine-fix.md) | 2026-10-12 | The rule set goes live before the engine names the licence check right | Accepted |
 | [0026](0026-a-call-that-analyses-nothing-fails.md) | 2026-10-12 | A scorecard call that analyses nothing fails; a break at interface 0 raises the minor version | Accepted |
+| [0027](0027-a-narrowed-licence-run-is-named-for-its-folder.md) | 2026-10-12 | A licence run narrowed to a folder is named for that folder | Accepted |

@@ -6,6 +6,11 @@
 # the contents and no secret. Its check is reported as
 # "<name of the calling job> / REUSE lint".
 #
+# A run whose `root` is a folder checks that folder only. Its check is then
+# reported as "<name of the calling job> / REUSE lint (<root>)", so it never
+# stands in for the check of the whole repository, and its summary names the
+# folder (decision record 0027).
+#
 # The licence tool runs from its own public image, named by digest (decision
 # record 0008). The registry it is pulled from has no off switch yet: it is a
 # dated exception in hosts.toml (decision record 0005).
@@ -32,7 +37,7 @@ permissions: {}
 
 jobs:
   reuse:
-    name: REUSE lint
+    name: ${{ inputs.root == '.' && 'REUSE lint' || format('REUSE lint ({0})', inputs.root) }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     permissions:
@@ -72,6 +77,19 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Name the checked scope
+        if: github.event.pull_request.draft != true
+        shell: bash
+        env:
+          ROOT: ${{ inputs.root }}
+        run: |
+          if [ "$ROOT" = . ]; then
+            echo "Licence information checked for the whole repository." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "Licence information checked for \`$ROOT\` only; files outside it were not checked." \
+            >> "$GITHUB_STEP_SUMMARY"
 
       # The image's entry point is the tool, so the arguments are the ones the
       # job this workflow replaces passes. The tool runs as root on a checkout

@@ -1,7 +1,7 @@
 {
   "actions": {},
   "interface_major": 0,
-  "interface_minor": 1,
+  "interface_minor": 2,
   "workflows": {
     ".github/workflows/licence.yml": {
       "inputs": {
@@ -17,7 +17,7 @@
         }
       },
       "jobs": {
-        "reuse": "REUSE lint"
+        "reuse": "${{ inputs.root == '.' && 'REUSE lint' || format('REUSE lint ({0})', inputs.root) }}"
       },
       "outputs": [],
       "secrets": {},

@@ -7,10 +7,13 @@ Caller of the shared licence check, as a consumer keeps it in
 consumer's licence job: the steps live in .github/workflows/licence.yml of the
 shared repository, named here by commit with the version as a comment.
 
-Required check: the forge reports the job as "Licence / REUSE lint". The engine
-declares it under the calling job's own name, "Licence", which no run reports
-(cordanaLLM/praetor#1212). Until that issue is fixed the calling job stays out
-of the consumer's required checks, or the switch waits.
+Required check: the forge reports the job as "Licence / REUSE lint". The
+caller passes no `root`: a run narrowed to a folder is reported as
+"Licence / REUSE lint (<root>)" and never stands in for the whole repository
+(decision record 0027). The engine declares the check under the calling job's
+own name, "Licence", which no run reports (cordanaLLM/praetor#1212). Until that
+issue is fixed the calling job stays out of the consumer's required checks, or
+the switch waits.
 
 Fields: .Shared.Repository, .Shared.Commit and .Shared.Version are working
 names until the engine renders caller templates (cordanaLLM/praetor#1211);
