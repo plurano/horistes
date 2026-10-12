@@ -24,7 +24,7 @@ env:
   # SHA-256 of actionlint_1.7.12_linux_amd64.tar.gz, from the release's checksum file.
   ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
   # Published Praetor commit that builds the praetorctl this gate pins.
-  PRAETOR_REF: "bd40beae2969386ac33b446b8191ba760102e14c"
+  PRAETOR_REF: "6622361940dc66399d027f3a203884bce2f616ac"
 
 jobs:
   verify:
