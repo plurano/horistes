@@ -28,8 +28,6 @@ forge = [
 # itself beyond the forge. An action missing here fails the gate.
 [actions]
 "actions/checkout" = []
-# Mints an installation token of a forge app through the forge's API.
-"actions/create-github-app-token" = []
 # Takes the toolchain from the runner's cache or the forge-hosted manifest;
 # when both miss it downloads from the Go distribution site, which redirects.
 "actions/setup-go" = ["go.dev", "dl.google.com"]

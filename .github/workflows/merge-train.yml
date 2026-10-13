@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 ---
-# Merge train (reusable): lands the pull requests of the calling repository
-# one at a time, without a session or a person driving it (decision record
-# 0029). Each run does at most one write:
+# Merge train (reusable): one sweep over every repository the merge-train
+# app is installed on, landing pull requests one at a time without a session
+# or a person driving it (decision record 0029). In each repository a run does
+# at most one write:
 #
 # - It lands the oldest pull request the forge reports CLEAN (or a state the
 #   caller accepts in `accept_states`), through the merge mutation with the
@@ -18,30 +19,42 @@
 #
 # Left alone: drafts, pull requests from forks, a base other than the default
 # branch, the labels in `hold_labels`, heads in `person_branches` (release
-# pull requests by default: a release is a person's act), and dependency
-# updates whose own commit (the update bot's, not a repin or a merge pushed on
-# top) is younger than `min_age_days` (3 days, the fleet's minimum age; a
-# security label or "[SECURITY]" in the title skips the wait).
+# pull requests by default: a release is a person's act), dependency updates
+# whose own commit (the update bot's, not a repin or a merge pushed on top) is
+# younger than `min_age_days` (3 days, the fleet's minimum age; a security
+# label or "[SECURITY]" in the title skips the wait), and archived
+# repositories. A repository leaves the train when the app is uninstalled
+# from it.
 #
-# CREDENTIAL. The writes are made with a token of the merge-train app, minted
-# per run for the calling repository only, with contents, pull requests and
-# workflows write and checks read. Workflows write is there because the forge
-# refuses a merge or an update-branch that changes a file under
-# .github/workflows without it: pin updates do, and so does an update after
-# the default branch changed a workflow. Events GITHUB_TOKEN causes start no
-# workflow run, so a head it updated would never get its checks. GITHUB_TOKEN
-# gets no permission at all. The calling workflow passes the app's private key as the
-# secret `app_private_key` and its client id as `app_client_id`.
+# CREDENTIAL. One repository holds the app's private key, as the secret
+# MERGE_TRAIN_APP_KEY of its environment `merge-train`; the environment lets
+# only the default branch deploy, so a workflow edited on another branch never
+# reads the key. The job runs in that environment and the caller passes the
+# secret as `app_private_key` and the client id as `app_client_id`. The key
+# signs a JWT of the app (openssl, the key through a pipe, never a file). For
+# every repository the job mints a token limited to that repository, with
+# contents, pull requests and workflows write and checks read (read rights
+# only when `switch` is off), and revokes it when the repository is done.
+# Workflows write is there because the forge refuses a merge or an
+# update-branch that changes a file under .github/workflows without it: pin
+# updates do, and so does an update after the default branch changed a
+# workflow. Events GITHUB_TOKEN causes start no workflow run, so a head it
+# updated would never get its checks. GITHUB_TOKEN gets no permission at all.
+#
+# A refusal in one repository is reported and the sweep goes on; the run ends
+# red when any repository refused. Repositories not reached within 25 minutes
+# are named in the summary.
 name: Merge train
 
 on:
   workflow_call:
     inputs:
       runner:
-        description: Label of the runner the job runs on.
+        description: >-
+          Label of the runner the job runs on. It needs python3 and the openssl
+          command; there is no default, so the caller names its own runner.
         type: string
-        required: false
-        default: ubuntu-26.04
+        required: true
       app_client_id:
         description: Client id of the merge-train app.
         type: string
@@ -90,7 +103,9 @@ on:
         default: security
     secrets:
       app_private_key:
-        description: Private key of the merge-train app.
+        description: >-
+          Private key of the merge-train app, the secret of the environment
+          merge-train of the calling repository.
         required: true
 
 permissions: {}
@@ -99,24 +114,15 @@ jobs:
   train:
     name: Merge train
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 10
+    environment: merge-train
+    timeout-minutes: 30
     permissions: {}
     steps:
-      - name: Mint the app token for this repository
-        id: token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ inputs.app_client_id }}
-          private-key: ${{ secrets.app_private_key }}
-          permission-contents: write
-          permission-pull-requests: write
-          permission-workflows: write
-          permission-checks: read
-
-      - name: Land one clean pull request, or update the next one
+      - name: Land or update one pull request in every repository of the app
         shell: python
         env:
-          TRAIN_TOKEN: ${{ steps.token.outputs.token }}
+          TRAIN_APP_CLIENT_ID: ${{ inputs.app_client_id }}
+          TRAIN_APP_KEY: ${{ secrets.app_private_key }}
           TRAIN_SWITCH: ${{ inputs.switch }}
           TRAIN_MERGE_METHOD: ${{ inputs.merge_method }}
           TRAIN_ACCEPT_STATES: ${{ inputs.accept_states }}
@@ -126,13 +132,25 @@ jobs:
           TRAIN_PERSON_BRANCHES: ${{ inputs.person_branches }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
         run: |
-          """Merge train of the calling repository: land one clean pull request, or update the head.
+          """Merge train of every repository the app is installed on.
+
+          In each repository it lands one clean pull request, or updates the next one.
+
+          The app's key signs a short-lived JWT (openssl, the key passed through a pipe
+          and never written to a file). With it the sweep lists the app's installations,
+          reads each installation's repositories with a read-only token, and mints for
+          every repository a token limited to that one repository; the train runs with
+          it, and the token is revoked at once. A refusal in one repository is recorded
+          and the sweep goes on with the next.
 
           Exit codes: 0 done, 1 a forge call failed or was refused, 3 a setting is invalid.
           """
 
+          import base64
           import json
           import os
+          import shutil
+          import subprocess
           import sys
           import time
           import urllib.error
@@ -140,8 +158,19 @@ jobs:
           from datetime import UTC, datetime, timedelta
 
           TIMEOUT = 30
-          SETTLE_ROUNDS = 6
-          SETTLE_SECONDS = 10
+          SETTLE_ROUNDS = 3
+          SETTLE_SECONDS = 5
+          SWEEP_SECONDS = 1500
+          MAX_PAGES = 20
+          JWT_SECONDS = 540
+          WRITE_RIGHTS = {
+              "contents": "write",
+              "pull_requests": "write",
+              "workflows": "write",
+              "checks": "read",
+          }
+          READ_RIGHTS = {"contents": "read", "pull_requests": "read", "checks": "read"}
+          LIST_RIGHTS = {"metadata": "read"}
           METHODS = ("SQUASH", "MERGE")
           ACCEPTABLE = ("UNSTABLE", "HAS_HOOKS")
           RED = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
@@ -210,6 +239,13 @@ jobs:
                   raise InvalidSettingError(f"accept_states holds {accept}, allowed: {', '.join(ACCEPTABLE)}")
               if not age.isdigit() or int(age) > 30:
                   raise InvalidSettingError(f"min_age_days is {age!r}, not a whole number from 0 to 30")
+              if not env.get("TRAIN_APP_CLIENT_ID", "").strip():
+                  raise InvalidSettingError("app_client_id is empty")
+              if "PRIVATE KEY-----" not in env.get("TRAIN_APP_KEY", ""):
+                  raise InvalidSettingError(
+                      "the app key is empty or no PEM key: the caller passes no secret, "
+                      "or the job runs outside the environment that holds it"
+                  )
               return {
                   "switch": switch,
                   "method": method,
@@ -219,6 +255,7 @@ jobs:
                   "dependency": tuple(env["TRAIN_DEPENDENCY_BRANCHES"].split()),
                   "person": tuple(env["TRAIN_PERSON_BRANCHES"].split()),
                   "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
+                  "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
               }
 
 
@@ -410,9 +447,10 @@ jobs:
               return rows, notes, "no pull request at a mergeable state"
 
 
-          def summary(env, repo, rows, notes, outcome):
+          def report(name, repo, rows, notes, outcome):
+              """The section of one repository with open pull requests."""
               lines = [
-                  f"Merge train: {outcome}",
+                  f"### {name}: {outcome}",
                   "",
                   "| Pull request | Merge state | Train |",
                   "|---|---|---|",
@@ -423,7 +461,144 @@ jobs:
               ]
               if repo["pullRequests"]["pageInfo"]["hasNextPage"]:
                   lines.append("\nOnly the 100 oldest open pull requests were read.")
-              text = "\n".join(lines) + "\n"
+              return "\n".join(lines) + "\n"
+
+
+          def b64url(data):
+              return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+          def app_jwt(env, conf):
+              """A JWT of the app, signed RS256 by openssl; the key goes through a pipe, never a file."""
+              openssl = shutil.which("openssl")
+              if not openssl:
+                  raise RefusedError("openssl is not on the runner: the app's JWT cannot be signed")
+              now = int(time.time())
+              claims = {"iat": now - 60, "exp": now + JWT_SECONDS, "iss": conf["client_id"]}
+              head = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+              signing_input = f"{head}.{b64url(json.dumps(claims).encode())}"
+              read_end, write_end = os.pipe()
+              with os.fdopen(write_end, "w") as pipe:
+                  pipe.write(env["TRAIN_APP_KEY"])
+              try:
+                  done = subprocess.run(
+                      [openssl, "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
+                      input=signing_input.encode(),
+                      capture_output=True,
+                      pass_fds=(read_end,),
+                      timeout=TIMEOUT,
+                      check=False,
+                  )
+              finally:
+                  os.close(read_end)
+              if done.returncode != 0 or not done.stdout:
+                  raise RefusedError(f"openssl could not sign the app's JWT (exit {done.returncode})")
+              return f"{signing_input}.{b64url(done.stdout)}"
+
+
+          def pages(env, token, path, key=None):
+              """Every item of a paginated list, at most MAX_PAGES pages of 100."""
+              items = []
+              for page in range(1, MAX_PAGES + 1):
+                  answer = call(f"{env['GITHUB_API_URL']}{path}?per_page=100&page={page}", token, "GET")
+                  batch = answer[key] if key else answer
+                  items += batch
+                  if len(batch) < 100:
+                      return items
+              raise RefusedError(f"GET {path}: more than {MAX_PAGES * 100} entries")
+
+
+          def mint(env, conf, installation, rights, repositories=None):
+              """An installation token with exactly these rights, for these repositories only."""
+              body = {"permissions": rights}
+              if repositories is not None:
+                  body["repositories"] = repositories
+              url = f"{env['GITHUB_API_URL']}/app/installations/{installation['id']}/access_tokens"
+              return call(url, app_jwt(env, conf), "POST", body)["token"]
+
+
+          def revoke(env, token):
+              call(f"{env['GITHUB_API_URL']}/installation/token", token, "DELETE")
+
+
+          def repositories(env, conf, installation):
+              """The installation's repositories the train serves, read with a read-only token."""
+              token = mint(env, conf, installation, LIST_RIGHTS)
+              try:
+                  listed = pages(env, token, "/installation/repositories", "repositories")
+              finally:
+                  revoke(env, token)
+              return [r for r in listed if not r.get("archived") and not r.get("disabled")]
+
+
+          def one(env, conf, installation, target, now):
+              """The train in one repository, with a token for that repository alone."""
+              rights = WRITE_RIGHTS if conf["switch"] == "on" else READ_RIGHTS
+              token = mint(env, conf, installation, rights, [target["name"]])
+              local = {**env, "GITHUB_REPOSITORY": target["full_name"], "TRAIN_TOKEN": token}
+              try:
+                  repo = fetch(local)
+                  rows, notes, outcome = run(local, conf, repo, now)
+              finally:
+                  revoke(env, token)
+              moved = any(note.startswith(("armed", "updated")) for note in notes.values())
+              section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""
+              return outcome, section, moved
+
+
+          def sweep(env, conf, started):
+              """Run the train in every repository; the per-account tally, the sections, the refusals."""
+              accounts, sections, refusals, skipped = {}, [], [], []
+              for installation in pages(env, app_jwt(env, conf), "/app/installations"):
+                  account = installation["account"]["login"]
+                  if installation.get("suspended_at"):
+                      accounts[account] = "suspended"
+                      continue
+                  try:
+                      targets = repositories(env, conf, installation)
+                  except RefusedError as err:
+                      refusals.append(f"{account}: {err}")
+                      accounts[account] = "refused"
+                      continue
+                  tally = {"repositories": 0, "landed": 0, "updated": 0, "refused": 0}
+                  accounts[account] = tally
+                  for target in targets:
+                      if time.monotonic() - started > SWEEP_SECONDS:
+                          skipped.append(target["full_name"])
+                          continue
+                      tally["repositories"] += 1
+                      try:
+                          outcome, section, moved = one(env, conf, installation, target, datetime.now(UTC))
+                      except RefusedError as err:
+                          tally["refused"] += 1
+                          refusals.append(f"{target['full_name']}: {err}")
+                          continue
+                      tally["landed"] += outcome.startswith("landed")
+                      tally["updated"] += moved
+                      sections.append(section)
+              return accounts, [s for s in sections if s], refusals, skipped
+
+
+          def summary(env, accounts, sections, refusals, skipped):
+              lines = [
+                  "## Merge train sweep",
+                  "",
+                  "| Account | Repositories | Landed | Updated | Refused |",
+                  "|---|---|---|---|---|",
+              ]
+              for account, tally in sorted(accounts.items(), key=lambda item: item[0].lower()):
+                  if isinstance(tally, str):
+                      lines.append(f"| {account} | {tally} | | | |")
+                  else:
+                      lines.append(
+                          f"| {account} | {tally['repositories']} | {tally['landed']} "
+                          f"| {tally['updated']} | {tally['refused']} |"
+                      )
+              if refusals:
+                  lines += ["", "Refused:", ""] + [f"- {line}" for line in refusals]
+              if skipped:
+                  lines += ["", f"Not reached within {SWEEP_SECONDS} s: {', '.join(skipped)}"]
+              text = "\n".join([*lines, "", *sections]) + "\n"
               sys.stdout.write(text)
               with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
                   handle.write(text)
@@ -436,13 +611,16 @@ jobs:
                   sys.stdout.write(f"::error title=Merge train setting::{err}\n")
                   return 3
               try:
-                  repo = fetch(env)
-                  rows, notes, outcome = run(env, conf, repo, datetime.now(UTC))
+                  accounts, sections, refusals, skipped = sweep(env, conf, time.monotonic())
               except RefusedError as err:
                   sys.stdout.write(f"::error title=Merge train refused::{err}\n")
                   return 1
-              summary(env, repo, rows, notes, outcome)
-              return 0
+              summary(env, accounts, sections, refusals, skipped)
+              for line in refusals:
+                  sys.stdout.write(f"::error title=Merge train refused::{line}\n")
+              if skipped:
+                  sys.stdout.write(f"::warning title=Merge train::{len(skipped)} repositories not reached\n")
+              return 1 if refusals else 0
 
 
           sys.exit(main(os.environ))

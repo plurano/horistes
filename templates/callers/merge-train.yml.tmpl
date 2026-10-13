@@ -2,49 +2,52 @@
 SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 SPDX-License-Identifier: EUPL-1.2
 
-Caller of the shared merge train, as a consumer keeps it in
-.github/workflows/merge-train.yml. The rendered file is the whole of the
-consumer's train: the steps live in .github/workflows/merge-train.yml of the
-shared repository, named here by commit with the version as a comment
-(decision record 0029).
+Caller of the shared merge train, kept once in the fleet's operations
+repository as .github/workflows/merge-train.yml. One run sweeps every
+repository the merge-train app is installed on; the repositories it serves
+keep no caller and no secret. The steps live in
+.github/workflows/merge-train.yml of the shared repository, named here by
+commit with the version as a comment (decision record 0029).
 
-Before the first run: the merge-train app is installed on the repository, the
-repository (or its organisation) holds the app's private key as the secret
-MERGE_TRAIN_APP_KEY and its client id as the variable
-MERGE_TRAIN_APP_CLIENT_ID. Without them the token step fails and the run is
-red; nothing is written.
+Before the first run, in the repository that keeps this caller: the
+environment merge-train lets only the branch main deploy and holds the app's
+private key as the secret MERGE_TRAIN_APP_KEY; the repository variable
+MERGE_TRAIN_APP_CLIENT_ID holds the app's client id. The called job names the
+environment, so a run from any other branch is refused before the key is
+read. Without the key or the client id the run stops with exit code 3 and
+writes nothing.
 
-Off switch: the variable MERGE_TRAIN set to `off` makes every run report only.
-Unset, the train runs.
+Runner: one of the fleet's own runners with python3 and openssl; the fleet
+runs no hosted runner minutes for this.
 
-Scopes: none. The called job writes with the app's token, minted per run for
-this repository only; GITHUB_TOKEN gets no permission.
+Off switch: the variable MERGE_TRAIN set to `off` makes every run report only,
+with read rights. Unset, the train runs.
 
-Required check: none. The job runs on a push to the default branch, on a
-schedule and by hand, never on a pull request, and is no check of a pull
-request (cordanaLLM/praetor#1212 for the name the engine declares).
+Scopes: none. The called job writes with the app's tokens, one per
+repository, minted for that repository alone and revoked after it;
+GITHUB_TOKEN gets no permission.
 
-Triggers: a push to the default branch is the moment the previous pull request
-landed, so the next one moves at once; the hourly schedule, off the top of the
-hour, picks up a pull request that turned clean without a push; dispatch is the
-manual nudge. Concurrency keeps one run at a time and never cancels a run
-halfway.
+Required check: none. The job runs on a schedule and by hand, never on a pull
+request, and is no check of a pull request (cordanaLLM/praetor#1212 for the
+name the engine declares).
+
+Triggers: every 20 minutes, off the top of the hour; one run lands or updates
+at most one pull request in each repository. Dispatch is the manual nudge.
+Concurrency keeps one run at a time and never cancels a run halfway.
 
 Fields: .Shared.Repository, .Shared.Commit and .Shared.Version are working
 names until the engine renders caller templates (cordanaLLM/praetor#1211);
 .RunnerTag is the engine's own.
 */ -%>
 ---
-# Merge train: lands this repository's clean pull requests one at a time and
-# keeps the next one up to date. The job is the shared workflow of
-# <% .Shared.Repository %>, named by commit.
+# Merge train: in every repository of the merge-train app, lands one clean
+# pull request or keeps the next one up to date. The job is the shared
+# workflow of <% .Shared.Repository %>, named by commit.
 name: Merge train
 
 on:
-  push:
-    branches: [main]
   schedule:
-    - cron: "41 * * * *"
+    - cron: "7,27,47 * * * *"
   workflow_dispatch:
 
 permissions: {}

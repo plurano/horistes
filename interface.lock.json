@@ -61,8 +61,8 @@
           "type": "string"
         },
         "runner": {
-          "default": "ubuntu-26.04",
-          "required": false,
+          "default": null,
+          "required": true,
           "type": "string"
         },
         "security_labels": {

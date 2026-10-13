@@ -2,22 +2,29 @@
 # SPDX-License-Identifier: EUPL-1.2
 """The merge train's script, run as written against a stand-in forge (decision record 0029).
 
-The script of the step "Land one clean pull request, or update the next one"
-is taken out of the reusable workflow and run with the environment the step
-sets. A small HTTP server answers the GraphQL and REST calls it makes and
-records every write. Only the wait between two reads of an UNKNOWN merge state
-is shortened.
+The script of the step "Land or update one pull request in every repository of
+the app" is taken out of the reusable workflow and run with the environment the
+step sets. A small HTTP server stands in for the forge: it checks the app's JWT
+against a key made for the test run, lists installations and their
+repositories, mints and revokes tokens, answers the GraphQL and REST calls of
+the train and records every write. Only the wait between two reads of an
+UNKNOWN merge state is shortened.
 """
 
 from __future__ import annotations
 
+import base64
+import functools
 import json
+import re
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from conftest import ROOT
@@ -26,18 +33,36 @@ sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
 
 TRAIN = ROOT / ".github/workflows/merge-train.yml"
-STEP = "Land one clean pull request, or update the next one"
+STEP = "Land or update one pull request in every repository of the app"
 NOW = datetime.now(UTC)
 OLD = (NOW - timedelta(days=10)).isoformat()
 YOUNG = (NOW - timedelta(hours=5)).isoformat()
 CONFLICT = "merge conflict between base and head"
 NO_NEW = "There are no new commits on the base branch."
+CLIENT_ID = "Iv23planted"
+WRITE = {"contents": "write", "pull_requests": "write", "workflows": "write", "checks": "read"}
+READ = {"contents": "read", "pull_requests": "read", "checks": "read"}
 
 
 def script() -> str:
     steps = [s for s in ciwf.load(TRAIN)["jobs"]["train"]["steps"] if s.get("name") == STEP]
     assert len(steps) == 1, f"one step named {STEP!r}"
     return steps[0]["run"]
+
+
+def openssl(*args: str, data: bytes = b"") -> bytes:
+    done = subprocess.run(
+        ["openssl", *args], input=data, capture_output=True, check=True, timeout=60
+    )
+    return done.stdout
+
+
+@functools.cache
+def app_key(which: str = "app") -> tuple[str, bytes]:
+    """A key made for this test run: the private PEM text and the public PEM."""
+    del which
+    private = openssl("genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048")
+    return private.decode(), openssl("pkey", "-pubout", data=private)
 
 
 def pull(number: int, state: str, **fields) -> dict:
@@ -80,82 +105,234 @@ def repository(*pulls: dict, auto_merge: bool = True) -> dict:
 
 
 class Forge:
-    """What the stand-in forge serves, and every write it received."""
+    """What the stand-in forge serves, and every write, token and revocation it saw.
+
+    `Forge(*reads)` installs the app on the account fleet with the one repository
+    fleet/app, read as `reads` in turn (the last read repeats). `install` adds
+    accounts and repositories. Writes of fleet/app are kept in `writes` as before;
+    `where` keeps every write with its repository.
+    """
 
     def __init__(self, *reads: dict) -> None:
-        self.reads = list(reads)
+        self.public = app_key()[1]
+        self.installations: list[dict] = []
+        self.reads: dict[str, list[dict]] = {}
+        self.archived: set[str] = set()
+        self.tokens: dict[str, tuple] = {}
+        self.minted: list[tuple[int, dict]] = []
+        self.revoked: list[str] = []
         self.writes: list[tuple] = []
+        self.where: list[tuple[str, tuple]] = []
         self.merged = True
         self.refuse_merge = ""
+        self.refuse_merge_in: set[str] = set()
         self.update_answers: dict[int, tuple[int, str]] = {}
+        self.workdir = Path()
+        self.install(7, "fleet", app=list(reads))
 
-    def graphql(self, query: str, variables: dict) -> dict:
+    def install(self, number: int, account: str, suspended: bool = False, **repos) -> None:
+        self.installations.append(
+            {"id": number, "account": account, "suspended": suspended, "repos": list(repos)}
+        )
+        for name, reads in repos.items():
+            self.reads[f"{account}/{name}"] = list(reads)
+
+    def jwt_refusal(self, header: str) -> str:
+        """Why the Authorization header is no valid JWT of the app, or ''."""
+        head, payload, signature = header.removeprefix("Bearer ").split(".")
+        (self.workdir / "jwt.pub").write_bytes(self.public)
+        (self.workdir / "jwt.sig").write_bytes(base64.urlsafe_b64decode(signature + "=="))
+        checked = subprocess.run(
+            [
+                "openssl",
+                "dgst",
+                "-sha256",
+                "-verify",
+                str(self.workdir / "jwt.pub"),
+                "-signature",
+                str(self.workdir / "jwt.sig"),
+            ],
+            input=f"{head}.{payload}".encode(),
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=="))
+        now = time.time()
+        if checked.returncode != 0:
+            return "signature does not match the app's key"
+        if json.loads(base64.urlsafe_b64decode(head + "=="))["alg"] != "RS256":
+            return "not RS256"
+        if claims["iss"] != CLIENT_ID or not claims["iat"] <= now < claims["exp"]:
+            return f"claims {claims}"
+        if claims["exp"] - claims["iat"] > 600:
+            return "lives longer than ten minutes"
+        return ""
+
+    def mint(self, number: int, body: dict) -> tuple[int, dict]:
+        self.minted.append((number, body))
+        (inst,) = [i for i in self.installations if i["id"] == number]
+        names = body.get("repositories")
+        if names is None and body["permissions"] == {"metadata": "read"}:
+            token = f"list-token-{number}"
+            self.tokens[token] = ("list", number, None)
+        elif names and len(names) == 1 and names[0] in inst["repos"]:
+            full = f"{inst['account']}/{names[0]}"
+            token = "planted-token" if full == "fleet/app" else f"token-{full}"
+            self.tokens[token] = ("repo", number, full, body["permissions"])
+        else:
+            return 422, {"message": f"stand-in forge: token request {body} not expected"}
+        return 201, {"token": token}
+
+    def repo_of(self, header: str) -> tuple:
+        token = header.removeprefix("Bearer ")
+        kind = self.tokens.get(token, ("unknown",))
+        assert kind[0] == "repo" and token not in self.revoked, (token, kind, self.revoked)
+        return kind[2], kind[3]
+
+    def graphql(self, header: str, query: str, variables: dict) -> dict:
+        full, rights = self.repo_of(header)
+        if "mergePullRequest" in query or "enablePullRequestAutoMerge" in query:
+            assert rights == WRITE, rights
         if "mergePullRequest" in query:
-            self.writes.append(("merge", variables["id"], variables["oid"], variables["method"]))
-            if self.refuse_merge:
-                return {"errors": [{"message": self.refuse_merge}]}
+            self.write(full, ("merge", variables["id"], variables["oid"], variables["method"]))
+            if self.refuse_merge or full in self.refuse_merge_in:
+                return {"errors": [{"message": self.refuse_merge or "refused here"}]}
             return {"data": {"mergePullRequest": {"pullRequest": {"merged": self.merged}}}}
         if "enablePullRequestAutoMerge" in query:
-            self.writes.append(("arm", variables["id"], variables["oid"], variables["method"]))
+            self.write(full, ("arm", variables["id"], variables["oid"], variables["method"]))
             armed = {"autoMergeRequest": {"enabledAt": NOW.isoformat()}}
             return {"data": {"enablePullRequestAutoMerge": {"pullRequest": armed}}}
-        assert variables == {"owner": "fleet", "name": "app"}, variables
-        read = self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
+        owner, name = full.split("/")
+        assert variables == {"owner": owner, "name": name}, variables
+        reads = self.reads[full]
+        read = reads.pop(0) if len(reads) > 1 else reads[0]
         return {"data": {"repository": read}}
 
-    def update(self, number: int, body: dict) -> tuple[int, dict]:
-        self.writes.append(("update", number, body["expected_head_sha"]))
+    def write(self, full: str, write: tuple) -> None:
+        self.where.append((full, write))
+        if full == "fleet/app":
+            self.writes.append(write)
+
+    def update(self, header: str, full: str, number: int, body: dict) -> tuple[int, dict]:
+        token_repo, rights = self.repo_of(header)
+        assert (token_repo, rights) == (full, WRITE), (token_repo, rights, full)
+        self.write(full, ("update", number, body["expected_head_sha"]))
         code, message = self.update_answers.get(number, (202, "Updating pull request branch."))
         return code, {"message": message}
 
+    def installation_list(self) -> list[dict]:
+        return [
+            {
+                "id": i["id"],
+                "account": {"login": i["account"]},
+                "suspended_at": OLD if i["suspended"] else None,
+            }
+            for i in self.installations
+        ]
+
+    def repositories(self, header: str) -> dict:
+        kind = self.tokens[header.removeprefix("Bearer ")]
+        assert kind[0] == "list", kind
+        (inst,) = [i for i in self.installations if i["id"] == kind[1]]
+        repos = [
+            {
+                "name": name,
+                "full_name": f"{inst['account']}/{name}",
+                "archived": f"{inst['account']}/{name}" in self.archived,
+                "disabled": False,
+            }
+            for name in inst["repos"]
+        ]
+        return {"total_count": len(repos), "repositories": repos}
+
+
+class Handler(BaseHTTPRequestHandler):
+    """The stand-in forge's HTTP side; what it serves is the Forge on its server."""
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def answer(self, code: int, body: dict | list | None) -> None:
+        data = b"" if body is None else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def body(self) -> dict:
+        return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+
+    def app_call(self) -> bool:
+        """Refuse a call of the app whose JWT does not hold; True when refused."""
+        refusal = self.server.forge.jwt_refusal(self.headers["Authorization"])
+        if refusal:
+            self.answer(401, {"message": f"A JSON web token could not be decoded: {refusal}"})
+        return bool(refusal)
+
+    def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/app/installations":
+            if not self.app_call():
+                self.answer(200, self.server.forge.installation_list())
+        elif path == "/installation/repositories":
+            self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
+        else:
+            raise AssertionError(self.path)
+
+    def do_POST(self) -> None:
+        if self.path == "/graphql":
+            request = self.body()
+            header = self.headers["Authorization"]
+            self.answer(
+                200, self.server.forge.graphql(header, request["query"], request["variables"])
+            )
+            return
+        prefix, _, tail = self.path.partition("/app/installations/")
+        number, _, action = tail.partition("/")
+        assert (prefix, action) == ("", "access_tokens"), self.path
+        if not self.app_call():
+            self.answer(*self.server.forge.mint(int(number), self.body()))
+
+    def do_PUT(self) -> None:
+        prefix, _, tail = self.path.rpartition("/pulls/")
+        number, _, action = tail.partition("/")
+        assert prefix.startswith("/repos/") and action == "update-branch", self.path
+        full = prefix.removeprefix("/repos/")
+        self.answer(
+            *self.server.forge.update(self.headers["Authorization"], full, int(number), self.body())
+        )
+
+    def do_DELETE(self) -> None:
+        assert self.path == "/installation/token", self.path
+        self.server.forge.revoked.append(self.headers["Authorization"].removeprefix("Bearer "))
+        self.answer(204, None)
+
 
 def serve(forge: Forge) -> ThreadingHTTPServer:
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args) -> None:
-            pass
-
-        def answer(self, code: int, body: dict) -> None:
-            data = json.dumps(body).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def body(self) -> dict:
-            assert self.headers["Authorization"] == "Bearer planted-token"
-            return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-
-        def do_POST(self) -> None:
-            assert self.path == "/graphql", self.path
-            request = self.body()
-            self.answer(200, forge.graphql(request["query"], request["variables"]))
-
-        def do_PUT(self) -> None:
-            prefix, _, tail = self.path.rpartition("/pulls/")
-            number, _, action = tail.partition("/")
-            assert (prefix, action) == ("/repos/fleet/app", "update-branch"), self.path
-            self.answer(*forge.update(int(number), self.body()))
-
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.forge = forge
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
 def train(tmp_path: Path, forge: Forge, text: str | None = None, **settings: str):
     """Run the step's script against the stand-in forge; the result and the summary written."""
-    source = (text or script()).replace("SETTLE_SECONDS = 10", "SETTLE_SECONDS = 0")
+    source = (text or script()).replace("SETTLE_SECONDS = 5", "SETTLE_SECONDS = 0")
     path = tmp_path / "train.py"
     path.write_text(source, encoding="utf-8")
     summary = tmp_path / "summary.md"
+    forge.workdir = tmp_path
     server = serve(forge)
     url = f"http://127.0.0.1:{server.server_address[1]}"
     env = {
-        "GITHUB_REPOSITORY": "fleet/app",
+        "PATH": "/usr/bin:/bin",
         "GITHUB_API_URL": url,
         "GITHUB_GRAPHQL_URL": f"{url}/graphql",
         "GITHUB_STEP_SUMMARY": str(summary),
-        "TRAIN_TOKEN": "planted-token",
+        "TRAIN_APP_CLIENT_ID": CLIENT_ID,
+        "TRAIN_APP_KEY": app_key()[0],
         "TRAIN_SWITCH": "on",
         "TRAIN_MERGE_METHOD": "SQUASH",
         "TRAIN_ACCEPT_STATES": "",
@@ -173,7 +350,7 @@ def train(tmp_path: Path, forge: Forge, text: str | None = None, **settings: str
             text=True,
             check=False,
             env=env,
-            timeout=60,
+            timeout=120,
         )
     finally:
         server.shutdown()
@@ -199,7 +376,7 @@ def test_clean_pull_request_lands(tmp_path):
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(1)]
-    assert "Merge train: landed #1" in summary
+    assert "### fleet/app: landed #1" in summary
 
 
 def test_planted_red_pull_request_is_not_landed(tmp_path):
@@ -398,7 +575,7 @@ def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
     done, _ = train(tmp_path, forge, **{key: value})
     assert done.returncode == 3, done.stdout + done.stderr
     assert done.stdout.startswith("::error title=Merge train setting::")
-    assert forge.writes == []
+    assert (forge.minted, forge.writes) == ([], [])
 
 
 def test_merge_method_merge_is_passed(tmp_path):
@@ -408,11 +585,20 @@ def test_merge_method_merge_is_passed(tmp_path):
     assert forge.writes == [("merge", "PR_1", f"{1:040x}", "MERGE")]
 
 
-def test_token_is_never_printed(tmp_path):
+def test_token_and_key_are_never_printed(tmp_path):
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.refuse_merge = "refused"
     done, summary = train(tmp_path, forge)
-    assert "planted-token" not in done.stdout + done.stderr + summary
+    out = done.stdout + done.stderr + summary
+    assert "planted-token" not in out and "list-token" not in out
+    body = "".join(app_key()[0].splitlines()[1:-1])
+    assert body[:40] not in out.replace("\n", "")
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "jwt.pub",
+        "jwt.sig",
+        "summary.md",
+        "train.py",
+    ]
 
 
 def test_script_passes_the_python_linter(tmp_path):
@@ -433,28 +619,24 @@ def test_script_passes_the_python_linter(tmp_path):
 MANIFEST = ROOT / "apps/merge-train.json"
 
 
-def test_app_rights_are_the_rights_the_token_step_asks_for():
-    """The app holds what the train's token needs, metadata read (always granted), nothing else."""
-    token = ciwf.load(TRAIN)["jobs"]["train"]["steps"][0]
-    assert token["uses"].startswith("actions/create-github-app-token@")
-    asked = {
-        key.removeprefix("permission-").replace("-", "_"): value
-        for key, value in token["with"].items()
-        if key.startswith("permission-")
-    }
-    assert asked == {
-        "contents": "write",
-        "pull_requests": "write",
-        "workflows": "write",
-        "checks": "read",
-    }
+def test_app_rights_are_the_rights_the_train_asks_for(tmp_path):
+    """The app holds what the train's tokens ask for, metadata read (always granted), no more."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.minted == [
+        (7, {"permissions": {"metadata": "read"}}),
+        (7, {"permissions": WRITE, "repositories": ["app"]}),
+    ]
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    assert manifest["default_permissions"] == {**asked, "metadata": "read"}
+    assert manifest["default_permissions"] == {**WRITE, "metadata": "read"}
 
 
-def test_token_is_minted_for_the_calling_repository_only():
-    token = ciwf.load(TRAIN)["jobs"]["train"]["steps"][0]["with"]
-    assert not {"owner", "repositories", "skip-token-revoke"} & set(token)
+def test_switched_off_asks_for_read_rights_only(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.minted[1] == (7, {"permissions": READ, "repositories": ["app"]})
 
 
 def test_app_has_no_webhook_no_events_and_no_user_authorisation():
@@ -475,3 +657,137 @@ def test_github_token_gets_no_permission():
     doc = ciwf.load(TRAIN)
     assert doc["permissions"] == {}
     assert doc["jobs"]["train"]["permissions"] == {}
+
+
+def sweep_forge() -> Forge:
+    """fleet/app lands #1, other/b updates #2, other/old is archived, gone is suspended."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.install(9, "other", b=[repository(pull(2, "BEHIND"))], old=[repository(pull(3, "CLEAN"))])
+    forge.install(11, "gone", True, c=[repository(pull(4, "CLEAN"))])
+    forge.archived.add("other/old")
+    return forge
+
+
+def test_sweep_runs_the_train_in_every_repository_of_the_app(tmp_path):
+    forge = sweep_forge()
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.where == [
+        ("fleet/app", landed(1)),
+        ("other/b", armed(2)),
+        ("other/b", updated(2)),
+    ]
+    assert "| fleet | 1 | 1 | 0 | 0 |" in summary
+    assert "| other | 1 | 0 | 1 | 0 |" in summary
+    assert "| gone | suspended | | | |" in summary
+    assert "### fleet/app: landed #1" in summary
+    assert "### other/b:" in summary
+
+
+def test_sweep_mints_one_token_per_repository_and_revokes_each(tmp_path):
+    forge = sweep_forge()
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.minted == [
+        (7, {"permissions": {"metadata": "read"}}),
+        (7, {"permissions": WRITE, "repositories": ["app"]}),
+        (9, {"permissions": {"metadata": "read"}}),
+        (9, {"permissions": WRITE, "repositories": ["b"]}),
+    ]
+    assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_without_revocation_tokens_outlive_the_sweep(tmp_path):
+    mutant = script().replace("def revoke(env, token):\n", "def revoke(env, token):\n    return\n")
+    assert mutant != script()
+    forge = sweep_forge()
+    done, _ = train(tmp_path, forge, mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.revoked == []
+
+
+def test_without_the_repository_limit_the_forge_refuses_the_token(tmp_path):
+    mutant = script().replace('rights, [target["name"]])', "rights)")
+    assert mutant != script()
+    forge = sweep_forge()
+    done, _ = train(tmp_path, forge, mutant)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.where == []
+
+
+def test_refusal_in_one_repository_does_not_stop_the_others(tmp_path):
+    forge = sweep_forge()
+    forge.refuse_merge_in.add("fleet/app")
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert ("other/b", updated(2)) in forge.where
+    assert "::error title=Merge train refused::fleet/app: " in done.stdout
+    assert "| fleet | 1 | 0 | 0 | 1 |" in summary
+    assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_without_collecting_refusals_one_repository_stops_the_sweep(tmp_path):
+    mutant = script().replace(
+        '            except RefusedError as err:\n                tally["refused"] += 1\n',
+        '            except KeyError as err:\n                tally["refused"] += 1\n',
+    )
+    assert mutant != script()
+    forge = sweep_forge()
+    forge.refuse_merge_in.add("fleet/app")
+    done, _ = train(tmp_path, forge, mutant)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert ("other/b", updated(2)) not in forge.where
+
+
+def test_key_of_another_app_is_refused(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.public = openssl("pkey", "-pubout", data=openssl("genpkey", "-algorithm", "RSA"))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "::error title=Merge train refused::" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("app_client_id", ""), ("app_key", ""), ("app_key", "not a key")],
+)
+def test_missing_app_credential_stops_before_any_call(tmp_path, key, value):
+    """An environment secret the caller did not pass arrives empty; the run says so."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, **{key: value})
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert (forge.minted, forge.where) == ([], [])
+
+
+def key_on_disk(text: str) -> list[str]:
+    """Ways the script could put the key in a file; empty when the key goes through a pipe only."""
+    found = [word for word in ("tempfile", "write_text", "write_bytes") if word in text]
+    if len(re.findall(r"(?<![.\w])open\(", text)) != 1:
+        found.append("open() other than the summary file")
+    if "pass_fds=(read_end,)" not in text:
+        found.append("no pipe to openssl")
+    return found
+
+
+def test_key_reaches_openssl_through_a_pipe_only():
+    assert key_on_disk(script()) == []
+
+
+def test_key_written_to_a_file_is_found():
+    mutant = script().replace(
+        "    read_end, write_end = os.pipe()\n",
+        "    read_end, write_end = os.pipe()\n"
+        "    with open('key.pem', 'w') as kept:\n        kept.write(env['TRAIN_APP_KEY'])\n",
+    )
+    assert mutant != script()
+    assert key_on_disk(mutant) == ["open() other than the summary file"]
+
+
+def test_job_reads_the_key_from_the_environment_merge_train():
+    job = ciwf.load(TRAIN)["jobs"]["train"]
+    assert job["environment"] == "merge-train"
+    env = [s for s in job["steps"] if s.get("name") == STEP][0]["env"]
+    assert env["TRAIN_APP_KEY"] == "${{ secrets.app_private_key }}"
+    assert env["TRAIN_APP_CLIENT_ID"] == "${{ inputs.app_client_id }}"
