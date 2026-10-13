@@ -196,8 +196,11 @@ template is rendered in public repositories only: elsewhere, and with false,
 its `Analysis` check fails ([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)). It takes no
 `RunnerTag`.
 
-Until cordanaLLM/praetor issue 1212 is fixed, the calling job stays out of the
-consumer's required checks; each template's note says why.
+A caller that runs on pull requests or in a merge queue also holds the job
+`result`. It carries the calling job's own name, which the engine declares as
+the required check, and fails unless the call passed; the forge reports the
+calling job itself only as "<name> / <called job>"
+([ADR-0030](docs/adr/0030-a-result-job-reports-the-calling-jobs-name.md)).
 
 ## Switching a consumer
 

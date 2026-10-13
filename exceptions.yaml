@@ -6,16 +6,4 @@
 # issue that tracks its cause, a reason and a day it ends, at most 90 days
 # ahead. tools/exceptions.py is the only reader and fails the gate on an entry
 # that is incomplete, expired or longer.
-exceptions:
-  - rule: required-check-is-reported
-    path: .github/rulesets/main.json
-    issue: cordanaLLM/praetor#1212
-    reason: >-
-      the engine declares the required check of a job that calls a reusable
-      workflow under the calling job's own name (`Licence`), which no run
-      reports; the reported name is `Licence / REUSE lint`. The rule set is
-      live on the public repository (ADR-0025): until the engine declares the
-      reported name, a pull request whose `Licence` check never reports merges
-      through the maintainer's pull-request bypass. The entry leaves when the
-      engine declares the reported name.
-    expires: "2026-12-31"
+exceptions: []
