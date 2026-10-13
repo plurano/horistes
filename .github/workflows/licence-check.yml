@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: EUPL-1.2
 ---
 # This repository's own licence check: a thin caller of the reusable workflow
-# beside it, the same shape a consumer's caller has.
+# beside it, the same shape a consumer's caller has, and one job that reports
+# its result under the name the rule set requires.
 name: Licence check
 
 on:
@@ -24,3 +25,22 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/licence.yml
+
+  # The forge reports the calling job above only as "Licence / REUSE lint",
+  # never as "Licence", so a rule set that requires "Licence" waits forever.
+  # This job reports "Licence" and fails unless the licence check passed; it
+  # runs under always() so a failed or cancelled check still reports here.
+  result:
+    name: Licence
+    needs: licence
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail unless the licence check passed
+        if: needs.licence.result != 'success'
+        shell: bash
+        run: |
+          echo "The licence check did not pass."
+          exit 1
