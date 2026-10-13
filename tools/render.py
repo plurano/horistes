@@ -18,11 +18,14 @@ Anything else between the delimiters (a function, a pipeline, a condition) is
 refused, and so is a field the context does not hold. The context of `render`
 is a TOML file; `check` renders every template with the sample context below.
 
-`check` then reads the result as a workflow: its one job must call a workflow
-file of this repository by a full commit id, pass only inputs that workflow
-declares, and grant the scopes that workflow's jobs ask for, no more and no
-fewer. An input that switches on a host hosts.toml marks `public_only` is
-passed as the repository's visibility (PUBLIC below) or as false. While
+`check` then reads the result as a workflow: its one calling job must call a
+workflow file of this repository by a full commit id, pass only inputs that
+workflow declares, and grant the scopes that workflow's jobs ask for, no more
+and no fewer. An input that switches on a host hosts.toml marks `public_only` is
+passed as the repository's visibility (PUBLIC below) or as false. A caller that
+runs on pull requests also holds the job `result`, in exactly the shape that
+reports the calling job's own name and fails unless the call passed; the forge
+reports a called workflow's checks only as "<calling job> / <called job>". While
 exceptions.yaml holds an entry on the required check's name, the note of every
 template must name that entry's issue.
 
@@ -59,6 +62,14 @@ LEVELS = {"none": 0, "read": 1, "write": 2}
 # event names no repository: the switch fails towards off.
 PUBLIC = "${{ github.event.repository.visibility == 'public' }}"
 SECRET = re.compile(r"\$\{\{ secrets\.[A-Z][A-Z0-9_]* \}\}")
+# The one job beside the call, read by an allow-list: the forge never reports a
+# called workflow's checks under the calling job's own name, so this job does.
+RESULT = "result"
+RESULT_KEYS = ("if", "name", "needs", "permissions", "runs-on", "steps", "timeout-minutes")
+STEP_KEYS = ("if", "name", "run", "shell")
+ECHO = re.compile(r'echo "[^"$`\\]*"')
+GATING = {"pull_request", "pull_request_target", "merge_group"}
+LONGEST_MINUTES = 10
 SAMPLE = {
     "RunnerTag": "ubuntu-26.04",
     "Shared": {
@@ -260,6 +271,51 @@ def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
     return problems
 
 
+def _step_problems(step: object, key: str) -> list[str]:
+    """What keeps the one step of job `result` from failing exactly when the call did not pass."""
+    if not isinstance(step, dict) or sorted(step) != sorted(STEP_KEYS):
+        return [f"the step of job `{RESULT}` has keys other than {', '.join(STEP_KEYS)}"]
+    problems = []
+    if step["if"] != f"needs.{key}.result != 'success'":
+        problems.append(
+            f"the step of job `{RESULT}` does not run on `needs.{key}.result != 'success'`"
+        )
+    if step["shell"] != "bash":
+        problems.append(f"the step of job `{RESULT}` does not run in bash")
+    lines = str(step["run"]).strip().split("\n")
+    if lines[-1] != "exit 1" or not all(ECHO.fullmatch(line) for line in lines[:-1]):
+        problems.append(f"the step of job `{RESULT}` does more than print a line and `exit 1`")
+    return problems
+
+
+def _result_problems(jobs: dict, key: str, doc: dict) -> list[str]:
+    """What is wrong with the job that reports the calling job's own name."""
+    name = jobs[key].get("name", key)
+    result = jobs.get(RESULT)
+    if result is None:
+        if not GATING & set(ciwf.triggers(doc)):
+            return []
+        return [
+            f"the caller runs on pull requests and no job `{RESULT}` reports `{name}`; the "
+            f"forge reports the calling job only as `{name} / <called job>`"
+        ]
+    if not isinstance(result, dict) or sorted(result) != sorted(RESULT_KEYS):
+        return [f"job `{RESULT}` has keys other than {', '.join(RESULT_KEYS)}"]
+    wanted = {"name": name, "needs": key, "if": "always()", "permissions": {}}
+    problems = [
+        f"job `{RESULT}` has `{field}: {result[field]}`, not `{value}`"
+        for field, value in wanted.items()
+        if result[field] != value
+    ]
+    minutes = result["timeout-minutes"]
+    if type(minutes) is not int or not 1 <= minutes <= LONGEST_MINUTES:
+        problems.append(f"job `{RESULT}` has no timeout of 1 to {LONGEST_MINUTES} minutes")
+    steps = result["steps"]
+    if not isinstance(steps, list) or len(steps) != 1:
+        return [*problems, f"job `{RESULT}` has not exactly one step"]
+    return problems + _step_problems(steps[0], key)
+
+
 def caller_problems(text: str, root: Path) -> list[str]:
     """What keeps a rendered text from being a thin caller of a workflow kept in `root`."""
     try:
@@ -267,12 +323,13 @@ def caller_problems(text: str, root: Path) -> list[str]:
     except yaml.YAMLError as err:
         return [f"the result is no YAML: {err}"]
     jobs = doc.get("jobs") if isinstance(doc, dict) else None
-    if not isinstance(jobs, dict) or len(jobs) != 1:
-        return ["the result is no workflow with exactly one job"]
-    job = next(iter(jobs.values()))
+    calls = [key for key in jobs if key != RESULT] if isinstance(jobs, dict) else []
+    if len(calls) != 1:
+        return [f"the result is no workflow with exactly one job besides `{RESULT}`"]
+    job = jobs[calls[0]]
     if not isinstance(job, dict) or "steps" in job:
         return ["the job has steps of its own; a caller only calls"]
-    problems = _job_problems(job, doc, root)
+    problems = _job_problems(job, doc, root) + _result_problems(jobs, calls[0], doc)
     if f"@{SAMPLE['Shared']['Commit']} # {SAMPLE['Shared']['Version']}\n" not in text:
         problems.append("the version field is not written as a comment behind the commit")
     return problems

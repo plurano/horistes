@@ -35,7 +35,7 @@ CALLED = ".github/workflows/licence.yml"
 ISSUE = "cordanaLLM/praetor#1212"
 GOOD = f"""\
 <%- /*
-Required check: the calling job stays out of the required checks ({ISSUE}).
+Required check: the job `result` reports the calling job's name ({ISSUE}).
 */ -%>
 ---
 name: Licence check
@@ -50,6 +50,21 @@ jobs:
     uses: <% .Shared.Repository %>/{CALLED}@<% .Shared.Commit %> # <% .Shared.Version %>
     with:
       path: docs
+
+  result:
+    name: Licence
+    needs: licence
+    if: always()
+    runs-on: <% .RunnerTag %>
+    timeout-minutes: 5
+    permissions: {{}}
+    steps:
+      - name: Fail unless the licence check passed
+        if: needs.licence.result != 'success'
+        shell: bash
+        run: |
+          echo "The licence check did not pass."
+          exit 1
 """
 USES = f"    uses: <% .Shared.Repository %>/{CALLED}@<% .Shared.Commit %> # <% .Shared.Version %>\n"
 EXCEPTIONS = f"""\
@@ -88,6 +103,25 @@ jobs:
     uses: owner/shared/{CALLED}@{COMMIT} # v1.2.3
     with:
       runner: ubuntu-26.04
+
+  # The forge reports the calling job above only as "Licence / REUSE lint",
+  # never as "Licence". This job reports "Licence" and fails unless the licence
+  # check passed; it runs under always() so a failed or cancelled check still
+  # reports here.
+  result:
+    name: Licence
+    needs: licence
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {{}}
+    steps:
+      - name: Fail unless the licence check passed
+        if: needs.licence.result != 'success'
+        shell: bash
+        run: |
+          echo "The licence check did not pass."
+          exit 1
 """
 
 
@@ -227,8 +261,10 @@ def test_scorecard_template_renders_into_the_recorded_caller():
 )
 def test_rendered_caller_passes_both_linters(tree, template, name):
     tree.write({name: rendered_real_template(template)})
+    # The runner label a consumer's adoption declares to actionlint, as here.
+    config = ["-config-file", str(ROOT / ".github/actionlint.yaml")]
     done = subprocess.run(
-        [*external("ACTIONLINT", "actionlint"), str(tree.root / name)],
+        [*external("ACTIONLINT", "actionlint"), *config, str(tree.root / name)],
         capture_output=True,
         text=True,
         check=False,
@@ -251,7 +287,9 @@ def test_good_template_passes(tree):
 
 
 def test_planted_templates_differ_from_the_good_one():
-    planted = [case.values[0] for case in (*PLANTED, *PLANTED_CALLED, *PLANTED_PUBLIC)]
+    planted = [
+        case.values[0] for case in (*PLANTED, *PLANTED_RESULT, *PLANTED_CALLED, *PLANTED_PUBLIC)
+    ]
     assert len({GOOD, REUSABLE, *planted}) == len(planted) + 2
 
 
@@ -307,7 +345,7 @@ PLANTED = [
         id="grant-left-to-the-empty-workflow-level",
     ),
     pytest.param(
-        GOOD.replace("permissions: {}\n", "").replace(
+        GOOD.replace("\npermissions: {}\n", "\n").replace(
             "    permissions:\n      contents: read\n", ""
         ),
         "the job's permissions name no scopes: <unset>",
@@ -385,6 +423,114 @@ def test_planted_template_fails(tree, template, message):
     assert done.returncode == 1, done.stdout
     assert message in done.stderr
     assert f"FAIL: {TEMPLATE}:" in done.stderr
+
+
+RESULT_JOB = GOOD[GOOD.index("\n  result:\n") :]
+STEP_IF = "if: needs.licence.result != 'success'"
+ECHO = 'echo "The licence check did not pass."'
+PLANTED_RESULT = [
+    pytest.param(
+        GOOD.replace(RESULT_JOB, "\n"),
+        "the caller runs on pull requests and no job `result` reports `Licence`",
+        id="result-missing",
+    ),
+    pytest.param(
+        GOOD.replace("    if: always()\n", "    if: success()\n"),
+        "job `result` has `if: success()`, not `always()`",
+        id="result-without-always",
+    ),
+    pytest.param(
+        GOOD.replace("    if: always()\n", ""),
+        "job `result` has keys other than",
+        id="result-without-condition",
+    ),
+    pytest.param(
+        GOOD.replace("    needs: licence\n", "    needs: [licence, other]\n"),
+        "job `result` has `needs: ['licence', 'other']`, not `licence`",
+        id="result-needs-more",
+    ),
+    pytest.param(
+        GOOD.replace("    name: Licence\n    needs:", "    name: Licence result\n    needs:"),
+        "job `result` has `name: Licence result`, not `Licence`",
+        id="result-under-another-name",
+    ),
+    pytest.param(
+        GOOD.replace(
+            "    permissions: {}\n    steps:", "    permissions:\n      contents: write\n    steps:"
+        ),
+        "job `result` has `permissions: {'contents': 'write'}`, not `{}`",
+        id="result-with-scopes",
+    ),
+    pytest.param(
+        GOOD.replace(
+            "    timeout-minutes: 5\n", "    timeout-minutes: 5\n    continue-on-error: true\n"
+        ),
+        "job `result` has keys other than",
+        id="result-may-fail",
+    ),
+    pytest.param(
+        GOOD.replace("timeout-minutes: 5", "timeout-minutes: 60"),
+        "job `result` has no timeout of 1 to 10 minutes",
+        id="result-timeout-too-long",
+    ),
+    pytest.param(
+        GOOD.replace("timeout-minutes: 5", "timeout-minutes: 0"),
+        "job `result` has no timeout of 1 to 10 minutes",
+        id="result-timeout-zero",
+    ),
+    pytest.param(
+        GOOD + "      - name: Second\n        run: exit 0\n",
+        "job `result` has not exactly one step",
+        id="result-second-step",
+    ),
+    pytest.param(
+        GOOD.replace(STEP_IF, "if: needs.licence.result == 'failure'"),
+        "the step of job `result` does not run on `needs.licence.result != 'success'`",
+        id="result-passes-a-cancelled-call",
+    ),
+    pytest.param(
+        GOOD.replace(STEP_IF + "\n", STEP_IF + "\n        continue-on-error: true\n"),
+        "the step of job `result` has keys other than",
+        id="result-step-may-fail",
+    ),
+    pytest.param(
+        GOOD.replace("shell: bash", "shell: pwsh"),
+        "the step of job `result` does not run in bash",
+        id="result-step-in-another-shell",
+    ),
+    pytest.param(
+        GOOD.replace("exit 1", "exit 0"),
+        "the step of job `result` does more than print a line and `exit 1`",
+        id="result-step-passes",
+    ),
+    pytest.param(
+        GOOD.replace(ECHO, "curl -fsS https://example.org"),
+        "the step of job `result` does more than print a line and `exit 1`",
+        id="result-step-runs-a-command",
+    ),
+    pytest.param(
+        GOOD.replace(ECHO, 'echo "$(id)"'),
+        "the step of job `result` does more than print a line and `exit 1`",
+        id="result-step-expands",
+    ),
+]
+
+
+@pytest.mark.parametrize(("template", "message"), PLANTED_RESULT)
+def test_planted_result_job_fails(tree, template, message):
+    done = check(tree, template)
+    assert done.returncode == 1, done.stdout
+    assert message in done.stderr
+
+
+def test_caller_that_gates_no_pull_request_needs_no_result_job(tree):
+    pushed = GOOD.replace(RESULT_JOB, "\n").replace("on:\n  pull_request:\n", "on:\n  push:\n")
+    assert check(tree, pushed).returncode == 0
+    for event in ("pull_request_target", "merge_group"):
+        gated = pushed.replace("on:\n  push:\n", f"on:\n  {event}:\n")
+        done = check(tree, gated)
+        assert done.returncode == 1, done.stdout
+        assert "no job `result` reports `Licence`" in done.stderr
 
 
 DEPTH = """\
