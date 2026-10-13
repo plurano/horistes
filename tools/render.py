@@ -58,6 +58,7 @@ LEVELS = {"none": 0, "read": 1, "write": 2}
 # True in a public repository and false in any other, and false too where the
 # event names no repository: the switch fails towards off.
 PUBLIC = "${{ github.event.repository.visibility == 'public' }}"
+SECRET = re.compile(r"\$\{\{ secrets\.[A-Z][A-Z0-9_]* \}\}")
 SAMPLE = {
     "RunnerTag": "ubuntu-26.04",
     "Shared": {
@@ -213,6 +214,32 @@ def _grant_problems(job: dict, doc: dict, called: dict, path: str) -> list[str]:
     return problems
 
 
+def _secret_problems(job: dict, called: dict, path: str) -> list[str]:
+    """What is wrong with the secrets a caller's job passes.
+
+    A caller passes by name exactly the secrets the called workflow declares,
+    each as one secret of the calling repository. `inherit` would hand over
+    every secret the caller holds, so it is refused.
+    """
+    passed = job.get("secrets", {})
+    if not isinstance(passed, dict):
+        return [f"the job passes secrets as `{passed}`; it names each one {path} declares"]
+    declared = ciwf.triggers(called)["workflow_call"].get("secrets") or {}
+    problems = [
+        f"the job passes the secret `{key}`, which {path} does not declare"
+        for key in sorted(set(passed) - set(declared))
+    ]
+    for key, spec in sorted(declared.items()):
+        if (spec or {}).get("required") and key not in passed:
+            problems.append(f"the job does not pass the secret `{key}`, which {path} requires")
+    problems += [
+        f"the job passes the secret `{key}` as `{value}`, not as one secret of the repository"
+        for key, value in sorted(passed.items())
+        if not SECRET.fullmatch(str(value))
+    ]
+    return problems
+
+
 def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
     """What is wrong with the one job of a rendered caller."""
     call = CALL.fullmatch(str(job.get("uses", "")))
@@ -229,8 +256,7 @@ def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
         return [*problems, f"{path} is no reusable workflow of this repository"]
     problems += _with_problems(job, called, path, _public_inputs(root, path))
     problems += _grant_problems(job, doc, called, path)
-    if "secrets" in job:
-        problems.append("the job passes secrets")
+    problems += _secret_problems(job, called, path)
     return problems
 
 

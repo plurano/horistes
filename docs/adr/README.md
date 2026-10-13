@@ -36,3 +36,4 @@ record that supersedes it.
 | [0026](0026-a-call-that-analyses-nothing-fails.md) | 2026-10-12 | A scorecard call that analyses nothing fails; a break at interface 0 raises the minor version | Accepted |
 | [0027](0027-a-narrowed-licence-run-is-named-for-its-folder.md) | 2026-10-12 | A licence run narrowed to a folder is named for that folder | Accepted |
 | [0028](0028-every-commit-is-scanned-for-secrets.md) | 2026-10-13 | Every commit is scanned for secrets in the gate, with the tool's own rules only | Accepted |
+| [0029](0029-a-forge-app-drives-the-merge-train.md) | 2026-10-13 | A forge app drives the merge train, with no bypass | Accepted |

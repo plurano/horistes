@@ -1,0 +1,448 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Merge train (reusable): lands the pull requests of the calling repository
+# one at a time, without a session or a person driving it (decision record
+# 0029). Each run does at most one write:
+#
+# - It lands the oldest pull request the forge reports CLEAN (or a state the
+#   caller accepts in `accept_states`), through the merge mutation with the
+#   head commit it read. The forge refuses that merge when a required check or
+#   rule fails, and the app has no bypass, so nothing red lands.
+# - When none is CLEAN and no armed pull request is still in flight, it arms
+#   auto-merge on the oldest BEHIND pull request whose checks are not red, and
+#   merges the default branch into its head (update-branch, never a rebase:
+#   a forge rebase re-commits the head unsigned). The forge offers auto-merge
+#   only while a pull request cannot merge at once, so BEHIND is where arming
+#   happens; a CLEAN pull request is landed directly.
+#
+# Left alone: drafts, pull requests from forks, a base other than the default
+# branch, the labels in `hold_labels`, heads in `person_branches` (release
+# pull requests by default: a release is a person's act), and dependency
+# updates whose own commit (the update bot's, not a repin or a merge pushed on
+# top) is younger than `min_age_days` (3 days, the fleet's minimum age; a
+# security label or "[SECURITY]" in the title skips the wait).
+#
+# CREDENTIAL. The writes are made with a token of the merge-train app, minted
+# per run for the calling repository only, with contents, pull requests and
+# workflows write and checks read. Workflows write is there because the forge
+# refuses a merge or an update-branch that changes a file under
+# .github/workflows without it: pin updates do, and so does an update after
+# the default branch changed a workflow. Events GITHUB_TOKEN causes start no
+# workflow run, so a head it updated would never get its checks. GITHUB_TOKEN
+# gets no permission at all. The calling workflow passes the app's private key as the
+# secret `app_private_key` and its client id as `app_client_id`.
+name: Merge train
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Label of the runner the job runs on.
+        type: string
+        required: false
+        default: ubuntu-26.04
+      app_client_id:
+        description: Client id of the merge-train app.
+        type: string
+        required: true
+      switch:
+        description: on lands and updates; off only reports.
+        type: string
+        required: false
+        default: "on"
+      merge_method:
+        description: SQUASH or MERGE. A forge rebase is refused (unsigned commits).
+        type: string
+        required: false
+        default: SQUASH
+      accept_states:
+        description: >-
+          Merge states landed besides CLEAN, separated by spaces: UNSTABLE,
+          HAS_HOOKS. Only for a repository that declares them acceptable.
+        type: string
+        required: false
+        default: ""
+      min_age_days:
+        description: Minimum age of a dependency update, whole days from 0 to 30.
+        type: string
+        required: false
+        default: "3"
+      hold_labels:
+        description: Labels that keep a pull request out of the train, comma-separated.
+        type: string
+        required: false
+        default: hold,do-not-merge,planted
+      dependency_branches:
+        description: Head prefixes of dependency updates, separated by spaces.
+        type: string
+        required: false
+        default: renovate/ dependabot/
+      person_branches:
+        description: Head prefixes only a person lands, separated by spaces.
+        type: string
+        required: false
+        default: release-please--
+      security_labels:
+        description: Labels that exempt a dependency update from the minimum age, comma-separated.
+        type: string
+        required: false
+        default: security
+    secrets:
+      app_private_key:
+        description: Private key of the merge-train app.
+        required: true
+
+permissions: {}
+
+jobs:
+  train:
+    name: Merge train
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Mint the app token for this repository
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.app_client_id }}
+          private-key: ${{ secrets.app_private_key }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+          permission-checks: read
+
+      - name: Land one clean pull request, or update the next one
+        shell: python
+        env:
+          TRAIN_TOKEN: ${{ steps.token.outputs.token }}
+          TRAIN_SWITCH: ${{ inputs.switch }}
+          TRAIN_MERGE_METHOD: ${{ inputs.merge_method }}
+          TRAIN_ACCEPT_STATES: ${{ inputs.accept_states }}
+          TRAIN_MIN_AGE_DAYS: ${{ inputs.min_age_days }}
+          TRAIN_HOLD_LABELS: ${{ inputs.hold_labels }}
+          TRAIN_DEPENDENCY_BRANCHES: ${{ inputs.dependency_branches }}
+          TRAIN_PERSON_BRANCHES: ${{ inputs.person_branches }}
+          TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
+        run: |
+          """Merge train of the calling repository: land one clean pull request, or update the head.
+
+          Exit codes: 0 done, 1 a forge call failed or was refused, 3 a setting is invalid.
+          """
+
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from datetime import UTC, datetime, timedelta
+
+          TIMEOUT = 30
+          SETTLE_ROUNDS = 6
+          SETTLE_SECONDS = 10
+          METHODS = ("SQUASH", "MERGE")
+          ACCEPTABLE = ("UNSTABLE", "HAS_HOOKS")
+          RED = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
+          NO_NEW_COMMITS = "There are no new commits on the base branch."
+          CONFLICT = "merge conflict between base and head"
+          QUERY = """
+          query($owner: String!, $name: String!) {
+            repository(owner: $owner, name: $name) {
+              defaultBranchRef { name }
+              autoMergeAllowed
+              pullRequests(states: OPEN, first: 100, orderBy: {field: CREATED_AT, direction: ASC}) {
+                pageInfo { hasNextPage }
+                nodes {
+                  number id title isDraft isCrossRepository baseRefName headRefName headRefOid
+                  mergeStateStatus
+                  autoMergeRequest { enabledAt }
+                  labels(first: 50) { nodes { name } }
+                  history: commits(last: 20) {
+                    nodes { commit { committedDate parents { totalCount } } }
+                  }
+                  latest: commits(last: 1) {
+                    nodes { commit { checkSuites(first: 30) { nodes { conclusion } } } }
+                  }
+                }
+              }
+            }
+          }
+          """
+          MERGE = """
+          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!) {
+            mergePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method}) {
+              pullRequest { merged }
+            }
+          }
+          """
+          ARM = """
+          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!) {
+            enablePullRequestAutoMerge(
+              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method}
+            ) {
+              pullRequest { autoMergeRequest { enabledAt } }
+            }
+          }
+          """
+
+
+          class RefusedError(Exception):
+              """A forge call that failed or was refused."""
+
+
+          class InvalidSettingError(Exception):
+              """A setting outside its allowed values."""
+
+
+          def settings(env):
+              """The inputs of the workflow, each checked against an allow-list."""
+              switch = env["TRAIN_SWITCH"]
+              method = env["TRAIN_MERGE_METHOD"].upper()
+              accept = env["TRAIN_ACCEPT_STATES"].upper().split()
+              age = env["TRAIN_MIN_AGE_DAYS"]
+              if switch not in ("on", "off"):
+                  raise InvalidSettingError(f"switch is {switch!r}, not on or off")
+              if method not in METHODS:
+                  raise InvalidSettingError(f"merge_method is {method!r}, not one of {', '.join(METHODS)}")
+              if any(state not in ACCEPTABLE for state in accept):
+                  raise InvalidSettingError(f"accept_states holds {accept}, allowed: {', '.join(ACCEPTABLE)}")
+              if not age.isdigit() or int(age) > 30:
+                  raise InvalidSettingError(f"min_age_days is {age!r}, not a whole number from 0 to 30")
+              return {
+                  "switch": switch,
+                  "method": method,
+                  "accept": frozenset(("CLEAN", *accept)),
+                  "min_age": timedelta(days=int(age)),
+                  "hold": frozenset(name for name in env["TRAIN_HOLD_LABELS"].split(",") if name),
+                  "dependency": tuple(env["TRAIN_DEPENDENCY_BRANCHES"].split()),
+                  "person": tuple(env["TRAIN_PERSON_BRANCHES"].split()),
+                  "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
+              }
+
+
+          def call(url, token, method="POST", body=None):
+              """One request to the forge; the parsed answer, or RefusedError with what it said."""
+              data = None if body is None else json.dumps(body).encode()
+              request = urllib.request.Request(url, data=data, method=method)
+              request.add_header("Authorization", f"Bearer {token}")
+              request.add_header("Accept", "application/vnd.github+json")
+              request.add_header("X-GitHub-Api-Version", "2022-11-28")
+              try:
+                  with urllib.request.urlopen(request, timeout=TIMEOUT) as answer:
+                      text = answer.read().decode()
+              except urllib.error.HTTPError as err:
+                  raise RefusedError(f"{method} {url}: HTTP {err.code} {err.read().decode()[:500]}") from err
+              except (urllib.error.URLError, TimeoutError) as err:
+                  raise RefusedError(f"{method} {url}: {err}") from err
+              return json.loads(text) if text else {}
+
+
+          def graphql(env, query, variables):
+              answer = call(
+                  env["GITHUB_GRAPHQL_URL"],
+                  env["TRAIN_TOKEN"],
+                  body={
+                      "query": query,
+                      "variables": variables,
+                  },
+              )
+              if answer.get("errors") or "data" not in answer:
+                  raise RefusedError(f"GraphQL: {json.dumps(answer.get('errors'))[:500]}")
+              return answer["data"]
+
+
+          def fetch(env):
+              """The repository and its open pull requests, re-read while a merge state is UNKNOWN."""
+              owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+              repo = {}
+              for attempt in range(SETTLE_ROUNDS):
+                  repo = graphql(env, QUERY, {"owner": owner, "name": name})["repository"]
+                  pulls = repo["pullRequests"]["nodes"]
+                  if all(pull["mergeStateStatus"] != "UNKNOWN" or pull["isDraft"] for pull in pulls):
+                      break
+                  if attempt + 1 < SETTLE_ROUNDS:
+                      time.sleep(SETTLE_SECONDS)
+              return repo
+
+
+          def update_made(pull):
+              """Commit time of the oldest commit of the last 20 that is no merge, or None.
+
+              The update bot rewrites its branch for every new version, so its commit is
+              the oldest one; a repin pushed on top, or a merge from the default branch,
+              does not restart the wait. With more commits than are read, a younger one
+              stands in, which only lengthens the wait.
+              """
+              times = [
+                  node["commit"]["committedDate"]
+                  for node in pull["history"]["nodes"]
+                  if node["commit"]["parents"]["totalCount"] == 1
+              ]
+              return datetime.fromisoformat(min(times)) if times else None
+
+
+          def is_red(pull):
+              nodes = pull["latest"]["nodes"]
+              suites = nodes[-1]["commit"]["checkSuites"]["nodes"] if nodes else []
+              return any(suite["conclusion"] in RED for suite in suites)
+
+
+          def too_young(pull, labels, conf, now):
+              """Why a dependency update waits for its minimum age, or None."""
+              if not pull["headRefName"].startswith(conf["dependency"]):
+                  return None
+              if labels & conf["security"] or "[SECURITY]" in pull["title"]:
+                  return None
+              changed = update_made(pull)
+              if changed is None:
+                  return "dependency update with no commit of its own to date"
+              if now - changed < conf["min_age"]:
+                  return f"dependency update made {changed:%Y-%m-%d %H:%M}Z, younger than the minimum age"
+              return None
+
+
+          def verdict(pull, repo, conf, now):
+              """land, behind, or the reason the train leaves the pull request alone."""
+              labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
+              state = pull["mergeStateStatus"]
+              held = sorted(labels & conf["hold"])
+              if pull["baseRefName"] != repo["defaultBranchRef"]["name"]:
+                  return "not for the default branch"
+              if pull["isDraft"]:
+                  return "draft"
+              if pull["isCrossRepository"]:
+                  return "from another repository: a person lands it"
+              if held:
+                  return f"labelled {held[0]}"
+              if conf["person"] and pull["headRefName"].startswith(conf["person"]):
+                  return "release or reserved branch: a person lands it"
+              young = too_young(pull, labels, conf, now)
+              if young:
+                  return young
+              if state in conf["accept"]:
+                  return "land"
+              if state == "BEHIND":
+                  return "red" if is_red(pull) else "behind"
+              return f"merge state {state}"
+
+
+          def in_flight(pull, reason):
+              """An armed pull request that can still land holds the train."""
+              waiting = reason in ("behind", "merge state BLOCKED")
+              return bool(pull["autoMergeRequest"]) and waiting and not is_red(pull)
+
+
+          def land(env, conf, pull):
+              data = graphql(
+                  env,
+                  MERGE,
+                  {
+                      "id": pull["id"],
+                      "oid": pull["headRefOid"],
+                      "method": conf["method"],
+                  },
+              )
+              if not data["mergePullRequest"]["pullRequest"]["merged"]:
+                  raise RefusedError(f"#{pull['number']}: the forge did not report it merged")
+
+
+          def arm(env, conf, pull):
+              data = graphql(
+                  env, ARM, {"id": pull["id"], "oid": pull["headRefOid"], "method": conf["method"]}
+              )
+              if not data["enablePullRequestAutoMerge"]["pullRequest"]["autoMergeRequest"]:
+                  raise RefusedError(f"#{pull['number']}: the forge returned no auto-merge request")
+
+
+          def update(env, pull):
+              """Merge the default branch into the head branch; False when it conflicts."""
+              url = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/pulls/{pull['number']}"
+              try:
+                  call(
+                      f"{url}/update-branch",
+                      env["TRAIN_TOKEN"],
+                      "PUT",
+                      {
+                          "expected_head_sha": pull["headRefOid"],
+                      },
+                  )
+              except RefusedError as err:
+                  if NO_NEW_COMMITS in str(err):
+                      return True
+                  if CONFLICT in str(err):
+                      return False
+                  raise
+              return True
+
+
+          def advance(env, conf, repo, rows, notes):
+              """Arm and update the oldest BEHIND pull request that is not red."""
+              for pull, reason in rows:
+                  if reason != "behind":
+                      continue
+                  if repo["autoMergeAllowed"] and not pull["autoMergeRequest"]:
+                      arm(env, conf, pull)
+                      notes[pull["number"]] = "armed, updated from the default branch"
+                  else:
+                      notes[pull["number"]] = "updated from the default branch"
+                  if update(env, pull):
+                      return
+                  notes[pull["number"]] = "conflicts with the default branch"
+
+
+          def run(env, conf, repo, now):
+              pulls = repo["pullRequests"]["nodes"]
+              rows = [(pull, verdict(pull, repo, conf, now)) for pull in pulls]
+              notes = {pull["number"]: reason for pull, reason in rows}
+              if conf["switch"] == "off":
+                  return rows, notes, "switched off: nothing landed or updated"
+              for pull, reason in rows:
+                  if reason == "land":
+                      land(env, conf, pull)
+                      notes[pull["number"]] = "landed"
+                      return rows, notes, f"landed #{pull['number']}"
+              holding = [pull["number"] for pull, reason in rows if in_flight(pull, reason)]
+              if holding:
+                  return rows, notes, f"#{holding[0]} is armed and in flight"
+              advance(env, conf, repo, rows, notes)
+              return rows, notes, "no pull request at a mergeable state"
+
+
+          def summary(env, repo, rows, notes, outcome):
+              lines = [
+                  f"Merge train: {outcome}",
+                  "",
+                  "| Pull request | Merge state | Train |",
+                  "|---|---|---|",
+              ]
+              lines += [
+                  f"| #{pull['number']} | {pull['mergeStateStatus']} | {notes[pull['number']]} |"
+                  for pull, _ in rows
+              ]
+              if repo["pullRequests"]["pageInfo"]["hasNextPage"]:
+                  lines.append("\nOnly the 100 oldest open pull requests were read.")
+              text = "\n".join(lines) + "\n"
+              sys.stdout.write(text)
+              with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+                  handle.write(text)
+
+
+          def main(env):
+              try:
+                  conf = settings(env)
+              except InvalidSettingError as err:
+                  sys.stdout.write(f"::error title=Merge train setting::{err}\n")
+                  return 3
+              try:
+                  repo = fetch(env)
+                  rows, notes, outcome = run(env, conf, repo, datetime.now(UTC))
+              except RefusedError as err:
+                  sys.stdout.write(f"::error title=Merge train refused::{err}\n")
+                  return 1
+              summary(env, repo, rows, notes, outcome)
+              return 0
+
+
+          sys.exit(main(os.environ))

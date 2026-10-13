@@ -46,11 +46,7 @@ UNGUARDED = REUSABLE.replace(RUN, RUN + LOG)
 GUARDED = UNGUARDED.replace("jobs:\n" + JOB, "jobs:\n" + GUARD + JOB + NEEDS)
 # What the host scan reads of this repository: the workflows, the declaration, the Makefile.
 REAL = (
-    ".github/workflows/ci.yml",
-    ".github/workflows/licence-check.yml",
-    ".github/workflows/pins.yml",
-    WORKFLOW,
-    SCORECARD,
+    *sorted(path.relative_to(ROOT).as_posix() for path in ROOT.glob(".github/workflows/*.yml")),
     "hosts.toml",
     "Makefile",
 )

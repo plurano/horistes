@@ -29,6 +29,7 @@ CONTEXT = {
 COMMIT = render.SAMPLE["Shared"]["Commit"]
 REAL = "templates/callers/licence.yml.tmpl"
 REAL_SCORECARD = "templates/callers/scorecard.yml.tmpl"
+REAL_TRAIN = "templates/callers/merge-train.yml.tmpl"
 TEMPLATE = "templates/callers/licence.yml.tmpl"
 CALLED = ".github/workflows/licence.yml"
 ISSUE = "cordanaLLM/praetor#1212"
@@ -220,8 +221,9 @@ def test_scorecard_template_renders_into_the_recorded_caller():
     [
         (REAL, ".github/workflows/licence-check.yml"),
         (REAL_SCORECARD, ".github/workflows/scorecard-check.yml"),
+        (REAL_TRAIN, ".github/workflows/merge-train.yml"),
     ],
-    ids=["licence", "scorecard"],
+    ids=["licence", "scorecard", "merge-train"],
 )
 def test_rendered_caller_passes_both_linters(tree, template, name):
     tree.write({name: rendered_real_template(template)})
@@ -318,8 +320,31 @@ PLANTED = [
     ),
     pytest.param(
         GOOD.replace("    with:\n", "    secrets: inherit\n    with:\n"),
-        "passes secrets",
-        id="secrets",
+        f"the job passes secrets as `inherit`; it names each one {CALLED} declares",
+        id="secrets-inherit",
+    ),
+    pytest.param(
+        GOOD.replace("    with:\n", "    secrets:\n      key: ${{ secrets.KEY }}\n    with:\n"),
+        f"the job passes the secret `key`, which {CALLED} does not declare",
+        id="secret-not-declared",
+    ),
+    pytest.param(
+        GOOD.replace("    with:\n", "    secrets:\n      token: ${{ github.token }}\n    with:\n"),
+        "the job passes the secret `token` as `${{ github.token }}`, not as one secret",
+        id="secret-not-a-secret",
+    ),
+    pytest.param(
+        GOOD.replace("    with:\n", "    secrets:\n      token: planted-value\n    with:\n"),
+        "the job passes the secret `token` as `planted-value`, not as one secret",
+        id="secret-written-out",
+    ),
+    pytest.param(
+        GOOD.replace(
+            "    with:\n",
+            "    secrets:\n      token: ${{ secrets.A }}${{ secrets.B }}\n    with:\n",
+        ),
+        "not as one secret of the repository",
+        id="two-secrets-in-one",
     ),
     pytest.param(
         GOOD.replace(USES, "    runs-on: ubuntu-26.04\n    steps:\n      - run: reuse lint\n"),
@@ -399,11 +424,36 @@ PLANTED_CALLED = [
         id="called-job-asks-for-less-than-its-workflow",
     ),
     pytest.param(
+        REUSABLE.replace(
+            "        required: false\n    outputs:", "        required: true\n    outputs:"
+        ),
+        f"the job does not pass the secret `token`, which {CALLED} requires",
+        id="required-secret-not-passed",
+    ),
+    pytest.param(
         REUSABLE.replace("permissions:\n  contents: read\njobs:", "jobs:"),
         f"a job of {CALLED} names no scopes, so the grant cannot be compared",
         id="called-workflow-without-scopes",
     ),
 ]
+
+
+PASSES_TOKEN = GOOD.replace(
+    "    with:\n", "    secrets:\n      token: ${{ secrets.LICENCE_TOKEN }}\n    with:\n"
+)
+
+
+def test_secret_the_called_workflow_declares_is_passed_by_name(tree):
+    done = check(tree, PASSES_TOKEN)
+    assert done.returncode == 0, done.stderr
+
+
+def test_secret_renamed_in_the_called_workflow_fails(tree):
+    called = REUSABLE.replace("    secrets:\n      token:\n", "    secrets:\n      key:\n")
+    assert called != REUSABLE
+    done = check(tree, PASSES_TOKEN, called=called)
+    assert done.returncode == 1, done.stdout
+    assert f"the job passes the secret `token`, which {CALLED} does not declare" in done.stderr
 
 
 @pytest.mark.parametrize(("called", "message"), PLANTED_CALLED)
