@@ -1,0 +1,18 @@
+{
+  "url": "https://github.com/plurano/horistes/blob/main/docs/adr/0029-a-forge-app-drives-the-merge-train.md",
+  "description": "Merge train of the fleet: lands clean pull requests one at a time and updates the next one by merge. No bypass, no webhooks. Installed on the fleet's own accounts.",
+  "public": true,
+  "hook_attributes": {
+    "url": "https://github.com/plurano/horistes",
+    "active": false
+  },
+  "default_events": [],
+  "default_permissions": {
+    "checks": "read",
+    "contents": "write",
+    "metadata": "read",
+    "pull_requests": "write",
+    "workflows": "write"
+  },
+  "request_oauth_on_install": false
+}

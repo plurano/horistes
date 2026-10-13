@@ -61,6 +61,7 @@ of the same owner can call it
 | :--- | :--- | :--- | :--- | :--- |
 | `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-26.04`, the newest working image); `root` (directory checked as the project root, default `.`) | `<calling job> / REUSE lint`; with another `root`, `<calling job> / REUSE lint (<root>)` ([ADR-0027](docs/adr/0027-a-narrowed-licence-run-is-named-for-its-folder.md)) | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)); the image is named by digest ([ADR-0008](docs/adr/0008-licence-tool-image-by-digest.md)) |
 | `.github/workflows/scorecard.yml` | the supply-chain checks of the OpenSSF Scorecard action, reported to code scanning and kept as the artifact `scorecard-result` | `outside_hosts` (boolean, default false: the run fails, [ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)); `publish` (boolean, default false) | `<calling job> / Public repository`, `<calling job> / Analysis`; with `outside_hosts` false, `Analysis` is the failed refusal and the analysis job reports as `Analysis (not started)` | with `outside_hosts`: `www.bestpractices.dev`, `api.deps.dev`, `api.osv.dev`, `oss-fuzz-build-logs.storage.googleapis.com`; with `publish`: `api.scorecard.dev`, `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
+| `.github/workflows/merge-train.yml` | in every repository the merge-train app is installed on, lands one clean pull request or updates the next one by merge ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md)) | `app_client_id` (required); `runner` (required, needs python3 and openssl); `switch` (`on` or `off`); `merge_method` (`SQUASH` or `MERGE`); `accept_states` (`UNSTABLE`, `HAS_HOOKS`; default none); `min_age_days` (default 3); `hold_labels`, `dependency_branches`, `person_branches`, `security_labels`; secret `app_private_key` | `<calling job> / Merge train`, never a check of a pull request | none |
 
 The licence job reads the contents and takes no secret; the caller grants
 `contents: read` and nothing else. On a draft pull request the job stops with
@@ -88,6 +89,25 @@ service takes a published result only from a job whose label is written out,
 and `make check-scorecard` holds the file to that and the service's other
 rules.
 
+The merge train runs from one caller in the fleet's operations repository
+and sweeps every repository the merge-train app is installed on; the
+repositories it serves keep no caller and no secret. The app's key is the
+secret `MERGE_TRAIN_APP_KEY` of the environment `merge-train` there, which
+only the branch main may use. For each repository the job mints a token
+limited to that repository, with `contents: write`, `pull_requests: write`,
+`workflows: write` and `checks: read`, and revokes it when the repository is
+done; GITHUB_TOKEN gets no scope. A run lands at most one pull request per
+repository: the oldest the forge reports CLEAN, through the merge call with
+the head commit it read, so a red or blocked pull request is refused by the
+forge itself and the app has no bypass. With none CLEAN and no armed one in
+flight, it arms auto-merge on the oldest BEHIND pull request whose checks are
+not red and merges the default branch into it. It leaves alone drafts, forks,
+other bases, the hold labels, release branches (`release-please--`, a release
+is a person's act), dependency updates younger than the minimum age and
+archived repositories. The app is one public app installed on every account
+of the fleet; its rights are in `apps/merge-train.json`, and a test holds them
+equal to what the train asks the forge for.
+
 ## Layout
 
 | Path | Content |
@@ -98,6 +118,7 @@ rules.
 | `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, the release read-back, and the check of action pins and runner labels |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
 | `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)); `readback` holds the parameter files of three read releases |
+| `apps/` | manifests of the forge apps the workflows use, with their computed rights ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md)) |
 | `interface.lock.json` | recorded interface of every workflow and action |
 | `hosts.toml` | hosts and outside actions the workflows may reach; a host without a switch has a day it ends, at most 90 days ahead ([ADR-0010](docs/adr/0010-one-longest-time-for-every-exception.md)); a host for public repositories only is marked ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)), and its workflow refuses another repository in a job of its own ([ADR-0015](docs/adr/0015-refusal-outside-a-public-repository-is-a-failed-job.md)) that runs on every call and is given the visibility and every such input ([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)) |
 | `exceptions.yaml` | exceptions to rules no other list can carry, each with its issue and a day it ends ([ADR-0007](docs/adr/0007-one-own-exception-list.md)) |
@@ -164,7 +185,9 @@ else, and a field the context does not hold; exit code 3.
 
 `make check-templates`, part of the gate, renders every template with sample
 values and fails unless the result calls a workflow file of this repository by
-commit, with inputs that workflow declares and no secret. The job must grant
+commit, with inputs that workflow declares. A secret is passed only when that
+workflow declares it, by name, as `${{ secrets.NAME }}`; `secrets: inherit`
+and a secret written out are refused. The job must grant
 exactly the scopes the called workflow's jobs ask for, and an input that
 switches on a host for public repositories only is passed as
 `${{ github.event.repository.visibility == 'public' }}` or as false

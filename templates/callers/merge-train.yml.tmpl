@@ -1,0 +1,69 @@
+<%- /*
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+
+Caller of the shared merge train, kept once in the fleet's operations
+repository as .github/workflows/merge-train.yml. One run sweeps every
+repository the merge-train app is installed on; the repositories it serves
+keep no caller and no secret. The steps live in
+.github/workflows/merge-train.yml of the shared repository, named here by
+commit with the version as a comment (decision record 0029).
+
+Before the first run, in the repository that keeps this caller: the
+environment merge-train lets only the branch main deploy and holds the app's
+private key as the secret MERGE_TRAIN_APP_KEY; the repository variable
+MERGE_TRAIN_APP_CLIENT_ID holds the app's client id. The called job names the
+environment, so a run from any other branch is refused before the key is
+read. Without the key or the client id the run stops with exit code 3 and
+writes nothing.
+
+Runner: one of the fleet's own runners with python3 and openssl; the fleet
+runs no hosted runner minutes for this.
+
+Off switch: the variable MERGE_TRAIN set to `off` makes every run report only,
+with read rights. Unset, the train runs.
+
+Scopes: none. The called job writes with the app's tokens, one per
+repository, minted for that repository alone and revoked after it;
+GITHUB_TOKEN gets no permission.
+
+Required check: none. The job runs on a schedule and by hand, never on a pull
+request, and is no check of a pull request (cordanaLLM/praetor#1212 for the
+name the engine declares).
+
+Triggers: every 20 minutes, off the top of the hour; one run lands or updates
+at most one pull request in each repository. Dispatch is the manual nudge.
+Concurrency keeps one run at a time and never cancels a run halfway.
+
+Fields: .Shared.Repository, .Shared.Commit and .Shared.Version are working
+names until the engine renders caller templates (cordanaLLM/praetor#1211);
+.RunnerTag is the engine's own.
+*/ -%>
+---
+# Merge train: in every repository of the merge-train app, lands one clean
+# pull request or keeps the next one up to date. The job is the shared
+# workflow of <% .Shared.Repository %>, named by commit.
+name: Merge train
+
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: merge-train
+  cancel-in-progress: false
+
+jobs:
+  train:
+    name: Merge train
+    permissions: {}
+    uses: <% .Shared.Repository %>/.github/workflows/merge-train.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      runner: <% .RunnerTag %>
+      app_client_id: ${{ vars.MERGE_TRAIN_APP_CLIENT_ID }}
+      switch: ${{ vars.MERGE_TRAIN || 'on' }}
+    secrets:
+      app_private_key: ${{ secrets.MERGE_TRAIN_APP_KEY }}

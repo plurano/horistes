@@ -23,6 +23,70 @@
       "secrets": {},
       "write_scopes": []
     },
+    ".github/workflows/merge-train.yml": {
+      "inputs": {
+        "accept_states": {
+          "default": "",
+          "required": false,
+          "type": "string"
+        },
+        "app_client_id": {
+          "default": null,
+          "required": true,
+          "type": "string"
+        },
+        "dependency_branches": {
+          "default": "renovate/ dependabot/",
+          "required": false,
+          "type": "string"
+        },
+        "hold_labels": {
+          "default": "hold,do-not-merge,planted",
+          "required": false,
+          "type": "string"
+        },
+        "merge_method": {
+          "default": "SQUASH",
+          "required": false,
+          "type": "string"
+        },
+        "min_age_days": {
+          "default": "3",
+          "required": false,
+          "type": "string"
+        },
+        "person_branches": {
+          "default": "release-please--",
+          "required": false,
+          "type": "string"
+        },
+        "runner": {
+          "default": null,
+          "required": true,
+          "type": "string"
+        },
+        "security_labels": {
+          "default": "security",
+          "required": false,
+          "type": "string"
+        },
+        "switch": {
+          "default": "on",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "train": "Merge train"
+      },
+      "outputs": [],
+      "secrets": {
+        "app_private_key": {
+          "required": true
+        }
+      },
+      "write_scopes": []
+    },
     ".github/workflows/scorecard.yml": {
       "inputs": {
         "outside_hosts": {

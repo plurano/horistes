@@ -12,6 +12,7 @@ version = 1
 path = [
     "README.md",
     ".gitignore",
+    "apps/merge-train.json",
     "default.json",
     "interface.lock.json",
     "renovate.json",
