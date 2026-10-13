@@ -106,8 +106,9 @@ rules.
 ## Gate
 
 `make verify-all` is the one gate, locally and in CI. It needs Python 3.12 or
-newer, actionlint 1.7.12 and `praetorctl` on the path; the other tools are
-installed into `.venv` from `requirements/tools.txt` with their hashes.
+newer, actionlint 1.7.12, gitleaks 8.30.1 and `praetorctl` on the path; the
+other tools are installed into `.venv` from `requirements/tools.txt` with their
+hashes.
 
 - `make verify` runs this repository's own checks without the engine: YAML and
   Python lint, actionlint and zizmor, the interface record, the host scan, the
@@ -125,6 +126,11 @@ installed into `.venv` from `requirements/tools.txt` with their hashes.
   (`tests/test_name.py`): the forge does not redirect a call to it. Two
   accepted records keep it and are named in the test
   ([ADR-0023](docs/adr/0023-the-name-is-horistes.md)).
+- Before `make verify-all`, the gate workflow scans every commit of the
+  checkout for secrets with gitleaks and its own rules. It refuses a
+  `.gitleaks.toml` or `.gitleaksignore` in the tree and ignores allow comments;
+  a finding is printed redacted ([ADR-0028](docs/adr/0028-every-commit-is-scanned-for-secrets.md)).
+  `tests/test_secret_scan.py` runs the step on planted repositories.
 - `make interface-snapshot` rewrites `interface.lock.json` after an interface
   change. A change that breaks a caller also raises the recorded version:
   `interface_minor` while `interface_major` is 0, `interface_major` from 1 on
@@ -422,8 +428,8 @@ has to pass the gate like any other pull request.
 | the licence tool's image | `.github/workflows/licence.yml` | the comment `# release X.Y.Z` on the line above `uses:` and the digest in it |
 
 Not read: the files the Praetor engine writes (`.devcontainer/` among them),
-the machine of a job, and the actionlint version with its checksum in the
-`Makefile` and the gate workflow.
+the machine of a job, and the actionlint and gitleaks versions with their
+checksums in the `Makefile` and the gate workflow.
 
 `make requirements` recompiles the tool pins by hand with the same command.
 Keep the header and the comment above the image line: `tests/test_update_bot.py`

@@ -36,6 +36,14 @@
         "docker"
       ],
       "enabled": false
+    },
+    {
+      "description": "praetor-managed files: praetorctl adopt ships their updates and praetorctl audit locks them byte for byte",
+      "matchFileNames": [
+        ".devcontainer/devcontainer.json",
+        ".devcontainer/Dockerfile.praetor"
+      ],
+      "enabled": false
     }
   ]
 }

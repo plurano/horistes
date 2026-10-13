@@ -23,8 +23,11 @@ env:
   ACTIONLINT_VERSION: "1.7.12"
   # SHA-256 of actionlint_1.7.12_linux_amd64.tar.gz, from the release's checksum file.
   ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+  GITLEAKS_VERSION: "8.30.1"
+  # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release's checksum file.
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
   # Published Praetor commit that builds the praetorctl this gate pins.
-  PRAETOR_REF: "6622361940dc66399d027f3a203884bce2f616ac"
+  PRAETOR_REF: "3bbde07342bdece12c46f74b0ee2c1f51129478f"
 
 jobs:
   verify:
@@ -96,6 +99,29 @@ jobs:
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
           echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict
           tar -xzf "$archive" -C "$RUNNER_TEMP/bin" actionlint
+
+      - name: Install the pinned gitleaks
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location --max-time 120 --retry 2 \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" gitleaks
+
+      # Every commit of the checkout, with the tool's own rules only: a rule
+      # file, an ignore file or an allow comment would let the change that
+      # adds it decide what the scan reports (decision record 0028).
+      - name: Scan every commit for secrets
+        run: |
+          unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
+          for file in .gitleaks.toml .gitleaksignore; do
+            if [ -e "$file" ]; then
+              echo "::error title=Secret scan refused::$file would set the rules of the scan; remove it"
+              exit 1
+            fi
+          done
+          gitleaks git --no-banner --verbose --redact --exit-code 1 --ignore-gitleaks-allow --timeout 300 .
 
       # The interface is compared with the commit the change starts from.
       - name: Verification gate
