@@ -8,10 +8,12 @@ VENV ?= .venv
 BIN := $(VENV)/bin
 # The ref the interface is compared with; CI passes the base of the change.
 BASE_REF ?= origin/main
-# actionlint is the one tool that does not come from requirements/tools.txt;
-# the gate refuses any other version than this one.
+# actionlint and gitleaks do not come from requirements/tools.txt. The gate
+# refuses any other actionlint version than this one; the tests refuse any
+# other gitleaks release than the one the gate workflow pins.
 ACTIONLINT ?= actionlint
 ACTIONLINT_VERSION := 1.7.12
+GITLEAKS ?= gitleaks
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
 .PHONY: verify verify-all tools requirements lint-yaml lint-python lint-workflows \
@@ -102,10 +104,12 @@ list-pins check-pins pin: tools
 check-runners: tools
 	$(BIN)/python -B tools/pins.py runners --root "$(PINS_ROOT)"
 
-# The tests plant one defect per rule; the two outside linters are run on a
-# planted workflow as well, so a linter that stopped refusing fails here.
+# The tests plant one defect per rule; the outside linters are run on a
+# planted workflow or repository as well, so a linter that stopped refusing
+# fails here.
 test: tools
-	ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" $(BIN)/python -B -m pytest
+	ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
+		$(BIN)/python -B -m pytest
 
 # Every file carries its licence header or is named in REUSE.toml.
 verify-reuse: tools

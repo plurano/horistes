@@ -59,3 +59,15 @@ exceptions:
       an SBOM step); raise them as docs/guides/releasing.md in Praetor describes, then remove this
       entry
     expires: "2027-01-09"
+  - rule: declared-linters
+    tool: semgrep
+    reason: >-
+      no workflow runs semgrep yet; its rules come from the semgrep registry, an outside host, which
+      needs a host decision first (docs/adr/0028-every-commit-is-scanned-for-secrets.md)
+    expires: "2027-01-11"
+  - rule: declared-linters
+    tool: trivy
+    reason: >-
+      no workflow runs trivy yet; it downloads its vulnerability database from an outside host,
+      which needs a host decision first (docs/adr/0028-every-commit-is-scanned-for-secrets.md)
+    expires: "2027-01-11"
