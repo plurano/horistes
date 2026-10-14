@@ -23,9 +23,12 @@ runs no hosted runner minutes for this.
 Off switch: the variable MERGE_TRAIN set to `off` makes every run report only,
 with read rights. Unset, the train runs.
 
-Scopes: none. The called job writes with the app's tokens, one per
+Scopes: none. The called jobs write with the app's tokens, one per
 repository, minted for that repository alone and revoked after it;
-GITHUB_TOKEN gets no permission.
+GITHUB_TOKEN gets no permission. After the sweep, a second called job runs
+release-please in every repository with release-please-config.json and
+.release-please-manifest.json on its default branch (decision record 0031);
+it needs nothing more from this caller.
 
 Required check: none. The job runs on a schedule and by hand, never on a pull
 request, and is no check of a pull request (cordanaLLM/praetor#1212 for the

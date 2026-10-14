@@ -96,10 +96,14 @@ def pull(number: int, state: str, **fields) -> dict:
     return node
 
 
-def repository(*pulls: dict, auto_merge: bool = True) -> dict:
+def repository(*pulls: dict, auto_merge: bool = True, release: tuple = (False, False)) -> dict:
+    """One repository as the query reads it; `release` says which release-please files it has."""
+    config, manifest = release
     return {
         "defaultBranchRef": {"name": "main"},
         "autoMergeAllowed": auto_merge,
+        "releaseConfig": {"oid": "c" * 40} if config else None,
+        "releaseManifest": {"oid": "d" * 40} if manifest else None,
         "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": list(pulls)},
     }
 
@@ -323,6 +327,7 @@ def train(tmp_path: Path, forge: Forge, text: str | None = None, **settings: str
     path = tmp_path / "train.py"
     path.write_text(source, encoding="utf-8")
     summary = tmp_path / "summary.md"
+    output = tmp_path / "output"
     forge.workdir = tmp_path
     server = serve(forge)
     url = f"http://127.0.0.1:{server.server_address[1]}"
@@ -331,6 +336,7 @@ def train(tmp_path: Path, forge: Forge, text: str | None = None, **settings: str
         "GITHUB_API_URL": url,
         "GITHUB_GRAPHQL_URL": f"{url}/graphql",
         "GITHUB_STEP_SUMMARY": str(summary),
+        "GITHUB_OUTPUT": str(output),
         "TRAIN_APP_CLIENT_ID": CLIENT_ID,
         "TRAIN_APP_KEY": app_key()[0],
         "TRAIN_SWITCH": "on",
@@ -357,6 +363,15 @@ def train(tmp_path: Path, forge: Forge, text: str | None = None, **settings: str
         server.server_close()
     written = summary.read_text(encoding="utf-8") if summary.exists() else ""
     return done, written
+
+
+def releases_of(tmp_path: Path) -> list[dict] | None:
+    """The `releases` output the step wrote for the release job, or None."""
+    output = tmp_path / "output"
+    lines = output.read_text(encoding="utf-8").splitlines() if output.exists() else []
+    values = [line.removeprefix("releases=") for line in lines if line.startswith("releases=")]
+    assert len(values) <= 1, lines
+    return json.loads(values[0]) if values else None
 
 
 def landed(number: int) -> tuple:
@@ -589,13 +604,14 @@ def test_token_and_key_are_never_printed(tmp_path):
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.refuse_merge = "refused"
     done, summary = train(tmp_path, forge)
-    out = done.stdout + done.stderr + summary
+    out = done.stdout + done.stderr + summary + (tmp_path / "output").read_text(encoding="utf-8")
     assert "planted-token" not in out and "list-token" not in out
     body = "".join(app_key()[0].splitlines()[1:-1])
     assert body[:40] not in out.replace("\n", "")
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         "jwt.pub",
         "jwt.sig",
+        "output",
         "summary.md",
         "train.py",
     ]
@@ -791,3 +807,149 @@ def test_job_reads_the_key_from_the_environment_merge_train():
     env = [s for s in job["steps"] if s.get("name") == STEP][0]["env"]
     assert env["TRAIN_APP_KEY"] == "${{ secrets.app_private_key }}"
     assert env["TRAIN_APP_CLIENT_ID"] == "${{ inputs.app_client_id }}"
+
+
+RELEASE_PLEASE = "googleapis/release-please-action@"
+APP_TOKEN = "actions/create-github-app-token@"
+TOKEN_RIGHTS = {
+    "permission-contents": "write",
+    "permission-pull-requests": "write",
+    "permission-workflows": "write",
+}
+
+
+def release_forge() -> Forge:
+    """fleet/app has both release-please files, other/b only the config, other/c none."""
+    forge = Forge(repository(pull(1, "CLEAN"), release=(True, True)))
+    forge.install(
+        9,
+        "other",
+        b=[repository(release=(True, False))],
+        c=[repository()],
+        d=[repository(release=(True, True))],
+        old=[repository(release=(True, True))],
+    )
+    forge.archived.add("other/old")
+    return forge
+
+
+def test_sweep_names_the_repositories_with_release_please(tmp_path):
+    forge = release_forge()
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [
+        {"owner": "fleet", "name": "app"},
+        {"owner": "other", "name": "d"},
+    ]
+    assert "Release pull requests and releases next: fleet/app, other/d" in summary
+
+
+def test_without_the_manifest_check_a_config_alone_is_named(tmp_path):
+    mutant = script().replace(
+        'bool(repo["releaseConfig"] and repo["releaseManifest"])', 'bool(repo["releaseConfig"])'
+    )
+    assert mutant != script()
+    done, _ = train(tmp_path, release_forge(), mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert {"owner": "other", "name": "b"} in releases_of(tmp_path)
+
+
+def test_release_list_is_written_when_a_repository_refused(tmp_path):
+    """A refusal in fleet/app keeps it off the list; the other repositories still get their run."""
+    forge = release_forge()
+    forge.refuse_merge_in.add("fleet/app")
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "other", "name": "d"}]
+
+
+def test_no_release_list_without_a_sweep(tmp_path):
+    forge = release_forge()
+    forge.public = openssl("pkey", "-pubout", data=openssl("genpkey", "-algorithm", "RSA"))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert releases_of(tmp_path) is None
+
+
+def test_release_list_is_bounded_by_the_matrix(tmp_path):
+    mutant = script().replace("MAX_RELEASES = 256", "MAX_RELEASES = 1")
+    assert mutant != script()
+    done, summary = train(tmp_path, release_forge(), mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "No release run, the job matrix holds 1: other/d" in summary
+
+
+def release_job_findings(doc: dict) -> list[str]:
+    """What keeps the release job from running release-please with the app's own token."""
+    found = []
+    job = doc["jobs"].get("release", {})
+    steps = job.get("steps", [])
+    minting = [s for s in steps if str(s.get("uses", "")).startswith(APP_TOKEN)]
+    running = [s for s in steps if str(s.get("uses", "")).startswith(RELEASE_PLEASE)]
+    if len(minting) != 1 or len(running) != 1:
+        return [f"{len(minting)} token steps and {len(running)} release-please steps"]
+    mint, run = minting[0]["with"], running[0]["with"]
+    if run.get("token") != f"${{{{ steps.{minting[0].get('id')}.outputs.token }}}}":
+        found.append(f"release-please token is {run.get('token')!r}, not the app's")
+    if mint.get("owner") != "${{ matrix.repository.owner }}":
+        found.append("token not minted for the repository's owner")
+    if mint.get("repositories") != "${{ matrix.repository.name }}":
+        found.append("token not limited to the repository")
+    rights = {key: value for key, value in mint.items() if key.startswith("permission-")}
+    if rights != TOKEN_RIGHTS:
+        found.append(f"token rights {rights}")
+    if run.get("repo-url") != "${{ matrix.repository.owner }}/${{ matrix.repository.name }}":
+        found.append("release-please runs on another repository")
+    if job.get("permissions") != {} or job.get("environment") != "merge-train":
+        found.append("GITHUB_TOKEN has rights, or the key's environment is missing")
+    if "inputs.switch == 'on'" not in job.get("if", ""):
+        found.append("runs while the train is switched off")
+    if job.get("strategy", {}).get("matrix", {}).get("repository") != (
+        "${{ fromJSON(needs.train.outputs.releases) }}"
+    ):
+        found.append("matrix is not the sweep's list")
+    return found
+
+
+def test_release_job_runs_release_please_with_the_app_token():
+    assert release_job_findings(ciwf.load(TRAIN)) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "finding"),
+    [
+        (
+            lambda w: w.update(token="${{ github.token }}"),
+            "release-please token is '${{ github.token }}', not the app's",
+        ),
+        (lambda w: w.pop("token"), "release-please token is None, not the app's"),
+    ],
+)
+def test_github_token_for_release_please_is_found(change, finding):
+    """GITHUB_TOKEN opens release pull requests that start no checks (cordanaLLM/imago#58)."""
+    doc = ciwf.load(TRAIN)
+    step = [s for s in doc["jobs"]["release"]["steps"] if s["uses"].startswith(RELEASE_PLEASE)][0]
+    change(step["with"])
+    assert release_job_findings(doc) == [finding]
+
+
+def test_release_job_mutants_are_found():
+    doc = ciwf.load(TRAIN)
+    job = doc["jobs"]["release"]
+    mint = [s for s in job["steps"] if s["uses"].startswith(APP_TOKEN)][0]["with"]
+    mint.pop("repositories")
+    mint["permission-issues"] = "write"
+    job["if"] = job["if"].replace("inputs.switch == 'on'", "true")
+    assert release_job_findings(doc) == [
+        "token not limited to the repository",
+        "token rights {'permission-contents': 'write', 'permission-pull-requests': 'write', "
+        "'permission-workflows': 'write', 'permission-issues': 'write'}",
+        "runs while the train is switched off",
+    ]
+
+
+def test_release_token_rights_are_within_the_app():
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))["default_permissions"]
+    for key, value in TOKEN_RIGHTS.items():
+        assert manifest[key.removeprefix("permission-").replace("-", "_")] == value
