@@ -26,6 +26,17 @@
 # repositories. A repository leaves the train when the app is uninstalled
 # from it.
 #
+# RELEASES. A repository with release-please-config.json and
+# .release-please-manifest.json on its default branch gets a second job after
+# the sweep (decision record 0031): release-please with a token of the app
+# limited to that repository, contents, pull requests and workflows write. It
+# opens or updates the release pull request and, once a person has merged it,
+# creates the release. It never merges: the train leaves heads in
+# `person_branches` alone, so a release stays a person's act. The app's events
+# start workflow runs, so the release pull request gets its required checks
+# and the release starts the repository's `release: published` workflows.
+# `switch: off` runs no release job.
+#
 # CREDENTIAL. One repository holds the app's private key, as the secret
 # MERGE_TRAIN_APP_KEY of its environment `merge-train`; the environment lets
 # only the default branch deploy, so a workflow edited on another branch never
@@ -117,8 +128,11 @@ jobs:
     environment: merge-train
     timeout-minutes: 30
     permissions: {}
+    outputs:
+      releases: ${{ steps.sweep.outputs.releases }}
     steps:
       - name: Land or update one pull request in every repository of the app
+        id: sweep
         shell: python
         env:
           TRAIN_APP_CLIENT_ID: ${{ inputs.app_client_id }}
@@ -163,6 +177,7 @@ jobs:
           SWEEP_SECONDS = 1500
           MAX_PAGES = 20
           JWT_SECONDS = 540
+          MAX_RELEASES = 256
           WRITE_RIGHTS = {
               "contents": "write",
               "pull_requests": "write",
@@ -181,6 +196,8 @@ jobs:
             repository(owner: $owner, name: $name) {
               defaultBranchRef { name }
               autoMergeAllowed
+              releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
+              releaseManifest: object(expression: "HEAD:.release-please-manifest.json") { oid }
               pullRequests(states: OPEN, first: 100, orderBy: {field: CREATED_AT, direction: ASC}) {
                 pageInfo { hasNextPage }
                 nodes {
@@ -543,12 +560,12 @@ jobs:
                   revoke(env, token)
               moved = any(note.startswith(("armed", "updated")) for note in notes.values())
               section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""
-              return outcome, section, moved
+              return outcome, section, moved, bool(repo["releaseConfig"] and repo["releaseManifest"])
 
 
           def sweep(env, conf, started):
               """Run the train in every repository; the per-account tally, the sections, the refusals."""
-              accounts, sections, refusals, skipped = {}, [], [], []
+              accounts, sections, refusals, skipped, releases = {}, [], [], [], []
               for installation in pages(env, app_jwt(env, conf), "/app/installations"):
                   account = installation["account"]["login"]
                   if installation.get("suspended_at"):
@@ -568,7 +585,8 @@ jobs:
                           continue
                       tally["repositories"] += 1
                       try:
-                          outcome, section, moved = one(env, conf, installation, target, datetime.now(UTC))
+                          now = datetime.now(UTC)
+                          outcome, section, moved, release = one(env, conf, installation, target, now)
                       except RefusedError as err:
                           tally["refused"] += 1
                           refusals.append(f"{target['full_name']}: {err}")
@@ -576,10 +594,17 @@ jobs:
                       tally["landed"] += outcome.startswith("landed")
                       tally["updated"] += moved
                       sections.append(section)
-              return accounts, [s for s in sections if s], refusals, skipped
+                      if release:
+                          releases.append({"owner": account, "name": target["name"]})
+              return accounts, [s for s in sections if s], refusals, skipped, releases
 
 
-          def summary(env, accounts, sections, refusals, skipped):
+          def append(path, text):
+              with open(path, "a", encoding="utf-8") as handle:
+                  handle.write(text)
+
+
+          def summary(env, accounts, sections, refusals, skipped, releases):
               lines = [
                   "## Merge train sweep",
                   "",
@@ -598,10 +623,16 @@ jobs:
                   lines += ["", "Refused:", ""] + [f"- {line}" for line in refusals]
               if skipped:
                   lines += ["", f"Not reached within {SWEEP_SECONDS} s: {', '.join(skipped)}"]
+              if len(releases) > MAX_RELEASES:
+                  late = ", ".join(f"{r['owner']}/{r['name']}" for r in releases[MAX_RELEASES:])
+                  lines += ["", f"No release run, the job matrix holds {MAX_RELEASES}: {late}"]
+                  del releases[MAX_RELEASES:]
+              named = ", ".join(f"{r['owner']}/{r['name']}" for r in releases) or "none"
+              lines += ["", f"Release pull requests and releases next: {named}"]
               text = "\n".join([*lines, "", *sections]) + "\n"
               sys.stdout.write(text)
-              with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
-                  handle.write(text)
+              append(env["GITHUB_STEP_SUMMARY"], text)
+              append(env["GITHUB_OUTPUT"], f"releases={json.dumps(releases, separators=(',', ':'))}\n")
 
 
           def main(env):
@@ -611,11 +642,11 @@ jobs:
                   sys.stdout.write(f"::error title=Merge train setting::{err}\n")
                   return 3
               try:
-                  accounts, sections, refusals, skipped = sweep(env, conf, time.monotonic())
+                  accounts, sections, refusals, skipped, releases = sweep(env, conf, time.monotonic())
               except RefusedError as err:
                   sys.stdout.write(f"::error title=Merge train refused::{err}\n")
                   return 1
-              summary(env, accounts, sections, refusals, skipped)
+              summary(env, accounts, sections, refusals, skipped, releases)
               for line in refusals:
                   sys.stdout.write(f"::error title=Merge train refused::{line}\n")
               if skipped:
@@ -624,3 +655,45 @@ jobs:
 
 
           sys.exit(main(os.environ))
+
+  release:
+    # release-please in every repository the sweep found with
+    # release-please-config.json and .release-please-manifest.json on its
+    # default branch, with a token of the app limited to that repository. Events
+    # the app's token causes start workflow runs, so the release pull request
+    # gets its required checks and a release starts the repository's
+    # `release: published` workflows; with GITHUB_TOKEN neither happens.
+    name: Release pull request and release
+    needs: train
+    if: >-
+      ${{ !cancelled() && inputs.switch == 'on'
+      && needs.train.outputs.releases != '' && needs.train.outputs.releases != '[]' }}
+    runs-on: ${{ inputs.runner }}
+    environment: merge-train
+    timeout-minutes: 15
+    permissions: {}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        repository: ${{ fromJSON(needs.train.outputs.releases) }}
+    steps:
+      - name: Mint a token for this repository alone
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.app_client_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ matrix.repository.owner }}
+          repositories: ${{ matrix.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Open or update the release pull request, create the release of a merged one
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.token.outputs.token }}
+          repo-url: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

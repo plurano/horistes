@@ -28,6 +28,8 @@ forge = [
 # itself beyond the forge. An action missing here fails the gate.
 [actions]
 "actions/checkout" = []
+# Mints and revokes an installation token through the forge's API.
+"actions/create-github-app-token" = []
 # Takes the toolchain from the runner's cache or the forge-hosted manifest;
 # when both miss it downloads from the Go distribution site, which redirects.
 "actions/setup-go" = ["go.dev", "dl.google.com"]
@@ -38,6 +40,9 @@ forge = [
 ]
 # Uploads to the forge's code scanning through its API.
 "github/codeql-action/upload-sarif" = []
+# Bundled in its own dist/index.js; reads and writes through the forge's REST
+# and GraphQL API, and links commits on the forge (`changelog-host`).
+"googleapis/release-please-action" = []
 # Runs from its image on the forge's registry. The first four hosts are asked
 # on every run, the last four only when the result is published (sources in
 # decision record 0013).
