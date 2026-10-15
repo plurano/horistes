@@ -42,10 +42,10 @@
 # only the default branch deploy, so a workflow edited on another branch never
 # reads the key. The job runs in that environment and the caller passes the
 # secret as `app_private_key` and the client id as `app_client_id`. The key
-# signs a JWT of the app (openssl, the key through a pipe, never a file). For
-# every repository the job mints a token limited to that repository, with
-# contents, pull requests and workflows write and checks read (read rights
-# only when `switch` is off), and revokes it when the repository is done.
+# signs a JWT of the app (openssl, the key through a pipe, never a file).
+# For every repository the job mints a token limited to that repository, with
+# contents, pull requests and workflows write, checks and actions read (read
+# rights only when `switch` is off), and revokes it when the repository is done.
 # Workflows write is there because the forge refuses a merge or an
 # update-branch that changes a file under .github/workflows without it: pin
 # updates do, and so does an update after the default branch changed a
@@ -161,6 +161,8 @@ jobs:
           """
 
           import base64
+          import hashlib
+          import io
           import json
           import os
           import shutil
@@ -168,7 +170,9 @@ jobs:
           import sys
           import time
           import urllib.error
+          import urllib.parse
           import urllib.request
+          import zipfile
           from datetime import UTC, datetime, timedelta
 
           TIMEOUT = 30
@@ -178,7 +182,9 @@ jobs:
           MAX_PAGES = 20
           JWT_SECONDS = 540
           MAX_RELEASES = 256
+          MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
           WRITE_RIGHTS = {
+              "actions": "read",
               "contents": "write",
               "pull_requests": "write",
               "workflows": "write",
@@ -232,6 +238,13 @@ jobs:
             }
           }
           """
+          COMMIT_MUTATION = """
+          mutation($input: CreateCommitOnBranchInput!) {
+            createCommitOnBranch(input: $input) {
+              commit { oid }
+            }
+          }
+          """
 
 
           class RefusedError(Exception):
@@ -276,17 +289,40 @@ jobs:
               }
 
 
-          def call(url, token, method="POST", body=None):
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              """An HTTP redirect handler that does not follow redirects."""
+
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def call(url, token=None, method="POST", body=None, raw=False, redirect=True):
               """One request to the forge; the parsed answer, or RefusedError with what it said."""
               data = None if body is None else json.dumps(body).encode()
               request = urllib.request.Request(url, data=data, method=method)
-              request.add_header("Authorization", f"Bearer {token}")
+              if token:
+                  request.add_header("Authorization", f"Bearer {token}")
               request.add_header("Accept", "application/vnd.github+json")
               request.add_header("X-GitHub-Api-Version", "2022-11-28")
+              opener = (
+                  urllib.request.build_opener()
+                  if redirect
+                  else urllib.request.build_opener(NoRedirect)
+              )
               try:
-                  with urllib.request.urlopen(request, timeout=TIMEOUT) as answer:
+                  with opener.open(request, timeout=TIMEOUT) as answer:
+                      if raw:
+                          content = answer.read(MAX_ARTIFACT_BYTES + 1)
+                          if len(content) > MAX_ARTIFACT_BYTES:
+                              raise RefusedError(
+                                  f"{method} {url}: artifact exceeds {MAX_ARTIFACT_BYTES} bytes"
+                              )
+                          return content
                       text = answer.read().decode()
               except urllib.error.HTTPError as err:
+                  if not redirect and err.code in (301, 302, 303, 307, 308):
+                      loc = err.headers.get("Location")
+                      return {"location": urllib.parse.urljoin(url, loc) if loc else ""}
                   raise RefusedError(f"{method} {url}: HTTP {err.code} {err.read().decode()[:500]}") from err
               except (urllib.error.URLError, TimeoutError) as err:
                   raise RefusedError(f"{method} {url}: {err}") from err
@@ -446,12 +482,293 @@ jobs:
                   notes[pull["number"]] = "conflicts with the default branch"
 
 
+          def bot_identity(env, conf):
+              """Discover the app's bot login and numeric id once per sweep."""
+              jwt = app_jwt(env, conf)
+              app = call(f"{env['GITHUB_API_URL']}/app", jwt, "GET")
+              slug = app["slug"]
+              login = f"{slug}[bot]"
+              user = call(f"{env['GITHUB_API_URL']}/users/{login}", None, "GET")
+              return login, str(user["id"])
+
+
+          def allowlist_paths(env, default_branch):
+              """The paths declared in .github/generated-files on the default branch, or None."""
+              url = (
+                  f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/"
+                  f"contents/.github/generated-files?ref={default_branch}"
+              )
+              try:
+                  data = call(url, env["TRAIN_TOKEN"], "GET")
+              except RefusedError as err:
+                  if "HTTP 404" in str(err):
+                      return None
+                  raise
+              if not isinstance(data, dict) or "content" not in data:
+                  return None
+              raw = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+              lines = [line.split("#", 1)[0].strip() for line in raw.splitlines()]
+              return frozenset(p for p in lines if p)
+
+
+          def find_artifact(env, pull):
+              """The newest unexpired regenerated artifact matching the head commit and branch, or None."""
+              head_sha = pull["headRefOid"]
+              head_branch = pull["headRefName"]
+              url = (
+                  f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/"
+                  f"actions/artifacts?name=regenerated-{head_sha}&per_page=10"
+              )
+              answer = call(url, env["TRAIN_TOKEN"], "GET")
+              artifacts = answer.get("artifacts", [])
+              matching = []
+              for art in artifacts:
+                  if art.get("expired"):
+                      continue
+                  run = art.get("workflow_run") or {}
+                  if run.get("head_sha") == head_sha and run.get("head_branch") == head_branch:
+                      matching.append(art)
+              if not matching:
+                  return None
+              matching.sort(
+                  key=lambda a: (a.get("created_at") or "", a.get("id") or 0), reverse=True
+              )
+              return matching[0]
+
+
+          def download_artifact(env, art):
+              """Download the artifact zip without sending Authorization to the storage URL."""
+              url = art["archive_download_url"]
+              redirect = call(url, env["TRAIN_TOKEN"], "GET", redirect=False)
+              storage_url = redirect.get("location")
+              if not storage_url:
+                  raise RefusedError(f"GET {url}: expected 302 redirect to storage URL")
+              expected_scheme = urllib.parse.urlsplit(env["GITHUB_API_URL"]).scheme
+              storage_scheme = urllib.parse.urlsplit(storage_url).scheme
+              if storage_scheme != expected_scheme:
+                  raise RefusedError(
+                      f"GET {url}: storage URL scheme {storage_scheme!r} != {expected_scheme!r}"
+                  )
+              return call(storage_url, None, "GET", raw=True)
+
+
+          def check_zip_members(repo, num, zf):
+              """Validate zip members against zip bombs and duplicates; return file member names."""
+              namelist = zf.namelist()
+              if len(namelist) != len(set(namelist)):
+                  raise RefusedError(f"{repo} #{num}: duplicate zip member names")
+              file_members = set()
+              total_size = 0
+              for info in zf.infolist():
+                  if info.file_size < 0 or info.file_size > MAX_ARTIFACT_BYTES:
+                      raise RefusedError(
+                          f"{repo} #{num}: zip member {info.filename} exceeds {MAX_ARTIFACT_BYTES} bytes"
+                      )
+                  total_size += info.file_size
+                  if total_size > MAX_ARTIFACT_BYTES:
+                      raise RefusedError(
+                          f"{repo} #{num}: zip total size exceeds {MAX_ARTIFACT_BYTES} bytes"
+                      )
+                  if info.filename.endswith("/"):
+                      if info.file_size > 0:
+                          raise RefusedError(
+                              f"{repo} #{num}: directory entry {info.filename!r} has size > 0"
+                          )
+                  else:
+                      file_members.add(info.filename)
+              return file_members
+
+
+          def check_safe_path(repo, num, p, allowlist):
+              """Ensure path has no parent traversal, leading slash, backslash, and is allowlisted."""
+              if "\\" in p or p.startswith("/") or ".." in p or p not in allowlist:
+                  raise RefusedError(f"{repo} #{num}: path {p!r} not allowed")
+
+
+          def check_manifest_entry(repo, num, entry, allowlist, seen_paths):
+              """Validate one manifest file entry schema and allowlist path."""
+              if not isinstance(entry, dict):
+                  raise RefusedError(f"{repo} #{num}: manifest files entry is not a dict")
+              p, size, sha = entry.get("path"), entry.get("bytes"), entry.get("sha256")
+              if not isinstance(p, str) or not isinstance(sha, str):
+                  raise RefusedError(f"{repo} #{num}: invalid manifest entry types")
+              if type(size) is not int or size < 0:
+                  raise RefusedError(f"{repo} #{num}: invalid manifest entry types")
+              if p in seen_paths:
+                  raise RefusedError(f"{repo} #{num}: duplicate path {p!r} in manifest files")
+              seen_paths.add(p)
+              check_safe_path(repo, num, p, allowlist)
+              return p, size, sha
+
+
+          def read_manifest(repo, num, head, zf):
+              """Read and validate top-level manifest.json from the zip archive."""
+              try:
+                  manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+              except Exception as err:
+                  raise RefusedError(f"{repo} #{num}: invalid manifest.json: {err}") from err
+              if not isinstance(manifest, dict):
+                  raise RefusedError(f"{repo} #{num}: manifest.json root is not a dict")
+              if manifest.get("schema") != "horistes.generated-files.v1":
+                  raise RefusedError(
+                      f"{repo} #{num}: unexpected manifest schema {manifest.get('schema')!r}"
+                  )
+              if manifest.get("head") != head:
+                  raise RefusedError(f"{repo} #{num}: manifest head {manifest.get('head')} != {head}")
+              files = manifest.get("files")
+              if not isinstance(files, list):
+                  raise RefusedError(f"{repo} #{num}: manifest files is not a list")
+              return manifest, files
+
+
+          def extract_manifest_files(repo, num, zf, files, names, allowlist):
+              """Validate and extract file members declared in manifest.json."""
+              expected = {"manifest.json"}
+              file_bytes = {}
+              seen_paths = set()
+              for entry in files:
+                  p, size, sha = check_manifest_entry(repo, num, entry, allowlist, seen_paths)
+                  member = f"files/{p}"
+                  if member not in names:
+                      raise RefusedError(f"{repo} #{num}: member {member!r} missing from artifact")
+                  expected.add(member)
+                  content = zf.read(member)
+                  if len(content) != size:
+                      raise RefusedError(f"{repo} #{num}: {p} size {len(content)} != {size}")
+                  if hashlib.sha256(content).hexdigest() != sha:
+                      raise RefusedError(f"{repo} #{num}: {p} sha256 mismatch")
+                  file_bytes[p] = content
+              if names != expected:
+                  extra = sorted(names - expected)
+                  raise RefusedError(f"{repo} #{num}: artifact contains unexpected members: {extra}")
+              return file_bytes
+
+
+          def validate_artifact(env, pull, data, allowlist):
+              """Validate zip content and manifest, returning (manifest, file_bytes_by_path)."""
+              repo = env["GITHUB_REPOSITORY"]
+              num = pull["number"]
+              head = pull["headRefOid"]
+              try:
+                  zf = zipfile.ZipFile(io.BytesIO(data))
+              except Exception as err:
+                  raise RefusedError(f"{repo} #{num}: bad zip archive: {err}") from err
+              names = check_zip_members(repo, num, zf)
+              if "manifest.json" not in names:
+                  raise RefusedError(f"{repo} #{num}: manifest.json missing from artifact")
+              manifest, files = read_manifest(repo, num, head, zf)
+              file_bytes = extract_manifest_files(repo, num, zf, files, names, allowlist)
+              return manifest, file_bytes
+
+
+          def filter_changed_files(env, pull, file_bytes):
+              """Files from the artifact whose content differs from headRefOid."""
+              changed = {}
+              for path, data in file_bytes.items():
+                  url = (
+                      f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/"
+                      f"contents/{path}?ref={pull['headRefOid']}"
+                  )
+                  try:
+                      head_file = call(url, env["TRAIN_TOKEN"], "GET")
+                  except RefusedError as err:
+                      if "HTTP 404" in str(err):
+                          head_file = None
+                      else:
+                          raise
+                  blob_sha = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+                  if head_file and head_file.get("sha") == blob_sha:
+                      continue
+                  changed[path] = data
+              return changed
+
+
+          def commit_generated_files(env, conf, pull, art, changed):
+              """Commit changed generated files to the pull request branch via createCommitOnBranch."""
+              run = art.get("workflow_run") or {}
+              run_ref = run.get("html_url") or run.get("id") or "unknown"
+              bot_login = conf["bot_login"]
+              bot_id = conf["bot_id"]
+              trailer = f"Signed-off-by: {bot_login} <{bot_id}+{bot_login}@users.noreply.github.com>"
+              body = (
+                  f"Regenerated by the dependency update's own workflow run {run_ref}, "
+                  f"artifact regenerated-{pull['headRefOid']}.\n\n{trailer}"
+              )
+              additions = [
+                  {"path": path, "contents": base64.b64encode(data).decode("ascii")}
+                  for path, data in sorted(changed.items())
+              ]
+              variables = {
+                  "input": {
+                      "branch": {
+                          "repositoryNameWithOwner": env["GITHUB_REPOSITORY"],
+                          "branchName": pull["headRefName"],
+                      },
+                      "expectedHeadOid": pull["headRefOid"],
+                      "fileChanges": {"additions": additions},
+                      "message": {
+                          "headline": "chore(deps): regenerate generated files",
+                          "body": body,
+                      },
+                  }
+              }
+              data = graphql(env, COMMIT_MUTATION, variables)
+              if not data.get("createCommitOnBranch", {}).get("commit", {}).get("oid"):
+                  raise RefusedError(f"#{pull['number']}: createCommitOnBranch returned no commit")
+
+
+          def is_candidate(pull, reason, default_branch, conf):
+              """Whether a pull request is a candidate for generated file regeneration."""
+              if not pull["headRefName"].startswith(conf["dependency"]):
+                  return False
+              if pull["isDraft"] or pull["isCrossRepository"]:
+                  return False
+              if pull["baseRefName"] != default_branch:
+                  return False
+              if reason.startswith("labelled "):
+                  return False
+              return reason != "release or reserved branch: a person lands it"
+
+
+          def regenerate(env, conf, repo, rows, notes):
+              """Commit regenerated files for the oldest candidate dependency update, or None."""
+              default_branch = repo["defaultBranchRef"]["name"]
+              candidates = [
+                  pull for pull, reason in rows if is_candidate(pull, reason, default_branch, conf)
+              ]
+              if not candidates:
+                  return None
+              allowlist = allowlist_paths(env, default_branch)
+              if allowlist is None:
+                  return None
+              for pull in candidates:
+                  try:
+                      art = find_artifact(env, pull)
+                      if not art:
+                          continue
+                      data = download_artifact(env, art)
+                      _, file_bytes = validate_artifact(env, pull, data, allowlist)
+                      changed = filter_changed_files(env, pull, file_bytes)
+                  except RefusedError as err:
+                      notes[pull["number"]] = f"generated files refused: {err}"[:200]
+                      continue
+                  if not changed:
+                      continue
+                  commit_generated_files(env, conf, pull, art, changed)
+                  notes[pull["number"]] = "generated files committed"
+                  return f"committed generated files to #{pull['number']}"
+              return None
+
+
           def run(env, conf, repo, now):
               pulls = repo["pullRequests"]["nodes"]
               rows = [(pull, verdict(pull, repo, conf, now)) for pull in pulls]
               notes = {pull["number"]: reason for pull, reason in rows}
               if conf["switch"] == "off":
                   return rows, notes, "switched off: nothing landed or updated"
+              outcome = regenerate(env, conf, repo, rows, notes)
+              if outcome:
+                  return rows, notes, outcome
               for pull, reason in rows:
                   if reason == "land":
                       land(env, conf, pull)
@@ -558,13 +875,18 @@ jobs:
                   rows, notes, outcome = run(local, conf, repo, now)
               finally:
                   revoke(env, token)
-              moved = any(note.startswith(("armed", "updated")) for note in notes.values())
+              moved = any(
+                  note.startswith(("armed", "updated")) or note == "generated files committed"
+                  for note in notes.values()
+              )
               section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""
               return outcome, section, moved, bool(repo["releaseConfig"] and repo["releaseManifest"])
 
 
           def sweep(env, conf, started):
               """Run the train in every repository; the per-account tally, the sections, the refusals."""
+              bot_login, bot_id = bot_identity(env, conf)
+              conf = {**conf, "bot_login": bot_login, "bot_id": bot_id}
               accounts, sections, refusals, skipped, releases = {}, [], [], [], []
               for installation in pages(env, app_jwt(env, conf), "/app/installations"):
                   account = installation["account"]["login"]

@@ -36,7 +36,19 @@ REFERENCE = "github>plurano/horistes"
 # What the preset may hold, and what one of its rules may hold. Allow-lists on
 # purpose: a key that names a manager, a file or a package of one repository
 # fails here before it reaches every repository that extends the preset.
-SHARED = {"$schema", "description", "extends", "minimumReleaseAge", "automerge", "packageRules"}
+SHARED = {
+    "$schema",
+    "description",
+    "extends",
+    "minimumReleaseAge",
+    "automerge",
+    "gitIgnoredAuthors",
+    "packageRules",
+}
+# The commit address of the merge-train app's bot user (numeric user id, then the
+# app slug), read from GET /users/plurano-merge-train[bot]. Renovate compares an
+# entry for equality before it reads it as a glob, so the brackets stay literal.
+TRAIN_BOT = "342223998+plurano-merge-train[bot]@users.noreply.github.com"
 RULE = {"description", "matchManagers", "matchDepTypes", "enabled"}
 # The keys both files may hold: Renovate appends these lists, the repository's
 # entries behind the preset's.
@@ -166,6 +178,10 @@ def test_waiting_time_is_three_days_and_nothing_merges_itself():
 
 def test_commits_of_the_bot_carry_the_sign_off_the_gate_asks_for():
     assert PRESET["extends"] == ["config:recommended", ":gitSignOff"]
+
+
+def test_generated_file_commits_of_the_train_do_not_mark_an_update_as_edited():
+    assert PRESET["gitIgnoredAuthors"] == [TRAIN_BOT]
 
 
 def test_this_repository_extends_the_preset_and_nothing_else():

@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import base64
 import functools
+import hashlib
+import io
 import json
 import re
 import subprocess
 import sys
 import threading
 import time
+import zipfile
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from conftest import ROOT
@@ -40,7 +43,13 @@ YOUNG = (NOW - timedelta(hours=5)).isoformat()
 CONFLICT = "merge conflict between base and head"
 NO_NEW = "There are no new commits on the base branch."
 CLIENT_ID = "Iv23planted"
-WRITE = {"contents": "write", "pull_requests": "write", "workflows": "write", "checks": "read"}
+WRITE = {
+    "actions": "read",
+    "contents": "write",
+    "pull_requests": "write",
+    "workflows": "write",
+    "checks": "read",
+}
 READ = {"contents": "read", "pull_requests": "read", "checks": "read"}
 
 
@@ -132,7 +141,59 @@ class Forge:
         self.refuse_merge_in: set[str] = set()
         self.update_answers: dict[int, tuple[int, str]] = {}
         self.workdir = Path()
+        self.contents: dict[tuple[str, str, str], tuple[int, dict]] = {}
+        self.artifacts: dict[tuple[str, str], list[dict]] = {}
+        self.storage: dict[int, bytes] = {}
+        self.storage_auth_seen: list[str] = []
+        self.users_auth_seen: list[str] = []
+        self.artifact_redirect_locations: dict[int, str | None] = {}
+        self.refuse_commit = False
         self.install(7, "fleet", app=list(reads))
+
+    def set_allowlist(self, repo: str, default_branch: str, paths: list[str]) -> None:
+        text = "\n".join(paths)
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        self.contents[(repo, ".github/generated-files", default_branch)] = (
+            200,
+            {"type": "file", "content": encoded, "encoding": "base64"},
+        )
+
+    def set_head_content(self, repo: str, path: str, head_sha: str, data: bytes) -> None:
+        blob_sha = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+        self.contents[(repo, path, head_sha)] = (
+            200,
+            {"type": "file", "sha": blob_sha, "size": len(data)},
+        )
+
+    def add_artifact(
+        self,
+        repo: str,
+        artifact_id: int,
+        name: str,
+        zip_bytes: bytes,
+        head_sha: str,
+        head_branch: str,
+        expired: bool = False,
+        created_at: str | None = None,
+        workflow_run_id: int = 12345,
+        html_url: str | None = None,
+    ) -> None:
+        self.storage[artifact_id] = zip_bytes
+        art = {
+            "id": artifact_id,
+            "name": name,
+            "size_in_bytes": len(zip_bytes),
+            "archive_download_url": f"http://127.0.0.1/repos/{repo}/actions/artifacts/{artifact_id}/zip",
+            "expired": expired,
+            "created_at": created_at or NOW.isoformat(),
+            "workflow_run": {
+                "id": workflow_run_id,
+                "head_sha": head_sha,
+                "head_branch": head_branch,
+                "html_url": html_url or f"https://github.com/{repo}/actions/runs/{workflow_run_id}",
+            },
+        }
+        self.artifacts.setdefault((repo, name), []).append(art)
 
     def install(self, number: int, account: str, suspended: bool = False, **repos) -> None:
         self.installations.append(
@@ -194,9 +255,25 @@ class Forge:
         assert kind[0] == "repo" and token not in self.revoked, (token, kind, self.revoked)
         return kind[2], kind[3]
 
+    def _handle_commit_mutation(self, full: str, variables: dict) -> dict:
+        if self.refuse_commit:
+            return {"errors": [{"message": "createCommitOnBranch refused by stand-in"}]}
+        inp = variables["input"]
+        branch = inp["branch"]["branchName"]
+        expected = inp["expectedHeadOid"]
+        paths = [a["path"] for a in inp.get("fileChanges", {}).get("additions", [])]
+        headline = inp["message"]["headline"]
+        body = inp["message"]["body"]
+        self.write(full, ("commit", branch, expected, paths, headline, body))
+        return {"data": {"createCommitOnBranch": {"commit": {"oid": "c" * 40}}}}
+
     def graphql(self, header: str, query: str, variables: dict) -> dict:
         full, rights = self.repo_of(header)
-        if "mergePullRequest" in query or "enablePullRequestAutoMerge" in query:
+        if (
+            "mergePullRequest" in query
+            or "enablePullRequestAutoMerge" in query
+            or "createCommitOnBranch" in query
+        ):
             assert rights == WRITE, rights
         if "mergePullRequest" in query:
             self.write(full, ("merge", variables["id"], variables["oid"], variables["method"]))
@@ -207,6 +284,8 @@ class Forge:
             self.write(full, ("arm", variables["id"], variables["oid"], variables["method"]))
             armed = {"autoMergeRequest": {"enabledAt": NOW.isoformat()}}
             return {"data": {"enablePullRequestAutoMerge": {"pullRequest": armed}}}
+        if "createCommitOnBranch" in query:
+            return self._handle_commit_mutation(full, variables)
         owner, name = full.split("/")
         assert variables == {"owner": owner, "name": name}, variables
         reads = self.reads[full]
@@ -275,13 +354,91 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(401, {"message": f"A JSON web token could not be decoded: {refusal}"})
         return bool(refusal)
 
-    def do_GET(self) -> None:
-        path = urlsplit(self.path).path
+    def _get_contents(self, path: str) -> None:
+        full_repo, _, file_path = path.removeprefix("/repos/").partition("/contents/")
+        query = parse_qs(urlsplit(self.path).query)
+        ref = query.get("ref", [""])[0]
+        target = self.server.forge.contents.get((full_repo, file_path, ref))
+        if target is not None:
+            code, body = target
+            self.answer(code, body)
+        else:
+            self.answer(404, {"message": "Not Found"})
+
+    def _get_artifacts(self, path: str) -> None:
+        full_repo = path.removeprefix("/repos/").removesuffix("/actions/artifacts")
+        query = parse_qs(urlsplit(self.path).query)
+        name = query.get("name", [""])[0]
+        arts = self.server.forge.artifacts.get((full_repo, name), [])
+        host = self.headers.get("Host", "127.0.0.1")
+        arts_copy = []
+        for art in arts:
+            item = dict(art)
+            item["archive_download_url"] = (
+                f"http://{host}/repos/{full_repo}/actions/artifacts/{art['id']}/zip"
+            )
+            arts_copy.append(item)
+        self.answer(200, {"total_count": len(arts_copy), "artifacts": arts_copy})
+
+    def _get_artifact_zip(self, path: str) -> None:
+        _, _, tail = path.removeprefix("/repos/").partition("/actions/artifacts/")
+        art_id = int(tail.removesuffix("/zip"))
+        self.server.forge.repo_of(self.headers["Authorization"])
+        loc = self.server.forge.artifact_redirect_locations.get(art_id, f"/storage/{art_id}")
+        self.send_response(302)
+        if loc is not None:
+            self.send_header("Location", loc)
+        self.end_headers()
+
+    def _get_storage(self, path: str) -> None:
+        if self.headers.get("Authorization"):
+            self.server.forge.storage_auth_seen.append(self.headers["Authorization"])
+            self.answer(400, {"message": "storage URL refuses Authorization header"})
+            return
+        art_id = int(path.removeprefix("/storage/"))
+        data = self.server.forge.storage.get(art_id)
+        if data is None:
+            self.answer(404, {"message": "Not Found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _dispatch_app(self, path: str) -> bool:
+        if path == "/app":
+            if not self.app_call():
+                self.answer(200, {"slug": "merge-train-app"})
+            return True
+        if path.startswith("/users/"):
+            if self.headers.get("Authorization"):
+                self.server.forge.users_auth_seen.append(self.headers["Authorization"])
+                self.answer(401, {"message": "Users endpoint does not accept Authorization header"})
+                return True
+            self.answer(200, {"id": 123456, "login": path.removeprefix("/users/")})
+            return True
         if path == "/app/installations":
             if not self.app_call():
                 self.answer(200, self.server.forge.installation_list())
-        elif path == "/installation/repositories":
+            return True
+        if path == "/installation/repositories":
             self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
+            return True
+        return False
+
+    def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if self._dispatch_app(path):
+            return
+        if "/contents/" in path and path.startswith("/repos/"):
+            self._get_contents(path)
+        elif path.startswith("/repos/") and path.endswith("/actions/artifacts"):
+            self._get_artifacts(path)
+        elif "/actions/artifacts/" in path and path.endswith("/zip"):
+            self._get_artifact_zip(path)
+        elif path.startswith("/storage/"):
+            self._get_storage(path)
         else:
             raise AssertionError(self.path)
 
@@ -953,3 +1110,722 @@ def test_release_token_rights_are_within_the_app():
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))["default_permissions"]
     for key, value in TOKEN_RIGHTS.items():
         assert manifest[key.removeprefix("permission-").replace("-", "_")] == value
+
+
+def _write_manifest_files(zf, files, corrupt_sha, extra_members=None):
+    if isinstance(files, dict):
+        manifest_files = []
+        for path, data in files.items():
+            digest = "0" * 64 if corrupt_sha else hashlib.sha256(data).hexdigest()
+            manifest_files.append({"path": path, "sha256": digest, "bytes": len(data)})
+            zf.writestr(f"files/{path}", data)
+        return manifest_files
+    extra = extra_members or {}
+    written = set()
+    for entry in files:
+        if not (isinstance(entry, dict) and isinstance(entry.get("path"), str)):
+            continue
+        p = entry["path"]
+        if p in written or f"files/{p}" in extra:
+            continue
+        written.add(p)
+        zf.writestr(f"files/{p}", b"x" * entry.get("bytes", 8))
+    return files
+
+
+def make_artifact_zip(
+    head: str,
+    files: dict[str, bytes] | list,
+    schema: str = "horistes.generated-files.v1",
+    manifest_head: str | None = None,
+    extra_members: dict[str, bytes] | None = None,
+    corrupt_sha: bool = False,
+    duplicate_member: str | None = None,
+) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        manifest_files = _write_manifest_files(zf, files, corrupt_sha, extra_members)
+        manifest = {
+            "schema": schema,
+            "head": manifest_head or head,
+            "files": manifest_files,
+            "commands": [["cargo", "build"]],
+        }
+        zf.writestr("manifest.json", json.dumps(manifest))
+        if extra_members:
+            for member_name, member_data in extra_members.items():
+                zf.writestr(member_name, member_data)
+        if duplicate_member:
+            with pytest.warns(UserWarning, match="Duplicate name"):
+                zf.writestr(duplicate_member, b"duplicate-content")
+    return buf.getvalue()
+
+
+def make_oversize_member_zip(
+    head: str, path: str = "notices.txt", declared_size: int = 17 * 1024 * 1024
+) -> bytes:
+    import struct
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "schema": "horistes.generated-files.v1",
+                    "head": head,
+                    "files": [
+                        {
+                            "path": path,
+                            "sha256": hashlib.sha256(b"short").hexdigest(),
+                            "bytes": 5,
+                        }
+                    ],
+                    "commands": [],
+                }
+            ),
+        )
+        zf.writestr(f"files/{path}", b"short")
+    data = bytearray(buf.getvalue())
+    target_name = f"files/{path}".encode()
+    # Central directory headers; the archive is a few hundred bytes, read once.
+    for header in re.finditer(re.escape(b"PK\x01\x02"), bytes(data)):
+        pos = header.start()
+        fname_len = struct.unpack("<H", data[pos + 28 : pos + 30])[0]
+        fname = data[pos + 46 : pos + 46 + fname_len]
+        if fname == target_name:
+            struct.pack_into("<I", data, pos + 24, declared_size)
+    return bytes(data)
+
+
+def test_dependency_pull_with_valid_artifact_commits_generated_files(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt", "wasm/module.wasm"])
+    zip_bytes = make_artifact_zip(
+        head, {"notices.txt": b"licenses", "wasm/module.wasm": b"\x00asm\x01\x00\x00\x00"}
+    )
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+        workflow_run_id=456,
+        html_url="https://github.com/fleet/app/actions/runs/456",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(forge.writes) == 1
+    kind, branch, exp_head, paths, headline, body = forge.writes[0]
+    assert kind == "commit"
+    assert branch == "renovate/demo-dep"
+    assert exp_head == head
+    assert paths == ["notices.txt", "wasm/module.wasm"]
+    assert headline == "chore(deps): regenerate generated files"
+    assert (
+        "Regenerated by the dependency update's own workflow run "
+        "https://github.com/fleet/app/actions/runs/456" in body
+    )
+    assert body.endswith(
+        "Signed-off-by: merge-train-app[bot] <123456+merge-train-app[bot]@users.noreply.github.com>"
+    )
+    assert not any(w[0] == "merge" for w in forge.writes)
+    assert "### fleet/app: committed generated files to #1" in summary
+    assert "| #1 | BEHIND | generated files committed |" in summary
+    assert "| fleet | 1 | 0 | 1 | 0 |" in summary
+
+
+def test_negative_no_allowlist_file(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+
+
+def test_negative_path_not_in_allowlist(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["allowed.txt"])
+    zip_bytes = make_artifact_zip(head, {"allowed.txt": b"ok", "secret.env": b"TOKEN=1"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "path 'secret.env' not allowed" in summary
+
+
+def test_negative_manifest_head_mismatch(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    bad_head = f"{2:040x}"
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"}, manifest_head=bad_head)
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "manifest head" in summary
+
+
+def test_negative_artifact_from_another_head_branch(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/other-dep",
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+
+
+def test_negative_sha256_mismatch(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"}, corrupt_sha=True)
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "sha256 mismatch" in summary
+
+
+def test_negative_extra_zip_member(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(
+        head, {"notices.txt": b"licenses"}, extra_members={"extra.txt": b"surprise"}
+    )
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "unexpected members" in summary
+
+
+def test_negative_path_with_parent_traversal(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["../evil.txt"])
+    zip_bytes = make_artifact_zip(head, {"../evil.txt": b"surprise"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "not allowed" in summary
+
+
+def test_negative_artifact_size_above_bound(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    large_zip = b"x" * (16 * 1024 * 1024 + 1)
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        large_zip,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "artifact exceeds" in summary
+
+
+def test_negative_switch_off(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, _ = train(tmp_path, forge, switch="off")
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+
+
+def test_negative_non_dependency_branch(tmp_path):
+    head = f"{1:040x}"
+    pull_req = pull(1, "BEHIND", headRefName="feat/demo-feature")
+    forge = Forge(repository(pull_req))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="feat/demo-feature",
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+
+
+def test_negative_held_label(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep", labels=["hold"])
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+
+
+def test_negative_content_already_equal(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    content = b"already current content"
+    forge.set_head_content("fleet/app", "notices.txt", head, content)
+    zip_bytes = make_artifact_zip(head, {"notices.txt": content})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "| #1 | BLOCKED | merge state BLOCKED |" in summary
+
+
+def test_without_the_allowlist_check_the_unallowed_path_would_be_committed(tmp_path):
+    mutant = script().replace("or p not in allowlist", "or False")
+    assert mutant != script()
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["allowed.txt"])
+    zip_bytes = make_artifact_zip(head, {"planted.txt": b"unallowed content"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, _ = train(tmp_path, forge, mutant)
+    assert done.returncode == 0
+    assert len(forge.writes) == 1
+    assert forge.writes[0][0] == "commit"
+    assert forge.writes[0][3] == ["planted.txt"]
+
+
+def test_rights_token_carries_actions_read_and_storage_url_never_receives_authorization(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"content"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0
+    repo_token_mint = [m for m in forge.minted if m[1].get("repositories") == ["app"]]
+    assert len(repo_token_mint) == 1
+    assert repo_token_mint[0][1]["permissions"]["actions"] == "read"
+    assert len(forge.storage_auth_seen) == 0
+
+
+def test_bot_identity_users_endpoint_refuses_authorization(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert len(forge.users_auth_seen) == 0
+
+
+def test_without_bot_identity_unauthenticated_users_call_fails(tmp_path):
+    mutant = script().replace(
+        'call(f"{env[\'GITHUB_API_URL\']}/users/{login}", None, "GET")',
+        'call(f"{env[\'GITHUB_API_URL\']}/users/{login}", jwt, "GET")',
+    )
+    assert mutant != script()
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, mutant)
+    assert done.returncode == 1
+    assert len(forge.users_auth_seen) > 0
+
+
+def test_negative_artifact_storage_scheme_mismatch(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"content"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    forge.artifact_redirect_locations[101] = "ftp://storage.example.com/evil.zip"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "storage URL scheme 'ftp' != 'http'" in summary
+
+
+def test_negative_artifact_storage_location_empty(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"content"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    forge.artifact_redirect_locations[101] = ""
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "expected 302 redirect to storage URL" in summary
+
+
+def test_negative_zip_oversize_declared_file_size(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_oversize_member_zip(head, "notices.txt", 17 * 1024 * 1024)
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "exceeds 16777216 bytes" in summary
+
+
+def test_negative_zip_duplicate_member_names(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(
+        head, {"notices.txt": b"content"}, duplicate_member="files/notices.txt"
+    )
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "duplicate zip member names" in summary
+
+
+def test_positive_zip_directory_entry_accepted(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"content"}, extra_members={"files/": b""})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert len(forge.writes) == 1
+    assert forge.writes[0][0] == "commit"
+    assert forge.writes[0][3] == ["notices.txt"]
+    assert "generated files committed" in summary
+
+
+def test_negative_zip_directory_entry_nonzero_size_refused(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(
+        head, {"notices.txt": b"content"}, extra_members={"files/": b"has-size"}
+    )
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "directory entry 'files/' has size > 0" in summary
+
+
+def test_negative_manifest_non_dict_file_entry(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, ["not_a_dict"])
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "manifest files entry is not a dict" in summary
+
+
+def test_negative_manifest_duplicate_path(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    digest = hashlib.sha256(b"content").hexdigest()
+    entries = [
+        {"path": "notices.txt", "bytes": 7, "sha256": digest},
+        {"path": "notices.txt", "bytes": 7, "sha256": digest},
+    ]
+    zip_bytes = make_artifact_zip(head, entries, extra_members={"files/notices.txt": b"content"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "duplicate path 'notices.txt' in manifest files" in summary
+
+
+def test_first_candidate_bad_second_good_commits_second(tmp_path):
+    head1 = f"{1:040x}"
+    head2 = f"{2:040x}"
+    p1 = pull(1, "BEHIND", headRefName="renovate/demo-1", headRefOid=head1)
+    p2 = pull(2, "BEHIND", headRefName="renovate/demo-2", headRefOid=head2)
+    forge = Forge(repository(p1, p2))
+    forge.set_allowlist("fleet/app", "main", ["allowed.txt"])
+    zip1 = make_artifact_zip(head1, {"forbidden.txt": b"bad"})
+    zip2 = make_artifact_zip(head2, {"allowed.txt": b"good"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    forge.add_artifact(
+        "fleet/app",
+        102,
+        f"regenerated-{head2}",
+        zip2,
+        head_sha=head2,
+        head_branch="renovate/demo-2",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert len(forge.writes) == 1
+    assert forge.writes[0][0] == "commit"
+    assert forge.writes[0][1] == "renovate/demo-2"
+    assert (
+        "| #1 | BEHIND | generated files refused: fleet/app #1: path 'forbidden.txt' not allowed |"
+        in summary
+    )
+    assert "| #2 | BEHIND | generated files committed |" in summary
+    assert "### fleet/app: committed generated files to #2" in summary
+
+
+def test_refused_artifact_falls_through_to_land_clean_pull(tmp_path):
+    head1 = f"{1:040x}"
+    p1 = pull(1, "BEHIND", headRefName="renovate/demo-1", headRefOid=head1)
+    p2 = pull(2, "CLEAN", headRefName="feat/other-change")
+    forge = Forge(repository(p1, p2))
+    forge.set_allowlist("fleet/app", "main", ["allowed.txt"])
+    zip1 = make_artifact_zip(head1, {"forbidden.txt": b"bad"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert forge.writes == [landed(2)]
+    assert (
+        "| #1 | BEHIND | generated files refused: fleet/app #1: path 'forbidden.txt' not allowed |"
+        in summary
+    )
+    assert "| #2 | CLEAN | landed |" in summary
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_commit_mutation_refusal_fails_repository_run(tmp_path):
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.refuse_commit = True
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1
+    assert "createCommitOnBranch refused" in done.stdout
+
+
+def test_regenerate_excludes_person_branch(tmp_path):
+    head = f"{1:040x}"
+    rel_pull = pull(1, "BEHIND", headRefName="release-please--branches--main")
+    forge = Forge(repository(rel_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="release-please--branches--main",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "a person lands it" in summary
