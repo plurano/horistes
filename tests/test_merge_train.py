@@ -857,6 +857,17 @@ def test_sweep_runs_the_train_in_every_repository_of_the_app(tmp_path):
     assert "### other/b:" in summary
 
 
+def test_empty_repository_does_not_stop_the_sweep(tmp_path):
+    empty = repository()
+    empty["defaultBranchRef"] = None
+    forge = Forge(empty)
+    forge.install(9, "other", b=[repository(pull(2, "CLEAN"))])
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.where == [("other/b", landed(2))]
+    assert "### other/b: landed #2" in summary
+
+
 def test_sweep_mints_one_token_per_repository_and_revokes_each(tmp_path):
     forge = sweep_forge()
     done, _ = train(tmp_path, forge)

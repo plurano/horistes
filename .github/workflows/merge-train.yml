@@ -732,6 +732,9 @@ jobs:
 
           def regenerate(env, conf, repo, rows, notes):
               """Commit regenerated files for the oldest candidate dependency update, or None."""
+              if repo["defaultBranchRef"] is None:
+                  # An empty repository has no default branch and no pull requests.
+                  return None
               default_branch = repo["defaultBranchRef"]["name"]
               candidates = [
                   pull for pull, reason in rows if is_candidate(pull, reason, default_branch, conf)
