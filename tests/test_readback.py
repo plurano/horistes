@@ -14,6 +14,7 @@ import hashlib
 import json
 import sys
 import tomllib
+from pathlib import Path
 
 import pytest
 from conftest import ROOT
@@ -42,6 +43,7 @@ IMAGES = f'images = ["{NAME}:{{version}}"]\n'
 BLOBS = f'\n[blobs]\nchecksums = "{SUMS}"\nsignature = "{BUNDLE}"\n'
 PARAMS = HEAD + OTHERS + IMAGES + BLOBS
 ACCEPTED, REFUSED = 15, 43
+LOCAL_ACCEPTED, LOCAL_REFUSED = 15, 43
 VERIFIER_CONTROLS = 41
 
 
@@ -211,17 +213,32 @@ def read(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("COSIGN", raising=False)
     monkeypatch.delenv("GIT", raising=False)
 
-    def run(world, params: str = PARAMS, tag: str = TAG, command: str = "verify"):
+    def run(
+        world,
+        params: str = PARAMS,
+        tag: str = TAG,
+        command: str = "verify",
+        local: Path | None = None,
+    ):
         file = tmp_path / "release.toml"
         file.write_text(params, encoding="utf-8")
         words = [command, "--params", str(file)]
         if command == "verify":
             words += ["--tag", tag, "--work", str(tmp_path / "work")]
+        if local is not None:
+            words += ["--local", str(local)]
         code = readback.main(words, world)
         taken = capsys.readouterr()
         return code, taken.out, taken.err
 
     return run
+
+
+def populate(folder: Path, world: World) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, data in world.assets.items():
+        (folder / name).write_bytes(data)
+    return folder
 
 
 def failed(out: str) -> list[str]:
@@ -247,6 +264,36 @@ def test_api_is_asked_once_for_the_assets_and_once_for_the_attestations(read):
     assert asked == [
         RELEASE,
         f"{readback.API}/repos/{REPOSITORY}/attestations/sha256:{sha(b'archive')}",
+    ]
+
+
+def test_local_folder_holding_blob_assets_passes_with_every_control_refused(read, tmp_path):
+    world = World()
+    folder = populate(tmp_path / "local-assets", world)
+    code, out, err = read(world, local=folder)
+    assert code == 0, out + err
+    assert out.count("PASS accept") == LOCAL_ACCEPTED
+    assert out.count("PASS refuse") == LOCAL_REFUSED
+    assert out.endswith(
+        f"PASS: {LOCAL_ACCEPTED + LOCAL_REFUSED} line(s), "
+        "every check accepted, every control refused\n"
+    )
+    assert (
+        f"NOTE read-back of {REPOSITORY} {TAG} at commit {COMMIT}, "
+        f"no credentials, files from local folder {folder}"
+    ) in out
+
+
+def test_local_mode_makes_no_get_to_release_or_download_and_asks_attestations_once(read, tmp_path):
+    world = World()
+    folder = populate(tmp_path / "local-assets", world)
+    read(world, local=folder)
+    asked = [call[1] for call in world.calls if call[0] == "GET"]
+    assert RELEASE not in asked
+    assert not any(url.startswith(DOWNLOAD) for url in asked)
+    attestations = [url for url in asked if "/attestations/" in url]
+    assert attestations == [
+        f"{readback.API}/repos/{REPOSITORY}/attestations/sha256:{sha(b'archive')}"
     ]
 
 
@@ -457,6 +504,30 @@ def test_planted_defect_fails_and_is_named(read, plant, line):
     assert out.splitlines()[-1].startswith(f"FAIL: {len(failed(out))} of ")
 
 
+# In local mode, forge_records_another_digest is skipped because local files
+# have no recorded digest on the forge prior to the draft release.
+LOCAL_PLANTED = [
+    (plant, line)
+    for plant, line in PLANTED
+    if plant is not forge_records_another_digest and not plant.__name__.startswith("image_")
+]
+
+
+@pytest.mark.parametrize(
+    ("plant", "line"),
+    LOCAL_PLANTED,
+    ids=[f"local-{p.__name__}-{n}" for n, (p, _) in enumerate(LOCAL_PLANTED)],
+)
+def test_local_planted_defect_fails_and_is_named(read, tmp_path, plant, line):
+    world = World()
+    plant(world)
+    folder = populate(tmp_path / "local-assets", world)
+    code, out, err = read(world, local=folder)
+    assert code == 1, out + err
+    assert line in out
+    assert out.splitlines()[-1].startswith(f"FAIL: {len(failed(out))} of ")
+
+
 def test_one_file_without_provenance_fails_that_file_alone(read):
     world = World()
     attestation_leaves_a_file_out(world)
@@ -610,6 +681,81 @@ def test_work_folder_that_exists_is_exit_three(read, tmp_path):
     code, _, err = read(World())
     assert code == 3
     assert "it must not exist yet" in err
+
+
+def test_local_folder_holding_symlink_is_exit_three(read, tmp_path):
+    world = World()
+    folder = populate(tmp_path / "local-assets", world)
+    (folder / "symlink-file.txt").symlink_to(folder / ARCHIVE)
+    code, out, err = read(world, local=folder)
+    assert code == 3
+    assert "is a symlink" in err
+    assert "PASS:" not in out
+    assert "FAIL:" not in out
+
+
+def test_local_folder_holding_subdirectory_is_exit_three(read, tmp_path):
+    world = World()
+    folder = populate(tmp_path / "local-assets", world)
+    (folder / "sub").mkdir()
+    code, out, err = read(world, local=folder)
+    assert code == 3
+    assert "is a directory" in err
+    assert "PASS:" not in out
+    assert "FAIL:" not in out
+
+
+def test_local_folder_holding_bad_name_is_exit_three(read, tmp_path):
+    world = World()
+    folder = populate(tmp_path / "local-assets", world)
+    (folder / ".hidden").write_bytes(b"bad")
+    code, out, err = read(world, local=folder)
+    assert code == 3
+    assert "is not a plain file name" in err
+    assert "PASS:" not in out
+    assert "FAIL:" not in out
+
+
+def test_local_folder_missing_is_exit_three(read, tmp_path):
+    world = World()
+    missing = tmp_path / "missing-folder"
+    code, out, err = read(world, local=missing)
+    assert code == 3
+    assert "not a directory" in err
+    assert "PASS:" not in out
+    assert "FAIL:" not in out
+
+
+def test_local_flag_with_check_is_exit_three(read, tmp_path):
+    world = World()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    code, out, err = read(world, command="check", local=folder)
+    assert code == 3
+    assert "--local is only valid with verify" in err
+    assert world.calls == []
+
+
+def test_local_folder_empty_fails_missing_checksums(read, tmp_path):
+    world = World()
+    empty = tmp_path / "empty-folder"
+    empty.mkdir()
+    code, out, err = read(world, local=empty)
+    assert code == 1, out + err
+    assert f"FAIL accept  {SUMS} (the checksums) is on the release" in out
+
+
+def test_local_folder_with_more_than_max_assets_is_exit_three(read, tmp_path):
+    world = World()
+    folder = tmp_path / "many-assets"
+    folder.mkdir()
+    for index in range(readback.MAX_ASSETS + 1):
+        (folder / f"asset-{index}.txt").write_bytes(b"data")
+    code, out, err = read(world, local=folder)
+    assert code == 3
+    assert f"holds more than {readback.MAX_ASSETS} assets" in err
+    assert "PASS:" not in out
+    assert "FAIL:" not in out
 
 
 MANY = json.dumps([f"r.test/a{number}:1" for number in range(21)])
