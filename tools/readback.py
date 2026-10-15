@@ -4,11 +4,19 @@
 
     readback.py check --params FILE
     readback.py verify --params FILE --tag TAG [--work DIR]
+    readback.py verify --params FILE --tag TAG --local DIR [--work DIR]
 
 No request and no command of a run carries credentials (tools/stranger.py).
 The commit of the tag is asked from the forge with `git ls-remote`; every
 signature and every provenance attestation must then come from the signer
 workflow of the repository, run on that tag at that commit.
+
+With `--local DIR` the assets are the files directly in DIR instead of the
+assets of a published release, so a release workflow reads its build files
+back before the draft exists (ADR-0033). A link, a subdirectory or a name that
+is not plain stops the run. Nothing else changes: the tag must be pushed and
+the files attested, and every check and control runs as for a published
+release.
 
 The parameter file is the only thing a repository writes:
 
@@ -337,26 +345,101 @@ def _commit(world, repository: str, tag: str) -> str:
     return commit
 
 
-def _assets(world, params: Params, tag: str, work: Path) -> dict[str, str | None]:
-    """The assets of the release as the forge lists them: name to recorded SHA-256 or None."""
-    url = f"{API}/repos/{params.repository}/releases/tags/{tag}"
-    path = work / "release.json"
-    try:
-        world.fetch(url, path, API_ACCEPT, SMALL)
-    except stranger.FetchError as err:
-        raise ReadError(str(err)) from err
-    answer = _json(path, url)
-    listed = answer.get("assets") if isinstance(answer, dict) else None
-    if not isinstance(listed, list) or len(listed) > MAX_ASSETS:
-        raise ReadError(f"{url}: no list of at most {MAX_ASSETS} assets")
-    assets: dict[str, str | None] = {}
-    for entry in listed:
-        name = entry.get("name") if isinstance(entry, dict) else None
-        if not isinstance(name, str) or not PLAIN.fullmatch(name):
-            raise ReadError(f"{url}: asset name {name!r} is not a plain file name")
-        recorded = entry.get("digest")
-        assets[name] = recorded.removeprefix("sha256:") if isinstance(recorded, str) else None
-    return assets
+class Published:
+    """Assets downloaded from a published release on the forge."""
+
+    def __init__(self, world, repository: str, tag: str) -> None:
+        self.world = world
+        self.repository = repository
+        self.tag = tag
+        self.base = f"{FORGE}/{repository}/releases/download/{tag}"
+
+    def note(self, commit: str) -> str:
+        return f"read-back of {self.repository} {self.tag} at commit {commit}, no credentials"
+
+    def assets(self, work: Path) -> dict[str, str | None]:
+        url = f"{API}/repos/{self.repository}/releases/tags/{self.tag}"
+        path = work / "release.json"
+        try:
+            self.world.fetch(url, path, API_ACCEPT, SMALL)
+        except stranger.FetchError as err:
+            raise ReadError(str(err)) from err
+        answer = _json(path, url)
+        listed = answer.get("assets") if isinstance(answer, dict) else None
+        if not isinstance(listed, list) or len(listed) > MAX_ASSETS:
+            raise ReadError(f"{url}: no list of at most {MAX_ASSETS} assets")
+        assets: dict[str, str | None] = {}
+        for entry in listed:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not PLAIN.fullmatch(name):
+                raise ReadError(f"{url}: asset name {name!r} is not a plain file name")
+            recorded = entry.get("digest")
+            assets[name] = recorded.removeprefix("sha256:") if isinstance(recorded, str) else None
+        return assets
+
+    def fetch(self, name: str, target: Path) -> str:
+        return self.world.fetch(f"{self.base}/{name}", target)
+
+
+class Local:
+    """Assets read from a local folder before a release exists."""
+
+    def __init__(self, folder: Path, repository: str, tag: str) -> None:
+        self.folder = folder
+        self.repository = repository
+        self.tag = tag
+
+    def note(self, commit: str) -> str:
+        return (
+            f"read-back of {self.repository} {self.tag} at commit {commit}, "
+            f"no credentials, files from local folder {self.folder}"
+        )
+
+    def _entries(self) -> list[os.DirEntry]:
+        if not self.folder.is_dir():
+            raise ReadError(f"--local {self.folder}: not a directory")
+        entries = []
+        try:
+            with os.scandir(self.folder) as iterator:
+                for _ in range(MAX_ASSETS + 2):
+                    try:
+                        entry = next(iterator)
+                    except StopIteration:
+                        break
+                    entries.append(entry)
+        except OSError as err:
+            raise ReadError(f"--local {self.folder}: {err}") from err
+        if len(entries) > MAX_ASSETS:
+            raise ReadError(f"--local {self.folder}: holds more than {MAX_ASSETS} assets")
+        return entries
+
+    def assets(self, _work: Path) -> dict[str, str | None]:
+        found: dict[str, str | None] = {}
+        for entry in self._entries()[: MAX_ASSETS + 1]:
+            if entry.is_symlink():
+                raise ReadError(f"--local {self.folder}: entry {entry.name!r} is a symlink")
+            if entry.is_dir():
+                raise ReadError(f"--local {self.folder}: entry {entry.name!r} is a directory")
+            if not entry.is_file():
+                raise ReadError(
+                    f"--local {self.folder}: entry {entry.name!r} is not a regular file"
+                )
+            if not PLAIN.fullmatch(entry.name):
+                raise ReadError(
+                    f"--local {self.folder}: asset name {entry.name!r} is not a plain file name"
+                )
+            found[entry.name] = None
+        return found
+
+    def fetch(self, name: str, target: Path) -> str:
+        path = self.folder / name
+        if not path.is_file() or path.is_symlink():
+            raise stranger.FetchError(f"{path}: no such file", 404)
+        try:
+            shutil.copyfile(path, target)
+        except OSError as err:
+            raise stranger.FetchError(str(err)) from err
+        return stranger.digest(target)
 
 
 def _name_set(report: Report, assets: dict, expected: dict[str, str]) -> None:
@@ -369,12 +452,14 @@ def _name_set(report: Report, assets: dict, expected: dict[str, str]) -> None:
         report.accept(f"the release holds exactly the {len(expected)} expected asset(s)", True)
 
 
-def _download(report: Report, world, base: str, names: list[str], folder: Path, assets: dict):
+def _download(
+    report: Report, source: Published | Local, names: list[str], folder: Path, assets: dict
+):
     """Save the named assets; the names that came and equal the forge's recorded digest."""
     got = []
     for name in names:
         try:
-            found = world.fetch(f"{base}/{name}", folder / name)
+            found = source.fetch(name, folder / name)
         except stranger.FetchError as err:
             report.accept(f"download {name}", False, str(err))
             continue
@@ -540,17 +625,26 @@ def _provenance(report: Report, world, params: Params, claim: Claim, folder: Pat
         report.refuse(f"provenance of {first}, control: {what}", code, _tail(err))
 
 
-def _blobs(report: Report, world, params: Params, tag: str, claim: Claim, assets, work, others):
+def _blobs(
+    report: Report,
+    world,
+    params: Params,
+    tag: str,
+    claim: Claim,
+    assets: dict,
+    work: Path,
+    others,
+    source: Published | Local,
+) -> None:
     blobs, folder = params.blobs, work / "assets"
     folder.mkdir()
-    base = f"{FORGE}/{params.repository}/releases/download/{tag}"
     try:
-        world.fetch(f"{base}/{ABSENT}", work / ABSENT)
+        source.fetch(ABSENT, work / ABSENT)
         report.refuse("download, control: an asset that does not exist", 0)
     except stranger.FetchError as err:
         report.refuse("download, control: an asset that does not exist", err.status, str(err))
     head = [name for name in (blobs.checksums, blobs.signature) if name in assets]
-    head = _download(report, world, base, head, folder, assets)
+    head = _download(report, source, head, folder, assets)
     listed = _listed(report, folder / blobs.checksums) if blobs.checksums in head else None
     expected = dict.fromkeys(listed or {}, "listed in the checksums")
     expected |= {blobs.checksums: "the checksums", blobs.signature: "the signature"}
@@ -561,9 +655,7 @@ def _blobs(report: Report, world, params: Params, tag: str, claim: Claim, assets
     _name_set(report, assets, expected)
     if listed is None:
         return
-    got = _download(
-        report, world, base, [name for name in listed if name in assets], folder, assets
-    )
+    got = _download(report, source, [name for name in listed if name in assets], folder, assets)
     _digests(report, listed, got, folder)
     if blobs.signature in head:
         _signature(report, world, params, claim, folder, got, others)
@@ -630,7 +722,14 @@ def _image(report: Report, world, claim: Claim, reference: str, others) -> None:
     _prove(report, world, label, attested, claim, others, lambda out: _attested(out, digest))
 
 
-def verify(params: Params, tag: str, work: Path, world, report: Report) -> None:
+def verify(
+    params: Params,
+    tag: str,
+    work: Path,
+    world,
+    report: Report,
+    local: Path | None = None,
+) -> None:
     """Read one release back; the lines go to the report."""
     code, out, err = world.run([*_cosign(), "version"])
     if code != 0:
@@ -640,11 +739,16 @@ def verify(params: Params, tag: str, work: Path, world, report: Report) -> None:
     ref = f"refs/tags/{tag}"
     claim = Claim(_identity(params.repository, params.signer, ref), params.repository, ref, commit)
     others = controls(params, claim)
-    report.note(f"read-back of {params.repository} {tag} at commit {commit}, no credentials")
+    source = (
+        Local(local, params.repository, tag)
+        if local is not None
+        else Published(world, params.repository, tag)
+    )
+    report.note(source.note(commit))
     report.note(f"signer {claim.identity}; cosign {' '.join(version) or 'of unknown version'}")
-    assets = _assets(world, params, tag, work)
+    assets = source.assets(work)
     if params.blobs:
-        _blobs(report, world, params, tag, claim, assets, work, others)
+        _blobs(report, world, params, tag, claim, assets, work, others, source)
     else:
         expected = {_fill(name, tag): "declared unverified" for name in params.unverified}
         _name_set(report, assets, expected)
@@ -671,6 +775,7 @@ def main(arguments: list[str] | None = None, world=None) -> int:
     parser.add_argument("--params", type=Path, required=True)
     parser.add_argument("--tag", default="")
     parser.add_argument("--work", type=Path)
+    parser.add_argument("--local", type=Path)
     args = parser.parse_args(arguments)
     try:
         params = load(args.params)
@@ -678,6 +783,9 @@ def main(arguments: list[str] | None = None, world=None) -> int:
         sys.stderr.write(f"ERROR: {args.params}: {err}\n")
         return 3
     if args.command == "check":
+        if args.local is not None:
+            sys.stderr.write("ERROR: --local is only valid with verify\n")
+            return 3
         sys.stdout.write(f"PASS: {args.params} names what to verify for {params.repository}\n")
         return 0
     report = Report()
@@ -686,7 +794,9 @@ def main(arguments: list[str] | None = None, world=None) -> int:
             raise ReadError(f"--tag {args.tag!r} is not a plain tag name")
         work = _folder(args.work)
         (work / "home").mkdir()
-        verify(params, args.tag, work, world or stranger.Stranger(work / "home"), report)
+        verify(
+            params, args.tag, work, world or stranger.Stranger(work / "home"), report, args.local
+        )
     except (ReadError, OSError) as err:
         sys.stderr.write(f"ERROR: {err}\n")
         return 3

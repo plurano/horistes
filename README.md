@@ -316,6 +316,14 @@ no token and an empty home folder
 python3 tools/readback.py verify --params release.toml --tag v1.2.3
 ```
 
+Before a release exists on the forge, a release workflow can read its own
+build files back from a local folder before creating the draft release
+([ADR-0033](docs/adr/0033-read-back-of-local-files-before-the-draft.md)):
+
+```sh
+python3 tools/readback.py verify --params release.toml --tag v1.2.3 --local dist/
+```
+
 The tool needs Python 3.12, `git` and `cosign` (read with v2.6.3) and
 nothing else from this repository than `tools/readback.py` and
 `tools/stranger.py`. A repository writes one parameter file and no script:
