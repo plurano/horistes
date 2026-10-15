@@ -131,6 +131,18 @@ jobs:
     outputs:
       releases: ${{ steps.sweep.outputs.releases }}
     steps:
+      # Merge train of every repository the app is installed on.
+      #
+      # In each repository it lands one clean pull request, or updates the next one.
+      #
+      # The app's key signs a short-lived JWT (openssl, the key passed through a pipe
+      # and never written to a file). With it the sweep lists the app's installations,
+      # reads each installation's repositories with a read-only token, and mints for
+      # every repository a token limited to that one repository; the train runs with
+      # it, and the token is revoked at once. A refusal in one repository is recorded
+      # and the sweep goes on with the next.
+      #
+      # Exit codes: 0 done, 1 a forge call failed or was refused, 3 a setting is invalid.
       - name: Land or update one pull request in every repository of the app
         id: sweep
         shell: python
@@ -146,20 +158,6 @@ jobs:
           TRAIN_PERSON_BRANCHES: ${{ inputs.person_branches }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
         run: |
-          """Merge train of every repository the app is installed on.
-
-          In each repository it lands one clean pull request, or updates the next one.
-
-          The app's key signs a short-lived JWT (openssl, the key passed through a pipe
-          and never written to a file). With it the sweep lists the app's installations,
-          reads each installation's repositories with a read-only token, and mints for
-          every repository a token limited to that one repository; the train runs with
-          it, and the token is revoked at once. A refusal in one repository is recorded
-          and the sweep goes on with the next.
-
-          Exit codes: 0 done, 1 a forge call failed or was refused, 3 a setting is invalid.
-          """
-
           import base64
           import hashlib
           import io
@@ -178,6 +176,9 @@ jobs:
           TIMEOUT = 30
           SETTLE_ROUNDS = 3
           SETTLE_SECONDS = 5
+          PULL_PAGES = 4
+          READ_ATTEMPTS = 3
+          READ_BACKOFF_SECONDS = 5
           SWEEP_SECONDS = 1500
           MAX_PAGES = 20
           JWT_SECONDS = 540
@@ -198,14 +199,15 @@ jobs:
           NO_NEW_COMMITS = "There are no new commits on the base branch."
           CONFLICT = "merge conflict between base and head"
           QUERY = """
-          query($owner: String!, $name: String!) {
+          query($owner: String!, $name: String!, $after: String) {
             repository(owner: $owner, name: $name) {
               defaultBranchRef { name }
               autoMergeAllowed
               releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
               releaseManifest: object(expression: "HEAD:.release-please-manifest.json") { oid }
-              pullRequests(states: OPEN, first: 100, orderBy: {field: CREATED_AT, direction: ASC}) {
-                pageInfo { hasNextPage }
+              pullRequests(states: OPEN, first: 25, after: $after,
+                           orderBy: {field: CREATED_AT, direction: ASC}) {
+                pageInfo { hasNextPage endCursor }
                 nodes {
                   number id title isDraft isCrossRepository baseRefName headRefName headRefOid
                   mergeStateStatus
@@ -343,12 +345,37 @@ jobs:
               return answer["data"]
 
 
+          def read_page(env, variables):
+              """One page of the read; a forge gateway error (502, 504) is tried again."""
+              for attempt in range(1, READ_ATTEMPTS + 1):
+                  try:
+                      return graphql(env, QUERY, variables)["repository"]
+                  except RefusedError as err:
+                      if getattr(err.__cause__, "code", 0) not in (502, 504) or attempt == READ_ATTEMPTS:
+                          raise
+                      time.sleep(READ_BACKOFF_SECONDS)
+
+
+          def pull_pages(env):
+              """The oldest open pull requests, at most PULL_PAGES pages."""
+              owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+              variables, pulls, repo = {"owner": owner, "name": name, "after": None}, [], {}
+              for _ in range(PULL_PAGES):
+                  repo = read_page(env, variables)
+                  pulls += repo["pullRequests"]["nodes"]
+                  page = repo["pullRequests"]["pageInfo"]
+                  if not page["hasNextPage"]:
+                      break
+                  variables["after"] = page["endCursor"]
+              repo["pullRequests"]["nodes"] = pulls
+              return repo
+
+
           def fetch(env):
               """The repository and its open pull requests, re-read while a merge state is UNKNOWN."""
-              owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
               repo = {}
               for attempt in range(SETTLE_ROUNDS):
-                  repo = graphql(env, QUERY, {"owner": owner, "name": name})["repository"]
+                  repo = pull_pages(env)
                   pulls = repo["pullRequests"]["nodes"]
                   if all(pull["mergeStateStatus"] != "UNKNOWN" or pull["isDraft"] for pull in pulls):
                       break

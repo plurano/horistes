@@ -8,7 +8,7 @@ step sets. A small HTTP server stands in for the forge: it checks the app's JWT
 against a key made for the test run, lists installations and their
 repositories, mints and revokes tokens, answers the GraphQL and REST calls of
 the train and records every write. Only the wait between two reads of an
-UNKNOWN merge state is shortened.
+UNKNOWN merge state and between read retries are shortened.
 """
 
 from __future__ import annotations
@@ -130,6 +130,10 @@ class Forge:
         self.public = app_key()[1]
         self.installations: list[dict] = []
         self.reads: dict[str, list[dict]] = {}
+        self.active_reads: dict[str, dict] = {}
+        self.read_calls: list[tuple[str, dict]] = []
+        self.read_statuses: dict[str, list[int]] = {}
+        self.mutation_statuses: dict[str, list[int]] = {}
         self.archived: set[str] = set()
         self.tokens: dict[str, tuple] = {}
         self.minted: list[tuple[int, dict]] = []
@@ -286,11 +290,46 @@ class Forge:
             return {"data": {"enablePullRequestAutoMerge": {"pullRequest": armed}}}
         if "createCommitOnBranch" in query:
             return self._handle_commit_mutation(full, variables)
+        return self.pull_page(full, query, variables)
+
+    def pull_page(self, full: str, query: str, variables: dict) -> dict:
         owner, name = full.split("/")
-        assert variables == {"owner": owner, "name": name}, variables
-        reads = self.reads[full]
-        read = reads.pop(0) if len(reads) > 1 else reads[0]
-        return {"data": {"repository": read}}
+        after = variables.get("after")
+        expected = {"owner": owner, "name": name}
+        if "after" in variables:
+            expected["after"] = after
+        assert variables == expected, variables
+        size = int(re.search(r"pullRequests\(states: OPEN, first: (\d+)", query)[1])
+        if after is None:
+            reads = self.reads[full]
+            self.active_reads[full] = reads.pop(0) if len(reads) > 1 else reads[0]
+        read = self.active_reads[full]
+        start = int(after.removeprefix("cursor-")) if after else 0
+        nodes = read["pullRequests"]["nodes"]
+        end = min(start + size, len(nodes))
+        page = {
+            "nodes": nodes[start:end],
+            "pageInfo": {"hasNextPage": end < len(nodes), "endCursor": f"cursor-{end}"},
+        }
+        return {"data": {"repository": {**read, "pullRequests": page}}}
+
+    def graphql_response(self, header: str, query: str, variables: dict) -> tuple[int, dict]:
+        full, _ = self.repo_of(header)
+        if query.lstrip().startswith("mutation"):
+            body = self.graphql(header, query, variables)
+            operation = re.search(r"\b(\w+)\(\s*input:", query)[1]
+            statuses = self.mutation_statuses.get(operation, [])
+        else:
+            self.read_calls.append((full, dict(variables)))
+            size = int(re.search(r"pullRequests\(states: OPEN, first: (\d+)", query)[1])
+            if size > 25:
+                return 502, {"message": "stand-in forge: read page size exceeds 25"}
+            statuses = self.read_statuses.get(full, [])
+            body = None
+        status = statuses.pop(0) if statuses else 200
+        if status != 200:
+            return status, {"message": f"stand-in forge: queued HTTP {status}"}
+        return status, body or self.graphql(header, query, variables)
 
     def write(self, full: str, write: tuple) -> None:
         self.where.append((full, write))
@@ -447,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
             request = self.body()
             header = self.headers["Authorization"]
             self.answer(
-                200, self.server.forge.graphql(header, request["query"], request["variables"])
+                *self.server.forge.graphql_response(header, request["query"], request["variables"])
             )
             return
         prefix, _, tail = self.path.partition("/app/installations/")
@@ -481,6 +520,7 @@ def serve(forge: Forge) -> ThreadingHTTPServer:
 def train(tmp_path: Path, forge: Forge, text: str | None = None, **settings: str):
     """Run the step's script against the stand-in forge; the result and the summary written."""
     source = (text or script()).replace("SETTLE_SECONDS = 5", "SETTLE_SECONDS = 0")
+    source = source.replace("READ_BACKOFF_SECONDS = 5", "READ_BACKOFF_SECONDS = 0")
     path = tmp_path / "train.py"
     path.write_text(source, encoding="utf-8")
     summary = tmp_path / "summary.md"
@@ -549,6 +589,108 @@ def test_clean_pull_request_lands(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(1)]
     assert "### fleet/app: landed #1" in summary
+
+
+def test_clean_pull_request_on_second_page_lands(tmp_path):
+    forge = Forge(repository(*(pull(n, "CLEAN" if n == 30 else "DIRTY") for n in range(1, 31))))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(30)]
+    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25"]
+
+
+@pytest.mark.parametrize("status", [502, 504])
+def test_transient_read_error_is_retried(tmp_path, status):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.read_statuses["fleet/app"] = [status]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert len(forge.read_calls) == 2
+
+
+@pytest.mark.parametrize("status", [502, 504])
+def test_exhausted_read_retries_fail_closed(tmp_path, status):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.read_statuses["fleet/app"] = [status] * 4
+    done, _ = train(tmp_path, forge)
+    assert done.returncode != 0
+    assert f"HTTP {status}" in done.stdout + done.stderr
+    assert forge.writes == []
+    assert [full for full, _ in forge.read_calls] == ["fleet/app"] * 3
+    assert forge.read_statuses["fleet/app"] == [status]
+
+
+def test_read_500_is_not_retried(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.read_statuses["fleet/app"] = [500]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode != 0
+    assert "HTTP 500" in done.stdout + done.stderr
+    assert forge.writes == []
+    assert len(forge.read_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "state, operation, write",
+    [("CLEAN", "mergePullRequest", landed(1)), ("BEHIND", "enablePullRequestAutoMerge", armed(1))],
+)
+def test_mutation_502_is_not_retried(tmp_path, state, operation, write):
+    forge = Forge(repository(pull(1, state)))
+    forge.mutation_statuses[operation] = [502, 502]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode != 0
+    assert "HTTP 502" in done.stdout + done.stderr
+    assert forge.writes == [write]
+    assert forge.mutation_statuses[operation] == [502]
+
+
+@pytest.mark.parametrize(
+    "count, pages, truncated", [(25, 1, False), (100, 4, False), (120, 4, True)]
+)
+def test_pull_pages_stop_at_cap(tmp_path, count, pages, truncated):
+    forge = Forge(
+        repository(*(pull(n, "CLEAN" if n == 101 else "DIRTY") for n in range(1, count + 1)))
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert len(forge.read_calls) == pages
+    assert ("Only the 100 oldest open pull requests were read." in summary) == truncated
+    assert f"| #{min(count, 100)} |" in summary
+    assert "| #101 |" not in summary
+
+
+def test_page_size_100_is_refused_by_forge(tmp_path):
+    source = script()
+    mutant = source.replace("first: 25, after:", "first: 100, after:")
+    assert mutant != source
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, mutant)
+    assert done.returncode != 0
+    assert "HTTP 502" in done.stdout + done.stderr
+    assert "read page size exceeds 25" in done.stdout + done.stderr
+    assert forge.writes == []
+
+
+def test_unknown_state_rereads_all_pull_pages(tmp_path):
+    first = repository(*(pull(n, "UNKNOWN" if n == 30 else "DIRTY") for n in range(1, 31)))
+    second = repository(*(pull(n, "CLEAN" if n == 30 else "DIRTY") for n in range(1, 31)))
+    forge = Forge(first, second)
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(30)]
+    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25"] * 2
+
+
+def test_second_page_read_retry_keeps_cursor_and_earlier_nodes(tmp_path):
+    forge = Forge(repository(*(pull(n, "CLEAN" if n == 30 else "DIRTY") for n in range(1, 31))))
+    forge.read_statuses["fleet/app"] = [200, 502, 200]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(30)]
+    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25", "cursor-25"]
+    assert "| #1 | DIRTY |" in summary
 
 
 def test_planted_red_pull_request_is_not_landed(tmp_path):
