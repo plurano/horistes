@@ -465,7 +465,8 @@ finding is fixed.
 Newer releases are proposed by Renovate (the update bot; the English verb)
 from `renovate.json` and the preset it extends, `default.json`
 ([ADR-0019](docs/adr/0019-update-proposals-from-renovate-configured-here.md),
-[ADR-0020](docs/adr/0020-shared-update-bot-values-as-a-preset.md)).
+[ADR-0020](docs/adr/0020-shared-update-bot-values-as-a-preset.md),
+[ADR-0036](docs/adr/0036-the-update-bot-moves-pinned-release-tools-and-checksums.md)).
 A proposal waits three days after the release, is never merged by the bot and
 has to pass the gate like any other pull request.
 
@@ -474,10 +475,10 @@ has to pass the gate like any other pull request.
 | outside actions | `.github/workflows/` | the commit and the release in the comment behind it |
 | tools of the gate | `requirements/tools.txt` | the compile command in the header of the file, which it reruns |
 | the licence tool's image | `.github/workflows/licence.yml` | the comment `# release X.Y.Z` on the line above `uses:` and the digest in it |
+| actionlint and gitleaks | `.github/workflows/ci.yml` and `Makefile` | the release tag in `*_VERSION`, and the checksum from the release's checksum file into `*_SHA256` |
 
-Not read: the files the Praetor engine writes (`.devcontainer/` among them),
-the machine of a job, and the actionlint and gitleaks versions with their
-checksums in the `Makefile` and the gate workflow.
+Not read: the files the Praetor engine writes (`.devcontainer/` among them)
+and the machine of a job.
 
 `make requirements` recompiles the tool pins by hand with the same command.
 Keep the header and the comment above the image line: `tests/test_update_bot.py`
