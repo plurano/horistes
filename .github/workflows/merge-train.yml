@@ -616,13 +616,14 @@ jobs:
                   notes[pull["number"]] = "conflicts with the default branch"
 
 
-          def bot_identity(env, conf):
-              """Discover the app's bot login and numeric id once per sweep."""
-              jwt = app_jwt(env, conf)
-              app = call(f"{env['GITHUB_API_URL']}/app", jwt, "GET")
-              slug = app["slug"]
-              login = f"{slug}[bot]"
-              user = call(f"{env['GITHUB_API_URL']}/users/{login}", None, "GET")
+          def bot_identity(env, conf, token):
+              """The app's bot login and numeric id; the user lookup carries an installation token.
+
+              Unauthenticated, it would share the runner address's 60 calls an hour.
+              """
+              app = call(f"{env['GITHUB_API_URL']}/app", app_jwt(env, conf), "GET")
+              login = f"{app['slug']}[bot]"
+              user = call(f"{env['GITHUB_API_URL']}/users/{login}", token, "GET")
               return login, str(user["id"])
 
 
@@ -991,10 +992,15 @@ jobs:
               call(f"{env['GITHUB_API_URL']}/installation/token", token, "DELETE")
 
 
-          def repositories(env, conf, installation):
-              """The installation's repositories the train serves, read with a read-only token."""
+          def repositories(env, conf, installation, identity):
+              """The installation's repositories the train serves, read with a read-only token.
+
+              The first call fills identity with the bot login and id, using that token.
+              """
               token = mint(env, conf, installation, LIST_RIGHTS)
               try:
+                  if not identity:
+                      identity["bot_login"], identity["bot_id"] = bot_identity(env, conf, token)
                   listed = pages(env, token, "/installation/repositories", "repositories")
               finally:
                   revoke(env, token)
@@ -1021,16 +1027,14 @@ jobs:
 
           def sweep(env, conf, started):
               """Run the train in every repository; the per-account tally, the sections, the refusals."""
-              bot_login, bot_id = bot_identity(env, conf)
-              conf = {**conf, "bot_login": bot_login, "bot_id": bot_id}
-              accounts, sections, refusals, skipped, releases = {}, [], [], [], []
+              accounts, sections, refusals, skipped, releases, identity = {}, [], [], [], [], {}
               for installation in pages(env, app_jwt(env, conf), "/app/installations"):
                   account = installation["account"]["login"]
                   if installation.get("suspended_at"):
                       accounts[account] = "suspended"
                       continue
                   try:
-                      targets = repositories(env, conf, installation)
+                      targets = repositories(env, conf, installation, identity)
                   except RefusedError as err:
                       refusals.append(f"{account}: {err}")
                       accounts[account] = "refused"
@@ -1044,7 +1048,9 @@ jobs:
                       tally["repositories"] += 1
                       try:
                           now = datetime.now(UTC)
-                          outcome, section, moved, release = one(env, conf, installation, target, now)
+                          outcome, section, moved, release = one(
+                              env, {**conf, **identity}, installation, target, now
+                          )
                       except RefusedError as err:
                           tally["refused"] += 1
                           refusals.append(f"{target['full_name']}: {err}")
