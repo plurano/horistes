@@ -77,7 +77,16 @@ SAMPLE = {
         "Commit": "0123456789abcdef0123456789abcdef01234567",
         "Version": "v1.2.3",
     },
+    "Licence": {
+        "CopyrightText": "2026 Owner <owner@example.org>",
+        "Identifier": "EUPL-1.2",
+    },
 }
+HEADER = (
+    f"# SPDX-FileCopyrightText: {SAMPLE['Licence']['CopyrightText']}\n"
+    + "# SPDX-"
+    + f"License-Identifier: {SAMPLE['Licence']['Identifier']}\n"
+)
 
 
 def _value(name: str, context: dict, where: str) -> str:
@@ -330,6 +339,8 @@ def caller_problems(text: str, root: Path) -> list[str]:
     if not isinstance(job, dict) or "steps" in job:
         return ["the job has steps of its own; a caller only calls"]
     problems = _job_problems(job, doc, root) + _result_problems(jobs, calls[0], doc)
+    if not text.startswith(HEADER):
+        problems.append("the rendered caller does not start with the two SPDX header lines")
     if f"@{SAMPLE['Shared']['Commit']} # {SAMPLE['Shared']['Version']}\n" not in text:
         problems.append("the version field is not written as a comment behind the commit")
     return problems

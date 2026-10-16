@@ -41,7 +41,17 @@ written out, so the called workflow names it.
 
 Concurrency is set here and not in the shared workflow, so a consumer's group
 never collides with another caller's.
+
+Licence header: the rendered caller starts with the consumer's own header,
+written from .Licence (working names, as above), so the consumer's licence
+check accepts it (#3). The REUSE-IgnoreStart and REUSE-IgnoreEnd notes render
+as nothing and keep this repository's licence check from reading the field
+lines as tags.
 */ -%>
+<%- /* REUSE-IgnoreStart */ -%>
+# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-License-Identifier: <% .Licence.Identifier %>
+<%/* REUSE-IgnoreEnd */ -%>
 ---
 # Scorecard: the supply-chain checks of this repository, reported to code
 # scanning. The job is the shared workflow of <% .Shared.Repository %>, named
