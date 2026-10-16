@@ -507,11 +507,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.answer(200, {"slug": "merge-train-app"})
             return True
         if path.startswith("/users/"):
-            if self.headers.get("Authorization"):
-                self.server.forge.users_auth_seen.append(self.headers["Authorization"])
-                self.answer(401, {"message": "Users endpoint does not accept Authorization header"})
-                return True
-            self.answer(200, {"id": 123456, "login": path.removeprefix("/users/")})
+            header = self.headers.get("Authorization", "")
+            self.server.forge.users_auth_seen.append(header)
+            token = header.removeprefix("Bearer ")
+            if not header:
+                # the runner address shares 60 unauthenticated calls an hour with every job on it
+                self.answer(403, {"message": "API rate limit exceeded for 192.0.2.1."})
+            elif token not in self.server.forge.tokens or token in self.server.forge.revoked:
+                self.answer(401, {"message": "Bad credentials"})
+            else:
+                self.answer(200, {"id": 123456, "login": path.removeprefix("/users/")})
             return True
         if path == "/app/installations":
             if not self.app_call():
@@ -1788,23 +1793,24 @@ def test_rights_token_carries_actions_read_and_storage_url_never_receives_author
     assert len(forge.storage_auth_seen) == 0
 
 
-def test_bot_identity_users_endpoint_refuses_authorization(tmp_path):
+def test_bot_identity_lookup_carries_an_installation_token(tmp_path):
     forge = Forge(repository(pull(1, "CLEAN")))
     done, _ = train(tmp_path, forge)
-    assert done.returncode == 0
-    assert len(forge.users_auth_seen) == 0
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.users_auth_seen == ["Bearer list-token-7"]
 
 
-def test_without_bot_identity_unauthenticated_users_call_fails(tmp_path):
+def test_negative_unauthenticated_bot_identity_lookup_is_rate_limited(tmp_path):
     mutant = script().replace(
+        'call(f"{env[\'GITHUB_API_URL\']}/users/{login}", token, "GET")',
         'call(f"{env[\'GITHUB_API_URL\']}/users/{login}", None, "GET")',
-        'call(f"{env[\'GITHUB_API_URL\']}/users/{login}", jwt, "GET")',
     )
     assert mutant != script()
     forge = Forge(repository(pull(1, "CLEAN")))
-    done, _ = train(tmp_path, forge, mutant)
-    assert done.returncode == 1
-    assert len(forge.users_auth_seen) > 0
+    done, summary = train(tmp_path, forge, mutant)
+    assert forge.users_auth_seen == [""]
+    assert "API rate limit exceeded" in summary
+    assert not forge.writes
 
 
 def test_negative_artifact_storage_scheme_mismatch(tmp_path):
