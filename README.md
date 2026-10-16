@@ -175,7 +175,21 @@ RunnerTag = "ubuntu-26.04"
 Repository = "owner/name"
 Commit = "<full id of the commit of this repository the caller names>"
 Version = "<the version that commit carries, written as a comment>"
+
+[Licence]
+CopyrightText = "2026 Owner <owner@example.org>"
+Identifier = "EUPL-1.2"
 ```
+
+Every rendered caller starts with the consumer's own licence header, written
+from `.Licence`, so the consumer's licence check accepts the file
+([#3](https://github.com/plurano/horistes/issues/3)). The two header lines of
+each template sit between `REUSE-IgnoreStart` and `REUSE-IgnoreEnd` notes; the
+notes render as nothing and keep this repository's licence check from reading
+the field lines as tags. `.Licence.CopyrightText` and `.Licence.Identifier` are
+working names, like the `.Shared` fields, until the engine renders caller
+templates. The consumer's `LICENSES/` must hold the named licence; `reuse lint`
+otherwise fails and names the missing licence.
 
 The templates are written for the engine (Go `text/template` with the
 delimiters `<%` and `%>`). The engine does not render them yet

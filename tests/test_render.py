@@ -25,6 +25,7 @@ CONTEXT = {
     "HasGPU": True,
     "Count": 7,
     "Shared": render.SAMPLE["Shared"],
+    "Licence": render.SAMPLE["Licence"],
 }
 COMMIT = render.SAMPLE["Shared"]["Commit"]
 REAL = "templates/callers/licence.yml.tmpl"
@@ -37,6 +38,10 @@ GOOD = f"""\
 <%- /*
 Required check: the job `result` reports the calling job's name ({ISSUE}).
 */ -%>
+<%- /* REUSE-IgnoreStart */ -%>
+# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-License-Identifier: <% .Licence.Identifier %>
+<%/* REUSE-IgnoreEnd */ -%>
 ---
 name: Licence check
 on:
@@ -77,6 +82,8 @@ exceptions:
     expires: "2026-12-31"
 """
 RENDERED = f"""\
+# SPDX-FileCopyrightText: 2026 Owner <owner@example.org>
+# SPDX-License-Identifier: EUPL-1.2
 ---
 # Licence check: every file carries its licence information. The job is the
 # shared workflow of owner/shared, named by commit.
@@ -126,6 +133,8 @@ jobs:
 
 
 RENDERED_SCORECARD = f"""\
+# SPDX-FileCopyrightText: 2026 Owner <owner@example.org>
+# SPDX-License-Identifier: EUPL-1.2
 ---
 # Scorecard: the supply-chain checks of this repository, reported to code
 # scanning. The job is the shared workflow of owner/shared, named
@@ -413,6 +422,22 @@ PLANTED = [
         GOOD.replace(f" ({ISSUE})", ""),
         f"note does not name {ISSUE}",
         id="note-without-the-open-issue",
+    ),
+    pytest.param(
+        GOOD.replace(
+            "<%- /* REUSE-IgnoreStart */ -%>\n"
+            "# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>\n"
+            "# SPDX-License-Identifier: <% .Licence.Identifier %>\n"
+            "<%/* REUSE-IgnoreEnd */ -%>\n",
+            "",
+        ),
+        "the rendered caller does not start with the two SPDX header lines",
+        id="no-spdx-header",
+    ),
+    pytest.param(
+        GOOD.replace("# SPDX-" + "License-Identifier: <% .Licence.Identifier %>\n", ""),
+        "the rendered caller does not start with the two SPDX header lines",
+        id="spdx-missing-identifier",
     ),
 ]
 
@@ -736,7 +761,7 @@ def test_unreadable_called_workflow_is_a_failure(tree):
 def test_refused_template_is_reported_with_its_line(tree):
     done = check(tree, GOOD.replace("on:\n  pull_request:\n", "on: <% hostedGateOn %>\n"))
     assert done.returncode == 1
-    assert done.stderr.startswith(f"FAIL: {TEMPLATE}:6: `<% hostedGateOn %>`")
+    assert done.stderr.startswith(f"FAIL: {TEMPLATE}:10: `<% hostedGateOn %>`")
 
 
 CONTEXT_FILE = f"""\
@@ -746,6 +771,10 @@ RunnerTag = "ubuntu-26.04"
 Repository = "owner/shared"
 Commit = "{COMMIT}"
 Version = "v1.2.3"
+
+[Licence]
+CopyrightText = "2026 Owner <owner@example.org>"
+Identifier = "EUPL-1.2"
 """
 
 
