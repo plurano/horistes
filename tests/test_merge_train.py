@@ -42,6 +42,7 @@ OLD = (NOW - timedelta(days=10)).isoformat()
 YOUNG = (NOW - timedelta(hours=5)).isoformat()
 CONFLICT = "merge conflict between base and head"
 NO_NEW = "There are no new commits on the base branch."
+QUEUE_ONLY = "Repository rule violations found\n\nChanges must be made through the merge queue"
 CLIENT_ID = "Iv23planted"
 WRITE = {
     "actions": "read",
@@ -105,12 +106,15 @@ def pull(number: int, state: str, **fields) -> dict:
     return node
 
 
-def repository(*pulls: dict, auto_merge: bool = True, release: tuple = (False, False)) -> dict:
+def repository(
+    *pulls: dict, auto_merge: bool = True, release: tuple = (False, False), queue: bool = False
+) -> dict:
     """One repository as the query reads it; `release` says which release-please files it has."""
     config, manifest = release
     return {
         "defaultBranchRef": {"name": "main"},
         "autoMergeAllowed": auto_merge,
+        "mergeQueue": {"id": "MQ_planted"} if queue else None,
         "releaseConfig": {"oid": "c" * 40} if config else None,
         "releaseManifest": {"oid": "d" * 40} if manifest else None,
         "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": list(pulls)},
@@ -275,12 +279,19 @@ class Forge:
         full, rights = self.repo_of(header)
         if (
             "mergePullRequest" in query
+            or "enqueuePullRequest" in query
             or "enablePullRequestAutoMerge" in query
             or "createCommitOnBranch" in query
         ):
             assert rights == WRITE, rights
+        if "enqueuePullRequest" in query:
+            self.write(full, ("enqueue", variables["id"], variables["oid"]))
+            entry = {"state": "QUEUED"} if self.merged else None
+            return {"data": {"enqueuePullRequest": {"mergeQueueEntry": entry}}}
         if "mergePullRequest" in query:
             self.write(full, ("merge", variables["id"], variables["oid"], variables["method"]))
+            if (self.active_reads.get(full) or {}).get("mergeQueue"):
+                return {"errors": [{"type": "UNPROCESSABLE", "message": QUEUE_ONLY}]}
             if self.refuse_merge or full in self.refuse_merge_in:
                 return {"errors": [{"message": self.refuse_merge or "refused here"}]}
             return {"data": {"mergePullRequest": {"pullRequest": {"merged": self.merged}}}}
@@ -579,6 +590,10 @@ def armed(number: int) -> tuple:
     return ("arm", f"PR_{number}", f"{number:040x}", "SQUASH")
 
 
+def queued(number: int) -> tuple:
+    return ("enqueue", f"PR_{number}", f"{number:040x}")
+
+
 def updated(number: int) -> tuple:
     return ("update", number, f"{number:040x}")
 
@@ -589,6 +604,44 @@ def test_clean_pull_request_lands(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(1)]
     assert "### fleet/app: landed #1" in summary
+
+
+def test_clean_pull_request_is_queued_where_the_branch_has_a_merge_queue(tmp_path):
+    forge = Forge(repository(pull(1, "DIRTY"), pull(2, "CLEAN"), queue=True))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [queued(2)]
+    assert "### fleet/app: queued #2" in summary
+    assert "| #2 | CLEAN | queued |" in summary
+
+
+def test_without_the_queue_check_the_merge_is_refused(tmp_path):
+    """The planted case: the forge refuses a direct merge where a queue is required."""
+    flow = script().replace('reason == "land" and repo.get("mergeQueue")', "False")
+    assert flow != script(), "the queue check is where the test expects it"
+    forge = Forge(repository(pull(1, "CLEAN"), queue=True))
+    done, _ = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "Changes must be made through the merge queue" in done.stdout
+    assert forge.writes == [landed(1)]
+
+
+def test_queued_pull_request_holds_the_train(tmp_path):
+    waiting = pull(1, "CLEAN", isInMergeQueue=True)
+    forge = Forge(repository(waiting, pull(2, "CLEAN"), pull(3, "BEHIND"), queue=True))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "#1 is in the merge queue" in summary
+    assert "| #1 | CLEAN | in the merge queue |" in summary
+
+
+def test_missing_queue_entry_fails(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN"), queue=True))
+    forge.merged = False
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "no merge queue entry" in done.stdout
 
 
 def test_clean_pull_request_on_second_page_lands(tmp_path):

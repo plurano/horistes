@@ -41,3 +41,4 @@ record that supersedes it.
 | [0031](0031-the-merge-train-app-runs-release-please.md) | 2026-10-14 | The merge-train app runs release-please, and a person still merges the release | Accepted |
 | [0032](0032-the-merge-train-commits-generated-files.md) | 2026-10-15 | The merge train commits generated files for dependency updates | Accepted |
 | [0033](0033-read-back-of-local-files-before-the-draft.md) | 2026-10-15 | The read-back reads a release's files from a local folder before the draft | Accepted |
+| [0034](0034-the-merge-train-queues-where-the-branch-has-a-merge-queue.md) | 2026-10-16 | The merge train queues a pull request where the default branch has a merge queue | Accepted |
