@@ -16,6 +16,9 @@
 #   a forge rebase re-commits the head unsigned). The forge offers auto-merge
 #   only while a pull request cannot merge at once, so BEHIND is where arming
 #   happens; a CLEAN pull request is landed directly.
+# - When squashing, the train writes the squash commit message from the pull
+#   request's own non-merge commits and their sign-offs (decision record 0037),
+#   without Co-authored-by trailers.
 #
 # Left alone: drafts, pull requests from forks, a base other than the default
 # branch, the labels in `hold_labels`, heads in `person_branches` (release
@@ -131,6 +134,125 @@ jobs:
     outputs:
       releases: ${{ steps.sweep.outputs.releases }}
     steps:
+      # The train's pure rules (which pull request it lands, updates or leaves
+      # alone, and the squash message), written as a module the train script
+      # imports: the script alone would exceed the engine's cap of 4096 fields
+      # per run script (decision records 0034, 0037).
+      - name: Write the train rules module
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/train_rules.py" <<'PY'
+          """Rules of the merge train: verdicts and the squash message (decision records 0029, 0037)."""
+
+          from datetime import datetime
+
+          RED = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
+
+
+          def update_made(pull):
+              """Commit time of the oldest commit of the last 20 that is no merge, or None.
+
+              The update bot rewrites its branch for every new version, so its commit is
+              the oldest one; a repin pushed on top, or a merge from the default branch,
+              does not restart the wait. With more commits than are read, a younger one
+              stands in, which only lengthens the wait.
+              """
+              times = [
+                  node["commit"]["committedDate"]
+                  for node in pull["history"]["nodes"]
+                  if node["commit"]["parents"]["totalCount"] == 1
+              ]
+              return datetime.fromisoformat(min(times)) if times else None
+
+
+          def is_red(pull):
+              nodes = pull["latest"]["nodes"]
+              suites = nodes[-1]["commit"]["checkSuites"]["nodes"] if nodes else []
+              return any(suite["conclusion"] in RED for suite in suites)
+
+
+          def too_young(pull, labels, conf, now):
+              """Why a dependency update waits for its minimum age, or None."""
+              if not pull["headRefName"].startswith(conf["dependency"]):
+                  return None
+              if labels & conf["security"] or "[SECURITY]" in pull["title"]:
+                  return None
+              changed = update_made(pull)
+              if changed is None:
+                  return "dependency update with no commit of its own to date"
+              if now - changed < conf["min_age"]:
+                  return f"dependency update made {changed:%Y-%m-%d %H:%M}Z, younger than the minimum age"
+              return None
+
+
+          def verdict(pull, repo, conf, now):
+              """land, behind, or the reason the train leaves the pull request alone."""
+              labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
+              state = pull["mergeStateStatus"]
+              held = sorted(labels & conf["hold"])
+              if pull["baseRefName"] != repo["defaultBranchRef"]["name"]:
+                  return "not for the default branch"
+              if pull["isDraft"]:
+                  return "draft"
+              if pull.get("isInMergeQueue"):
+                  return "in the merge queue"
+              if pull["isCrossRepository"]:
+                  return "from another repository: a person lands it"
+              if held:
+                  return f"labelled {held[0]}"
+              if conf["person"] and pull["headRefName"].startswith(conf["person"]):
+                  return "release or reserved branch: a person lands it"
+              young = too_young(pull, labels, conf, now)
+              if young:
+                  return young
+              if state in conf["accept"]:
+                  return "land"
+              if state == "BEHIND":
+                  return "red" if is_red(pull) else "behind"
+              return f"merge state {state}"
+
+
+          def in_flight(pull, reason):
+              """An armed pull request that can still land holds the train."""
+              waiting = reason in ("behind", "merge state BLOCKED")
+              return bool(pull["autoMergeRequest"]) and waiting and not is_red(pull)
+
+
+          def clean_commit(message, sign_offs):
+              """Subject and trailer-stripped body of one commit; appends new sign-offs."""
+              subject, _, rest = message.partition("\n")
+              kept = []
+              for line in rest.splitlines():
+                  text = line.strip()
+                  low = text.lower()
+                  if low.startswith("signed-off-by:") and text[14:].strip():
+                      if text not in sign_offs:
+                          sign_offs.append(text)
+                  elif not low.startswith("co-authored-by:"):
+                      kept.append(line)
+              return subject.strip(), "\n".join(kept).strip()
+
+
+          def squash_message(title, number, messages):
+              """Headline and body of a squash merge from the non-merge commit messages."""
+              entries, sign_offs = [], []
+              for message in messages:
+                  subject, body = clean_commit(message, sign_offs)
+                  if len(messages) == 1:
+                      entries.append(body)
+                  else:
+                      entries.append(f"* {subject}\n\n{body}" if body else f"* {subject}")
+              if not sign_offs:
+                  raise ValueError("no Signed-off-by on its commits")
+              headline = f"{title} (#{number})"
+              prefix = "\n\n".join(e for e in entries if e)
+              full_body = f"{prefix}\n\n" + "\n".join(sign_offs) if prefix else "\n".join(sign_offs)
+              lines = full_body.lower().splitlines()
+              if any(line.strip().startswith("co-authored-by:") for line in lines):
+                  raise ValueError("squash message holds a Co-authored-by line")
+              return headline, full_body
+          PY
+
       # Merge train of every repository the app is installed on.
       #
       # In each repository it lands one clean pull request, or updates the next one.
@@ -173,6 +295,9 @@ jobs:
           import zipfile
           from datetime import UTC, datetime, timedelta
 
+          sys.path.insert(0, os.environ["RUNNER_TEMP"])
+          from train_rules import in_flight, squash_message, verdict
+
           TIMEOUT = 30
           SETTLE_ROUNDS = 3
           SETTLE_SECONDS = 5
@@ -195,7 +320,6 @@ jobs:
           LIST_RIGHTS = {"metadata": "read"}
           METHODS = ("SQUASH", "MERGE")
           ACCEPTABLE = ("UNSTABLE", "HAS_HOOKS")
-          RED = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
           NO_NEW_COMMITS = "There are no new commits on the base branch."
           CONFLICT = "merge conflict between base and head"
           QUERY = """
@@ -225,9 +349,25 @@ jobs:
             }
           }
           """
+          COMMITS = """
+          query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                commits(first: 100) {
+                  totalCount
+                  nodes { commit { message parents { totalCount } } }
+                }
+              }
+            }
+          }
+          """
           MERGE = """
-          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!) {
-            mergePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method}) {
+          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
+                   $headline: String, $body: String) {
+            mergePullRequest(
+              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
+                      commitHeadline: $headline, commitBody: $body}
+            ) {
               pullRequest { merged }
             }
           }
@@ -241,9 +381,11 @@ jobs:
           }
           """
           ARM = """
-          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!) {
+          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
+                   $headline: String, $body: String) {
             enablePullRequestAutoMerge(
-              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method}
+              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
+                      commitHeadline: $headline, commitBody: $body}
             ) {
               pullRequest { autoMergeRequest { enabledAt } }
             }
@@ -393,73 +535,31 @@ jobs:
               return repo
 
 
-          def update_made(pull):
-              """Commit time of the oldest commit of the last 20 that is no merge, or None.
-
-              The update bot rewrites its branch for every new version, so its commit is
-              the oldest one; a repin pushed on top, or a merge from the default branch,
-              does not restart the wait. With more commits than are read, a younger one
-              stands in, which only lengthens the wait.
-              """
-              times = [
-                  node["commit"]["committedDate"]
-                  for node in pull["history"]["nodes"]
+          def pull_commits(env, number):
+              """The non-merge commit messages of one pull request, oldest first."""
+              owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+              data = graphql(env, COMMITS, {"owner": owner, "name": name, "number": number})
+              commits = data["repository"]["pullRequest"]["commits"]
+              if commits["totalCount"] > 100:
+                  raise RefusedError(f"#{number}: more than 100 commits, cannot read every sign-off")
+              return [
+                  node["commit"]["message"]
+                  for node in commits["nodes"]
                   if node["commit"]["parents"]["totalCount"] == 1
               ]
-              return datetime.fromisoformat(min(times)) if times else None
 
 
-          def is_red(pull):
-              nodes = pull["latest"]["nodes"]
-              suites = nodes[-1]["commit"]["checkSuites"]["nodes"] if nodes else []
-              return any(suite["conclusion"] in RED for suite in suites)
-
-
-          def too_young(pull, labels, conf, now):
-              """Why a dependency update waits for its minimum age, or None."""
-              if not pull["headRefName"].startswith(conf["dependency"]):
-                  return None
-              if labels & conf["security"] or "[SECURITY]" in pull["title"]:
-                  return None
-              changed = update_made(pull)
-              if changed is None:
-                  return "dependency update with no commit of its own to date"
-              if now - changed < conf["min_age"]:
-                  return f"dependency update made {changed:%Y-%m-%d %H:%M}Z, younger than the minimum age"
-              return None
-
-
-          def verdict(pull, repo, conf, now):
-              """land, behind, or the reason the train leaves the pull request alone."""
-              labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
-              state = pull["mergeStateStatus"]
-              held = sorted(labels & conf["hold"])
-              if pull["baseRefName"] != repo["defaultBranchRef"]["name"]:
-                  return "not for the default branch"
-              if pull["isDraft"]:
-                  return "draft"
-              if pull.get("isInMergeQueue"):
-                  return "in the merge queue"
-              if pull["isCrossRepository"]:
-                  return "from another repository: a person lands it"
-              if held:
-                  return f"labelled {held[0]}"
-              if conf["person"] and pull["headRefName"].startswith(conf["person"]):
-                  return "release or reserved branch: a person lands it"
-              young = too_young(pull, labels, conf, now)
-              if young:
-                  return young
-              if state in conf["accept"]:
-                  return "land"
-              if state == "BEHIND":
-                  return "red" if is_red(pull) else "behind"
-              return f"merge state {state}"
-
-
-          def in_flight(pull, reason):
-              """An armed pull request that can still land holds the train."""
-              waiting = reason in ("behind", "merge state BLOCKED")
-              return bool(pull["autoMergeRequest"]) and waiting and not is_red(pull)
+          def commit_variables(env, conf, pull):
+              """Variables for MERGE and ARM; headline and body when squashing."""
+              base = {"id": pull["id"], "oid": pull["headRefOid"], "method": conf["method"]}
+              if conf["method"] != "SQUASH":
+                  return base
+              messages = pull_commits(env, pull["number"])
+              try:
+                  headline, body = squash_message(pull["title"], pull["number"], messages)
+              except ValueError as err:
+                  raise RefusedError(f"#{pull['number']}: {err}") from err
+              return {**base, "headline": headline, "body": body}
 
 
           def land(env, conf, pull, queue):
@@ -468,24 +568,14 @@ jobs:
                   if not data["enqueuePullRequest"]["mergeQueueEntry"]:
                       raise RefusedError(f"#{pull['number']}: no merge queue entry")
                   return "queued"
-              data = graphql(
-                  env,
-                  MERGE,
-                  {
-                      "id": pull["id"],
-                      "oid": pull["headRefOid"],
-                      "method": conf["method"],
-                  },
-              )
+              data = graphql(env, MERGE, commit_variables(env, conf, pull))
               if not data["mergePullRequest"]["pullRequest"]["merged"]:
                   raise RefusedError(f"#{pull['number']}: the forge did not report it merged")
               return "landed"
 
 
           def arm(env, conf, pull):
-              data = graphql(
-                  env, ARM, {"id": pull["id"], "oid": pull["headRefOid"], "method": conf["method"]}
-              )
+              data = graphql(env, ARM, commit_variables(env, conf, pull))
               if not data["enablePullRequestAutoMerge"]["pullRequest"]["autoMergeRequest"]:
                   raise RefusedError(f"#{pull['number']}: the forge returned no auto-merge request")
 

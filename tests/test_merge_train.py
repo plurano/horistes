@@ -60,6 +60,19 @@ def script() -> str:
     return steps[0]["run"]
 
 
+MODULE_STEP = "Write the train rules module"
+
+
+def module() -> str:
+    """The rules module the step before the train writes."""
+    steps = [s for s in ciwf.load(TRAIN)["jobs"]["train"]["steps"] if s.get("name") == MODULE_STEP]
+    assert len(steps) == 1, f"one step named {MODULE_STEP!r}"
+    lines = steps[0]["run"].splitlines()
+    assert lines[0] == """cat > "$RUNNER_TEMP/train_rules.py" <<'PY'""", lines[0]
+    assert lines[-1] == "PY", lines[-1]
+    return "\n".join(lines[1:-1]) + "\n"
+
+
 def openssl(*args: str, data: bytes = b"") -> bytes:
     done = subprocess.run(
         ["openssl", *args], input=data, capture_output=True, check=True, timeout=60
@@ -156,6 +169,9 @@ class Forge:
         self.users_auth_seen: list[str] = []
         self.artifact_redirect_locations: dict[int, str | None] = {}
         self.refuse_commit = False
+        self.messages: list[tuple[str, str, str | None, str | None]] = []
+        self.commits: dict[int, list[tuple[str, int]]] = {}
+        self.commit_counts: dict[int, int] = {}
         self.install(7, "fleet", app=list(reads))
 
     def set_allowlist(self, repo: str, default_branch: str, paths: list[str]) -> None:
@@ -275,6 +291,11 @@ class Forge:
         self.write(full, ("commit", branch, expected, paths, headline, body))
         return {"data": {"createCommitOnBranch": {"commit": {"oid": "c" * 40}}}}
 
+    def _record_message(self, kind: str, query: str, variables: dict) -> None:
+        headline = variables.get("headline") if "commitHeadline: $headline" in query else None
+        body = variables.get("body") if "commitBody: $body" in query else None
+        self.messages.append((kind, variables["id"], headline, body))
+
     def graphql(self, header: str, query: str, variables: dict) -> dict:
         full, rights = self.repo_of(header)
         if (
@@ -289,6 +310,7 @@ class Forge:
             entry = {"state": "QUEUED"} if self.merged else None
             return {"data": {"enqueuePullRequest": {"mergeQueueEntry": entry}}}
         if "mergePullRequest" in query:
+            self._record_message("merge", query, variables)
             self.write(full, ("merge", variables["id"], variables["oid"], variables["method"]))
             if (self.active_reads.get(full) or {}).get("mergeQueue"):
                 return {"errors": [{"type": "UNPROCESSABLE", "message": QUEUE_ONLY}]}
@@ -296,12 +318,32 @@ class Forge:
                 return {"errors": [{"message": self.refuse_merge or "refused here"}]}
             return {"data": {"mergePullRequest": {"pullRequest": {"merged": self.merged}}}}
         if "enablePullRequestAutoMerge" in query:
+            self._record_message("arm", query, variables)
             self.write(full, ("arm", variables["id"], variables["oid"], variables["method"]))
             armed = {"autoMergeRequest": {"enabledAt": NOW.isoformat()}}
             return {"data": {"enablePullRequestAutoMerge": {"pullRequest": armed}}}
         if "createCommitOnBranch" in query:
             return self._handle_commit_mutation(full, variables)
+        if "pullRequest(" in query:
+            return self.pull_commits(full, variables)
         return self.pull_page(full, query, variables)
+
+    def pull_commits(self, full: str, variables: dict) -> dict:
+        owner, name = full.split("/")
+        number = variables["number"]
+        assert variables == {"owner": owner, "name": name, "number": number}, variables
+        default = [(f"change {number}\n\nbody {number}\n\nSigned-off-by: Dev <dev@example.org>", 1)]
+        items = self.commits.get(number, default)
+        total = self.commit_counts.get(number, len(items))
+        nodes = [
+            {"commit": {"message": message, "parents": {"totalCount": parents}}}
+            for message, parents in items
+        ]
+        return {
+            "data": {
+                "repository": {"pullRequest": {"commits": {"totalCount": total, "nodes": nodes}}}
+            }
+        }
 
     def pull_page(self, full: str, query: str, variables: dict) -> dict:
         owner, name = full.split("/")
@@ -330,12 +372,15 @@ class Forge:
             body = self.graphql(header, query, variables)
             operation = re.search(r"\b(\w+)\(\s*input:", query)[1]
             statuses = self.mutation_statuses.get(operation, [])
-        else:
+        elif "pullRequests(" in query:
             self.read_calls.append((full, dict(variables)))
             size = int(re.search(r"pullRequests\(states: OPEN, first: (\d+)", query)[1])
             if size > 25:
                 return 502, {"message": "stand-in forge: read page size exceeds 25"}
             statuses = self.read_statuses.get(full, [])
+            body = None
+        else:
+            statuses = []
             body = None
         status = statuses.pop(0) if statuses else 200
         if status != 200:
@@ -528,8 +573,15 @@ def serve(forge: Forge) -> ThreadingHTTPServer:
     return server
 
 
-def train(tmp_path: Path, forge: Forge, text: str | None = None, **settings: str):
+def train(
+    tmp_path: Path,
+    forge: Forge,
+    text: str | None = None,
+    helper: str | None = None,
+    **settings: str,
+):
     """Run the step's script against the stand-in forge; the result and the summary written."""
+    (tmp_path / "train_rules.py").write_text(helper or module(), encoding="utf-8")
     source = (text or script()).replace("SETTLE_SECONDS = 5", "SETTLE_SECONDS = 0")
     source = source.replace("READ_BACKOFF_SECONDS = 5", "READ_BACKOFF_SECONDS = 0")
     path = tmp_path / "train.py"
@@ -545,6 +597,7 @@ def train(tmp_path: Path, forge: Forge, text: str | None = None, **settings: str
         "GITHUB_GRAPHQL_URL": f"{url}/graphql",
         "GITHUB_STEP_SUMMARY": str(summary),
         "GITHUB_OUTPUT": str(output),
+        "RUNNER_TEMP": str(tmp_path),
         "TRAIN_APP_CLIENT_ID": CLIENT_ID,
         "TRAIN_APP_KEY": app_key()[0],
         "TRAIN_SWITCH": "on",
@@ -757,10 +810,10 @@ def test_planted_red_pull_request_is_not_landed(tmp_path):
 
 def test_without_the_state_check_the_red_pull_request_would_land(tmp_path):
     """A mutant that lands whatever it reads is caught by the planted case."""
-    mutant = script().replace('if state in conf["accept"]:', "if True:")
-    assert mutant != script()
+    mutant = module().replace('if state in conf["accept"]:', "if True:")
+    assert mutant != module()
     forge = Forge(repository(pull(1, "BLOCKED", suites=["FAILURE"])))
-    done, _ = train(tmp_path, forge, mutant)
+    done, _ = train(tmp_path, forge, helper=mutant)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(1)]
 
@@ -965,12 +1018,14 @@ def test_token_and_key_are_never_printed(tmp_path):
         "output",
         "summary.md",
         "train.py",
+        "train_rules.py",
     ]
 
 
-def test_script_passes_the_python_linter(tmp_path):
-    path = tmp_path / "train.py"
-    path.write_text(script(), encoding="utf-8")
+@pytest.mark.parametrize("name", ["train", "train_rules"])
+def test_script_passes_the_python_linter(tmp_path, name):
+    path = tmp_path / f"{name}.py"
+    path.write_text(script() if name == "train" else module(), encoding="utf-8")
     ruff = ROOT / ".venv/bin/ruff"
     command = [str(ruff)] if ruff.exists() else [sys.executable, "-m", "ruff"]
     done = subprocess.run(
@@ -2034,3 +2089,138 @@ def test_regenerate_excludes_person_branch(tmp_path):
     assert done.returncode == 0
     assert not any(w[0] == "commit" for w in forge.writes)
     assert "a person lands it" in summary
+
+
+PLANTED_COMMITS = [
+    ("feat: first step\n\nFirst body.\n\nSigned-off-by: Dev <dev@example.org>", 1),
+    (
+        "Merge branch 'main' into feat/change-1\n\n"
+        "Signed-off-by: plurano-merge-train[bot] "
+        "<1+plurano-merge-train[bot]@users.noreply.github.com>",
+        2,
+    ),
+    (
+        "fix: follow up\n\nSecond body.\n\n"
+        "Co-authored-by: plurano-merge-train[bot] "
+        "<1+plurano-merge-train[bot]@users.noreply.github.com>\n"
+        "Signed-off-by: Dev <dev@example.org>",
+        1,
+    ),
+]
+PLANTED_BODY = (
+    "* feat: first step\n\nFirst body.\n\n"
+    "* fix: follow up\n\nSecond body.\n\n"
+    "Signed-off-by: Dev <dev@example.org>"
+)
+
+
+@pytest.mark.parametrize(("state", "kind"), [("CLEAN", "merge"), ("BEHIND", "arm")])
+def test_planted_squash_message_drops_bot_merge_and_co_author(tmp_path, state, kind):
+    forge = Forge(repository(pull(1, state)))
+    forge.commits[1] = list(PLANTED_COMMITS)
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.messages == [(kind, "PR_1", "change 1 (#1)", PLANTED_BODY)]
+    body = forge.messages[0][3]
+    assert body is not None
+    assert "co-authored-by" not in body.lower()
+    assert body.count("Signed-off-by:") == 1
+
+
+def test_single_commit_squash_message_uses_body_and_distinct_sign_offs(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.messages == [
+        ("merge", "PR_1", "change 1 (#1)", "body 1\n\nSigned-off-by: Dev <dev@example.org>")
+    ]
+
+
+def test_multiple_distinct_sign_offs_kept_in_first_seen_order(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.commits[1] = [
+        ("feat: a\n\nSigned-off-by: First <first@example.org>", 1),
+        (
+            "feat: b\n\n"
+            "Signed-off-by: Second <second@example.org>\n"
+            "Signed-off-by: First <first@example.org>",
+            1,
+        ),
+    ]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.messages == [
+        (
+            "merge",
+            "PR_1",
+            "change 1 (#1)",
+            "* feat: a\n\n* feat: b\n\n"
+            "Signed-off-by: First <first@example.org>\n"
+            "Signed-off-by: Second <second@example.org>",
+        )
+    ]
+
+
+@pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
+def test_pull_without_sign_off_is_refused_before_any_write(tmp_path, state):
+    forge = Forge(repository(pull(1, state)))
+    forge.commits[1] = [("feat: unsigned\n\nBody without trailer.", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1
+    assert forge.writes == []
+    assert forge.messages == []
+    assert "fleet/app: #1: no Signed-off-by on its commits" in summary
+
+
+def test_pull_with_more_than_100_commits_is_refused(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.commit_counts[1] = 101
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1
+    assert forge.writes == []
+    assert forge.messages == []
+    assert "fleet/app: #1: more than 100 commits" in summary
+
+
+@pytest.mark.parametrize(("state", "kind"), [("CLEAN", "merge"), ("BEHIND", "arm")])
+def test_merge_method_merge_sends_no_headline_or_body(tmp_path, state, kind):
+    forge = Forge(repository(pull(1, state)))
+    forge.commits[1] = [("feat: unsigned", 1)]
+    done, _ = train(tmp_path, forge, merge_method="merge")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.messages == [(kind, "PR_1", None, None)]
+
+
+def test_without_commit_body_in_merge_mutation_the_planted_test_fails(tmp_path):
+    mutant = script().replace(", commitBody: $body", "")
+    assert mutant != script()
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.commits[1] = list(PLANTED_COMMITS)
+    done, _ = train(tmp_path, forge, mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.messages == [("merge", "PR_1", "change 1 (#1)", None)]
+    assert forge.messages[0][3] != PLANTED_BODY
+
+
+def test_without_trailer_stripping_the_guard_refuses_co_authored_by(tmp_path):
+    mutant = module().replace('elif not low.startswith("co-authored-by:"):', "else:")
+    assert mutant != module()
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.commits[1] = list(PLANTED_COMMITS)
+    done, summary = train(tmp_path, forge, helper=mutant)
+    assert done.returncode == 1
+    assert forge.writes == []
+    assert "fleet/app: #1: squash message holds a Co-authored-by line" in summary
+
+
+def test_co_authored_by_named_in_prose_still_lands(tmp_path):
+    prose = "fix: drop the trailer\n\nThe forge added a Co-authored-by: line for the bot.\n\n"
+    forge = Forge(repository(pull(1, "CLEAN", title="fix: no Co-authored-by: trailer")))
+    forge.commits[1] = [(prose + "Signed-off-by: Dev <dev@example.org>", 1)]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert forge.messages[0][3] == (
+        "The forge added a Co-authored-by: line for the bot.\n\n"
+        "Signed-off-by: Dev <dev@example.org>"
+    )
