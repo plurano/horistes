@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Licence image age: verifies weekly that the licence tool image pinned in
+# .github/workflows/licence.yml has not fallen behind a newer release by more
+# than 14 days (decision record 0035).
+name: Licence image age
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - tools/image_age.py
+      - .github/workflows/image-age.yml
+      - .github/workflows/licence.yml
+      - renovate.json
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: image-age-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image-age:
+    name: Licence image age
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check licence image age
+        shell: bash
+        env:
+          TAGS_URL: https://hub.docker.com/v2/repositories/fsfe/reuse/tags?page_size=100&ordering=last_updated
+        run: |
+          python3 -B tools/image_age.py check --tags-url "$TAGS_URL"

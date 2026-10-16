@@ -42,3 +42,4 @@ record that supersedes it.
 | [0032](0032-the-merge-train-commits-generated-files.md) | 2026-10-15 | The merge train commits generated files for dependency updates | Accepted |
 | [0033](0033-read-back-of-local-files-before-the-draft.md) | 2026-10-15 | The read-back reads a release's files from a local folder before the draft | Accepted |
 | [0034](0034-the-merge-train-queues-where-the-branch-has-a-merge-queue.md) | 2026-10-16 | The merge train queues a pull request where the default branch has a merge queue | Accepted |
+| [0035](0035-a-weekly-job-bounds-the-licence-tool-image-age.md) | 2026-10-16 | A weekly job bounds the licence tool's image age | Accepted |

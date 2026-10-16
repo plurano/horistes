@@ -94,6 +94,13 @@ reason = "files of those tools"
 reason = "image of the licence tool, named by digest; no pinned copy on the forge's registry yet"
 expires = 2026-12-31
 
+# The age check of the licence tool's pinned image (decision record 0035). It
+# is no reusable workflow, so no input switches the host off. It leaves with
+# the docker.io exception above, when a pinned image of the licence tool is on
+# the forge's registry.
+[files.".github/workflows/image-age.yml"."hub.docker.com"]
+reason = "tag list of the licence tool's image: release names, push days and digests"
+
 # The shared scorecard workflow. The action has no switch for the hosts it
 # asks, so `outside_hosts` gates the whole job. A host that is asked with the
 # name of the calling repository is for public repositories only (decision
