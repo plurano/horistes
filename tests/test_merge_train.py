@@ -97,6 +97,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "number": number,
         "id": f"PR_{number}",
         "title": fields.pop("title", f"change {number}"),
+        "body": fields.pop("body", ""),
         "isDraft": False,
         "isCrossRepository": False,
         "baseRefName": "main",
@@ -832,6 +833,8 @@ def test_without_the_state_check_the_red_pull_request_would_land(tmp_path):
         ({"baseRefName": "next"}, "not for the default branch"),
         ({"labels": ("planted",)}, "labelled planted"),
         ({"labels": ("do-not-merge", "hold")}, "labelled do-not-merge"),
+        ({"labels": ("superseded",)}, "superseded: a person closes it"),
+        ({"body": "Superseded by #9."}, "superseded: a person closes it"),
         ({"headRefName": "release-please--branches--main"}, "a person lands it"),
         ({"mergeStateStatus": "UNSTABLE"}, "merge state UNSTABLE"),
         ({"mergeStateStatus": "HAS_HOOKS"}, "merge state HAS_HOOKS"),
@@ -844,6 +847,40 @@ def test_left_alone(tmp_path, fields, reason):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
     assert reason in summary
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["Supersedes #1.", "Folds three changes; supersedes #4, #1 and #6.", "(supersedes #1)"],
+)
+def test_planted_superseded_pull_request_stays_unmerged(tmp_path, body):
+    """The planted case: #1 is CLEAN, but the open #2 says it replaces #1."""
+    forge = Forge(repository(pull(1, "CLEAN"), pull(2, "BLOCKED", body=body)))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | CLEAN | superseded: a person closes it |" in summary
+
+
+def test_without_the_superseded_check_the_replaced_pull_request_would_land(tmp_path):
+    mutant = module().replace(
+        'if "superseded" in labels or pull["number"] in replaced:', "if False:"
+    )
+    assert mutant != module()
+    forge = Forge(repository(pull(1, "CLEAN"), pull(2, "BLOCKED", body="Supersedes #1")))
+    done, _ = train(tmp_path, forge, helper=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+
+
+@pytest.mark.parametrize(
+    "body", ["Follows up #1.", "Supersedes the old approach; see #1.", "Supersedes #11"]
+)
+def test_a_mention_that_replaces_nothing_lands(tmp_path, body):
+    forge = Forge(repository(pull(1, "CLEAN"), pull(2, "BLOCKED", body=body)))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
 
 
 def test_accepted_state_lands_only_when_declared(tmp_path):

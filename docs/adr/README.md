@@ -44,3 +44,5 @@ record that supersedes it.
 | [0034](0034-the-merge-train-queues-where-the-branch-has-a-merge-queue.md) | 2026-10-16 | The merge train queues a pull request where the default branch has a merge queue | Accepted |
 | [0035](0035-a-weekly-job-bounds-the-licence-tool-image-age.md) | 2026-10-16 | A weekly job bounds the licence tool's image age | Accepted |
 | [0036](0036-the-update-bot-moves-pinned-release-tools-and-checksums.md) | 2026-10-16 | The update bot moves pinned release tools and their checksums | Accepted |
+| [0037](0037-the-merge-train-writes-the-squash-message.md) | 2026-10-16 | The merge train writes the squash message | Accepted |
+| [0038](0038-the-merge-train-skips-superseded-pull-requests.md) | 2026-10-16 | The merge train skips superseded pull requests | Accepted |

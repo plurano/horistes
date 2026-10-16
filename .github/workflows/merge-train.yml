@@ -20,14 +20,16 @@
 #   request's own non-merge commits and their sign-offs (decision record 0037),
 #   without Co-authored-by trailers.
 #
-# Left alone: drafts, pull requests from forks, a base other than the default
-# branch, the labels in `hold_labels`, heads in `person_branches` (release
-# pull requests by default: a release is a person's act), dependency updates
-# whose own commit (the update bot's, not a repin or a merge pushed on top) is
-# younger than `min_age_days` (3 days, the fleet's minimum age; a security
-# label or "[SECURITY]" in the title skips the wait), and archived
-# repositories. A repository leaves the train when the app is uninstalled
-# from it.
+# Left alone: drafts, superseded pull requests (label `superseded`, a body
+# that says "Superseded by #N", or another open pull request whose body says
+# "Supersedes #N"; decision record 0038), pull requests from forks, a base
+# other than the default branch, the labels in `hold_labels`, heads in
+# `person_branches` (release pull requests by default: a release is a
+# person's act), dependency updates whose own commit (the update bot's, not
+# a repin or a merge pushed on top) is younger than `min_age_days` (3 days,
+# the fleet's minimum age; a security label or "[SECURITY]" in the title
+# skips the wait), and archived repositories. A repository leaves the train
+# when the app is uninstalled from it.
 #
 # RELEASES. A repository with release-please-config.json and
 # .release-please-manifest.json on its default branch gets a second job after
@@ -144,9 +146,14 @@ jobs:
           cat > "$RUNNER_TEMP/train_rules.py" <<'PY'
           """Rules of the merge train: verdicts and the squash message (decision records 0029, 0037)."""
 
+          import re
           from datetime import datetime
 
           RED = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
+          SUPERSEDES = re.compile(
+              r"\bsupersedes\s+(#\d+(?:(?:\s*,\s*|\s*,?\s*and\s+|\s+)#\d+)*)", re.I
+          )
+          SUPERSEDED_BY = re.compile(r"\bsuperseded\s+by\s+#\d+", re.I)
 
 
           def update_made(pull):
@@ -185,7 +192,19 @@ jobs:
               return None
 
 
-          def verdict(pull, repo, conf, now):
+          def superseded(pulls):
+              """Numbers of open pull requests another open one supersedes, or that say so themselves."""
+              found = set()
+              for pull in pulls:
+                  body = pull.get("body") or ""
+                  for listed in SUPERSEDES.findall(body):
+                      found.update(int(number) for number in re.findall(r"#(\d+)", listed))
+                  if SUPERSEDED_BY.search(body):
+                      found.add(pull["number"])
+              return frozenset(found)
+
+
+          def verdict(pull, repo, conf, now, replaced=frozenset()):
               """land, behind, or the reason the train leaves the pull request alone."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
               state = pull["mergeStateStatus"]
@@ -194,6 +213,8 @@ jobs:
                   return "not for the default branch"
               if pull["isDraft"]:
                   return "draft"
+              if "superseded" in labels or pull["number"] in replaced:
+                  return "superseded: a person closes it"
               if pull.get("isInMergeQueue"):
                   return "in the merge queue"
               if pull["isCrossRepository"]:
@@ -296,7 +317,7 @@ jobs:
           from datetime import UTC, datetime, timedelta
 
           sys.path.insert(0, os.environ["RUNNER_TEMP"])
-          from train_rules import in_flight, squash_message, verdict
+          from train_rules import in_flight, squash_message, superseded, verdict
 
           TIMEOUT = 30
           SETTLE_ROUNDS = 3
@@ -334,7 +355,7 @@ jobs:
                            orderBy: {field: CREATED_AT, direction: ASC}) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
-                  number id title isDraft isCrossRepository baseRefName headRefName headRefOid
+                  number id title body isDraft isCrossRepository baseRefName headRefName headRefOid
                   mergeStateStatus isInMergeQueue
                   autoMergeRequest { enabledAt }
                   labels(first: 50) { nodes { name } }
@@ -900,7 +921,8 @@ jobs:
 
           def run(env, conf, repo, now):
               pulls = repo["pullRequests"]["nodes"]
-              rows = [(pull, verdict(pull, repo, conf, now)) for pull in pulls]
+              replaced = superseded(pulls)
+              rows = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
               notes = {pull["number"]: reason for pull, reason in rows}
               if conf["switch"] == "off":
                   return rows, notes, "switched off: nothing landed or updated"
