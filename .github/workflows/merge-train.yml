@@ -203,6 +203,7 @@ jobs:
             repository(owner: $owner, name: $name) {
               defaultBranchRef { name }
               autoMergeAllowed
+              mergeQueue { id }
               releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
               releaseManifest: object(expression: "HEAD:.release-please-manifest.json") { oid }
               pullRequests(states: OPEN, first: 25, after: $after,
@@ -210,7 +211,7 @@ jobs:
                 pageInfo { hasNextPage endCursor }
                 nodes {
                   number id title isDraft isCrossRepository baseRefName headRefName headRefOid
-                  mergeStateStatus
+                  mergeStateStatus isInMergeQueue
                   autoMergeRequest { enabledAt }
                   labels(first: 50) { nodes { name } }
                   history: commits(last: 20) {
@@ -228,6 +229,14 @@ jobs:
           mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!) {
             mergePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method}) {
               pullRequest { merged }
+            }
+          }
+          """
+          # A default branch with a merge queue refuses a direct merge; the queue lands it.
+          ENQUEUE = """
+          mutation($id: ID!, $oid: GitObjectID!) {
+            enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
+              mergeQueueEntry { state }
             }
           }
           """
@@ -429,6 +438,8 @@ jobs:
                   return "not for the default branch"
               if pull["isDraft"]:
                   return "draft"
+              if pull.get("isInMergeQueue"):
+                  return "in the merge queue"
               if pull["isCrossRepository"]:
                   return "from another repository: a person lands it"
               if held:
@@ -451,7 +462,12 @@ jobs:
               return bool(pull["autoMergeRequest"]) and waiting and not is_red(pull)
 
 
-          def land(env, conf, pull):
+          def land(env, conf, pull, queue):
+              if queue:
+                  data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
+                  if not data["enqueuePullRequest"]["mergeQueueEntry"]:
+                      raise RefusedError(f"#{pull['number']}: no merge queue entry")
+                  return "queued"
               data = graphql(
                   env,
                   MERGE,
@@ -463,6 +479,7 @@ jobs:
               )
               if not data["mergePullRequest"]["pullRequest"]["merged"]:
                   raise RefusedError(f"#{pull['number']}: the forge did not report it merged")
+              return "landed"
 
 
           def arm(env, conf, pull):
@@ -801,9 +818,8 @@ jobs:
                   return rows, notes, outcome
               for pull, reason in rows:
                   if reason == "land":
-                      land(env, conf, pull)
-                      notes[pull["number"]] = "landed"
-                      return rows, notes, f"landed #{pull['number']}"
+                      done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
+                      return rows, notes, f"{done} #{pull['number']}"
               holding = [pull["number"] for pull, reason in rows if in_flight(pull, reason)]
               if holding:
                   return rows, notes, f"#{holding[0]} is armed and in flight"
@@ -906,7 +922,7 @@ jobs:
               finally:
                   revoke(env, token)
               moved = any(
-                  note.startswith(("armed", "updated")) or note == "generated files committed"
+                  note.startswith(("armed", "updated", "queued")) or note == "generated files committed"
                   for note in notes.values()
               )
               section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""

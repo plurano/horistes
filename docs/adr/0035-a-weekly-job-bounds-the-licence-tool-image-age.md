@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 SPDX-License-Identifier: EUPL-1.2
 -->
 
-# ADR-0034: A weekly job bounds the licence tool's image age
+# ADR-0035: A weekly job bounds the licence tool's image age
 
 - **Status**: Accepted
 - **Date**: 2026-10-16

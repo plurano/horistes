@@ -3,7 +3,7 @@
 ---
 # Licence image age: verifies weekly that the licence tool image pinned in
 # .github/workflows/licence.yml has not fallen behind a newer release by more
-# than 14 days (decision record 0034).
+# than 14 days (decision record 0035).
 name: Licence image age
 
 on:
