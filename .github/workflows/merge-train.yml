@@ -462,13 +462,12 @@ jobs:
               return bool(pull["autoMergeRequest"]) and waiting and not is_red(pull)
 
 
-          def enqueue(env, pull):
-              data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
-              if not data["enqueuePullRequest"]["mergeQueueEntry"]:
-                  raise RefusedError(f"#{pull['number']}: the forge returned no merge queue entry")
-
-
-          def land(env, conf, pull):
+          def land(env, conf, pull, queue):
+              if queue:
+                  data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
+                  if not data["enqueuePullRequest"]["mergeQueueEntry"]:
+                      raise RefusedError(f"#{pull['number']}: no merge queue entry")
+                  return "queued"
               data = graphql(
                   env,
                   MERGE,
@@ -480,6 +479,7 @@ jobs:
               )
               if not data["mergePullRequest"]["pullRequest"]["merged"]:
                   raise RefusedError(f"#{pull['number']}: the forge did not report it merged")
+              return "landed"
 
 
           def arm(env, conf, pull):
@@ -816,18 +816,10 @@ jobs:
               outcome = regenerate(env, conf, repo, rows, notes)
               if outcome:
                   return rows, notes, outcome
-              queued = [pull["number"] for pull, reason in rows if reason == "in the merge queue"]
-              if queued:
-                  return rows, notes, f"#{queued[0]} is in the merge queue"
               for pull, reason in rows:
-                  if reason == "land" and repo.get("mergeQueue"):
-                      enqueue(env, pull)
-                      notes[pull["number"]] = "queued"
-                      return rows, notes, f"queued #{pull['number']}"
                   if reason == "land":
-                      land(env, conf, pull)
-                      notes[pull["number"]] = "landed"
-                      return rows, notes, f"landed #{pull['number']}"
+                      done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
+                      return rows, notes, f"{done} #{pull['number']}"
               holding = [pull["number"] for pull, reason in rows if in_flight(pull, reason)]
               if holding:
                   return rows, notes, f"#{holding[0]} is armed and in flight"

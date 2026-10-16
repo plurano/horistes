@@ -617,7 +617,7 @@ def test_clean_pull_request_is_queued_where_the_branch_has_a_merge_queue(tmp_pat
 
 def test_without_the_queue_check_the_merge_is_refused(tmp_path):
     """The planted case: the forge refuses a direct merge where a queue is required."""
-    flow = script().replace('reason == "land" and repo.get("mergeQueue")', "False")
+    flow = script().replace("    if queue:", "    if False:")
     assert flow != script(), "the queue check is where the test expects it"
     forge = Forge(repository(pull(1, "CLEAN"), queue=True))
     done, _ = train(tmp_path, forge, flow)
@@ -626,13 +626,12 @@ def test_without_the_queue_check_the_merge_is_refused(tmp_path):
     assert forge.writes == [landed(1)]
 
 
-def test_queued_pull_request_holds_the_train(tmp_path):
+def test_queued_pull_request_is_left_to_the_queue(tmp_path):
     waiting = pull(1, "CLEAN", isInMergeQueue=True)
     forge = Forge(repository(waiting, pull(2, "CLEAN"), pull(3, "BEHIND"), queue=True))
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert forge.writes == []
-    assert "#1 is in the merge queue" in summary
+    assert forge.writes == [queued(2)]
     assert "| #1 | CLEAN | in the merge queue |" in summary
 
 

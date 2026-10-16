@@ -24,11 +24,10 @@ found a CLEAN pull request there ended with a refusal and failed the run.
   added to the queue with the `enqueuePullRequest` mutation, bound to the head
   commit it read. A missing queue entry in the answer is a refusal. The
   repository section reports `queued #N`.
-- **A queued pull request holds the train.** Each pull request reads
-  `isInMergeQueue`. One in the queue is left alone ("in the merge queue"),
-  and while any is queued the train writes nothing else in that repository,
-  as it does for an armed pull request in flight. The queue lands it with its
-  own checks.
+- **The queue keeps the order.** Each pull request reads `isInMergeQueue`.
+  One already in the queue is left alone ("in the merge queue"); the queue
+  lands it with its own checks. The train may queue the next clean pull
+  request behind it, one write per repository and run as before.
 - **Unchanged:** every other verdict, the BEHIND path (arm, then update by
   merge), and repositories without a queue, which still land through the
   merge mutation.
@@ -42,7 +41,9 @@ found a CLEAN pull request there ended with a refusal and failed the run.
   first sweep that queues a pull request; a refusal there is reported as any
   other.
 - **Neutral:** skipping such repositories was the other option. It would have
-  left their clean pull requests to a person.
+  left their clean pull requests to a person. The engine audit caps a run
+  script at 4096 fields; this step is close to it, so a later change may have
+  to move code out of the inline script.
 
 ## References
 
