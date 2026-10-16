@@ -60,6 +60,10 @@ HELD = {"rust-toolchain"}
 SWITCH = {"enabled": False}
 TOOLS = "requirements/tools.txt"
 LICENCE = ".github/workflows/licence.yml"
+GATE = ".github/workflows/ci.yml"
+MAKEFILE = "Makefile"
+ACTIONLINT_SHA = "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+GITLEAKS_SHA = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
 
 # The options Renovate 44 accepts in a `uv pip compile` header (its
 # pip-compile manager, `common.ts`); it refuses the update on any other.
@@ -147,13 +151,37 @@ def file_patterns(manager: dict) -> list[re.Pattern]:
 
 
 def image_matches(path: str, text: str) -> list[dict]:
-    """What the custom managers of the configuration read in one file."""
+    """What the custom image managers of the configuration read in one file."""
     out = []
     for manager in CONFIG["customManagers"]:
+        if manager.get("datasourceTemplate") != "docker":
+            continue
         if not any(pattern.search(path) for pattern in file_patterns(manager)):
             continue
         for expression in manager["matchStrings"]:
             out += [found.groupdict() for found in python_pattern(expression).finditer(text)]
+    return out
+
+
+def tool_managers() -> list[dict]:
+    """Custom managers configuring github-release-attachments tool releases."""
+    return [
+        manager
+        for manager in CONFIG["customManagers"]
+        if manager.get("datasourceTemplate") == "github-release-attachments"
+    ]
+
+
+def tool_matches(path: str, text: str) -> list[tuple[dict, dict]]:
+    """What the custom tool managers read in one file."""
+    out = []
+    for manager in tool_managers():
+        if not any(pattern.search(path) for pattern in file_patterns(manager)):
+            continue
+        for expression in manager["matchStrings"]:
+            out += [
+                (manager, found.groupdict()) for found in python_pattern(expression).finditer(text)
+            ]
     return out
 
 
@@ -379,3 +407,222 @@ def test_actions_manager_proposes_no_image_and_no_machine(kind):
     rule = {"matchManagers": ["github-actions"], "matchDepTypes": [kind], "enabled": False}
     kept = [{key: entry[key] for key in rule if key in entry} for entry in rules()]
     assert rule in kept
+
+
+def test_first_custom_manager_is_the_licence_manager():
+    first = CONFIG["customManagers"][0]
+    assert first["description"].startswith("The licence tool image")
+    assert first["datasourceTemplate"] == "docker"
+    assert first["managerFilePatterns"] == ["/^\\.github/workflows/licence\\.yml$/"]
+
+
+def test_custom_tool_managers_declare_github_release_attachments():
+    managers = tool_managers()
+    assert len(managers) == 3
+    for manager in managers:
+        assert manager["datasourceTemplate"] == "github-release-attachments"
+        assert manager["depNameTemplate"] in {"rhysd/actionlint", "gitleaks/gitleaks"}
+
+
+def test_a_checksum_pin_reads_the_release_tag_itself():
+    """The datasource fetches releases/tags/<currentValue> to map the checksum.
+
+    A version stripped of its v by extractVersion names no release there, and
+    the bot then proposes the version with no checksum.
+    """
+    for manager in tool_managers():
+        if "(?<currentDigest>" in manager["matchStrings"][0]:
+            assert "extractVersionTemplate" not in manager
+            assert "(?<currentValue>v" in manager["matchStrings"][0]
+        else:
+            assert manager["extractVersionTemplate"] == "^v(?<version>.+)$"
+
+
+def test_actionlint_is_read_with_release_and_checksum_in_gate_and_makefile():
+    gate_text = (ROOT / GATE).read_text(encoding="utf-8")
+    make_text = (ROOT / MAKEFILE).read_text(encoding="utf-8")
+
+    ci_matches = [
+        groups
+        for mgr, groups in tool_matches(GATE, gate_text)
+        if mgr["depNameTemplate"] == "rhysd/actionlint"
+    ]
+    assert len(ci_matches) == 1
+    ci_actionlint = ci_matches[0]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", ci_actionlint["currentValue"])
+    assert re.fullmatch(r"[0-9a-f]{64}", ci_actionlint["currentDigest"])
+
+    make_matches = [
+        groups
+        for mgr, groups in tool_matches(MAKEFILE, make_text)
+        if mgr["depNameTemplate"] == "rhysd/actionlint"
+    ]
+    assert len(make_matches) == 1
+    make_actionlint = make_matches[0]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", make_actionlint["currentValue"])
+
+    assert ci_actionlint["currentValue"] == "v" + make_actionlint["currentValue"]
+
+
+def test_gitleaks_is_read_with_release_and_checksum_in_gate():
+    gate_text = (ROOT / GATE).read_text(encoding="utf-8")
+    ci_matches = [
+        groups
+        for mgr, groups in tool_matches(GATE, gate_text)
+        if mgr["depNameTemplate"] == "gitleaks/gitleaks"
+    ]
+    assert len(ci_matches) == 1
+    ci_gitleaks = ci_matches[0]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", ci_gitleaks["currentValue"])
+    assert re.fullmatch(r"[0-9a-f]{64}", ci_gitleaks["currentDigest"])
+
+
+@pytest.mark.parametrize(
+    ("dep_name", "path", "new_version"),
+    [
+        ("rhysd/actionlint", GATE, "v1.7.13"),
+        ("rhysd/actionlint", MAKEFILE, "1.7.13"),
+        ("gitleaks/gitleaks", GATE, "v8.30.2"),
+    ],
+)
+def test_auto_replace_string_template_renders_and_rematches(dep_name, path, new_version):
+    managers = [
+        m
+        for m in tool_managers()
+        if m["depNameTemplate"] == dep_name
+        and any(pattern.search(path) for pattern in file_patterns(m))
+    ]
+    assert len(managers) == 1
+    manager = managers[0]
+    template = manager.get("autoReplaceStringTemplate")
+    assert template, f"missing autoReplaceStringTemplate for {dep_name} in {path}"
+
+    rendered = template.replace(
+        "{{{replace '^v' '' newValue}}}", new_version.removeprefix("v")
+    ).replace("{{{newValue}}}", new_version)
+    assert "{{" not in rendered.replace("{{{newDigest}}}", "")
+    fake_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    if "{{{newDigest}}}" in template:
+        rendered = rendered.replace("{{{newDigest}}}", fake_digest)
+
+    pattern = python_pattern(manager["matchStrings"][0])
+    matches = list(pattern.finditer(rendered))
+    assert len(matches) == 1
+    matched_groups = matches[0].groupdict()
+    assert matched_groups["currentValue"] == new_version
+    if "{{{newDigest}}}" in template:
+        assert matched_groups["currentDigest"] == fake_digest
+
+    original_text = (ROOT / path).read_text(encoding="utf-8")
+    (orig_match,) = pattern.finditer(original_text)
+    old_version = orig_match.group("currentValue")
+    assert old_version not in rendered
+
+
+def planted_gate(old: str, new: str) -> str:
+    text = (ROOT / GATE).read_text(encoding="utf-8")
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
+
+
+def planted_makefile(old: str, new: str) -> str:
+    text = (ROOT / MAKEFILE).read_text(encoding="utf-8")
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "dep_name"),
+    [
+        (
+            (
+                "  # SHA-256 of actionlint_1.7.12_linux_amd64.tar.gz, "
+                "from the release's checksum file.\n"
+            ),
+            "  # checksum of actionlint_1.7.12_linux_amd64.tar.gz\n",
+            "rhysd/actionlint",
+        ),
+        (
+            (
+                "  # SHA-256 of actionlint_1.7.12_linux_amd64.tar.gz, "
+                "from the release's checksum file.\n"
+            ),
+            "",
+            "rhysd/actionlint",
+        ),
+        (
+            (
+                "  # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz, "
+                "from the release's checksum file.\n"
+            ),
+            "  # checksum of gitleaks_8.30.1_linux_x64.tar.gz\n",
+            "gitleaks/gitleaks",
+        ),
+        (
+            (
+                "  # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz, "
+                "from the release's checksum file.\n"
+            ),
+            "",
+            "gitleaks/gitleaks",
+        ),
+        (
+            (
+                '  ACTIONLINT_VERSION: "v1.7.12"\n'
+                "  # SHA-256 of actionlint_1.7.12_linux_amd64.tar.gz, "
+                "from the release's checksum file.\n"
+                f'  ACTIONLINT_SHA256: "{ACTIONLINT_SHA}"\n'
+            ),
+            (
+                '  ACTIONLINT_VERSION: "v1.7.12"\n'
+                "  # SHA-256 of actionlint_1.7.12_linux_amd64.tar.gz, "
+                "from the release's checksum file.\n"
+                '  OTHER_VAR: "value"\n'
+                f'  ACTIONLINT_SHA256: "{ACTIONLINT_SHA}"\n'
+            ),
+            "rhysd/actionlint",
+        ),
+        (
+            (
+                '  GITLEAKS_VERSION: "v8.30.1"\n'
+                "  # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz, "
+                "from the release's checksum file.\n"
+                f'  GITLEAKS_SHA256: "{GITLEAKS_SHA}"\n'
+            ),
+            (
+                '  GITLEAKS_VERSION: "v8.30.1"\n'
+                "  # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz, "
+                "from the release's checksum file.\n"
+                '  OTHER_VAR: "value"\n'
+                f'  GITLEAKS_SHA256: "{GITLEAKS_SHA}"\n'
+            ),
+            "gitleaks/gitleaks",
+        ),
+        (
+            '  ACTIONLINT_VERSION: "v1.7.12"\n',
+            '  ACTIONLINT_VERSION: "1.7.12"\n',
+            "rhysd/actionlint",
+        ),
+        ('  GITLEAKS_VERSION: "v8.30.1"\n', '  GITLEAKS_VERSION: "8.30.1"\n', "gitleaks/gitleaks"),
+    ],
+)
+def test_planted_ci_tool_pin_is_not_read(old, new, dep_name):
+    text = planted_gate(old, new)
+    matches = [m for mgr, m in tool_matches(GATE, text) if mgr["depNameTemplate"] == dep_name]
+    assert matches == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("ACTIONLINT_VERSION := 1.7.12\n", "ACTIONLINT_VER := 1.7.12\n"),
+        ("ACTIONLINT_VERSION := 1.7.12\n", "ACTIONLINT_VERSION = 1.7.12\n"),
+        ("ACTIONLINT_VERSION := 1.7.12\n", ""),
+    ],
+)
+def test_planted_makefile_tool_pin_is_not_read(old, new):
+    text = planted_makefile(old, new)
+    matches = [
+        m for mgr, m in tool_matches(MAKEFILE, text) if mgr["depNameTemplate"] == "rhysd/actionlint"
+    ]
+    assert matches == []

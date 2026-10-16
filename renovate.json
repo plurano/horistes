@@ -24,6 +24,46 @@
         "# release (?<currentValue>\\S+)\\n\\s+uses: docker://(?<depName>docker\\.io/fsfe/reuse)@(?<currentDigest>sha256:[0-9a-f]{64})\\n"
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "The actionlint release and checksum in the CI workflow.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "  ACTIONLINT_VERSION: \"(?<currentValue>v[^\"]+)\"\\n  # SHA-256 of actionlint_\\S+_linux_amd64\\.tar\\.gz, from the release's checksum file\\.\\n  ACTIONLINT_SHA256: \"(?<currentDigest>[0-9a-f]{64})\"\\n"
+      ],
+      "autoReplaceStringTemplate": "  ACTIONLINT_VERSION: \"{{{newValue}}}\"\n  # SHA-256 of actionlint_{{{replace '^v' '' newValue}}}_linux_amd64.tar.gz, from the release's checksum file.\n  ACTIONLINT_SHA256: \"{{{newDigest}}}\"\n",
+      "depNameTemplate": "rhysd/actionlint",
+      "datasourceTemplate": "github-release-attachments"
+    },
+    {
+      "customType": "regex",
+      "description": "The actionlint release in the Makefile.",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "ACTIONLINT_VERSION := (?<currentValue>\\S+)\\n"
+      ],
+      "autoReplaceStringTemplate": "ACTIONLINT_VERSION := {{{newValue}}}\n",
+      "depNameTemplate": "rhysd/actionlint",
+      "datasourceTemplate": "github-release-attachments",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "The gitleaks release and checksum in the CI workflow.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "  GITLEAKS_VERSION: \"(?<currentValue>v[^\"]+)\"\\n  # SHA-256 of gitleaks_\\S+_linux_x64\\.tar\\.gz, from the release's checksum file\\.\\n  GITLEAKS_SHA256: \"(?<currentDigest>[0-9a-f]{64})\"\\n"
+      ],
+      "autoReplaceStringTemplate": "  GITLEAKS_VERSION: \"{{{newValue}}}\"\n  # SHA-256 of gitleaks_{{{replace '^v' '' newValue}}}_linux_x64.tar.gz, from the release's checksum file.\n  GITLEAKS_SHA256: \"{{{newDigest}}}\"\n",
+      "depNameTemplate": "gitleaks/gitleaks",
+      "datasourceTemplate": "github-release-attachments"
     }
   ],
   "packageRules": [

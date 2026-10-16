@@ -121,7 +121,7 @@ def test_gitleaks_is_the_release_the_gate_pins():
         check=True,
         timeout=20,
     )
-    assert done.stdout.strip().removeprefix("v") == pinned
+    assert done.stdout.strip().removeprefix("v") == pinned.removeprefix("v")
 
 
 def test_planted_token_is_not_written_in_this_file():
