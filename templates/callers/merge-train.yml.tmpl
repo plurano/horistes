@@ -41,7 +41,17 @@ Concurrency keeps one run at a time and never cancels a run halfway.
 Fields: .Shared.Repository, .Shared.Commit and .Shared.Version are working
 names until the engine renders caller templates (cordanaLLM/praetor#1211);
 .RunnerTag is the engine's own.
+
+Licence header: the rendered caller starts with the consumer's own header,
+written from .Licence (working names, as above), so the consumer's licence
+check accepts it (#3). The REUSE-IgnoreStart and REUSE-IgnoreEnd notes render
+as nothing and keep this repository's licence check from reading the field
+lines as tags.
 */ -%>
+<%- /* REUSE-IgnoreStart */ -%>
+# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-License-Identifier: <% .Licence.Identifier %>
+<%/* REUSE-IgnoreEnd */ -%>
 ---
 # Merge train: in every repository of the merge-train app, lands one clean
 # pull request or keeps the next one up to date. The job is the shared
