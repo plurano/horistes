@@ -964,6 +964,25 @@ def test_red_armed_pull_request_does_not_hold_the_train(tmp_path):
     assert forge.writes == [armed(2), updated(2)]
 
 
+def test_armed_behind_pull_request_is_updated(tmp_path):
+    """An armed BEHIND pull request cannot land before the update, so it holds nothing."""
+    waiting = pull(1, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(waiting, pull(2, "BEHIND")))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert "armed and in flight" not in summary
+    assert "| #1 | BEHIND | updated from the default branch |" in summary
+
+
+def test_armed_behind_goes_before_an_older_unarmed_one(tmp_path):
+    waiting = pull(2, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(pull(1, "BEHIND"), waiting))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2)]
+
+
 def test_conflict_moves_to_the_next_pull_request(tmp_path):
     forge = Forge(repository(pull(1, "BEHIND"), pull(2, "BEHIND")))
     forge.update_answers[1] = (422, f"{CONFLICT}.")

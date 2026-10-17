@@ -101,8 +101,9 @@ repository: the oldest the forge reports CLEAN, through the merge call with
 the head commit it read, so a red or blocked pull request is refused by the
 forge itself and the app has no bypass. With none CLEAN and no armed one in
 flight, it arms auto-merge on the oldest BEHIND pull request whose checks are
-not red and merges the default branch into it. It leaves alone drafts, forks,
-other bases, the hold labels, release branches (`release-please--`, a release
+not red and merges the default branch into it; an armed pull request that is
+BEHIND is updated first. It leaves alone drafts, forks, other bases, the hold
+labels, release branches (`release-please--`, a release
 is a person's act), dependency updates younger than the minimum age and
 archived repositories. The app is one public app installed on every account
 of the fleet; its rights are in `apps/merge-train.json`, and a test holds them
