@@ -47,3 +47,4 @@ record that supersedes it.
 | [0037](0037-the-merge-train-writes-the-squash-message.md) | 2026-10-16 | The merge train writes the squash message | Accepted |
 | [0038](0038-the-merge-train-skips-superseded-pull-requests.md) | 2026-10-16 | The merge train skips superseded pull requests | Accepted |
 | [0039](0039-the-merge-train-closes-the-issues-its-merges-name.md) | 2026-10-17 | The merge train closes the issues its merges name | Accepted |
+| [0040](0040-the-merge-train-leaves-a-release-to-its-writer.md) | 2026-10-18 | The merge train leaves a release to its writer | Accepted |

@@ -1414,11 +1414,9 @@ def release_job_findings(doc: dict) -> list[str]:
     steps = job.get("steps", [])
     minting = [s for s in steps if str(s.get("uses", "")).startswith(APP_TOKEN)]
     running = [s for s in steps if str(s.get("uses", "")).startswith(RELEASE_PLEASE)]
-    if len(minting) != 1 or len(running) != 1:
+    if len(minting) != 1 or len(running) != 2:
         return [f"{len(minting)} token steps and {len(running)} release-please steps"]
-    mint, run = minting[0]["with"], running[0]["with"]
-    if run.get("token") != f"${{{{ steps.{minting[0].get('id')}.outputs.token }}}}":
-        found.append(f"release-please token is {run.get('token')!r}, not the app's")
+    mint = minting[0].get("with", {})
     if mint.get("owner") != "${{ matrix.repository.owner }}":
         found.append("token not minted for the repository's owner")
     if mint.get("repositories") != "${{ matrix.repository.name }}":
@@ -1426,8 +1424,35 @@ def release_job_findings(doc: dict) -> list[str]:
     rights = {key: value for key, value in mint.items() if key.startswith("permission-")}
     if rights != TOKEN_RIGHTS:
         found.append(f"token rights {rights}")
-    if run.get("repo-url") != "${{ matrix.repository.owner }}/${{ matrix.repository.name }}":
-        found.append("release-please runs on another repository")
+    expected_token = f"${{{{ steps.{minting[0].get('id')}.outputs.token }}}}"
+    expected_repo = "${{ matrix.repository.owner }}/${{ matrix.repository.name }}"
+    create_step, pr_step = running[0], running[1]
+    create_with = create_step.get("with", {})
+    pr_with = pr_step.get("with", {})
+    if create_with.get("token") != expected_token:
+        found.append(f"release step token is {create_with.get('token')!r}, not the app's")
+    if pr_with.get("token") != expected_token:
+        found.append(f"pull-request step token is {pr_with.get('token')!r}, not the app's")
+    if create_with.get("repo-url") != expected_repo:
+        found.append("release step runs on another repository")
+    if pr_with.get("repo-url") != expected_repo:
+        found.append("pull-request step runs on another repository")
+    if create_with.get("skip-github-pull-request") not in (True, "true"):
+        found.append("release step does not skip pull requests")
+    if create_step.get("continue-on-error") not in (True, "true"):
+        found.append("release step does not continue on error")
+    if "steps.settings.outputs.skip == 'false'" not in str(create_step.get("if", "")):
+        found.append("release step does not check skip setting")
+    if pr_with.get("skip-github-release") not in (True, "true"):
+        found.append("pull-request step does not skip releases")
+    judging = [s for s in steps if str(s.get("run", "")).endswith('release_labels.py" after')]
+    judge_env = judging[0].get("env", {}) if len(judging) == 1 else {}
+    outcome = f"${{{{ steps.{create_step.get('id')}.outcome }}}}"
+    if (judge_env.get("OUTCOME"), judge_env.get("SKIP")) != (
+        outcome,
+        "${{ steps.settings.outputs.skip }}",
+    ):
+        found.append("no step judges the release step that continues on error")
     if job.get("permissions") != {} or job.get("environment") != "merge-train":
         found.append("GITHUB_TOKEN has rights, or the key's environment is missing")
     if "inputs.switch == 'on'" not in job.get("if", ""):
@@ -1444,27 +1469,94 @@ def test_release_job_runs_release_please_with_the_app_token():
 
 
 @pytest.mark.parametrize(
-    ("change", "finding"),
+    ("step_index", "change", "finding"),
     [
         (
+            0,
             lambda w: w.update(token="${{ github.token }}"),
-            "release-please token is '${{ github.token }}', not the app's",
+            "release step token is '${{ github.token }}', not the app's",
         ),
-        (lambda w: w.pop("token"), "release-please token is None, not the app's"),
+        (0, lambda w: w.pop("token"), "release step token is None, not the app's"),
+        (
+            1,
+            lambda w: w.update(token="${{ github.token }}"),
+            "pull-request step token is '${{ github.token }}', not the app's",
+        ),
+        (1, lambda w: w.pop("token"), "pull-request step token is None, not the app's"),
     ],
 )
-def test_github_token_for_release_please_is_found(change, finding):
+def test_github_token_for_release_please_is_found(step_index, change, finding):
     """GITHUB_TOKEN opens release pull requests that start no checks (cordanaLLM/imago#58)."""
     doc = ciwf.load(TRAIN)
-    step = [s for s in doc["jobs"]["release"]["steps"] if s["uses"].startswith(RELEASE_PLEASE)][0]
-    change(step["with"])
+    steps = [
+        s for s in doc["jobs"]["release"]["steps"] if s.get("uses", "").startswith(RELEASE_PLEASE)
+    ]
+    change(steps[step_index]["with"])
     assert release_job_findings(doc) == [finding]
+
+
+@pytest.mark.parametrize(
+    ("step_index", "finding"),
+    [
+        (0, "release step runs on another repository"),
+        (1, "pull-request step runs on another repository"),
+    ],
+)
+def test_release_please_repo_url_is_found(step_index, finding):
+    doc = ciwf.load(TRAIN)
+    steps = [
+        s for s in doc["jobs"]["release"]["steps"] if s.get("uses", "").startswith(RELEASE_PLEASE)
+    ]
+    steps[step_index]["with"]["repo-url"] = "other/repo"
+    assert release_job_findings(doc) == [finding]
+
+
+@pytest.mark.parametrize(
+    ("mutator", "finding"),
+    [
+        (
+            lambda steps: steps[0]["with"].pop("skip-github-pull-request"),
+            "release step does not skip pull requests",
+        ),
+        (
+            lambda steps: steps[0].pop("continue-on-error"),
+            "release step does not continue on error",
+        ),
+        (
+            lambda steps: steps[0].pop("if"),
+            "release step does not check skip setting",
+        ),
+        (
+            lambda steps: steps[1]["with"].pop("skip-github-release"),
+            "pull-request step does not skip releases",
+        ),
+    ],
+)
+def test_release_step_pieces_are_found(mutator, finding):
+    doc = ciwf.load(TRAIN)
+    steps = [
+        s for s in doc["jobs"]["release"]["steps"] if s.get("uses", "").startswith(RELEASE_PLEASE)
+    ]
+    mutator(steps)
+    assert release_job_findings(doc) == [finding]
+
+
+def test_release_job_without_the_judge_is_found():
+    """continue-on-error would turn every failed release green without the judge step."""
+    doc = ciwf.load(TRAIN)
+    steps = doc["jobs"]["release"]["steps"]
+    judge = [s for s in steps if str(s.get("run", "")).endswith('release_labels.py" after')]
+    assert len(judge) == 1
+    judge[0]["env"]["OUTCOME"] = "success"
+    assert release_job_findings(doc) == ["no step judges the release step that continues on error"]
+    steps.remove(judge[0])
+    assert release_job_findings(doc) == ["no step judges the release step that continues on error"]
 
 
 def test_release_job_mutants_are_found():
     doc = ciwf.load(TRAIN)
     job = doc["jobs"]["release"]
-    mint = [s for s in job["steps"] if s["uses"].startswith(APP_TOKEN)][0]["with"]
+    mint = [s for s in job["steps"] if s.get("uses", "").startswith(APP_TOKEN)][0]["with"]
     mint.pop("repositories")
     mint["permission-issues"] = "write"
     job["if"] = job["if"].replace("inputs.switch == 'on'", "true")
