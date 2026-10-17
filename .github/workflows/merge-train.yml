@@ -22,6 +22,12 @@
 # - When squashing, the train writes the squash commit message from the pull
 #   request's own non-merge commits and their sign-offs (decision record 0037),
 #   without Co-authored-by trailers.
+# - After that write, it closes the open issues that the pull requests it
+#   merged in the last 7 days name as closed (`Closes #N` and the forge's
+#   other closing forms): the forge leaves them open when the app merges, and
+#   that holds for auto-merges the forge carries out for the app too
+#   (decision record 0039). Same repository only; an issue reopened after the
+#   merge stays open.
 #
 # Left alone: drafts, superseded pull requests (label `superseded`, a body
 # that says "Superseded by #N", or another open pull request whose body says
@@ -54,6 +60,8 @@
 # For every repository the job mints a token limited to that repository, with
 # contents, pull requests and workflows write, checks and actions read (read
 # rights only when `switch` is off), and revokes it when the repository is done.
+# Only when an issue is to be closed, a second token for that repository
+# carries issues write alone, for the comment and the close.
 # Workflows write is there because the forge refuses a merge or an
 # update-branch that changes a file under .github/workflows without it: pin
 # updates do, and so does an update after the default branch changed a
@@ -140,14 +148,15 @@ jobs:
       releases: ${{ steps.sweep.outputs.releases }}
     steps:
       # The train's pure rules (which pull request it lands, updates or leaves
-      # alone, and the squash message), written as a module the train script
-      # imports: the script alone would exceed the engine's cap of 4096 fields
-      # per run script (decision records 0034, 0037).
+      # alone, which issues it closes, and the squash message) and its GraphQL
+      # documents, written as a module the train script imports: the script alone
+      # would exceed the engine's cap of 4096 fields per run script (decision
+      # records 0034, 0037, 0039).
       - name: Write the train rules module
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/train_rules.py" <<'PY'
-          """Rules of the merge train: verdicts and the squash message (decision records 0029, 0037)."""
+          """Merge train rules: verdicts, issues to close, squash message, GraphQL documents."""
 
           import re
           from datetime import datetime
@@ -245,6 +254,32 @@ jobs:
               return armed and reason == "merge state BLOCKED" and not is_red(pull)
 
 
+          def issues_to_close(merged, repository, bot, since):
+              """(pull request, merge commit, issue) for each open issue a train merge should have closed.
+
+              The forge leaves the issues a pull request closes open when the train merges it
+              (decision record 0039). Only pull requests the app merged since `since`, only
+              issues of the same repository, and never an issue reopened after the merge:
+              reopening is a person's call.
+              """
+              found = []
+              for pull in merged:
+                  merged_at = datetime.fromisoformat(pull["mergedAt"])
+                  if (pull["mergedBy"] or {}).get("login") != bot or merged_at < since:
+                      continue
+                  for issue in pull["closingIssuesReferences"]["nodes"]:
+                      if issue["state"] != "OPEN" or issue["repository"]["nameWithOwner"] != repository:
+                          continue
+                      reopened = [
+                          datetime.fromisoformat(event["createdAt"])
+                          for event in issue["timelineItems"]["nodes"]
+                      ]
+                      if any(when > merged_at for when in reopened):
+                          continue
+                      found.append((pull["number"], pull["mergeCommit"]["oid"], issue["number"]))
+              return found
+
+
           def clean_commit(message, sign_offs):
               """Subject and trailer-stripped body of one commit; appends new sign-offs."""
               subject, _, rest = message.partition("\n")
@@ -278,6 +313,106 @@ jobs:
               if any(line.strip().startswith("co-authored-by:") for line in lines):
                   raise ValueError("squash message holds a Co-authored-by line")
               return headline, full_body
+
+          QUERY = """
+          query($owner: String!, $name: String!, $after: String) {
+            repository(owner: $owner, name: $name) {
+              defaultBranchRef { name }
+              autoMergeAllowed
+              mergeQueue { id }
+              releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
+              releaseManifest: object(expression: "HEAD:.release-please-manifest.json") { oid }
+              pullRequests(states: OPEN, first: 25, after: $after,
+                           orderBy: {field: CREATED_AT, direction: ASC}) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  number id title body isDraft isCrossRepository baseRefName headRefName headRefOid
+                  mergeStateStatus isInMergeQueue
+                  autoMergeRequest { enabledAt }
+                  labels(first: 50) { nodes { name } }
+                  history: commits(last: 20) {
+                    nodes { commit { committedDate parents { totalCount } } }
+                  }
+                  latest: commits(last: 1) {
+                    nodes { commit { checkSuites(first: 30) { nodes { conclusion } } } }
+                  }
+                }
+              }
+            }
+          }
+          """
+          COMMITS = """
+          query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                commits(first: 100) {
+                  totalCount
+                  nodes { commit { message parents { totalCount } } }
+                }
+              }
+            }
+          }
+          """
+          # The newest merged pull requests and the issues each one closes, for the close step.
+          MERGED = """
+          query($owner: String!, $name: String!) {
+            repository(owner: $owner, name: $name) {
+              pullRequests(states: MERGED, first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                nodes {
+                  number mergedAt
+                  mergedBy { login }
+                  mergeCommit { oid }
+                  closingIssuesReferences(first: 25) {
+                    nodes {
+                      number state
+                      repository { nameWithOwner }
+                      timelineItems(itemTypes: [REOPENED_EVENT], last: 5) {
+                        nodes { ... on ReopenedEvent { createdAt } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          """
+          MERGE = """
+          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
+                   $headline: String, $body: String) {
+            mergePullRequest(
+              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
+                      commitHeadline: $headline, commitBody: $body}
+            ) {
+              pullRequest { merged }
+            }
+          }
+          """
+          # A default branch with a merge queue refuses a direct merge; the queue lands it.
+          ENQUEUE = """
+          mutation($id: ID!, $oid: GitObjectID!) {
+            enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
+              mergeQueueEntry { state }
+            }
+          }
+          """
+          ARM = """
+          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
+                   $headline: String, $body: String) {
+            enablePullRequestAutoMerge(
+              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
+                      commitHeadline: $headline, commitBody: $body}
+            ) {
+              pullRequest { autoMergeRequest { enabledAt } }
+            }
+          }
+          """
+          COMMIT_MUTATION = """
+          mutation($input: CreateCommitOnBranchInput!) {
+            createCommitOnBranch(input: $input) {
+              commit { oid }
+            }
+          }
+          """
           PY
 
       # Merge train of every repository the app is installed on.
@@ -323,7 +458,20 @@ jobs:
           from datetime import UTC, datetime, timedelta
 
           sys.path.insert(0, os.environ["RUNNER_TEMP"])
-          from train_rules import in_flight, squash_message, superseded, verdict
+          from train_rules import (
+              ARM,
+              COMMIT_MUTATION,
+              COMMITS,
+              ENQUEUE,
+              MERGE,
+              MERGED,
+              QUERY,
+              in_flight,
+              issues_to_close,
+              squash_message,
+              superseded,
+              verdict,
+          )
 
           TIMEOUT = 30
           SETTLE_ROUNDS = 3
@@ -344,87 +492,13 @@ jobs:
               "checks": "read",
           }
           READ_RIGHTS = {"contents": "read", "pull_requests": "read", "checks": "read"}
+          ISSUE_RIGHTS = {"issues": "write"}
+          CLOSE_DAYS = 7
           LIST_RIGHTS = {"metadata": "read"}
           METHODS = ("SQUASH", "MERGE")
           ACCEPTABLE = ("UNSTABLE", "HAS_HOOKS")
           NO_NEW_COMMITS = "There are no new commits on the base branch."
           CONFLICT = "merge conflict between base and head"
-          QUERY = """
-          query($owner: String!, $name: String!, $after: String) {
-            repository(owner: $owner, name: $name) {
-              defaultBranchRef { name }
-              autoMergeAllowed
-              mergeQueue { id }
-              releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
-              releaseManifest: object(expression: "HEAD:.release-please-manifest.json") { oid }
-              pullRequests(states: OPEN, first: 25, after: $after,
-                           orderBy: {field: CREATED_AT, direction: ASC}) {
-                pageInfo { hasNextPage endCursor }
-                nodes {
-                  number id title body isDraft isCrossRepository baseRefName headRefName headRefOid
-                  mergeStateStatus isInMergeQueue
-                  autoMergeRequest { enabledAt }
-                  labels(first: 50) { nodes { name } }
-                  history: commits(last: 20) {
-                    nodes { commit { committedDate parents { totalCount } } }
-                  }
-                  latest: commits(last: 1) {
-                    nodes { commit { checkSuites(first: 30) { nodes { conclusion } } } }
-                  }
-                }
-              }
-            }
-          }
-          """
-          COMMITS = """
-          query($owner: String!, $name: String!, $number: Int!) {
-            repository(owner: $owner, name: $name) {
-              pullRequest(number: $number) {
-                commits(first: 100) {
-                  totalCount
-                  nodes { commit { message parents { totalCount } } }
-                }
-              }
-            }
-          }
-          """
-          MERGE = """
-          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
-                   $headline: String, $body: String) {
-            mergePullRequest(
-              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
-                      commitHeadline: $headline, commitBody: $body}
-            ) {
-              pullRequest { merged }
-            }
-          }
-          """
-          # A default branch with a merge queue refuses a direct merge; the queue lands it.
-          ENQUEUE = """
-          mutation($id: ID!, $oid: GitObjectID!) {
-            enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
-              mergeQueueEntry { state }
-            }
-          }
-          """
-          ARM = """
-          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
-                   $headline: String, $body: String) {
-            enablePullRequestAutoMerge(
-              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
-                      commitHeadline: $headline, commitBody: $body}
-            ) {
-              pullRequest { autoMergeRequest { enabledAt } }
-            }
-          }
-          """
-          COMMIT_MUTATION = """
-          mutation($input: CreateCommitOnBranchInput!) {
-            createCommitOnBranch(input: $input) {
-              commit { oid }
-            }
-          }
-          """
 
 
           class RefusedError(Exception):
@@ -1038,14 +1112,49 @@ jobs:
               return [r for r in listed if not r.get("archived") and not r.get("disabled")]
 
 
+          def close_issues(env, conf, installation, target, now):
+              """Close the open issues that pull requests the app merged name as closed; the lines to report.
+
+              The token for it carries issues write and nothing else, and is minted only when
+              an issue is to be closed.
+              """
+              owner, name = target["full_name"].split("/", 1)
+              data = graphql(env, MERGED, {"owner": owner, "name": name})
+              merged = data["repository"]["pullRequests"]["nodes"]
+              bot = conf["bot_login"].removesuffix("[bot]")
+              since = now - timedelta(days=CLOSE_DAYS)
+              found = issues_to_close(merged, target["full_name"], bot, since)
+              if not found:
+                  return []
+              try:
+                  token = mint(env, conf, installation, ISSUE_RIGHTS, [target["name"]])
+              except RefusedError as err:
+                  numbers = ", ".join(f"#{issue}" for _, _, issue in found)
+                  raise RefusedError(f"issues {numbers} stay open, no issues write: {err}") from err
+              url = f"{env['GITHUB_API_URL']}/repos/{target['full_name']}/issues"
+              lines = []
+              try:
+                  for number, oid, issue in found:
+                      text = f"Closed by #{number}, which the merge train merged as {oid}."
+                      call(f"{url}/{issue}/comments", token, "POST", {"body": text})
+                      call(f"{url}/{issue}", token, "PATCH", {"state": "closed", "state_reason": "completed"})
+                      lines.append(f"Closed issue #{issue}: #{number} merged as {oid[:7]}.")
+              finally:
+                  revoke(env, token)
+              return lines
+
+
           def one(env, conf, installation, target, now):
               """The train in one repository, with a token for that repository alone."""
               rights = WRITE_RIGHTS if conf["switch"] == "on" else READ_RIGHTS
               token = mint(env, conf, installation, rights, [target["name"]])
               local = {**env, "GITHUB_REPOSITORY": target["full_name"], "TRAIN_TOKEN": token}
+              closed = []
               try:
                   repo = fetch(local)
                   rows, notes, outcome = run(local, conf, repo, now)
+                  if conf["switch"] == "on":
+                      closed = close_issues(local, conf, installation, target, now)
               finally:
                   revoke(env, token)
               moved = any(
@@ -1053,6 +1162,9 @@ jobs:
                   for note in notes.values()
               )
               section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""
+              if closed:
+                  section = section or f"### {target['full_name']}: {outcome}\n"
+                  section += "\n" + "\n".join(closed) + "\n"
               return outcome, section, moved, bool(repo["releaseConfig"] and repo["releaseManifest"])
 
 

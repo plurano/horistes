@@ -46,3 +46,4 @@ record that supersedes it.
 | [0036](0036-the-update-bot-moves-pinned-release-tools-and-checksums.md) | 2026-10-16 | The update bot moves pinned release tools and their checksums | Accepted |
 | [0037](0037-the-merge-train-writes-the-squash-message.md) | 2026-10-16 | The merge train writes the squash message | Accepted |
 | [0038](0038-the-merge-train-skips-superseded-pull-requests.md) | 2026-10-16 | The merge train skips superseded pull requests | Accepted |
+| [0039](0039-the-merge-train-closes-the-issues-its-merges-name.md) | 2026-10-17 | The merge train closes the issues its merges name | Accepted |

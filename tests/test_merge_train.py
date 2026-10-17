@@ -52,6 +52,8 @@ WRITE = {
     "checks": "read",
 }
 READ = {"contents": "read", "pull_requests": "read", "checks": "read"}
+ISSUES = {"issues": "write"}
+BOT = "merge-train-app"
 
 
 def script() -> str:
@@ -120,6 +122,28 @@ def pull(number: int, state: str, **fields) -> dict:
     return node
 
 
+def merged_pull(number: int, *issues: tuple, by: str = BOT, at: str = YOUNG, **fields) -> dict:
+    """One merged pull request as the close step reads it; issues: (number, state, reopened)."""
+    nodes = []
+    for issue in issues:
+        issue_number, state, reopened = (*issue, ())[:3]
+        nodes.append(
+            {
+                "number": issue_number,
+                "state": state,
+                "repository": {"nameWithOwner": fields.get("issue_repo", "fleet/app")},
+                "timelineItems": {"nodes": [{"createdAt": when} for when in reopened]},
+            }
+        )
+    return {
+        "number": number,
+        "mergedAt": at,
+        "mergedBy": {"login": by} if by else None,
+        "mergeCommit": {"oid": f"{number:x}" * 40},
+        "closingIssuesReferences": {"nodes": nodes},
+    }
+
+
 def repository(
     *pulls: dict, auto_merge: bool = True, release: tuple = (False, False), queue: bool = False
 ) -> dict:
@@ -173,6 +197,8 @@ class Forge:
         self.messages: list[tuple[str, str, str | None, str | None]] = []
         self.commits: dict[int, list[tuple[str, int]]] = {}
         self.commit_counts: dict[int, int] = {}
+        self.merged_pulls: dict[str, list[dict]] = {}
+        self.issue_right = True
         self.install(7, "fleet", app=list(reads))
 
     def set_allowlist(self, repo: str, default_branch: str, paths: list[str]) -> None:
@@ -266,6 +292,8 @@ class Forge:
         if names is None and body["permissions"] == {"metadata": "read"}:
             token = f"list-token-{number}"
             self.tokens[token] = ("list", number, None)
+        elif "issues" in body["permissions"] and not self.issue_right:
+            return 422, {"message": "The permissions requested are not granted."}
         elif names and len(names) == 1 and names[0] in inst["repos"]:
             full = f"{inst['account']}/{names[0]}"
             token = "planted-token" if full == "fleet/app" else f"token-{full}"
@@ -327,6 +355,9 @@ class Forge:
             return self._handle_commit_mutation(full, variables)
         if "pullRequest(" in query:
             return self.pull_commits(full, variables)
+        if "states: MERGED" in query:
+            nodes = self.merged_pulls.get(full, [])
+            return {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
         return self.pull_page(full, query, variables)
 
     def pull_commits(self, full: str, variables: dict) -> dict:
@@ -373,7 +404,7 @@ class Forge:
             body = self.graphql(header, query, variables)
             operation = re.search(r"\b(\w+)\(\s*input:", query)[1]
             statuses = self.mutation_statuses.get(operation, [])
-        elif "pullRequests(" in query:
+        elif "pullRequests(" in query and "states: MERGED" not in query:
             self.read_calls.append((full, dict(variables)))
             size = int(re.search(r"pullRequests\(states: OPEN, first: (\d+)", query)[1])
             if size > 25:
@@ -399,6 +430,12 @@ class Forge:
         self.write(full, ("update", number, body["expected_head_sha"]))
         code, message = self.update_answers.get(number, (202, "Updating pull request branch."))
         return code, {"message": message}
+
+    def issue_write(self, header: str, full: str, write: tuple) -> tuple[int, dict]:
+        token_repo, rights = self.repo_of(header)
+        assert (token_repo, rights) == (full, ISSUES), (token_repo, rights, full)
+        self.write(full, write)
+        return 200, {}
 
     def installation_list(self) -> list[dict]:
         return [
@@ -544,6 +581,12 @@ class Handler(BaseHTTPRequestHandler):
             raise AssertionError(self.path)
 
     def do_POST(self) -> None:
+        if self.path.startswith("/repos/") and self.path.endswith("/comments"):
+            full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
+            number = int(tail.removesuffix("/comments"))
+            write = ("comment", number, self.body()["body"])
+            self.answer(*self.server.forge.issue_write(self.headers["Authorization"], full, write))
+            return
         if self.path == "/graphql":
             request = self.body()
             header = self.headers["Authorization"]
@@ -565,6 +608,12 @@ class Handler(BaseHTTPRequestHandler):
         self.answer(
             *self.server.forge.update(self.headers["Authorization"], full, int(number), self.body())
         )
+
+    def do_PATCH(self) -> None:
+        full, _, number = self.path.removeprefix("/repos/").partition("/issues/")
+        body = self.body()
+        write = ("close", int(number), body["state"], body["state_reason"])
+        self.answer(*self.server.forge.issue_write(self.headers["Authorization"], full, write))
 
     def do_DELETE(self) -> None:
         assert self.path == "/installation/token", self.path
@@ -773,11 +822,11 @@ def test_pull_pages_stop_at_cap(tmp_path, count, pages, truncated):
 
 
 def test_page_size_100_is_refused_by_forge(tmp_path):
-    source = script()
+    source = module()
     mutant = source.replace("first: 25, after:", "first: 100, after:")
     assert mutant != source
     forge = Forge(repository(pull(1, "CLEAN")))
-    done, _ = train(tmp_path, forge, mutant)
+    done, _ = train(tmp_path, forge, helper=mutant)
     assert done.returncode != 0
     assert "HTTP 502" in done.stdout + done.stderr
     assert "read page size exceeds 25" in done.stdout + done.stderr
@@ -1112,7 +1161,7 @@ def test_app_rights_are_the_rights_the_train_asks_for(tmp_path):
         (7, {"permissions": WRITE, "repositories": ["app"]}),
     ]
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    assert manifest["default_permissions"] == {**WRITE, "metadata": "read"}
+    assert manifest["default_permissions"] == {**WRITE, **ISSUES, "metadata": "read"}
 
 
 def test_switched_off_asks_for_read_rights_only(tmp_path):
@@ -2254,11 +2303,11 @@ def test_merge_method_merge_sends_no_headline_or_body(tmp_path, state, kind):
 
 
 def test_without_commit_body_in_merge_mutation_the_planted_test_fails(tmp_path):
-    mutant = script().replace(", commitBody: $body", "")
-    assert mutant != script()
+    mutant = module().replace(", commitBody: $body", "")
+    assert mutant != module()
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.commits[1] = list(PLANTED_COMMITS)
-    done, _ = train(tmp_path, forge, mutant)
+    done, _ = train(tmp_path, forge, helper=mutant)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.messages == [("merge", "PR_1", "change 1 (#1)", None)]
     assert forge.messages[0][3] != PLANTED_BODY
@@ -2286,3 +2335,90 @@ def test_co_authored_by_named_in_prose_still_lands(tmp_path):
         "The forge added a Co-authored-by: line for the bot.\n\n"
         "Signed-off-by: Dev <dev@example.org>"
     )
+
+
+def closed(issue: int, pull: int) -> list[tuple]:
+    oid = f"{pull:x}" * 40
+    text = f"Closed by #{pull}, which the merge train merged as {oid}."
+    return [("comment", issue, text), ("close", issue, "closed", "completed")]
+
+
+def test_issue_a_train_merge_names_is_closed(tmp_path):
+    """Planted: an app merge whose body says Closes #3 left #3 open; the sweep closes it."""
+    forge = Forge(repository(pull(1, "BLOCKED")))
+    forge.merged_pulls["fleet/app"] = [merged_pull(5, (3, "OPEN"))]
+    done, written = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == closed(3, 5)
+    assert (7, {"permissions": ISSUES, "repositories": ["app"]}) in forge.minted
+    assert len(forge.revoked) == len(forge.minted)
+    assert "Closed issue #3: #5 merged as 5555555." in written
+
+
+def test_without_the_close_step_the_issue_stays_open(tmp_path):
+    """Mutation: the sweep without the close step leaves the planted issue open."""
+    call = "closed = close_issues(local, conf, installation, target, now)"
+    text = script()
+    assert text.count(call) == 1
+    forge = Forge(repository(pull(1, "BLOCKED")))
+    forge.merged_pulls["fleet/app"] = [merged_pull(5, (3, "OPEN"))]
+    done, _ = train(tmp_path, forge, text.replace(call, "closed = []"))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+
+
+def test_landing_and_closing_in_one_run(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merged_pulls["fleet/app"] = [merged_pull(5, (3, "OPEN"), (4, "OPEN"))]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1), *closed(3, 5), *closed(4, 5)]
+
+
+@pytest.mark.parametrize(
+    ("merged", "why"),
+    [
+        (merged_pull(5, (3, "OPEN"), by="lusoris"), "a person merged it"),
+        (merged_pull(5, (3, "OPEN"), by=""), "no merger recorded"),
+        (merged_pull(5, (3, "CLOSED")), "already closed"),
+        (merged_pull(5, (3, "OPEN"), issue_repo="fleet/other"), "another repository"),
+        (merged_pull(5, (3, "OPEN"), at=OLD), "merged before the window"),
+        (merged_pull(5, (3, "OPEN", [NOW.isoformat()])), "reopened after the merge"),
+    ],
+)
+def test_issue_left_open(tmp_path, merged, why):
+    forge = Forge(repository(pull(1, "BLOCKED")))
+    forge.merged_pulls["fleet/app"] = [merged]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, why + done.stdout + done.stderr
+    assert forge.writes == [], why
+    assert all(body["permissions"] != ISSUES for _, body in forge.minted), why
+
+
+def test_reopened_before_the_merge_is_closed(tmp_path):
+    reopened = (NOW - timedelta(days=1)).isoformat()
+    forge = Forge(repository(pull(1, "BLOCKED")))
+    forge.merged_pulls["fleet/app"] = [merged_pull(5, (3, "OPEN", [reopened]))]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == closed(3, 5)
+
+
+def test_without_issues_write_the_open_issue_is_reported(tmp_path):
+    """No silent skip: an installation without issues write refuses, naming the issue."""
+    forge = Forge(repository(pull(1, "BLOCKED")))
+    forge.issue_right = False
+    forge.merged_pulls["fleet/app"] = [merged_pull(5, (3, "OPEN"))]
+    done, written = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "issues #3 stay open, no issues write" in written
+    assert len(forge.revoked) == len(forge.minted) - 1
+
+
+def test_switched_off_closes_nothing(tmp_path):
+    forge = Forge(repository(pull(1, "BLOCKED")))
+    forge.merged_pulls["fleet/app"] = [merged_pull(5, (3, "OPEN"))]
+    done, _ = train(tmp_path, forge, switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
