@@ -16,6 +16,9 @@
 #   a forge rebase re-commits the head unsigned). The forge offers auto-merge
 #   only while a pull request cannot merge at once, so BEHIND is where arming
 #   happens; a CLEAN pull request is landed directly.
+# - In flight means armed with checks still running (BLOCKED). An armed pull
+#   request that is BEHIND cannot land until the default branch is merged into
+#   it, so it holds nothing: the sweep updates it first, before it arms another.
 # - When squashing, the train writes the squash commit message from the pull
 #   request's own non-merge commits and their sign-offs (decision record 0037),
 #   without Co-authored-by trailers.
@@ -234,9 +237,12 @@ jobs:
 
 
           def in_flight(pull, reason):
-              """An armed pull request that can still land holds the train."""
-              waiting = reason in ("behind", "merge state BLOCKED")
-              return bool(pull["autoMergeRequest"]) and waiting and not is_red(pull)
+              """An armed pull request whose checks still run holds the train.
+
+              An armed BEHIND pull request does not: it cannot land before it is updated.
+              """
+              armed = bool(pull["autoMergeRequest"])
+              return armed and reason == "merge state BLOCKED" and not is_red(pull)
 
 
           def clean_commit(message, sign_offs):
@@ -623,10 +629,13 @@ jobs:
 
 
           def advance(env, conf, repo, rows, notes):
-              """Arm and update the oldest BEHIND pull request that is not red."""
-              for pull, reason in rows:
-                  if reason != "behind":
-                      continue
+              """Update the oldest armed BEHIND pull request, else arm and update the oldest BEHIND one.
+
+              An armed pull request goes first: it already waits for the forge to merge it.
+              """
+              behind = [pull for pull, reason in rows if reason == "behind"]
+              behind.sort(key=lambda pull: not pull["autoMergeRequest"])
+              for pull in behind:
                   if repo["autoMergeAllowed"] and not pull["autoMergeRequest"]:
                       arm(env, conf, pull)
                       notes[pull["number"]] = "armed, updated from the default branch"
