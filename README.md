@@ -61,7 +61,7 @@ of the same owner can call it
 | :--- | :--- | :--- | :--- | :--- |
 | `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-26.04`, the newest working image); `root` (directory checked as the project root, default `.`) | `<calling job> / REUSE lint`; with another `root`, `<calling job> / REUSE lint (<root>)` ([ADR-0027](docs/adr/0027-a-narrowed-licence-run-is-named-for-its-folder.md)) | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)); the image is named by digest ([ADR-0008](docs/adr/0008-licence-tool-image-by-digest.md)) |
 | `.github/workflows/scorecard.yml` | the supply-chain checks of the OpenSSF Scorecard action, reported to code scanning and kept as the artifact `scorecard-result` | `outside_hosts` (boolean, default false: the run fails, [ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)); `publish` (boolean, default false) | `<calling job> / Public repository`, `<calling job> / Analysis`; with `outside_hosts` false, `Analysis` is the failed refusal and the analysis job reports as `Analysis (not started)` | with `outside_hosts`: `www.bestpractices.dev`, `api.deps.dev`, `api.osv.dev`, `oss-fuzz-build-logs.storage.googleapis.com`; with `publish`: `api.scorecard.dev`, `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
-| `.github/workflows/merge-train.yml` | in every repository the merge-train app is installed on, lands one clean pull request (through the merge queue where the default branch has one) or updates the next one by merge ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md), [ADR-0034](docs/adr/0034-the-merge-train-queues-where-the-branch-has-a-merge-queue.md), [ADR-0037](docs/adr/0037-the-merge-train-writes-the-squash-message.md), [ADR-0039](docs/adr/0039-the-merge-train-closes-the-issues-its-merges-name.md)) | `app_client_id` (required); `runner` (required, needs python3 and openssl); `switch` (`on` or `off`); `merge_method` (`SQUASH` or `MERGE`); `accept_states` (`UNSTABLE`, `HAS_HOOKS`; default none); `min_age_days` (default 3); `hold_labels`, `dependency_branches`, `person_branches`, `security_labels`; secret `app_private_key` | `<calling job> / Merge train`, never a check of a pull request | none |
+| `.github/workflows/merge-train.yml` | in every repository the merge-train app is installed on, lands one clean pull request (through the merge queue where the default branch has one) or updates the next one by merge ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md), [ADR-0034](docs/adr/0034-the-merge-train-queues-where-the-branch-has-a-merge-queue.md), [ADR-0037](docs/adr/0037-the-merge-train-writes-the-squash-message.md), [ADR-0039](docs/adr/0039-the-merge-train-closes-the-issues-its-merges-name.md), [ADR-0040](docs/adr/0040-the-merge-train-leaves-a-release-to-its-writer.md)) | `app_client_id` (required); `runner` (required, needs python3 and openssl); `switch` (`on` or `off`); `merge_method` (`SQUASH` or `MERGE`); `accept_states` (`UNSTABLE`, `HAS_HOOKS`; default none); `min_age_days` (default 3); `hold_labels`, `dependency_branches`, `person_branches`, `security_labels`; secret `app_private_key` | `<calling job> / Merge train`, never a check of a pull request | none |
 
 The licence job reads the contents and takes no secret; the caller grants
 `contents: read` and nothing else. On a draft pull request the job stops with
@@ -107,7 +107,14 @@ BEHIND is updated first. It then closes the open issues that its recent
 merges name as closed, which the forge leaves open when the app merges. It
 leaves alone drafts, forks, other bases, the hold labels, release branches
 (`release-please--`, a release is a person's act), dependency updates younger
-than the minimum age and archived repositories. The app is one public app installed on every account
+than the minimum age and archived repositories. After the sweep, a second job
+runs release-please with release creation and release pull request updates
+split into separate steps: a repository that writes its own release skips
+release creation and has its labels moved once the tag is on the merge commit,
+while a pre-existing release is verified
+([ADR-0031](docs/adr/0031-the-merge-train-app-runs-release-please.md),
+[ADR-0040](docs/adr/0040-the-merge-train-leaves-a-release-to-its-writer.md)).
+The app is one public app installed on every account
 of the fleet; its rights are in `apps/merge-train.json`, and a test holds them
 equal to what the train asks the forge for.
 

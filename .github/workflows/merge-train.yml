@@ -42,14 +42,16 @@
 #
 # RELEASES. A repository with release-please-config.json and
 # .release-please-manifest.json on its default branch gets a second job after
-# the sweep (decision record 0031): release-please with a token of the app
-# limited to that repository, contents, pull requests and workflows write. It
-# opens or updates the release pull request and, once a person has merged it,
-# creates the release. It never merges: the train leaves heads in
-# `person_branches` alone, so a release stays a person's act. The app's events
-# start workflow runs, so the release pull request gets its required checks
-# and the release starts the repository's `release: published` workflows.
-# `switch: off` runs no release job.
+# the sweep (decision records 0031, 0040): release-please with a token of the
+# app limited to that repository, contents, pull requests and workflows write.
+# The job splits release creation and release pull request updates into separate
+# steps: a repository that writes its own release skips release creation and has
+# its labels moved once the tag is on the merge commit, while a pre-existing
+# release is verified. The train never merges: heads in `person_branches` stay
+# untouched, so a release stays a person's act. The app's events start workflow
+# runs, so the release pull request gets its required checks and the release
+# starts the repository's `release: published` workflows. `switch: off` runs no
+# release job.
 #
 # CREDENTIAL. One repository holds the app's private key, as the secret
 # MERGE_TRAIN_APP_KEY of its environment `merge-train`; the environment lets
@@ -1270,6 +1272,12 @@ jobs:
     # the app's token causes start workflow runs, so the release pull request
     # gets its required checks and a release starts the repository's
     # `release: published` workflows; with GITHUB_TOKEN neither happens.
+    #
+    # The job splits release creation and release pull request updates into
+    # separate steps (decision records 0031, 0040): repositories that write
+    # their own releases skip release creation and have their labels moved once
+    # the tag is on the merge commit, while a pre-existing release is verified
+    # and accepted if already complete.
     name: Release pull request and release
     needs: train
     if: >-
@@ -1297,10 +1305,311 @@ jobs:
           permission-pull-requests: write
           permission-workflows: write
 
-      - name: Open or update the release pull request, create the release of a merged one
+      - name: Write the release labels module
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/release_labels.py" <<'PY'
+          """Release settings and label handling for release-please."""
+
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          PENDING_LABEL = "autorelease: pending"
+          TAGGED_LABEL = "autorelease: tagged"
+          TIMEOUT = 30
+          MAX_BYTES = 1024 * 1024
+
+
+          class CallError(Exception):
+              """A forge call failed or returned an error status; `status` is the HTTP code, if any."""
+
+              def __init__(self, message, status=None):
+                  super().__init__(message)
+                  self.status = status
+
+
+          def call(url, token, method="GET", body=None, status_only=False):
+              """Execute one HTTP request to the forge, with bounded read and timeout."""
+              data = None if body is None else json.dumps(body).encode("utf-8")
+              req = urllib.request.Request(url, data=data, method=method)
+              if token:
+                  req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              try:
+                  with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                      raw = resp.read(MAX_BYTES + 1)
+                      if len(raw) > MAX_BYTES:
+                          raise CallError(f"{method} {url}: body exceeds {MAX_BYTES} bytes")
+                      if status_only:
+                          return resp.status, raw
+                      try:
+                          parsed = json.loads(raw.decode("utf-8")) if raw else {}
+                      except json.JSONDecodeError as err:
+                          raise CallError(f"{method} {url}: invalid JSON response: {err}") from err
+                      return resp.status, parsed
+              except urllib.error.HTTPError as err:
+                  if status_only:
+                      return err.code, b""
+                  raw = err.read(MAX_BYTES + 1)
+                  detail = raw.decode("utf-8", errors="replace")[:200]
+                  raise CallError(f"{method} {url}: HTTP {err.code}: {detail}", err.code) from err
+              except (urllib.error.URLError, TimeoutError) as err:
+                  raise CallError(f"{method} {url}: connection error: {err}") from err
+
+
+          def read_config(api_url, repo, token):
+              """Read and parse release-please-config.json via the contents API."""
+              url = f"{api_url}/repos/{repo}/contents/release-please-config.json"
+              _, data = call(url, token, method="GET")
+              raw = data.get("content", "")
+              try:
+                  decoded = base64.b64decode(raw).decode("utf-8")
+                  return json.loads(decoded)
+              except ValueError as err:
+                  raise CallError(f"parse release-please-config.json: {err}") from err
+
+
+          def evaluate_skip(config):
+              """Determine effective skip-github-release across packages."""
+              top = config.get("skip-github-release", False)
+              packages = config.get("packages")
+              if not packages or not isinstance(packages, dict):
+                  return bool(top)
+              pkg_skips = {}
+              for name, pkg in sorted(packages.items())[:100]:
+                  val = pkg.get("skip-github-release", top) if isinstance(pkg, dict) else top
+                  pkg_skips[name] = bool(val)
+              values = set(pkg_skips.values())
+              if len(values) > 1:
+                  details = ", ".join(f"{k}={v}" for k, v in pkg_skips.items())
+                  raise ValueError(f"mixed skip-github-release across packages: {details}")
+              return next(iter(values))
+
+
+          def parse_release_pull(pull, include_v):
+              """Validate a merged release pull request and return item dict or None."""
+              labels = {lbl.get("name") for lbl in pull.get("labels", []) if isinstance(lbl, dict)}
+              if PENDING_LABEL not in labels:
+                  return None
+              num = pull.get("number")
+              merged = bool(pull.get("merged_at"))
+              base_ref = pull.get("base", {}).get("ref") if isinstance(pull.get("base"), dict) else ""
+              head_ref = pull.get("head", {}).get("ref") if isinstance(pull.get("head"), dict) else ""
+              title = pull.get("title", "")
+              sha = pull.get("merge_commit_sha") or ""
+              expected_head = f"release-please--branches--{base_ref}" if base_ref else ""
+              match = (
+                  re.fullmatch(rf"chore\({re.escape(base_ref)}\): release (\d+\.\d+\.\d+)", title)
+                  if base_ref
+                  else None
+              )
+              sha_valid = len(sha) == 40 and bool(re.fullmatch(r"[0-9a-fA-F]{40}", sha))
+              if not (merged and head_ref == expected_head and match and sha_valid):
+                  sys.stdout.write(f"::warning::pull #{num} labelled {PENDING_LABEL} fails release checks\n")
+                  return None
+              version = match.group(1)
+              tag = f"v{version}" if include_v else version
+              return {"number": num, "sha": sha, "tag": tag}
+
+
+          def read_pending(api_url, repo, token, config):
+              """List merged release pull requests still carrying autorelease: pending."""
+              include_v = config.get("include-v-in-tag", True)
+              url = f"{api_url}/repos/{repo}/pulls?state=closed&per_page=20"
+              _, pulls = call(url, token, method="GET")
+              if not isinstance(pulls, list):
+                  raise CallError(f"GET {url}: expected list of pulls")
+              pending = []
+              for pull in pulls[:20]:
+                  item = parse_release_pull(pull, include_v)
+                  if item is not None:
+                      pending.append(item)
+              return pending
+
+
+          def cmd_settings(env):
+              """Read release settings and emit skip and pending outputs."""
+              api_url = env.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+              repo = env["REPO"]
+              token = env["TOKEN"]
+              config = read_config(api_url, repo, token)
+              try:
+                  skip = evaluate_skip(config)
+              except ValueError as err:
+                  sys.stdout.write(f"::error::{err}\n")
+                  return 1
+              pending = read_pending(api_url, repo, token, config)
+              out_file = env.get("GITHUB_OUTPUT")
+              if out_file:
+                  skip_str = "true" if skip else "false"
+                  pending_str = json.dumps(pending, separators=(",", ":"))
+                  with open(out_file, "a", encoding="utf-8") as f:
+                      f.write(f"skip={skip_str}\npending={pending_str}\n")
+              return 0
+
+
+          def get_tag_commit(api_url, repo, token, tag):
+              """Resolve the commit SHA for a tag ref, unwrapping annotated tags once."""
+              tag_quoted = urllib.parse.quote(tag, safe="")
+              url = f"{api_url}/repos/{repo}/git/matching-refs/tags/{tag_quoted}"
+              try:
+                  _, entries = call(url, token, method="GET")
+              except CallError as err:
+                  if err.status == 404:
+                      return None
+                  raise
+              if not isinstance(entries, list):
+                  return None
+              if len(entries) >= 30:
+                  raise CallError(f"matching-refs for {tag}: {len(entries)} entries (>= 30)")
+              exact = f"refs/tags/{tag}"
+              entry = None
+              for item in entries[:30]:
+                  if item.get("ref") == exact:
+                      entry = item
+                      break
+              if not entry:
+                  return None
+              obj = entry.get("object", {})
+              obj_type = obj.get("type")
+              sha = obj.get("sha")
+              if obj_type == "commit":
+                  return sha
+              if obj_type == "tag" and sha:
+                  tag_url = f"{api_url}/repos/{repo}/git/tags/{sha}"
+                  _, tag_data = call(tag_url, token, method="GET")
+                  target_obj = tag_data.get("object", {})
+                  if target_obj.get("type") == "commit":
+                      return target_obj.get("sha")
+              return None
+
+
+          def move_pending_labels(api_url, repo, token, pending):
+              """For each pending item with tag on commit: add tagged label, then delete pending."""
+              for item in pending[:100]:
+                  commit = get_tag_commit(api_url, repo, token, item["tag"])
+                  if commit == item["sha"]:
+                      num = item["number"]
+                      post_url = f"{api_url}/repos/{repo}/issues/{num}/labels"
+                      call(post_url, token, method="POST", body={"labels": [TAGGED_LABEL]})
+                      del_quoted = urllib.parse.quote(PENDING_LABEL, safe="")
+                      del_url = f"{api_url}/repos/{repo}/issues/{num}/labels/{del_quoted}"
+                      call(del_url, token, method="DELETE")
+                  else:
+                      sys.stdout.write(
+                          f"::notice::pull #{item['number']} stays pending (tag not yet on merge commit)\n"
+                      )
+              return 0
+
+
+          def judge_failed_release(api_url, repo, token, pending):
+              """Judge a failed release-please run when releases were not skipped."""
+              if not pending:
+                  sys.stdout.write("::error::release step failed and pending is empty\n")
+                  return 1
+              for item in pending[:100]:
+                  pull_url = f"{api_url}/repos/{repo}/pulls/{item['number']}"
+                  _, pull = call(pull_url, token, method="GET")
+                  labels = {lbl.get("name") for lbl in pull.get("labels", []) if isinstance(lbl, dict)}
+                  if PENDING_LABEL in labels:
+                      sys.stdout.write(f"::error::pull #{item['number']} still carries {PENDING_LABEL}\n")
+                      return 1
+                  commit = get_tag_commit(api_url, repo, token, item["tag"])
+                  if commit != item["sha"]:
+                      sys.stdout.write(f"::error::tag {item['tag']} commit {commit} != {item['sha']}\n")
+                      return 1
+                  tag_quoted = urllib.parse.quote(item["tag"], safe="")
+                  rel_url = f"{api_url}/repos/{repo}/releases/tags/{tag_quoted}"
+                  status, _ = call(rel_url, token, method="GET", status_only=True)
+                  if status != 200:
+                      sys.stdout.write(f"::error::release {item['tag']} returned HTTP {status}\n")
+                      return 1
+              for item in pending[:100]:
+                  sys.stdout.write(f"::notice::release {item['tag']} existed on the release commit; done\n")
+              return 0
+
+
+          def cmd_after(env):
+              """Move release labels or judge a failed release run."""
+              api_url = env.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+              repo = env["REPO"]
+              token = env["TOKEN"]
+              skip = env.get("SKIP", "false").lower() == "true"
+              outcome = env.get("OUTCOME", "")
+              raw_pending = env.get("PENDING", "[]")
+              pending = json.loads(raw_pending) if raw_pending else []
+              if skip:
+                  return move_pending_labels(api_url, repo, token, pending)
+              if outcome in ("success", "skipped"):
+                  return 0
+              if outcome == "failure":
+                  return judge_failed_release(api_url, repo, token, pending)
+              sys.stdout.write(f"::error::unexpected release outcome: {outcome}\n")
+              return 1
+
+
+          def main(argv, env):
+              """Dispatch settings or after command."""
+              if len(argv) < 2:
+                  sys.stderr.write("usage: release_labels.py <settings|after>\n")
+                  return 2
+              commands = {"settings": cmd_settings, "after": cmd_after}
+              if argv[1] not in commands:
+                  sys.stderr.write(f"unknown command: {argv[1]}\n")
+                  return 2
+              try:
+                  return commands[argv[1]](env)
+              except (CallError, KeyError, json.JSONDecodeError) as err:
+                  sys.stdout.write(f"::error title=Release labels::{argv[1]}: {err}\n")
+                  return 1
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv, os.environ))
+          PY
+
+      - name: Read the release settings
+        id: settings
+        shell: bash
+        env:
+          TOKEN: ${{ steps.token.outputs.token }}
+          REPO: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+        run: python3 "$RUNNER_TEMP/release_labels.py" settings
+
+      - name: Create the releases of merged release pull requests
+        id: release
+        if: steps.settings.outputs.skip == 'false'
+        continue-on-error: true
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ steps.token.outputs.token }}
           repo-url: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      - name: Move the labels, or judge a failed release run
+        shell: bash
+        env:
+          TOKEN: ${{ steps.token.outputs.token }}
+          REPO: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          SKIP: ${{ steps.settings.outputs.skip }}
+          OUTCOME: ${{ steps.release.outcome }}
+          PENDING: ${{ steps.settings.outputs.pending }}
+        run: python3 "$RUNNER_TEMP/release_labels.py" after
+
+      - name: Open or update the release pull request
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.token.outputs.token }}
+          repo-url: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
