@@ -17,6 +17,13 @@
 #   a forge rebase re-commits the head unsigned). The forge offers auto-merge
 #   only while a pull request cannot merge at once, so BEHIND is where arming
 #   happens; a CLEAN pull request is landed directly.
+# - When nothing lands and no armed pull request is in flight, a red pull
+#   request whose red runs failed only at the step "Stop on a draft pull
+#   request" gets the label `merge-train: refresh` added and removed: a run
+#   started before "ready for review" replays the draft payload on a re-run,
+#   while the label events carry the current one (decision record 0041). Once
+#   per failed run; workflows without labeled or unlabeled triggers stay red,
+#   and the summary says a person pushes.
 # - In flight means armed with checks still running (BLOCKED). An armed pull
 #   request that is BEHIND cannot land until the default branch is merged into
 #   it, so it holds nothing: the sweep updates it first, before it arms another.
@@ -169,6 +176,10 @@ jobs:
               r"\bsupersedes\s+(#\d+(?:(?:\s*,\s*|\s*,?\s*and\s+|\s+)#\d+)*)", re.I
           )
           SUPERSEDED_BY = re.compile(r"\bsuperseded\s+by\s+#\d+", re.I)
+          DRAFT_STEP = "Stop on a draft pull request"
+          REFRESH_LABEL = "merge-train: refresh"
+          REFRESH_LIMIT = 3
+          STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
 
 
           def update_made(pull):
@@ -286,6 +297,65 @@ jobs:
               return armed and reason == "merge state BLOCKED" and not is_red(pull)
 
 
+          def red_runs(pull):
+              """(run id, creation time) per workflow whose newest run on the head commit is red."""
+              nodes = pull["latest"]["nodes"]
+              suites = nodes[-1]["commit"]["checkSuites"]["nodes"] if nodes else []
+              return [
+                  ((suite["workflowRun"] or {}).get("databaseId"), suite["createdAt"])
+                  for suite in newest_suites(suites).values()
+                  if suite["conclusion"] in RED
+              ]
+
+
+          def refresh_candidates(rows):
+              """Red pull requests a fresh event could unblock, oldest first, at most REFRESH_LIMIT."""
+              waiting = ("red", "merge state BLOCKED", "merge state UNSTABLE")
+              found = [pull for pull, reason in rows if reason in waiting and red_runs(pull)]
+              return found[:REFRESH_LIMIT]
+
+
+          def stopped_at_draft_step(jobs):
+              """Whether the failed steps of a run's jobs are the draft step and nothing else."""
+              failed = {
+                  step["name"]
+                  for job in jobs
+                  for step in job.get("steps") or []
+                  if step.get("conclusion") == "failure"
+              }
+              return failed == {DRAFT_STEP}
+
+
+          def refreshed_since(pull, created):
+              """Whether REFRESH_LABEL was removed at or after a run was created: no run followed it."""
+              when = datetime.fromisoformat(created)
+              return any(
+                  event["label"]["name"] == REFRESH_LABEL
+                  and datetime.fromisoformat(event["createdAt"]) >= when
+                  for event in pull["refreshes"]["nodes"]
+              )
+
+
+          def refresh(rows, notes, jobs, toggle):
+              """Give the oldest pull request whose red runs stopped at the draft step a fresh event.
+
+              A re-run replays the draft payload; a label event carries the current one
+              (decision record 0041). Once per failed run: a refresh that started no run
+              is left to a person. jobs reads a run's jobs; toggle adds and removes REFRESH_LABEL.
+              """
+              for pull in refresh_candidates(rows):
+                  runs = red_runs(pull)
+                  if not all(run and stopped_at_draft_step(jobs(run)) for run, _ in runs):
+                      continue
+                  if refreshed_since(pull, max(created for _, created in runs)):
+                      notes[pull["number"]] = STILL_STOPPED
+                      continue
+                  toggle(pull)
+                  notes[pull["number"]] = "refreshed: its red runs stopped at the draft step"
+                  return f"refreshed #{pull['number']}"
+              return None
+
+
           def issues_to_close(merged, repository, bot, since):
               """(pull request, merge commit, issue) for each open issue a train merge should have closed.
 
@@ -362,6 +432,9 @@ jobs:
                   mergeStateStatus isInMergeQueue
                   autoMergeRequest { enabledAt }
                   labels(first: 50) { nodes { name } }
+                  refreshes: timelineItems(itemTypes: [UNLABELED_EVENT], last: 5) {
+                    nodes { ... on UnlabeledEvent { createdAt label { name } } }
+                  }
                   history: commits(last: 20) {
                     nodes { commit { committedDate parents { totalCount } } }
                   }
@@ -374,7 +447,7 @@ jobs:
                             conclusion
                             createdAt
                             app { slug }
-                            workflowRun { workflow { databaseId } }
+                            workflowRun { databaseId workflow { databaseId } }
                           }
                         }
                       }
@@ -510,8 +583,10 @@ jobs:
               MERGE,
               MERGED,
               QUERY,
+              REFRESH_LABEL,
               in_flight,
               issues_to_close,
+              refresh,
               squash_message,
               superseded,
               verdict,
@@ -762,6 +837,26 @@ jobs:
                   if update(env, pull):
                       return
                   notes[pull["number"]] = "conflicts with the default branch"
+
+
+          def run_jobs(env, run_id):
+              """The jobs of one workflow run with their steps, at most 100."""
+              api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
+              url = f"{api}/actions/runs/{run_id}/jobs?per_page=100"
+              return call(url, env["TRAIN_TOKEN"], "GET")["jobs"]
+
+
+          def toggle_refresh(env, pull):
+              """Add REFRESH_LABEL and remove it: two events that carry the pull request as it is now."""
+              api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
+              url = f"{api}/issues/{pull['number']}/labels"
+              call(url, env["TRAIN_TOKEN"], "POST", {"labels": [REFRESH_LABEL]})
+              name = urllib.parse.quote(REFRESH_LABEL, safe="")
+              try:
+                  call(f"{url}/{name}", env["TRAIN_TOKEN"], "DELETE")
+              except RefusedError as err:
+                  if "HTTP 404" not in str(err):
+                      raise
 
 
           def bot_identity(env, conf, token):
@@ -1063,6 +1158,11 @@ jobs:
               holding = [pull["number"] for pull, reason in rows if in_flight(pull, reason)]
               if holding:
                   return rows, notes, f"#{holding[0]} is armed and in flight"
+              outcome = refresh(
+                  rows, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull)
+              )
+              if outcome:
+                  return rows, notes, outcome
               advance(env, conf, repo, rows, notes)
               return rows, notes, "no pull request at a mergeable state"
 
@@ -1202,7 +1302,8 @@ jobs:
               finally:
                   revoke(env, token)
               moved = any(
-                  note.startswith(("armed", "updated", "queued")) or note == "generated files committed"
+                  note.startswith(("armed", "updated", "queued", "refreshed"))
+                  or note == "generated files committed"
                   for note in notes.values()
               )
               section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""

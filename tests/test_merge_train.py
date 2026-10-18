@@ -28,7 +28,7 @@ import zipfile
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 from conftest import ROOT
@@ -125,6 +125,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "mergeStateStatus": state,
         "autoMergeRequest": None,
         "labels": {"nodes": [{"name": name} for name in labels]},
+        "refreshes": {"nodes": []},
         "history": {
             "nodes": [
                 {"commit": {"committedDate": when, "parents": {"totalCount": parents}}}
@@ -214,6 +215,9 @@ class Forge:
         self.commit_counts: dict[int, int] = {}
         self.merged_pulls: dict[str, list[dict]] = {}
         self.issue_right = True
+        self.jobs: dict[int, list[dict]] = {}
+        self.jobs_calls: list[int] = []
+        self.label_missing = False
         self.install(7, "fleet", app=list(reads))
 
     def set_allowlist(self, repo: str, default_branch: str, paths: list[str]) -> None:
@@ -446,6 +450,20 @@ class Forge:
         code, message = self.update_answers.get(number, (202, "Updating pull request branch."))
         return code, {"message": message}
 
+    def run_jobs(self, header: str, full: str, run_id: int) -> tuple[int, dict]:
+        token_repo, rights = self.repo_of(header)
+        assert (token_repo, rights) == (full, WRITE), (token_repo, rights, full)
+        self.jobs_calls.append(run_id)
+        return 200, {"jobs": self.jobs.get(run_id, [])}
+
+    def label_write(self, header: str, full: str, write: tuple) -> tuple[int, dict]:
+        token_repo, rights = self.repo_of(header)
+        assert (token_repo, rights) == (full, WRITE), (token_repo, rights, full)
+        if write[0] == "unlabel" and self.label_missing:
+            return 404, {"message": "Label does not exist"}
+        self.write(full, write)
+        return 200, {}
+
     def issue_write(self, header: str, full: str, write: tuple) -> tuple[int, dict]:
         token_repo, rights = self.repo_of(header)
         assert (token_repo, rights) == (full, ISSUES), (token_repo, rights, full)
@@ -592,6 +610,10 @@ class Handler(BaseHTTPRequestHandler):
             self._get_artifact_zip(path)
         elif path.startswith("/storage/"):
             self._get_storage(path)
+        elif re.fullmatch(r"/repos/[^/]+/[^/]+/actions/runs/\d+/jobs", path):
+            full, _, tail = path.removeprefix("/repos/").partition("/actions/runs/")
+            run_id = int(tail.removesuffix("/jobs"))
+            self.answer(*self.server.forge.run_jobs(self.headers["Authorization"], full, run_id))
         else:
             raise AssertionError(self.path)
 
@@ -601,6 +623,11 @@ class Handler(BaseHTTPRequestHandler):
             number = int(tail.removesuffix("/comments"))
             write = ("comment", number, self.body()["body"])
             self.answer(*self.server.forge.issue_write(self.headers["Authorization"], full, write))
+            return
+        if re.fullmatch(r"/repos/[^/]+/[^/]+/issues/\d+/labels", self.path):
+            full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
+            write = ("label", int(tail.removesuffix("/labels")), *self.body()["labels"])
+            self.answer(*self.server.forge.label_write(self.headers["Authorization"], full, write))
             return
         if self.path == "/graphql":
             request = self.body()
@@ -631,6 +658,12 @@ class Handler(BaseHTTPRequestHandler):
         self.answer(*self.server.forge.issue_write(self.headers["Authorization"], full, write))
 
     def do_DELETE(self) -> None:
+        if "/labels/" in self.path:
+            full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
+            number, _, name = tail.partition("/labels/")
+            write = ("unlabel", int(number), unquote(name))
+            self.answer(*self.server.forge.label_write(self.headers["Authorization"], full, write))
+            return
         assert self.path == "/installation/token", self.path
         self.server.forge.revoked.append(self.headers["Authorization"].removeprefix("Bearer "))
         self.answer(204, None)
@@ -2550,7 +2583,9 @@ def suite(
         "conclusion": conclusion,
         "createdAt": f"2026-10-18T01:{minute:02d}:00Z",
         "app": {"slug": app},
-        "workflowRun": {"workflow": {"databaseId": workflow}} if workflow else None,
+        "workflowRun": {"databaseId": number, "workflow": {"databaseId": workflow}}
+        if workflow
+        else None,
     }
 
 
@@ -2621,3 +2656,188 @@ def test_each_workflow_is_judged_by_its_newest_run(tmp_path, suites, red):
 
 def test_a_head_without_a_commit_node_is_not_red(tmp_path):
     assert load_rules(tmp_path).is_red(pull(1, "BEHIND", latest={"nodes": []})) is False
+
+
+DRAFT_STEP = "Stop on a draft pull request"
+REFRESH = "merge-train: refresh"
+# cordanaLLM/nucleus pull 205: the ready run (201) cancelled by the synchronize run
+# with the draft payload (202), which failed at the draft step; another workflow green.
+STOPPED = [
+    suite(201, "CANCELLED", 20, 7),
+    suite(202, "FAILURE", 21, 7),
+    suite(203, "SUCCESS", 20, 8),
+]
+REFRESH_CALL = (
+    "outcome = refresh(\n"
+    "        rows, notes, lambda run: run_jobs(env, run),"
+    " lambda pull: toggle_refresh(env, pull)\n"
+    "    )"
+)
+GUARD = "if refreshed_since(pull, max(created for _, created in runs)):"
+
+
+def steps(*failed: str) -> list[dict]:
+    """The jobs of one run whose steps named in `failed` failed."""
+    done = [{"name": "Set up job", "conclusion": "success"}]
+    return [
+        {
+            "id": 1,
+            "name": "Validate",
+            "steps": done + [{"name": n, "conclusion": "failure"} for n in failed],
+        }
+    ]
+
+
+def refreshed(number: int) -> list[tuple]:
+    return [("label", number, REFRESH), ("unlabel", number, REFRESH)]
+
+
+def unlabelled(minute: int, second: int = 0) -> dict:
+    """The refreshes timeline with one removal of the refresh label."""
+    when = f"2026-10-18T01:{minute:02d}:{second:02d}Z"
+    return {"nodes": [{"createdAt": when, "label": {"name": REFRESH}}]}
+
+
+def stopped_forge(state: str = "BLOCKED", suites=STOPPED, jobs=(DRAFT_STEP,), **fields) -> Forge:
+    forge = Forge(repository(pull(1, state, suites=suites, **fields)))
+    forge.jobs[202] = steps(*jobs)
+    return forge
+
+
+@pytest.mark.parametrize("state", ["BLOCKED", "BEHIND", "UNSTABLE"])
+def test_a_pull_request_stopped_at_the_draft_step_is_refreshed(tmp_path, state):
+    done, summary = train(tmp_path, stopped_forge(state))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "### fleet/app: refreshed #1" in summary
+    assert f"| #1 | {state} | refreshed: its red runs stopped at the draft step |" in summary
+
+
+def test_the_refresh_adds_the_label_then_removes_it_and_reads_only_the_red_run(tmp_path):
+    forge = stopped_forge()
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == refreshed(1)
+    assert forge.jobs_calls == [202]
+
+
+def test_the_refreshed_pull_request_lands_on_the_next_run(tmp_path):
+    forge = Forge(repository(pull(1, "BLOCKED", suites=STOPPED)), repository(pull(1, "CLEAN")))
+    forge.jobs[202] = steps(DRAFT_STEP)
+    first, _ = train(tmp_path, forge)
+    forge.revoked.clear()  # the stand-in names its tokens the same on every run
+    second, summary = train(tmp_path, forge)
+    assert first.returncode == second.returncode == 0, second.stdout + second.stderr
+    assert forge.writes == [*refreshed(1), landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+@pytest.mark.parametrize(
+    ("fields", "why"),
+    [
+        ({"jobs": ("Run the tests",)}, "another step failed"),
+        ({"jobs": (DRAFT_STEP, "Run the tests")}, "the draft step and another failed"),
+        ({"jobs": ()}, "no failed step"),
+        (
+            {"suites": [*STOPPED, suite(204, "FAILURE", 21, None, "other")]},
+            "a red suite of another app",
+        ),
+        (
+            {"suites": [*STOPPED, suite(205, "SUCCESS", 22, 7)]},
+            "a newer run of the workflow is green",
+        ),
+        ({"isDraft": True}, "a draft"),
+        ({"labels": ("hold",)}, "a held label"),
+        ({"state": "DIRTY"}, "a conflict: a person pushes anyway"),
+        ({"refreshes": unlabelled(21)}, "refreshed when the run was created"),
+        ({"refreshes": unlabelled(30)}, "refreshed after the run, which started no run"),
+    ],
+)
+def test_a_pull_request_the_refresh_cannot_help_is_left_alone(tmp_path, fields, why):
+    forge = stopped_forge(**fields)
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, why + done.stdout + done.stderr
+    assert forge.writes == [], why
+
+
+def test_a_refresh_that_started_no_run_is_left_to_a_person(tmp_path):
+    done, summary = train(tmp_path, stopped_forge(refreshes=unlabelled(30)))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (
+        "| #1 | BLOCKED | stopped at the draft step, a refresh started no run: a person pushes |"
+        in summary
+    )
+
+
+def test_a_refresh_before_the_failed_run_does_not_hold_the_next(tmp_path):
+    forge = stopped_forge(refreshes=unlabelled(20, 59))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == refreshed(1)
+
+
+def test_a_clean_pull_request_lands_before_any_refresh(tmp_path):
+    forge = Forge(repository(pull(1, "BLOCKED", suites=STOPPED), pull(2, "CLEAN")))
+    forge.jobs[202] = steps(DRAFT_STEP)
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert forge.jobs_calls == []
+
+
+def test_switched_off_the_train_refreshes_nothing(tmp_path):
+    forge = stopped_forge()
+    done, _ = train(tmp_path, forge, switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (forge.writes, forge.jobs_calls) == ([], [])
+
+
+def test_at_most_three_red_pull_requests_are_read(tmp_path):
+    pulls = [pull(n, "BLOCKED", suites=[suite(n, "FAILURE", 21, 7)]) for n in range(1, 6)]
+    forge = Forge(repository(*pulls))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (forge.writes, forge.jobs_calls) == ([], [1, 2, 3])
+
+
+def test_a_label_already_gone_still_counts_as_refreshed(tmp_path):
+    forge = stopped_forge()
+    forge.label_missing = True
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == refreshed(1)[:1]
+    assert "### fleet/app: refreshed #1" in summary
+
+
+@pytest.mark.parametrize(
+    ("where", "original", "mutant", "fields"),
+    [
+        ("script", REFRESH_CALL, "outcome = None", {}),
+        ("module", GUARD, "if False:", {"refreshes": unlabelled(30)}),
+        (
+            "module",
+            "return failed == {DRAFT_STEP}",
+            "return DRAFT_STEP in failed",
+            {"jobs": (DRAFT_STEP, "x")},
+        ),
+        (
+            "module",
+            '("red", "merge state BLOCKED",',
+            '("merge state BLOCKED",',
+            {"state": "BEHIND"},
+        ),
+    ],
+)
+def test_each_refresh_rule_is_needed(tmp_path, where, original, mutant, fields):
+    """Each mutant flips the outcome of one case: the rule it removes decides that case."""
+    text = script() if where == "script" else module()
+    assert original in text
+    changed = text.replace(original, mutant)
+    kept = stopped_forge(**fields)
+    mutated = stopped_forge(**fields)
+    first, _ = train(tmp_path, kept)
+    if where == "script":
+        second, _ = train(tmp_path, mutated, changed)
+    else:
+        second, _ = train(tmp_path, mutated, helper=changed)
+    assert first.returncode == second.returncode == 0, second.stdout + second.stderr
+    assert bool(kept.writes) != bool(mutated.writes), (kept.writes, mutated.writes)
