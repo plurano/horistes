@@ -17,6 +17,11 @@
 #   a forge rebase re-commits the head unsigned). The forge offers auto-merge
 #   only while a pull request cannot merge at once, so BEHIND is where arming
 #   happens; a CLEAN pull request is landed directly.
+# - It updates only a pull request that is armed or that it arms: where the
+#   repository allows no auto-merge, an unarmed BEHIND pull request stays as it
+#   is. Where a ruleset on the default branch demands linear history, or the
+#   rules cannot be read, it updates nothing and reports BEHIND: a merge
+#   commit would break that rule (decision record 0044).
 # - When nothing lands and no armed pull request is in flight, a red pull
 #   request whose red runs failed only at the step "Stop on a draft pull
 #   request" gets the label `merge-train: refresh` added and removed: a run
@@ -290,6 +295,36 @@ jobs:
               return f"merge state {state}"
 
 
+          def linear_history(repo):
+              """Whether the default branch takes no merge commit; True when its rules are unread."""
+              rules = (repo["defaultBranchRef"] or {}).get("rules")
+              if not rules or rules.get("nodes") is None:
+                  return True
+              return any(rule["type"] == "REQUIRED_LINEAR_HISTORY" for rule in rules["nodes"])
+
+
+          def updatable(repo, rows, notes):
+              """BEHIND pull requests the train may update, armed ones first, each with whether to arm it.
+
+              An armed pull request goes first: it already waits for the forge to merge it.
+              Only an armed pull request is updated, and none where the default branch
+              demands linear history (decision record 0044); `notes` says why one is skipped.
+              """
+              behind = [pull for pull, reason in rows if reason == "behind"]
+              if linear_history(repo):
+                  for pull in behind:
+                      notes[pull["number"]] = "behind: linear history, a person rebases"
+                  return []
+              behind.sort(key=lambda pull: not pull["autoMergeRequest"])
+              picked = []
+              for pull in behind:
+                  if pull["autoMergeRequest"] or repo["autoMergeAllowed"]:
+                      picked.append((pull, not pull["autoMergeRequest"]))
+                  else:
+                      notes[pull["number"]] = "behind: auto-merge off, not armed, not updated"
+              return picked
+
+
           def in_flight(pull, reason):
               """An armed pull request whose checks still run holds the train.
 
@@ -421,7 +456,7 @@ jobs:
           QUERY = """
           query($owner: String!, $name: String!, $after: String) {
             repository(owner: $owner, name: $name) {
-              defaultBranchRef { name }
+              defaultBranchRef { name rules(first: 50) { nodes { type } } }
               autoMergeAllowed
               mergeQueue { id }
               releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
@@ -591,6 +626,7 @@ jobs:
               refresh,
               squash_message,
               superseded,
+              updatable,
               verdict,
           )
 
@@ -839,14 +875,9 @@ jobs:
 
 
           def advance(env, conf, repo, rows, notes):
-              """Update the oldest armed BEHIND pull request, else arm and update the oldest BEHIND one.
-
-              An armed pull request goes first: it already waits for the forge to merge it.
-              """
-              behind = [pull for pull, reason in rows if reason == "behind"]
-              behind.sort(key=lambda pull: not pull["autoMergeRequest"])
-              for pull in behind:
-                  if repo["autoMergeAllowed"] and not pull["autoMergeRequest"]:
+              """Update the first pull request `updatable` names, arming it first where it says."""
+              for pull, arming in updatable(repo, rows, notes):
+                  if arming:
                       arm(env, conf, pull)
                       notes[pull["number"]] = "armed, updated from the default branch"
                   else:

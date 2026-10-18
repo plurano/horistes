@@ -103,7 +103,9 @@ the head commit it read, so a red or blocked pull request is refused by the
 forge itself and the app has no bypass. With none CLEAN and no armed one in
 flight, it arms auto-merge on the oldest BEHIND pull request whose checks are
 not red and merges the default branch into it; an armed pull request that is
-BEHIND is updated first. A red pull request whose red runs failed only at
+BEHIND is updated first. It updates no pull request it has not armed, and none
+where a ruleset on the default branch demands linear history (decision record
+0044). A red pull request whose red runs failed only at
 the draft step gets a fresh event instead, a label added and removed (a
 re-run would replay the draft payload). It then closes the open issues that
 its recent merges name as closed, which the forge leaves open when the app merges. It
