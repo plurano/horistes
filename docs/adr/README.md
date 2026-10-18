@@ -48,4 +48,5 @@ record that supersedes it.
 | [0038](0038-the-merge-train-skips-superseded-pull-requests.md) | 2026-10-16 | The merge train skips superseded pull requests | Accepted |
 | [0039](0039-the-merge-train-closes-the-issues-its-merges-name.md) | 2026-10-17 | The merge train closes the issues its merges name | Accepted |
 | [0040](0040-the-merge-train-leaves-a-release-to-its-writer.md) | 2026-10-18 | The merge train leaves a release to its writer | Accepted |
+| [0041](0041-the-merge-train-refreshes-a-draft-stopped-pull-request.md) | 2026-10-18 | The merge train refreshes a draft-stopped pull request | Accepted |
 | [0042](0042-the-merge-train-judges-each-workflow-by-its-newest-run.md) | 2026-10-18 | The merge train judges each workflow by its newest run | Accepted |
