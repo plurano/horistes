@@ -59,14 +59,6 @@ exceptions:
       an SBOM step); raise them as docs/guides/releasing.md in Praetor describes, then remove this
       entry
     expires: "2027-01-09"
-  - rule: HISS-18
-    path: .github/workflows/licence-check.yml
-    reason: >-
-      category A, 90 days. The draft check reads no job condition: job result runs under always()
-      and fails on a draft, because the called licence job fails in its first step there
-      (docs/adr/0030-a-result-job-reports-the-calling-jobs-name.md); remove this entry when the
-      engine reads the condition
-    expires: "2027-01-11"
   - rule: declared-linters
     tool: semgrep
     reason: >-

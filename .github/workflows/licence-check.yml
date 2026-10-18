@@ -20,8 +20,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A draft skips this job, and the result job below fails for it, so the
+  # required check stays red on a draft until the ready_for_review run.
   licence:
     name: Licence
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.draft == false
     permissions:
       contents: read
     uses: ./.github/workflows/licence.yml
@@ -29,7 +34,8 @@ jobs:
   # The forge reports the calling job above only as "Licence / REUSE lint",
   # never as "Licence", so a rule set that requires "Licence" waits forever.
   # This job reports "Licence" and fails unless the licence check passed; it
-  # runs under always() so a failed or cancelled check still reports here.
+  # runs under always() so a failed, cancelled or skipped check still reports
+  # here.
   result:
     name: Licence
     needs: licence
@@ -38,9 +44,17 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     steps:
+      # yamllint disable rule:line-length
+      - name: Report the draft
+        if: needs.licence.result == 'skipped'
+        shell: bash
+        run: |
+          echo "::error title=Gate not run on a draft::The gate did not run because the pull request is a draft. It runs when the pull request is marked ready for review."
+          exit 1
+      # yamllint enable rule:line-length
       - name: Fail unless the licence check passed
         if: needs.licence.result != 'success'
         shell: bash
         run: |
-          echo "The licence check did not pass."
+          echo "The licence check did not pass or was skipped on a draft."
           exit 1
