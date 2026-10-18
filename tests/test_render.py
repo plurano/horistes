@@ -377,12 +377,12 @@ PLANTED = [
     ),
     pytest.param(
         GOOD.replace("    with:\n", "    secrets:\n      token: ${{ github.token }}\n    with:\n"),
-        "the job passes the secret `token` as `${{ github.token }}`, not as one secret",
+        "the job passes the secret `token` as something other than one secret",
         id="secret-not-a-secret",
     ),
     pytest.param(
         GOOD.replace("    with:\n", "    secrets:\n      token: planted-value\n    with:\n"),
-        "the job passes the secret `token` as `planted-value`, not as one secret",
+        "the job passes the secret `token` as something other than one secret",
         id="secret-written-out",
     ),
     pytest.param(
@@ -390,7 +390,7 @@ PLANTED = [
             "    with:\n",
             "    secrets:\n      token: ${{ secrets.A }}${{ secrets.B }}\n    with:\n",
         ),
-        "not as one secret of the repository",
+        "something other than one secret of the repository",
         id="two-secrets-in-one",
     ),
     pytest.param(
@@ -625,6 +625,17 @@ def test_secret_renamed_in_the_called_workflow_fails(tree):
     done = check(tree, PASSES_TOKEN, called=called)
     assert done.returncode == 1, done.stdout
     assert f"the job passes the secret `token`, which {CALLED} does not declare" in done.stderr
+
+
+def test_secret_written_out_is_not_printed(tree):
+    # Built at run time so the secret scan of the gate does not take the test
+    # for a leak; the shape is that of a forge token.
+    planted = "ghp_" + "Zq7" * 12
+    text = GOOD.replace("    with:\n", f"    secrets:\n      token: {planted}\n    with:\n")
+    done = check(tree, text)
+    assert done.returncode == 1, done.stdout
+    assert planted not in done.stdout + done.stderr
+    assert "the job passes the secret `token` as something other than one secret" in done.stderr
 
 
 @pytest.mark.parametrize(("called", "message"), PLANTED_CALLED)

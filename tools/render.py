@@ -252,8 +252,11 @@ def _secret_problems(job: dict, called: dict, path: str) -> list[str]:
     for key, spec in sorted(declared.items()):
         if (spec or {}).get("required") and key not in passed:
             problems.append(f"the job does not pass the secret `{key}`, which {path} requires")
+    # The value is never printed: a value written out in the file may be the
+    # secret itself, and this line lands in a public run log.
     problems += [
-        f"the job passes the secret `{key}` as `{value}`, not as one secret of the repository"
+        f"the job passes the secret `{key}` as something other than one secret "
+        "of the repository (value not printed)"
         for key, value in sorted(passed.items())
         if not SECRET.fullmatch(str(value))
     ]
