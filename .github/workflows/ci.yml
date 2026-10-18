@@ -28,7 +28,7 @@ env:
   # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release's checksum file.
   GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
   # Published Praetor commit that builds the praetorctl this gate pins.
-  PRAETOR_REF: "3bbde07342bdece12c46f74b0ee2c1f51129478f"
+  PRAETOR_REF: "019b879ec69178570f53b97a113f67d62629e4c1"
 
 jobs:
   verify:
