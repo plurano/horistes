@@ -51,3 +51,4 @@ record that supersedes it.
 | [0041](0041-the-merge-train-refreshes-a-draft-stopped-pull-request.md) | 2026-10-18 | The merge train refreshes a draft-stopped pull request | Accepted |
 | [0042](0042-the-merge-train-judges-each-workflow-by-its-newest-run.md) | 2026-10-18 | The merge train judges each workflow by its newest run | Accepted |
 | [0043](0043-codeql-reports-to-code-scanning.md) | 2026-10-18 | CodeQL analyses the workflows and the Python tools and reports to code scanning | Accepted |
+| [0044](0044-the-merge-train-updates-only-what-it-armed.md) | 2026-10-18 | The merge train updates only what it armed, and never a linear-history branch | Accepted |

@@ -168,12 +168,21 @@ def merged_pull(number: int, *issues: tuple, by: str = BOT, at: str = YOUNG, **f
 
 
 def repository(
-    *pulls: dict, auto_merge: bool = True, release: tuple = (False, False), queue: bool = False
+    *pulls: dict,
+    auto_merge: bool = True,
+    release: tuple = (False, False),
+    queue: bool = False,
+    rules: tuple | None = (),
 ) -> dict:
-    """One repository as the query reads it; `release` says which release-please files it has."""
+    """One repository as the query reads it; `release` says which release-please files it has.
+
+    `rules` are the rule types of the default branch; None stands for rules the
+    token could not read.
+    """
     config, manifest = release
+    read = None if rules is None else {"nodes": [{"type": kind} for kind in rules]}
     return {
-        "defaultBranchRef": {"name": "main"},
+        "defaultBranchRef": {"name": "main", "rules": read},
         "autoMergeAllowed": auto_merge,
         "mergeQueue": {"id": "MQ_planted"} if queue else None,
         "releaseConfig": {"oid": "c" * 40} if config else None,
@@ -1040,11 +1049,43 @@ def test_behind_pull_request_is_armed_and_updated(tmp_path):
     assert "| #1 | BEHIND | armed, updated from the default branch |" in summary
 
 
-def test_behind_is_only_updated_without_auto_merge(tmp_path):
+def test_unarmed_behind_is_not_updated_without_auto_merge(tmp_path):
     forge = Forge(repository(pull(1, "BEHIND"), auto_merge=False))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | BEHIND | behind: auto-merge off, not armed, not updated |" in summary
+
+
+def test_armed_behind_is_updated_without_auto_merge(tmp_path):
+    waiting = pull(2, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(pull(1, "BEHIND"), waiting, auto_merge=False))
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert forge.writes == [updated(1)]
+    assert forge.writes == [updated(2)]
+
+
+@pytest.mark.parametrize(
+    "waiting",
+    [{}, {"autoMergeRequest": {"enabledAt": OLD}}],
+    ids=["unarmed", "armed"],
+)
+@pytest.mark.parametrize("rules", [("REQUIRED_LINEAR_HISTORY",), None], ids=["linear", "unread"])
+def test_linear_history_branch_is_never_updated(tmp_path, waiting, rules):
+    """A merge commit from the train would break the rule (decision record 0044)."""
+    kinds = rules and ("REQUIRED_SIGNATURES", *rules)
+    forge = Forge(repository(pull(1, "BEHIND", **waiting), rules=kinds))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | BEHIND | behind: linear history, a person rebases |" in summary
+
+
+def test_signed_branch_without_linear_history_is_armed_and_updated(tmp_path):
+    forge = Forge(repository(pull(1, "BEHIND"), rules=("REQUIRED_SIGNATURES",)))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(1), updated(1)]
 
 
 def test_red_behind_pull_request_is_skipped(tmp_path):
