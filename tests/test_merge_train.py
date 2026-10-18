@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import functools
 import hashlib
+import importlib.util
 import io
 import json
 import re
@@ -95,6 +96,22 @@ def pull(number: int, state: str, **fields) -> dict:
     commits = fields.pop("commits", [(OLD, 1)])
     suites = fields.pop("suites", ["SUCCESS"])
     labels = fields.pop("labels", ())
+    suite_nodes = []
+    base_time = datetime(2026, 10, 18, 0, 0, 0, tzinfo=UTC)
+    for i, item in enumerate(suites):
+        if isinstance(item, dict):
+            suite_nodes.append(item)
+        else:
+            created_at = (base_time + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            suite_nodes.append(
+                {
+                    "databaseId": 1000 + i,
+                    "conclusion": item,
+                    "createdAt": created_at,
+                    "app": {"slug": "github-actions"},
+                    "workflowRun": {"workflow": {"databaseId": 100 + i}},
+                }
+            )
     node = {
         "number": number,
         "id": f"PR_{number}",
@@ -114,9 +131,7 @@ def pull(number: int, state: str, **fields) -> dict:
                 for when, parents in commits
             ]
         },
-        "latest": {
-            "nodes": [{"commit": {"checkSuites": {"nodes": [{"conclusion": c} for c in suites]}}}]
-        },
+        "latest": {"nodes": [{"commit": {"checkSuites": {"nodes": suite_nodes}}}]},
     }
     node.update(fields)
     return node
@@ -2514,3 +2529,95 @@ def test_switched_off_closes_nothing(tmp_path):
     done, _ = train(tmp_path, forge, switch="off")
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
+
+
+def load_rules(tmp_path: Path, text: str | None = None):
+    """The train rules module, written from the step text and imported from a file."""
+    path = tmp_path / "train_rules_under_test.py"
+    path.write_text(text or module(), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("train_rules_under_test", path)
+    rules = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rules)
+    return rules
+
+
+def suite(
+    number: int, conclusion: str | None, minute: int, workflow: int | None = 1, app="github-actions"
+):
+    """One check suite node; workflow None stands for a suite of another app."""
+    return {
+        "databaseId": number,
+        "conclusion": conclusion,
+        "createdAt": f"2026-10-18T01:{minute:02d}:00Z",
+        "app": {"slug": app},
+        "workflowRun": {"workflow": {"databaseId": workflow}} if workflow else None,
+    }
+
+
+# cordanaLLM/nucleus pull 207 (bfe6923): pr-project-gate cancelled three times by its
+# concurrency group, then green; another workflow green; a Renovate suite with no run.
+NUCLEUS_207 = [
+    suite(105911160001, "CANCELLED", 10, 355134910),
+    suite(105911161630, "CANCELLED", 10, 355134910),
+    suite(105911346572, "CANCELLED", 11, 355134910),
+    suite(105917123100, "SUCCESS", 47, 355134910),
+    suite(105911160081, "SUCCESS", 10, 355116106),
+    suite(105911149923, None, 10, None, "renovate"),
+]
+OLD_RED = 'return any(suite["conclusion"] in RED for suite in suites)'
+NEW_RED = 'return any(suite["conclusion"] in RED for suite in newest_suites(suites).values())'
+
+
+def test_superseded_cancelled_runs_leave_the_pull_request_behind(tmp_path):
+    forge = Forge(repository(pull(1, "BEHIND", suites=NUCLEUS_207)))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(1), updated(1)]
+    assert "| #1 | BEHIND | armed, updated from the default branch |" in summary
+
+
+def test_with_every_suite_judged_the_superseded_runs_hold_it_red(tmp_path):
+    mutant = module().replace(NEW_RED, OLD_RED)
+    assert mutant != module()
+    forge = Forge(repository(pull(1, "BEHIND", suites=NUCLEUS_207)))
+    done, summary = train(tmp_path, forge, helper=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | BEHIND | red |" in summary
+
+
+@pytest.mark.parametrize(
+    ("suites", "red"),
+    [
+        (NUCLEUS_207, False),
+        ([suite(1, "SUCCESS", 0), suite(2, "CANCELLED", 5)], True),
+        ([suite(1, "SUCCESS", 0), suite(2, "FAILURE", 5)], True),
+        ([suite(1, "TIMED_OUT", 0), suite(2, "SUCCESS", 5), suite(3, None, 9)], False),
+        ([suite(1, "SUCCESS", 0, 1), suite(2, "FAILURE", 5, 2)], True),
+        ([suite(100, "FAILURE", 0), suite(200, "SUCCESS", 0)], False),
+        ([suite(100, "SUCCESS", 0), suite(200, "FAILURE", 0)], True),
+        ([suite(1, "FAILURE", 0, None, "scanner")], True),
+        ([suite(1, "FAILURE", 0, None, "scanner"), suite(2, "SUCCESS", 5, None, "scanner")], False),
+        ([suite(1, "FAILURE", 0, None, "scanner"), suite(2, "SUCCESS", 5, None, "other")], True),
+        ([], False),
+    ],
+    ids=[
+        "nucleus-207",
+        "newest-cancelled",
+        "newest-failure",
+        "newest-in-progress",
+        "two-workflows",
+        "tie-higher-id-green",
+        "tie-higher-id-red",
+        "app-failure",
+        "app-superseded",
+        "apps-apart",
+        "no-suites",
+    ],
+)
+def test_each_workflow_is_judged_by_its_newest_run(tmp_path, suites, red):
+    assert load_rules(tmp_path).is_red(pull(1, "BEHIND", suites=suites)) is red
+
+
+def test_a_head_without_a_commit_node_is_not_red(tmp_path):
+    assert load_rules(tmp_path).is_red(pull(1, "BEHIND", latest={"nodes": []})) is False

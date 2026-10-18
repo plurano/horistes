@@ -11,7 +11,8 @@
 #   head commit it read. The forge refuses that merge when a required check or
 #   rule fails, and the app has no bypass, so nothing red lands.
 # - When none is CLEAN and no armed pull request is still in flight, it arms
-#   auto-merge on the oldest BEHIND pull request whose checks are not red, and
+#   auto-merge on the oldest BEHIND pull request whose checks are not red (each
+#   workflow judged by its newest run; decision record 0042), and
 #   merges the default branch into its head (update-branch, never a rebase:
 #   a forge rebase re-commits the head unsigned). The forge offers auto-merge
 #   only while a pull request cannot merge at once, so BEHIND is where arming
@@ -186,10 +187,39 @@ jobs:
               return datetime.fromisoformat(min(times)) if times else None
 
 
+          def suite_key(suite):
+              """Key grouping check suites of the same workflow or app."""
+              run = suite.get("workflowRun")
+              if run and run.get("workflow"):
+                  return ("workflow", run["workflow"]["databaseId"])
+              app = suite.get("app") or {}
+              return ("app", app.get("slug") or "")
+
+
+          def suite_rank(suite):
+              """Creation time, then id: the later of two suites of one key ranks higher."""
+              return (suite.get("createdAt") or "", suite.get("databaseId") or 0)
+
+
+          def newest_suites(suites):
+              """Per key the suite with the greatest (createdAt, databaseId)."""
+              newest = {}
+              for suite in suites:
+                  key = suite_key(suite)
+                  if key not in newest or suite_rank(suite) > suite_rank(newest[key]):
+                      newest[key] = suite
+              return newest
+
+
           def is_red(pull):
+              """Each workflow judged by its newest run on the head commit.
+
+              A run a newer run of the same workflow cancelled is not red; decision
+              record 0042.
+              """
               nodes = pull["latest"]["nodes"]
               suites = nodes[-1]["commit"]["checkSuites"]["nodes"] if nodes else []
-              return any(suite["conclusion"] in RED for suite in suites)
+              return any(suite["conclusion"] in RED for suite in newest_suites(suites).values())
 
 
           def too_young(pull, labels, conf, now):
@@ -336,7 +366,19 @@ jobs:
                     nodes { commit { committedDate parents { totalCount } } }
                   }
                   latest: commits(last: 1) {
-                    nodes { commit { checkSuites(first: 30) { nodes { conclusion } } } }
+                    nodes {
+                      commit {
+                        checkSuites(first: 30) {
+                          nodes {
+                            databaseId
+                            conclusion
+                            createdAt
+                            app { slug }
+                            workflowRun { workflow { databaseId } }
+                          }
+                        }
+                      }
+                    }
                   }
                 }
               }
