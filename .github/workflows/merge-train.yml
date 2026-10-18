@@ -1393,42 +1393,75 @@ jobs:
               return next(iter(values))
 
 
-          def parse_release_pull(pull, include_v):
+          def package_settings(config, component):
+              """The settings of the package a release branch names, over the top-level ones."""
+              packages = config.get("packages") if isinstance(config.get("packages"), dict) else {}
+              entries = [p for p in list(packages.values())[:100] if isinstance(p, dict)]
+              named = [
+                  p for p in entries if component and component in (p.get("component"), p.get("package-name"))
+              ]
+              package = named[0] if named else entries[0] if len(entries) == 1 else {}
+              keys = (
+                  "include-component-in-tag",
+                  "include-v-in-tag",
+                  "tag-separator",
+                  "pull-request-title-pattern",
+              )
+              return {key: package.get(key, config.get(key)) for key in keys}
+
+
+          def release_tag(pull, config):
+              """The tag release-please gives a merged release pull request, or None for any other pull."""
+              base_ref = (pull.get("base") or {}).get("ref") or ""
+              head_ref = (pull.get("head") or {}).get("ref") or ""
+              # release-please's branch names: release-please--branches--<base>[--components--<component>]
+              branch = re.fullmatch(
+                  rf"release-please--branches--{re.escape(base_ref)}(?:--components--(.+))?", head_ref
+              )
+              if not base_ref or not branch:
+                  return None
+              component = branch.group(1) or ""
+              settings = package_settings(config, component)
+              if settings["pull-request-title-pattern"]:
+                  return None
+              # release-please's default title pattern, chore${scope}: release${component} ${version}.
+              title = re.fullmatch(
+                  r"chore(?:\((?P<branch>[\w./-]+)\))?: release ?(?:@?[\w./-]*)? "
+                  r"v?(?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)",
+                  pull.get("title") or "",
+              )
+              if not title or title.group("branch") not in (None, base_ref):
+                  return None
+              prefix = "v" if settings["include-v-in-tag"] is not False else ""
+              if component and settings["include-component-in-tag"] is not False:
+                  separator = settings["tag-separator"] if isinstance(settings["tag-separator"], str) else "-"
+                  prefix = f"{component}{separator}{prefix}"
+              return prefix + title.group("version")
+
+
+          def parse_release_pull(pull, config):
               """Validate a merged release pull request and return item dict or None."""
               labels = {lbl.get("name") for lbl in pull.get("labels", []) if isinstance(lbl, dict)}
               if PENDING_LABEL not in labels:
                   return None
               num = pull.get("number")
-              merged = bool(pull.get("merged_at"))
-              base_ref = pull.get("base", {}).get("ref") if isinstance(pull.get("base"), dict) else ""
-              head_ref = pull.get("head", {}).get("ref") if isinstance(pull.get("head"), dict) else ""
-              title = pull.get("title", "")
               sha = pull.get("merge_commit_sha") or ""
-              expected_head = f"release-please--branches--{base_ref}" if base_ref else ""
-              match = (
-                  re.fullmatch(rf"chore\({re.escape(base_ref)}\): release (\d+\.\d+\.\d+)", title)
-                  if base_ref
-                  else None
-              )
-              sha_valid = len(sha) == 40 and bool(re.fullmatch(r"[0-9a-fA-F]{40}", sha))
-              if not (merged and head_ref == expected_head and match and sha_valid):
+              tag = release_tag(pull, config)
+              if not (pull.get("merged_at") and tag and re.fullmatch(r"[0-9a-fA-F]{40}", sha)):
                   sys.stdout.write(f"::warning::pull #{num} labelled {PENDING_LABEL} fails release checks\n")
                   return None
-              version = match.group(1)
-              tag = f"v{version}" if include_v else version
               return {"number": num, "sha": sha, "tag": tag}
 
 
           def read_pending(api_url, repo, token, config):
               """List merged release pull requests still carrying autorelease: pending."""
-              include_v = config.get("include-v-in-tag", True)
               url = f"{api_url}/repos/{repo}/pulls?state=closed&per_page=20"
               _, pulls = call(url, token, method="GET")
               if not isinstance(pulls, list):
                   raise CallError(f"GET {url}: expected list of pulls")
               pending = []
               for pull in pulls[:20]:
-                  item = parse_release_pull(pull, include_v)
+                  item = parse_release_pull(pull, config)
                   if item is not None:
                       pending.append(item)
               return pending

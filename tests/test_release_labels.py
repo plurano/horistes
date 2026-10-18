@@ -396,3 +396,103 @@ def test_refused_read_is_an_error_line(tmp_path, forge):
     assert done.returncode == 1
     assert done.stdout.startswith("::error title=Release labels::settings:")
     assert "Traceback" not in done.stderr
+
+
+SANDBOX_HEAD = "release-please--branches--main--components--sandbox"
+SANDBOX_CONFIG = {
+    "include-component-in-tag": False,
+    "packages": {".": {"package-name": "sandbox"}},
+}
+
+
+def component_release(forge: Forge) -> None:
+    """jellysin/release-helper-sandbox pull 87: a component branch, no component in the tag."""
+    forge.config = SANDBOX_CONFIG
+    forge.pulls = [release_pull(head={"ref": SANDBOX_HEAD})]
+
+
+def test_component_branch_is_a_release_pull(tmp_path, forge):
+    component_release(forge)
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip=false\npending={ONE}\n"
+
+
+def test_component_branch_release_that_existed_is_done(tmp_path, forge):
+    """The k8s main run of 7e34991b: release-please moved the label, the release existed."""
+    component_release(forge)
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    pending = outputs.split("pending=", 1)[1].strip()
+    existing_release(forge)
+    forge.pulls = [release_pull(labels=(TAGGED,), head={"ref": SANDBOX_HEAD})]
+    done = after(tmp_path, forge, "false", "failure", pending)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "release v1.0.0 existed on the release commit; done" in done.stdout
+
+
+def test_without_the_component_branch_the_release_stays_red(tmp_path, forge):
+    """The mutant that reads only the bare branch name leaves pending empty, as on k8s."""
+    source = module().replace("(?:--components--(.+))?", "")
+    assert source != module()
+    component_release(forge)
+    settings_path = tmp_path / "output"
+    settings_path.write_text("", encoding="utf-8")
+    env = {"GITHUB_API_URL": forge.url, "GITHUB_OUTPUT": str(settings_path)}
+    done = run(tmp_path, "settings", env, source)
+    assert "fails release checks" in done.stdout
+    pending = settings_path.read_text(encoding="utf-8").split("pending=", 1)[1].strip()
+    existing_release(forge)
+    done = after(tmp_path, forge, "false", "failure", pending, source=source)
+    assert done.returncode == 1
+    assert "release step failed and pending is empty" in done.stdout
+
+
+@pytest.mark.parametrize(
+    ("config", "head", "title", "tag"),
+    [
+        ({}, "main--components--app", "chore(main): release app 1.0.0", "app-v1.0.0"),
+        (
+            {"tag-separator": "/"},
+            "main--components--app",
+            "chore(main): release 1.0.0",
+            "app/v1.0.0",
+        ),
+        (
+            {
+                "packages": {
+                    "a": {"component": "a"},
+                    "b": {"component": "b", "include-v-in-tag": False},
+                }
+            },
+            "main--components--b",
+            "chore(main): release b 2.0.0",
+            "b-2.0.0",
+        ),
+        ({}, "main", "chore: release 1.0.0-rc.1", "v1.0.0-rc.1"),
+        ({}, "main", "chore(main): release v1.0.0", "v1.0.0"),
+    ],
+)
+def test_tag_follows_release_please(tmp_path, forge, config, head, title, tag):
+    forge.config = config
+    forge.pulls = [release_pull(head={"ref": f"release-please--branches--{head}"}, title=title)]
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f'"tag":"{tag}"' in outputs
+
+
+@pytest.mark.parametrize(
+    ("config", "title"),
+    [
+        ({"pull-request-title-pattern": "release: ${version}"}, "release: 1.0.0"),
+        ({}, "chore(other): release 1.0.0"),
+        ({}, "chore(main): release main"),
+    ],
+)
+def test_title_release_please_would_not_read_is_named(tmp_path, forge, config, title):
+    forge.config = config
+    forge.pulls = [release_pull(title=title)]
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "::warning::pull #10 labelled autorelease: pending fails release checks" in done.stdout
+    assert outputs == "skip=false\npending=[]\n"
