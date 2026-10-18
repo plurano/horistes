@@ -27,6 +27,8 @@
 # - In flight means armed with checks still running (BLOCKED). An armed pull
 #   request that is BEHIND cannot land until the default branch is merged into
 #   it, so it holds nothing: the sweep updates it first, before it arms another.
+# - A merge the forge answers with "Merge already in progress" is in flight,
+#   not refused: the next run reads the pull request again.
 # - When squashing, the train writes the squash commit message from the pull
 #   request's own non-merge commits and their sign-offs (decision record 0037),
 #   without Co-authored-by trailers.
@@ -618,10 +620,15 @@ jobs:
           ACCEPTABLE = ("UNSTABLE", "HAS_HOOKS")
           NO_NEW_COMMITS = "There are no new commits on the base branch."
           CONFLICT = "merge conflict between base and head"
+          MERGE_IN_PROGRESS = "Merge already in progress"
 
 
           class RefusedError(Exception):
               """A forge call that failed or was refused."""
+
+
+          class MergeInProgressError(RefusedError):
+              """The forge answered that it is already merging the pull request."""
 
 
           class InvalidSettingError(Exception):
@@ -711,8 +718,14 @@ jobs:
                       "variables": variables,
                   },
               )
-              if answer.get("errors") or "data" not in answer:
-                  raise RefusedError(f"GraphQL: {json.dumps(answer.get('errors'))[:500]}")
+              errors = answer.get("errors")
+              if errors and all(
+                  error.get("type") == "UNPROCESSABLE" and error.get("message") == MERGE_IN_PROGRESS
+                  for error in errors
+              ):
+                  raise MergeInProgressError(f"GraphQL: {json.dumps(errors)[:500]}")
+              if errors or "data" not in answer:
+                  raise RefusedError(f"GraphQL: {json.dumps(errors)[:500]}")
               return answer["data"]
 
 
@@ -788,7 +801,11 @@ jobs:
                   if not data["enqueuePullRequest"]["mergeQueueEntry"]:
                       raise RefusedError(f"#{pull['number']}: no merge queue entry")
                   return "queued"
-              data = graphql(env, MERGE, commit_variables(env, conf, pull))
+              try:
+                  data = graphql(env, MERGE, commit_variables(env, conf, pull))
+              except MergeInProgressError:
+                  # The forge is already merging it; the next run reads the result.
+                  return "merge in flight"
               if not data["mergePullRequest"]["pullRequest"]["merged"]:
                   raise RefusedError(f"#{pull['number']}: the forge did not report it merged")
               return "landed"
