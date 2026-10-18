@@ -50,3 +50,4 @@ record that supersedes it.
 | [0040](0040-the-merge-train-leaves-a-release-to-its-writer.md) | 2026-10-18 | The merge train leaves a release to its writer | Accepted |
 | [0041](0041-the-merge-train-refreshes-a-draft-stopped-pull-request.md) | 2026-10-18 | The merge train refreshes a draft-stopped pull request | Accepted |
 | [0042](0042-the-merge-train-judges-each-workflow-by-its-newest-run.md) | 2026-10-18 | The merge train judges each workflow by its newest run | Accepted |
+| [0043](0043-codeql-reports-to-code-scanning.md) | 2026-10-18 | CodeQL analyses the workflows and the Python tools and reports to code scanning | Accepted |

@@ -124,7 +124,7 @@ equal to what the train asks the forge for.
 
 | Path | Content |
 | :--- | :--- |
-| `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`), its callers (`licence-check.yml`) and scheduled checks (`image-age.yml`, `pins.yml`) |
+| `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`), its callers (`licence-check.yml`) and scheduled checks (`codeql.yml`, `image-age.yml`, `pins.yml`) |
 | `actions/<name>/` | composite steps |
 | `templates/callers/` | the caller a consumer keeps, one template per shared workflow ([ADR-0009](docs/adr/0009-caller-templates-in-the-engines-syntax.md)) |
 | `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, the release read-back, and the check of action pins and runner labels |
@@ -497,6 +497,8 @@ Keep the header and the comment above the image line: `tests/test_update_bot.py`
 fails when the bot could no longer read one of them.
 `.github/workflows/image-age.yml` bounds the licence tool's image age weekly
 against Docker Hub ([ADR-0035](docs/adr/0035-a-weekly-job-bounds-the-licence-tool-image-age.md)).
+`.github/workflows/codeql.yml` runs CodeQL on the workflows and the Python tools
+and reports to the forge's code scanning ([ADR-0043](docs/adr/0043-codeql-reports-to-code-scanning.md)).
 
 ### The preset other repositories extend
 
