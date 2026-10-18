@@ -44,6 +44,13 @@ YOUNG = (NOW - timedelta(hours=5)).isoformat()
 CONFLICT = "merge conflict between base and head"
 NO_NEW = "There are no new commits on the base branch."
 QUEUE_ONLY = "Repository rule violations found\n\nChanges must be made through the merge queue"
+# The forge's answer while it is still merging (fleet run 39131740663, 2026-10-18).
+MERGE_IN_PROGRESS = {
+    "type": "UNPROCESSABLE",
+    "path": ["mergePullRequest"],
+    "locations": [{"line": 4, "column": 3}],
+    "message": "Merge already in progress",
+}
 CLIENT_ID = "Iv23planted"
 WRITE = {
     "actions": "read",
@@ -200,6 +207,7 @@ class Forge:
         self.where: list[tuple[str, tuple]] = []
         self.merged = True
         self.refuse_merge = ""
+        self.merge_errors: list[dict] = []
         self.refuse_merge_in: set[str] = set()
         self.update_answers: dict[int, tuple[int, str]] = {}
         self.workdir = Path()
@@ -362,6 +370,8 @@ class Forge:
             self.write(full, ("merge", variables["id"], variables["oid"], variables["method"]))
             if (self.active_reads.get(full) or {}).get("mergeQueue"):
                 return {"errors": [{"type": "UNPROCESSABLE", "message": QUEUE_ONLY}]}
+            if self.merge_errors:
+                return {"errors": self.merge_errors}
             if self.refuse_merge or full in self.refuse_merge_in:
                 return {"errors": [{"message": self.refuse_merge or "refused here"}]}
             return {"data": {"mergePullRequest": {"pullRequest": {"merged": self.merged}}}}
@@ -1111,6 +1121,30 @@ def test_refused_merge_fails(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "Required status check is failing" in done.stdout
+
+
+def test_merge_already_in_progress_is_in_flight(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merge_errors = [MERGE_IN_PROGRESS]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "merge in flight #1" in summary
+    assert "Refused:" not in summary
+
+
+@pytest.mark.parametrize(
+    "errors",
+    [
+        [{**MERGE_IN_PROGRESS, "message": "Pull request is not mergeable"}],
+        [{**MERGE_IN_PROGRESS, "type": "FORBIDDEN"}],
+        [MERGE_IN_PROGRESS, {"type": "UNPROCESSABLE", "message": "Head branch was modified"}],
+    ],
+)
+def test_other_merge_errors_stay_refused(tmp_path, errors):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merge_errors = errors
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
 
 
 def test_merge_not_reported_fails(tmp_path):
