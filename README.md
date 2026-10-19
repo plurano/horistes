@@ -129,7 +129,7 @@ equal to what the train asks the forge for.
 | `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`), its callers (`licence-check.yml`) and scheduled checks (`codeql.yml`, `image-age.yml`, `pins.yml`) |
 | `actions/<name>/` | composite steps |
 | `templates/callers/` | the caller a consumer keeps, one template per shared workflow ([ADR-0009](docs/adr/0009-caller-templates-in-the-engines-syntax.md)) |
-| `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, the release read-back, and the check of action pins and runner labels |
+| `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, the release read-back, the check of action pins and runner labels, and the check of relative Markdown links |
 | `tests/` | tests of those checks; each rule has a planted defect that must fail |
 | `tests/fixtures/` | planted cases a workflow is run on: `unlicensed` must fail the licence check, `licensed` must pass it ([ADR-0006](docs/adr/0006-planted-case-as-a-fixture.md)); `readback` holds the parameter files of three read releases |
 | `apps/` | manifests of the forge apps the workflows use, with their computed rights ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md)) |
@@ -148,7 +148,9 @@ hashes.
 - `make verify` runs this repository's own checks without the engine: YAML and
   Python lint, actionlint and zizmor, the interface record, the host scan, the
   accepted findings and exceptions, the caller templates, the Scorecard
-  service's rules, the runner labels, the tests and the licence headers.
+  service's rules, the runner labels, the relative Markdown links and their
+  heading anchors (`tools/links.py`, no host asked), the tests and the licence
+  headers.
 - The tests read the message of every commit between the base of the change
   and `HEAD` (`tests/test_commit_messages.py`), on every run of the gate. A
   message fails without a `Signed-off-by` trailer, and when it credits

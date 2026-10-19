@@ -18,7 +18,7 @@ PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsc
 
 .PHONY: verify verify-all tools requirements lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
-	interface-snapshot list-pins check-pins pin check-runners
+	interface-snapshot list-pins check-pins pin check-runners check-links
 
 # The one gate is `make verify-all`: CI runs exactly that target, so a local
 # green run and a green status check mean the same thing. This repository's own
@@ -30,8 +30,8 @@ verify-all: verify
 
 # This repository's own checks; they need no engine.
 verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-exceptions check-templates \
-	check-scorecard check-runners test verify-reuse
-	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, runner labels, tests and licence headers.'
+	check-scorecard check-runners check-links test verify-reuse
+	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, runner labels, markdown links, tests and licence headers.'
 
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.
@@ -103,6 +103,9 @@ list-pins check-pins pin: tools
 # gate here; another repository is read with PINS_ROOT.
 check-runners: tools
 	$(BIN)/python -B tools/pins.py runners --root "$(PINS_ROOT)"
+
+check-links: tools
+	$(BIN)/python -B tools/links.py
 
 # The tests plant one defect per rule; the outside linters are run on a
 # planted workflow or repository as well, so a linter that stopped refusing
