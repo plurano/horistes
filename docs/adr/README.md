@@ -53,3 +53,4 @@ record that supersedes it.
 | [0043](0043-codeql-reports-to-code-scanning.md) | 2026-10-18 | CodeQL analyses the workflows and the Python tools and reports to code scanning | Accepted |
 | [0044](0044-the-merge-train-updates-only-what-it-armed.md) | 2026-10-18 | The merge train updates only what it armed, and never a linear-history branch | Accepted |
 | [0045](0045-the-merge-train-opens-no-release-pull-request-where-the-release-train-is-off.md) | 2026-10-19 | The merge train opens no release pull request where the release train is off | Accepted |
+| [0046](0046-the-merge-train-counts-the-minimum-age-from-the-pull-request.md) | 2026-10-19 | The merge train counts the minimum age from the pull request | Accepted |
