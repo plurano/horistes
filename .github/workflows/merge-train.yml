@@ -49,11 +49,12 @@
 # "Supersedes #N"; decision record 0038), pull requests from forks, a base
 # other than the default branch, the labels in `hold_labels`, heads in
 # `person_branches` (release pull requests by default: a release is a
-# person's act), dependency updates whose own commit (the update bot's, not
-# a repin or a merge pushed on top) is younger than `min_age_days` (3 days,
-# the fleet's minimum age; a security label or "[SECURITY]" in the title
-# skips the wait), and archived repositories. A repository leaves the train
-# when the app is uninstalled from it.
+# person's act), dependency updates younger than `min_age_days` (3 days,
+# the fleet's minimum age: age counts from the pull request's opening; a
+# rebase or a new version pushed onto an open update does not restart it;
+# a security label or "[SECURITY]" in the title skips the wait), and
+# archived repositories. A repository leaves the train when the app is
+# uninstalled from it.
 #
 # RELEASES. A repository with release-please-config.json and
 # .release-please-manifest.json on its default branch gets a second job after
@@ -203,22 +204,6 @@ jobs:
           STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
 
 
-          def update_made(pull):
-              """Commit time of the oldest commit of the last 20 that is no merge, or None.
-
-              The update bot rewrites its branch for every new version, so its commit is
-              the oldest one; a repin pushed on top, or a merge from the default branch,
-              does not restart the wait. With more commits than are read, a younger one
-              stands in, which only lengthens the wait.
-              """
-              times = [
-                  node["commit"]["committedDate"]
-                  for node in pull["history"]["nodes"]
-                  if node["commit"]["parents"]["totalCount"] == 1
-              ]
-              return datetime.fromisoformat(min(times)) if times else None
-
-
           def suite_key(suite):
               """Key grouping check suites of the same workflow or app."""
               run = suite.get("workflowRun")
@@ -255,16 +240,18 @@ jobs:
 
 
           def too_young(pull, labels, conf, now):
-              """Why a dependency update waits for its minimum age, or None."""
+              """Why a dependency update waits for its minimum age, or None.
+
+              Age counts from the pull request's opening; a rebase or a new version pushed
+              onto an open update does not restart it.
+              """
               if not pull["headRefName"].startswith(conf["dependency"]):
                   return None
               if labels & conf["security"] or "[SECURITY]" in pull["title"]:
                   return None
-              changed = update_made(pull)
-              if changed is None:
-                  return "dependency update with no commit of its own to date"
-              if now - changed < conf["min_age"]:
-                  return f"dependency update made {changed:%Y-%m-%d %H:%M}Z, younger than the minimum age"
+              created = datetime.fromisoformat(pull["createdAt"])
+              if now - created < conf["min_age"]:
+                  return f"dependency update opened {created:%Y-%m-%d %H:%M}Z, younger than the minimum age"
               return None
 
 
@@ -503,15 +490,12 @@ jobs:
                            orderBy: {field: CREATED_AT, direction: ASC}) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
-                  number id title body isDraft isCrossRepository baseRefName headRefName headRefOid
+                  number id title body createdAt isDraft isCrossRepository baseRefName headRefName headRefOid
                   mergeStateStatus isInMergeQueue
                   autoMergeRequest { enabledAt }
                   labels(first: 50) { nodes { name } }
                   refreshes: timelineItems(itemTypes: [UNLABELED_EVENT], last: 5) {
                     nodes { ... on UnlabeledEvent { createdAt label { name } } }
-                  }
-                  history: commits(last: 20) {
-                    nodes { commit { committedDate parents { totalCount } } }
                   }
                   latest: commits(last: 1) {
                     nodes {

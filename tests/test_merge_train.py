@@ -100,7 +100,7 @@ def app_key(which: str = "app") -> tuple[str, bytes]:
 
 def pull(number: int, state: str, **fields) -> dict:
     """One open pull request as the query reads it."""
-    commits = fields.pop("commits", [(OLD, 1)])
+    commits = fields.pop("commits", None)
     suites = fields.pop("suites", ["SUCCESS"])
     labels = fields.pop("labels", ())
     suite_nodes = []
@@ -124,6 +124,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "id": f"PR_{number}",
         "title": fields.pop("title", f"change {number}"),
         "body": fields.pop("body", ""),
+        "createdAt": fields.pop("createdAt", OLD),
         "isDraft": False,
         "isCrossRepository": False,
         "baseRefName": "main",
@@ -133,14 +134,15 @@ def pull(number: int, state: str, **fields) -> dict:
         "autoMergeRequest": None,
         "labels": {"nodes": [{"name": name} for name in labels]},
         "refreshes": {"nodes": []},
-        "history": {
+        "latest": {"nodes": [{"commit": {"checkSuites": {"nodes": suite_nodes}}}]},
+    }
+    if commits is not None:
+        node["history"] = {
             "nodes": [
                 {"commit": {"committedDate": when, "parents": {"totalCount": parents}}}
                 for when, parents in commits
             ]
-        },
-        "latest": {"nodes": [{"commit": {"checkSuites": {"nodes": suite_nodes}}}]},
-    }
+        }
     node.update(fields)
     return node
 
@@ -1009,20 +1011,17 @@ def test_accepted_state_lands_only_when_declared(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("commits", "fields", "lands"),
+    ("created", "fields", "lands"),
     [
-        ([(YOUNG, 1)], {}, False),
-        ([(OLD, 1)], {}, True),
-        ([(OLD, 1), (YOUNG, 2)], {}, True),
-        ([(OLD, 1), (YOUNG, 1)], {}, True),
-        ([(YOUNG, 2)], {}, False),
-        ([(YOUNG, 1)], {"labels": ("security",)}, True),
-        ([(YOUNG, 1)], {"title": "fix(deps): update x [SECURITY]"}, True),
+        (YOUNG, {}, False),
+        (OLD, {}, True),
+        (YOUNG, {"labels": ("security",)}, True),
+        (YOUNG, {"title": "fix(deps): update x [SECURITY]"}, True),
     ],
-    ids=["young", "old", "merge-on-top", "repin-on-top", "only-merges", "label", "title"],
+    ids=["young", "old", "label", "title"],
 )
-def test_dependency_update_waits_for_the_minimum_age(tmp_path, commits, fields, lands):
-    update = pull(1, "CLEAN", headRefName="renovate/tool-1.x", commits=commits, **fields)
+def test_dependency_update_waits_for_the_minimum_age(tmp_path, created, fields, lands):
+    update = pull(1, "CLEAN", headRefName="renovate/tool-1.x", createdAt=created, **fields)
     forge = Forge(repository(update))
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
@@ -1030,10 +1029,72 @@ def test_dependency_update_waits_for_the_minimum_age(tmp_path, commits, fields, 
 
 
 def test_minimum_age_zero_lands_a_young_update(tmp_path):
-    forge = Forge(repository(pull(1, "CLEAN", headRefName="dependabot/x", commits=[(YOUNG, 1)])))
+    forge = Forge(repository(pull(1, "CLEAN", headRefName="dependabot/x", createdAt=YOUNG)))
     done, _ = train(tmp_path, forge, min_age_days="0")
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(1)]
+
+
+def test_rebased_dependency_update_lands_when_pull_request_is_old_enough(tmp_path):
+    four_days_ago = (NOW - timedelta(days=4)).isoformat()
+    one_hour_ago = (NOW - timedelta(hours=1)).isoformat()
+    update = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/tool-1.x",
+        createdAt=four_days_ago,
+        commits=[(one_hour_ago, 1)],
+    )
+    forge = Forge(repository(update))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+
+
+def test_dependency_update_younger_than_minimum_age_does_not_land(tmp_path):
+    one_day_ago = (NOW - timedelta(days=1)).isoformat()
+    update = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/tool-1.x",
+        createdAt=one_day_ago,
+    )
+    forge = Forge(repository(update))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    created_dt = datetime.fromisoformat(one_day_ago)
+    expected = (
+        f"dependency update opened {created_dt:%Y-%m-%d %H:%M}Z, younger than the minimum age"
+    )
+    assert expected in summary
+
+
+def test_without_pull_request_age_the_rebased_update_does_not_land(tmp_path):
+    read_from_commit = (
+        'created = datetime.fromisoformat(pull["history"]["nodes"][0]["commit"]["committedDate"])'
+    )
+    mutant = module().replace(
+        'created = datetime.fromisoformat(pull["createdAt"])',
+        read_from_commit,
+    )
+    assert mutant != module()
+    four_days_ago = (NOW - timedelta(days=4)).isoformat()
+    one_hour_ago = (NOW - timedelta(hours=1)).isoformat()
+    update = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/tool-1.x",
+        createdAt=four_days_ago,
+        commits=[(one_hour_ago, 1)],
+    )
+    forge = Forge(repository(update))
+    done, summary = train(tmp_path, forge, helper=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    commit_dt = datetime.fromisoformat(one_hour_ago)
+    expected = f"dependency update opened {commit_dt:%Y-%m-%d %H:%M}Z, younger than the minimum age"
+    assert expected in summary
 
 
 def test_one_landing_per_run(tmp_path):
