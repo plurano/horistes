@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import ACTION, CHECKOUT, HOSTS, REUSABLE
+from conftest import ACTION, CHECKOUT, HOSTS, REUSABLE, Tree
 
 WORKFLOW = ".github/workflows/licence.yml"
 RUN = '          test -d "$TARGET"\n'
@@ -339,3 +339,20 @@ def test_call_inside_the_repository_is_no_outside_action(tree, form):
     done = scan(tree.write({".github/workflows/licence-check.yml": caller}))
     assert done.returncode == 0, done.stderr
     assert "3 files, 1 outside actions" in done.stdout
+
+
+def test_list_subcommand_prints_host_rows_and_refuses_bad_input(tree):
+    """The list subcommand prints outside hosts per file and exits 0; bad input fails."""
+    tree.write(
+        {WORKFLOW: planted(LOG), "actions/draft-stop/action.yml": ACTION, "hosts.toml": DECLARED}
+    )
+    done = tree.tool("hosts.py", "list")
+    assert done.returncode == 0, done.stderr
+    assert f"{WORKFLOW}: rekor.sigstore.dev (URL)\n" in done.stdout
+    assert "actions/draft-stop/action.yml: forge only\n" in done.stdout
+    # Bad input: a missing declaration file fails with exit 3 and an error message.
+    bad_tree = Tree(tree.root / "bad")
+    bad = bad_tree.write({WORKFLOW: REUSABLE}).tool("hosts.py", "list")
+    assert bad.returncode == 3
+    assert "ERROR: " in bad.stderr
+    assert "hosts.toml" in bad.stderr

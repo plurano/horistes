@@ -12,7 +12,7 @@ import json
 import sys
 
 import pytest
-from conftest import CHECKOUT, HOSTS, PAGE, ROOT, forge_answers, forge_job, forge_run
+from conftest import CHECKOUT, HOSTS, PAGE, ROOT, Tree, forge_answers, forge_job, forge_run
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
@@ -945,3 +945,47 @@ def test_o9_push_on_which_the_caller_is_lost_stays_an_error(tree, held, code, li
     assert done.returncode == code
     assert line in done.stdout
     assert "outside 0" in done.stdout + done.stderr
+
+
+def test_called_root_differs_from_root_and_reads_the_called_workflow(tree):
+    """The called root is read for the called workflow when it differs from the root."""
+    called_dir = tree.root / "central"
+    tree.write(
+        {
+            OLD_FILE: OLD_WORKFLOW,
+            CALLER_FILE: CALLER,
+            "hosts.toml": HOSTS,
+            "trial.toml": MAP,
+            "runs.json": json.dumps({"errors": [], "subjects": passing()}),
+        }
+    )
+    Tree(called_dir).write({CALLED_FILE: CALLED, "hosts.toml": HOSTS})
+    done = tree.tool(
+        "verdict.py",
+        "--map",
+        str(tree.root / "trial.toml"),
+        "--runs",
+        str(tree.root / "runs.json"),
+        "--json",
+        str(tree.root / "result.json"),
+        "--called-root",
+        str(called_dir),
+    )
+    assert done.returncode == 0, done.stderr + done.stdout
+    # Planted: the same called files placed under --root only (missing from --called-root) fail.
+    empty_called = tree.root / "empty-called"
+    empty_called.mkdir()
+    tree.write({CALLED_FILE: CALLED})
+    planted_done = tree.tool(
+        "verdict.py",
+        "--map",
+        str(tree.root / "trial.toml"),
+        "--runs",
+        str(tree.root / "runs.json"),
+        "--json",
+        str(tree.root / "result.json"),
+        "--called-root",
+        str(empty_called),
+    )
+    assert planted_done.returncode == 3
+    assert f"{empty_called / CALLED_FILE}" in planted_done.stderr

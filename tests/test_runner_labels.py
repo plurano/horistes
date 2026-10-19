@@ -18,6 +18,7 @@ import pytest
 from conftest import ROOT
 
 sys.path.insert(0, str(ROOT / "tools"))
+import ciwf
 import pins
 
 WORKFLOW = ".github/workflows/build.yml"
@@ -257,3 +258,21 @@ def test_workflows_of_this_repository_name_no_floating_label(capsys):
     said = capsys.readouterr()
     assert "no floating runner label" in said.out
     assert said.err == ""
+
+
+def test_licence_workflow_input_runner_default_is_pinned(tree):
+    """The licence workflow declares its default runner as the current pinned release."""
+    licence_path = ROOT / ".github/workflows/licence.yml"
+    doc = ciwf.load(licence_path)
+    default = doc["on"]["workflow_call"]["inputs"]["runner"]["default"]
+    assert default == "ubuntu-26.04"
+    # A planted floating default is refused by the runner check.
+    text = licence_path.read_text(encoding="utf-8")
+    planted = text.replace(f"default: {default}", "default: ubuntu-latest")
+    tree.write({".github/workflows/licence.yml": planted})
+    done = tree.tool("pins.py", "runners")
+    assert done.returncode == 1, done.stdout
+    assert (
+        "default` of input `runner` of workflow_call: `ubuntu-latest` is a floating runner label"
+        in done.stderr
+    )
