@@ -3,7 +3,7 @@ version: 1
 repository:
   owner: plurano
   name: horistes
-  visibility: private
+  visibility: public
   description: "Reusable CI workflows and templates of the Plurano family."
   homepage: ""
   topics: []
