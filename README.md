@@ -536,10 +536,10 @@ none of its values.
   owner can extend the preset. A public repository waits until this one is
   public.
 - From the first release on, a consumer names the release
-  (`github><owner>/<this repository>#1.0.0`) and adds `renovate-config` to
-  its `enabledManagers`: Renovate then proposes the next release of the
-  preset like any other update. A reference without a release follows the
-  default branch.
+  (`github><owner>/<this repository>#<release tag>`) and adds
+  `renovate-config` to its `enabledManagers`: Renovate then proposes the
+  next release of the preset like any other update. A reference without a
+  release follows the default branch.
 - A repository that lints with REUSE names the configuration in its
   `REUSE.toml`, because JSON carries no comment for a header:
 
