@@ -80,7 +80,8 @@ import shutil
 import sys
 import tempfile
 import tomllib
-from dataclasses import dataclass, replace
+from copy import replace
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
