@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Scorecard: the supply-chain checks of this repository, reported to code
+# scanning. The job calls the reusable workflow beside it. It runs in a public
+# repository only.
+name: Scorecard check
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 2"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scorecard:
+    name: Scorecard
+    permissions:
+      contents: read
+      security-events: write # the findings go to the forge's code scanning
+      id-token: write # asked for by the called job; used only for a publication
+    uses: ./.github/workflows/scorecard.yml
+    with:
+      outside_hosts: ${{ github.event.repository.visibility == 'public' }}

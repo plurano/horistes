@@ -25,7 +25,9 @@ import ciwf
 from expressions import evaluate
 
 SCORECARD = ROOT / ".github/workflows/scorecard.yml"
+CALLER = ROOT / ".github/workflows/scorecard-check.yml"
 VISIBILITY = "${{ github.event.repository.visibility }}"
+PUBLIC = "${{ github.event.repository.visibility == 'public' }}"
 INPUT = re.compile(r"^\$\{\{\s*inputs\.(\w+)\s*\}\}$")
 DEFAULTS = {"outside_hosts": False, "publish": False}
 
@@ -118,3 +120,36 @@ def test_without_the_refusal_job_a_default_call_reads_green(tmp_path):
     checks = play(doc, DEFAULTS, "public", tmp_path)
     assert all(result != "failure" for result, _ in checks.values()), checks
     assert checks["Analysis (not started)"][0] == "skipped"
+
+
+def test_repositorys_own_scorecard_caller_runs_green_in_a_public_repository(tmp_path):
+    """The repository's own caller calls the shared workflow and runs green in public."""
+    caller = ciwf.load(CALLER)
+    job = caller["jobs"]["scorecard"]
+    assert job["uses"] == "./.github/workflows/scorecard.yml"
+    assert job["permissions"] == {
+        "contents": "read",
+        "security-events": "write",
+        "id-token": "write",
+    }
+    events = ciwf.triggers(caller)
+    assert "push" in events and "main" in events["push"].get("branches", [])
+    assert any("cron" in entry for entry in events.get("schedule", []))
+    assert "workflow_dispatch" in events
+    with_clause = job.get("with") or {}
+    assert with_clause.get("outside_hosts") == PUBLIC
+    assert "publish" not in with_clause
+
+    inputs = {"outside_hosts": True, "publish": False}
+    checks = play(ciwf.load(SCORECARD), inputs, "public", tmp_path)
+    assert checks.get("Analysis", ("", ""))[0] == "success"
+    assert not any(result == "failure" for result, _ in checks.values())
+
+    private_checks = play(ciwf.load(SCORECARD), inputs, "private", tmp_path)
+    assert private_checks["Public repository"][0] == "failure"
+    assert any(result == "failure" for result, _ in private_checks.values())
+
+    off_checks = play(
+        ciwf.load(SCORECARD), {"outside_hosts": False, "publish": False}, "public", tmp_path
+    )
+    assert off_checks["Analysis"][0] == "failure"
