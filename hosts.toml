@@ -33,6 +33,10 @@ forge = [
 # Takes the toolchain from the runner's cache or the forge-hosted manifest;
 # when both miss it downloads from the Go distribution site, which redirects.
 "actions/setup-go" = ["go.dev", "dl.google.com"]
+# Reads the version manifest from raw.githubusercontent.com and the CPython
+# build from the forge's release assets (read src/install-python.ts at v7.0.0,
+# 2026-10-19), both forge hosts.
+"actions/setup-python" = []
 # Uploads to the forge's artifact storage.
 "actions/upload-artifact" = [
     "results-receiver.actions.githubusercontent.com",

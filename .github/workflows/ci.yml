@@ -132,3 +132,45 @@ jobs:
             || github.event.merge_group.base_sha
             || github.event.before }}
         run: make verify-all BASE_REF="$BASE_REF"
+
+  # Stated Python floor (ADR-0048): consumer-facing tools promise Python 3.12,
+  # so their tests run on that floor in addition to the runner's Python.
+  floor:
+    name: Python 3.12 floor
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The tool environment is built from the Python 3.12 that setup-python
+      # put first on the path, so the tests below run on the floor.
+      - name: Install the pinned tools on Python 3.12
+        run: |
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          make tools
+
+      - name: Test the read-back and stranger tools on Python 3.12
+        run: .venv/bin/python -B -m pytest tests/test_readback.py tests/test_stranger.py -q -p no:cacheprovider
