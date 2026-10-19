@@ -2,24 +2,16 @@
 # SPDX-License-Identifier: EUPL-1.2
 ---
 # Action pins: runs `make check-pins` on the workflows of this repository
-# (decision records 0016 and 0017). The check asks the forge and the
-# repository of every action, so it is no part of the verification gate and no
-# required check. It runs on a pull request that changes a workflow, the tool
-# or the tool's pins, once a week, and by hand. The weekly run is the one that
-# sees a release name that was moved to another commit after the pin was
-# written.
+# (decision records 0016, 0017 and 0047). The check asks the forge and the
+# repository of every action, so it is no part of the verification gate. It
+# runs on every pull request, where it is a required check, once a week, and
+# by hand. The weekly run is the one that sees a release name that was moved
+# to another commit after the pin was written.
 name: Action pins
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - .github/workflows/**
-      - tools/pins.py
-      - tools/ciwf.py
-      - tools/forge.py
-      - requirements/tools.txt
-      - Makefile
   schedule:
     - cron: "41 5 * * 3"
   workflow_dispatch:
