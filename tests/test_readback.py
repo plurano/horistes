@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -846,3 +847,82 @@ def test_control_of_another_commit_is_a_commit_and_another(commit):
 def test_report_without_a_line_is_no_pass(capsys):
     assert readback.Report().end() == 1
     assert capsys.readouterr().out.startswith("FAIL: 0 of 0")
+
+
+def cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run tools/readback.py as a script in a subprocess with no network."""
+    return subprocess.run(
+        [sys.executable, "-B", str(ROOT / "tools/readback.py"), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+
+def test_cli_offline_check_and_help_pass_with_expected_output(tmp_path):
+    """The CLI entry point executes valid offline check and help invocations with exit 0."""
+    # Positive help invocation: prints usage and exits 0.
+    done = cli("--help")
+    assert done.returncode == 0, done.stderr
+    assert "usage: readback.py" in done.stdout
+    assert "{check,verify}" in done.stdout
+    assert done.stderr == ""
+
+    # Positive offline parameter check: exits 0 with confirmation line.
+    params_file = tmp_path / "valid.toml"
+    params_file.write_text(PARAMS, encoding="utf-8")
+    done = cli("check", "--params", str(params_file))
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == f"PASS: {params_file} names what to verify for {REPOSITORY}\n"
+    assert done.stderr == ""
+
+    # Negative: a parameter file with an unknown key fails with exit 3.
+    bad_params = tmp_path / "bad.toml"
+    bad_params.write_text("unknown = 1\n" + PARAMS, encoding="utf-8")
+    planted = cli("check", "--params", str(bad_params))
+    assert planted.returncode == 3
+    assert f"ERROR: {bad_params}: " in planted.stderr
+    assert "unknown key" in planted.stderr
+
+
+def test_cli_rejects_unknown_subcommand_and_unrecognized_arguments(tmp_path):
+    """The CLI entry point rejects unknown subcommands and bad arguments with exit 2."""
+    params_file = tmp_path / "params.toml"
+    params_file.write_text(PARAMS, encoding="utf-8")
+
+    # Negative: unknown subcommand fails with exit 2 and choice error message.
+    bad_sub = cli("unknown-subcommand", "--params", str(params_file))
+    assert bad_sub.returncode == 2
+    assert "invalid choice: 'unknown-subcommand'" in bad_sub.stderr
+
+    # Negative: unrecognized option argument fails with exit 2 and message.
+    bad_arg = cli("check", "--params", str(params_file), "--bogus")
+    assert bad_arg.returncode == 2
+    assert "unrecognized arguments: --bogus" in bad_arg.stderr
+
+    # Negative: --local belongs to verify; check refuses it with exit 3.
+    bad_mode = cli("check", "--params", str(params_file), "--local", str(tmp_path))
+    assert bad_mode.returncode == 3
+    assert "--local is only valid with verify" in bad_mode.stderr
+
+
+def test_cli_boundary_rejects_missing_required_arguments(tmp_path):
+    """The CLI entry point rejects missing required arguments with exit 2."""
+    params_file = tmp_path / "params.toml"
+    params_file.write_text(PARAMS, encoding="utf-8")
+
+    # Boundary: missing required --params argument fails with exit 2.
+    missing_params = cli("check")
+    assert missing_params.returncode == 2
+    assert "the following arguments are required: --params" in missing_params.stderr
+
+    # Boundary: missing required command argument fails with exit 2.
+    missing_cmd = cli("--params", str(params_file))
+    assert missing_cmd.returncode == 2
+    assert "the following arguments are required: command" in missing_cmd.stderr
+
+    # Boundary: verify refuses an empty tag before it asks the forge.
+    missing_tag = cli("verify", "--params", str(params_file))
+    assert missing_tag.returncode == 3
+    assert "ERROR: --tag '' is not a plain tag name" in missing_tag.stderr
