@@ -60,6 +60,11 @@
           "required": false,
           "type": "string"
         },
+        "release_off": {
+          "default": "",
+          "required": false,
+          "type": "string"
+        },
         "runner": {
           "default": null,
           "required": true,

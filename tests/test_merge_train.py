@@ -729,6 +729,7 @@ def train(
         "TRAIN_HOLD_LABELS": "hold,do-not-merge,planted",
         "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
         "TRAIN_PERSON_BRANCHES": "release-please--",
+        "TRAIN_RELEASE_OFF": "",
         "TRAIN_SECURITY_LABELS": "security",
         **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
     }
@@ -1220,6 +1221,7 @@ def test_switched_off_writes_nothing(tmp_path):
         ("min_age_days", "-1"),
         ("min_age_days", "31"),
         ("min_age_days", "two"),
+        ("release_off", "justname"),
     ],
 )
 def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
@@ -1492,6 +1494,32 @@ def test_sweep_names_the_repositories_with_release_please(tmp_path):
         {"owner": "other", "name": "d"},
     ]
     assert "Release pull requests and releases next: fleet/app, other/d" in summary
+
+
+def test_release_off_skips_listed_repository_and_reports_it(tmp_path):
+    forge = release_forge()
+    done, summary = train(tmp_path, forge, release_off="other/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release pull requests and releases next: fleet/app" in summary
+    assert "Release train off: other/d" in summary
+
+
+def test_release_off_is_case_insensitive(tmp_path):
+    forge = release_forge()
+    done, summary = train(tmp_path, forge, release_off="Other/D")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release pull requests and releases next: fleet/app" in summary
+    assert "Release train off: other/d" in summary
+
+
+def test_without_the_release_off_check_a_listed_repository_is_named(tmp_path):
+    mutant = script().replace('target["full_name"].lower() in conf["release_off"]', "False")
+    assert mutant != script()
+    done, _ = train(tmp_path, release_forge(), mutant, release_off="other/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert {"owner": "other", "name": "d"} in releases_of(tmp_path)
 
 
 def test_without_the_manifest_check_a_config_alone_is_named(tmp_path):
@@ -2916,3 +2944,21 @@ def test_each_refresh_rule_is_needed(tmp_path, where, original, mutant, fields):
         second, _ = train(tmp_path, mutated, helper=changed)
     assert first.returncode == second.returncode == 0, second.stdout + second.stderr
     assert bool(kept.writes) != bool(mutated.writes), (kept.writes, mutated.writes)
+
+
+def test_check_release_off_parses_and_lowercases(tmp_path):
+    rules = load_rules(tmp_path)
+    assert rules.check_release_off("Other/D cordanaLLM/Aegis-OS") == frozenset(
+        {"other/d", "cordanallm/aegis-os"}
+    )
+    assert rules.check_release_off("") == frozenset()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["justname", "a/b/c", "/name", "owner/", "/"],
+)
+def test_check_release_off_refuses_invalid_entry(tmp_path, invalid):
+    rules = load_rules(tmp_path)
+    with pytest.raises(ValueError, match="not owner/name"):
+        rules.check_release_off(invalid)
