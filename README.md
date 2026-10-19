@@ -170,6 +170,8 @@ hashes.
   change. A change that breaks a caller also raises the recorded version:
   `interface_minor` while `interface_major` is 0, `interface_major` from 1 on
   ([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)).
+- The floor job runs the read-back and stranger tests on Python 3.12
+  ([ADR-0048](docs/adr/0048-the-python-floor-is-tested-in-ci.md)).
 
 ## Caller templates
 
