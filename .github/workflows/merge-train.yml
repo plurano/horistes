@@ -67,7 +67,8 @@
 # runs, so the release pull request gets its required checks and the release
 # starts the repository's `release: published` workflows. `switch: off` runs no
 # release job. A repository listed in `release_off` gets no release job even
-# when both release files are present (decision record 0045).
+# when both release files are present (decision record 0045). At most 3 release
+# jobs run at once (`release_max_parallel`, a whole number from 1 to 3, default 3).
 #
 # CREDENTIAL. One repository holds the app's private key, as the secret
 # MERGE_TRAIN_APP_KEY of its environment `merge-train`; the environment lets
@@ -141,6 +142,11 @@ on:
         type: string
         required: false
         default: release-please--
+      release_max_parallel:
+        description: Release jobs that run at once, a whole number from 1 to 3.
+        type: number
+        required: false
+        default: 3
       release_off:
         description: >-
           Repositories, owner/name separated by spaces, where the train opens
@@ -473,6 +479,18 @@ jobs:
               return frozenset(repos)
 
 
+          MAX_RELEASE_PARALLEL = 3
+
+
+          def check_release_parallel(raw, error_cls=ValueError):
+              """Release jobs at once, a whole number from 1 to MAX_RELEASE_PARALLEL (HISS-06)."""
+              if not raw.isdigit() or not 1 <= int(raw) <= MAX_RELEASE_PARALLEL:
+                  raise error_cls(
+                      f"release_max_parallel is {raw!r}, not a whole number from 1 to {MAX_RELEASE_PARALLEL}"
+                  )
+              return int(raw)
+
+
           QUERY = """
           query($owner: String!, $name: String!, $after: String) {
             repository(owner: $owner, name: $name) {
@@ -615,6 +633,7 @@ jobs:
           TRAIN_DEPENDENCY_BRANCHES: ${{ inputs.dependency_branches }}
           TRAIN_PERSON_BRANCHES: ${{ inputs.person_branches }}
           TRAIN_RELEASE_OFF: ${{ inputs.release_off }}
+          TRAIN_RELEASE_MAX_PARALLEL: ${{ inputs.release_max_parallel }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
         run: |
           import base64
@@ -643,6 +662,7 @@ jobs:
               QUERY,
               REFRESH_LABEL,
               check_release_off,
+              check_release_parallel,
               in_flight,
               issues_to_close,
               refresh,
@@ -715,6 +735,7 @@ jobs:
                       "or the job runs outside the environment that holds it"
                   )
               release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
+              parallel = check_release_parallel(env["TRAIN_RELEASE_MAX_PARALLEL"], InvalidSettingError)
               return {
                   "switch": switch,
                   "method": method,
@@ -724,6 +745,7 @@ jobs:
                   "dependency": tuple(env["TRAIN_DEPENDENCY_BRANCHES"].split()),
                   "person": tuple(env["TRAIN_PERSON_BRANCHES"].split()),
                   "release_off": release_off,
+                  "release_max_parallel": parallel,
                   "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
                   "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
               }
@@ -1509,7 +1531,7 @@ jobs:
     permissions: {}
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: ${{ inputs.release_max_parallel }}
       matrix:
         repository: ${{ fromJSON(needs.train.outputs.releases) }}
     steps:

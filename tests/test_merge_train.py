@@ -730,6 +730,7 @@ def train(
         "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
         "TRAIN_PERSON_BRANCHES": "release-please--",
         "TRAIN_RELEASE_OFF": "",
+        "TRAIN_RELEASE_MAX_PARALLEL": "3",
         "TRAIN_SECURITY_LABELS": "security",
         **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
     }
@@ -1222,6 +1223,9 @@ def test_switched_off_writes_nothing(tmp_path):
         ("min_age_days", "31"),
         ("min_age_days", "two"),
         ("release_off", "justname"),
+        ("release_max_parallel", "0"),
+        ("release_max_parallel", "4"),
+        ("release_max_parallel", "two"),
     ],
 )
 def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
@@ -1230,6 +1234,13 @@ def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
     assert done.returncode == 3, done.stdout + done.stderr
     assert done.stdout.startswith("::error title=Merge train setting::")
     assert (forge.minted, forge.writes) == ([], [])
+
+
+@pytest.mark.parametrize("parallel", ["1", "3"])
+def test_release_max_parallel_boundaries_accepted(tmp_path, parallel):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, release_max_parallel=parallel)
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 def test_merge_method_merge_is_passed(tmp_path):
@@ -1615,8 +1626,26 @@ def release_job_findings(doc: dict) -> list[str]:
     return found
 
 
+def release_bound_findings(doc: dict) -> list[str]:
+    """What lets more release jobs run at once than the bound allows (HISS-06)."""
+    found = []
+    strategy = doc["jobs"].get("release", {}).get("strategy", {})
+    if strategy.get("max-parallel") != "${{ inputs.release_max_parallel }}":
+        found.append("strategy max-parallel is not '${{ inputs.release_max_parallel }}'")
+    inputs = doc.get("on", {}).get("workflow_call", {}).get("inputs", {})
+    bound = inputs.get("release_max_parallel") or {}
+    default = bound.get("default")
+    if bound.get("type") != "number" or type(default) is not int or default not in (1, 2, 3):
+        found.append(
+            "workflow_call input release_max_parallel is missing, "
+            "not type number, or default not int 1..3"
+        )
+    return found
+
+
 def test_release_job_runs_release_please_with_the_app_token():
     assert release_job_findings(ciwf.load(TRAIN)) == []
+    assert release_bound_findings(ciwf.load(TRAIN)) == []
 
 
 @pytest.mark.parametrize(
@@ -1690,6 +1719,34 @@ def test_release_step_pieces_are_found(mutator, finding):
     ]
     mutator(steps)
     assert release_job_findings(doc) == [finding]
+
+
+@pytest.mark.parametrize(
+    ("mutator", "finding"),
+    [
+        (
+            lambda doc: doc["jobs"]["release"]["strategy"].pop("max-parallel"),
+            "strategy max-parallel is not '${{ inputs.release_max_parallel }}'",
+        ),
+        (
+            lambda doc: doc["jobs"]["release"]["strategy"].update({"max-parallel": 4}),
+            "strategy max-parallel is not '${{ inputs.release_max_parallel }}'",
+        ),
+        (
+            lambda doc: doc["on"]["workflow_call"]["inputs"]["release_max_parallel"].update(
+                {"default": 4}
+            ),
+            (
+                "workflow_call input release_max_parallel is missing, "
+                "not type number, or default not int 1..3"
+            ),
+        ),
+    ],
+)
+def test_release_max_parallel_mutants_are_found(mutator, finding):
+    doc = ciwf.load(TRAIN)
+    mutator(doc)
+    assert release_bound_findings(doc) == [finding]
 
 
 def test_release_job_without_the_judge_is_found():
