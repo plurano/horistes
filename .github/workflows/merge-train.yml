@@ -66,7 +66,8 @@
 # untouched, so a release stays a person's act. The app's events start workflow
 # runs, so the release pull request gets its required checks and the release
 # starts the repository's `release: published` workflows. `switch: off` runs no
-# release job.
+# release job. A repository listed in `release_off` gets no release job even
+# when both release files are present (decision record 0045).
 #
 # CREDENTIAL. One repository holds the app's private key, as the secret
 # MERGE_TRAIN_APP_KEY of its environment `merge-train`; the environment lets
@@ -140,6 +141,13 @@ on:
         type: string
         required: false
         default: release-please--
+      release_off:
+        description: >-
+          Repositories, owner/name separated by spaces, where the train opens
+          and pushes no release pull request.
+        type: string
+        required: false
+        default: ""
       security_labels:
         description: Labels that exempt a dependency update from the minimum age, comma-separated.
         type: string
@@ -453,6 +461,18 @@ jobs:
                   raise ValueError("squash message holds a Co-authored-by line")
               return headline, full_body
 
+
+          def check_release_off(raw, error_cls=ValueError):
+              """Repositories opted out of release runs, lowercased frozenset of 'owner/name'."""
+              repos = set()
+              for item in raw.split():
+                  parts = item.split("/")
+                  if len(parts) != 2 or not parts[0] or not parts[1]:
+                      raise error_cls(f"release_off entry {item!r} is not owner/name")
+                  repos.add(item.lower())
+              return frozenset(repos)
+
+
           QUERY = """
           query($owner: String!, $name: String!, $after: String) {
             repository(owner: $owner, name: $name) {
@@ -594,6 +614,7 @@ jobs:
           TRAIN_HOLD_LABELS: ${{ inputs.hold_labels }}
           TRAIN_DEPENDENCY_BRANCHES: ${{ inputs.dependency_branches }}
           TRAIN_PERSON_BRANCHES: ${{ inputs.person_branches }}
+          TRAIN_RELEASE_OFF: ${{ inputs.release_off }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
         run: |
           import base64
@@ -621,6 +642,7 @@ jobs:
               MERGED,
               QUERY,
               REFRESH_LABEL,
+              check_release_off,
               in_flight,
               issues_to_close,
               refresh,
@@ -692,6 +714,7 @@ jobs:
                       "the app key is empty or no PEM key: the caller passes no secret, "
                       "or the job runs outside the environment that holds it"
                   )
+              release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
               return {
                   "switch": switch,
                   "method": method,
@@ -700,6 +723,7 @@ jobs:
                   "hold": frozenset(name for name in env["TRAIN_HOLD_LABELS"].split(",") if name),
                   "dependency": tuple(env["TRAIN_DEPENDENCY_BRANCHES"].split()),
                   "person": tuple(env["TRAIN_PERSON_BRANCHES"].split()),
+                  "release_off": release_off,
                   "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
                   "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
               }
@@ -1363,7 +1387,7 @@ jobs:
 
           def sweep(env, conf, started):
               """Run the train in every repository; the per-account tally, the sections, the refusals."""
-              accounts, sections, refusals, skipped, releases, identity = {}, [], [], [], [], {}
+              accounts, sections, refusals, skipped, releases, off, identity = {}, [], [], [], [], [], {}
               for installation in pages(env, app_jwt(env, conf), "/app/installations"):
                   account = installation["account"]["login"]
                   if installation.get("suspended_at"):
@@ -1395,8 +1419,11 @@ jobs:
                       tally["updated"] += moved
                       sections.append(section)
                       if release:
-                          releases.append({"owner": account, "name": target["name"]})
-              return accounts, [s for s in sections if s], refusals, skipped, releases
+                          if target["full_name"].lower() in conf["release_off"]:
+                              off.append(target["full_name"])
+                          else:
+                              releases.append({"owner": account, "name": target["name"]})
+              return accounts, [s for s in sections if s], refusals, skipped, releases, off
 
 
           def append(path, text):
@@ -1404,7 +1431,7 @@ jobs:
                   handle.write(text)
 
 
-          def summary(env, accounts, sections, refusals, skipped, releases):
+          def summary(env, accounts, sections, refusals, skipped, releases, off):
               lines = [
                   "## Merge train sweep",
                   "",
@@ -1427,6 +1454,8 @@ jobs:
                   late = ", ".join(f"{r['owner']}/{r['name']}" for r in releases[MAX_RELEASES:])
                   lines += ["", f"No release run, the job matrix holds {MAX_RELEASES}: {late}"]
                   del releases[MAX_RELEASES:]
+              if off:
+                  lines += ["", f"Release train off: {', '.join(off)}"]
               named = ", ".join(f"{r['owner']}/{r['name']}" for r in releases) or "none"
               lines += ["", f"Release pull requests and releases next: {named}"]
               text = "\n".join([*lines, "", *sections]) + "\n"
@@ -1442,11 +1471,11 @@ jobs:
                   sys.stdout.write(f"::error title=Merge train setting::{err}\n")
                   return 3
               try:
-                  accounts, sections, refusals, skipped, releases = sweep(env, conf, time.monotonic())
+                  accounts, sections, refusals, skipped, releases, off = sweep(env, conf, time.monotonic())
               except RefusedError as err:
                   sys.stdout.write(f"::error title=Merge train refused::{err}\n")
                   return 1
-              summary(env, accounts, sections, refusals, skipped, releases)
+              summary(env, accounts, sections, refusals, skipped, releases, off)
               for line in refusals:
                   sys.stdout.write(f"::error title=Merge train refused::{line}\n")
               if skipped:
