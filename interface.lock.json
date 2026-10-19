@@ -60,6 +60,11 @@
           "required": false,
           "type": "string"
         },
+        "release_max_parallel": {
+          "default": 3,
+          "required": false,
+          "type": "number"
+        },
         "release_off": {
           "default": "",
           "required": false,
