@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import string
 import subprocess
@@ -159,6 +160,18 @@ def test_gitleaks_is_the_release_the_gate_pins():
         timeout=20,
     )
     assert done.stdout.strip().removeprefix("v") == pinned.removeprefix("v")
+
+
+def full_commit(ref):
+    """Whether `ref` names one commit by its full 40-hex name, as the gate pins the engine."""
+    return re.fullmatch(r"[0-9a-f]{40}", ref) is not None
+
+
+@pytest.mark.parametrize("planted", ["019b879", "main", "v1.2.3", "0" * 39, "A" * 40, "0" * 41])
+def test_praetor_ref_is_declared_as_a_full_commit(planted):
+    """The gate pins PRAETOR_REF to a full commit; a short name, branch or tag is no pin."""
+    assert full_commit(ciwf.load(GATE)["env"]["PRAETOR_REF"])
+    assert not full_commit(planted)
 
 
 def test_planted_token_is_not_written_in_this_file():
