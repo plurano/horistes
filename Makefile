@@ -109,6 +109,7 @@ check-runners: tools
 # fails here.
 test: tools
 	ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
+		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" \
 		$(BIN)/python -B -m pytest
 
 # Every file carries its licence header or is named in REUSE.toml.
