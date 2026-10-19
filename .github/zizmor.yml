@@ -10,3 +10,4 @@ rules:
   self-repository:
     ignore:
       - licence-check.yml # expires 2026-12-31: actionlint refuses the `$/` form
+      - scorecard-check.yml # expires 2026-12-31: actionlint refuses the `$/` form
