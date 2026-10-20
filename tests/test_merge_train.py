@@ -1630,6 +1630,19 @@ def test_release_list_is_bounded_by_the_matrix(tmp_path):
     assert "No release run, the job matrix holds 1: other/d" in summary
 
 
+def frozen_findings(steps: list, pr_step: dict) -> list[str]:
+    """What lets release-please update a release pull request a person froze."""
+    found = []
+    if pr_step.get("if") != "steps.settings.outputs.frozen == 'false'":
+        found.append("pull-request step updates a frozen release pull request")
+    reading = [s for s in steps if str(s.get("run", "")).endswith('release_labels.py" settings')]
+    if len(reading) != 1 or reading[0].get("env", {}).get("HOLD_LABELS") != (
+        "${{ inputs.hold_labels }}"
+    ):
+        found.append("settings step does not read the hold labels")
+    return found
+
+
 def release_job_findings(doc: dict) -> list[str]:
     """What keeps the release job from running release-please with the app's own token."""
     found = []
@@ -1668,6 +1681,7 @@ def release_job_findings(doc: dict) -> list[str]:
         found.append("release step does not check skip setting")
     if pr_with.get("skip-github-release") not in (True, "true"):
         found.append("pull-request step does not skip releases")
+    found += frozen_findings(steps, pr_step)
     judging = [s for s in steps if str(s.get("run", "")).endswith('release_labels.py" after')]
     judge_env = judging[0].get("env", {}) if len(judging) == 1 else {}
     outcome = f"${{{{ steps.{create_step.get('id')}.outcome }}}}"
@@ -3080,3 +3094,49 @@ def test_check_release_off_refuses_invalid_entry(tmp_path, invalid):
     rules = load_rules(tmp_path)
     with pytest.raises(ValueError, match="not owner/name"):
         rules.check_release_off(invalid)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda job: job["steps"][-1].pop("if"),
+        lambda job: [s.get("env", {}).pop("HOLD_LABELS", None) for s in job["steps"]],
+    ],
+)
+def test_release_job_without_the_frozen_check_is_refused(mutate):
+    doc = ciwf.load(TRAIN)
+    mutate(doc["jobs"]["release"])
+    assert release_job_findings(doc) != []
+
+
+FROZEN_RELEASE = [
+    {
+        "headRefName": "release-please--branches--master--components--app",
+        "labels": ("autorelease: cut",),
+    },
+    {"headRefName": "release-please--branches--main", "labels": ("autorelease: pending",)},
+    {"headRefName": "feat/change-1", "labels": ("autorelease: pending",)},
+]
+
+
+@pytest.mark.parametrize("fields", FROZEN_RELEASE)
+def test_planted_release_pull_request_behind_main_is_not_updated(tmp_path, fields):
+    """The planted case: a labelled release pull request behind main, person_branches emptied."""
+    forge = Forge(repository(pull(1, "BEHIND", **fields)))
+    done, summary = train(tmp_path, forge, person_branches="")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "a person lands it" in summary
+
+
+@pytest.mark.parametrize("fields", FROZEN_RELEASE)
+def test_without_the_release_check_the_sweep_updates_it(tmp_path, fields):
+    mutant = module().replace("release = release or any(", "release = False and any(")
+    mutant = mutant.replace(
+        'release = pull["headRefName"].startswith(RELEASE_HEAD)', "release = False"
+    )
+    assert mutant != module()
+    forge = Forge(repository(pull(1, "BEHIND", **fields)))
+    done, _ = train(tmp_path, forge, helper=mutant, person_branches="")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert updated(1) in forge.writes
