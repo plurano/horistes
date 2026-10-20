@@ -35,11 +35,14 @@ verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-e
 
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.
-tools: $(VENV)/.stamp
-$(VENV)/.stamp: requirements/tools.txt
-	$(PYTHON) -m venv $(VENV)
-	$(BIN)/python -m pip install --quiet --disable-pip-version-check --require-hashes -r requirements/tools.txt
-	@touch $@
+# Linked worktrees share .venv by symlink: compare content, not mtime.
+tools:
+	@hash=$$(sha256sum requirements/tools.txt | cut -d ' ' -f 1); \
+	if [ "$$(cat $(VENV)/.stamp 2>/dev/null)" != "$$hash" ]; then \
+		if [ ! -x $(BIN)/python ]; then $(PYTHON) -m venv $(VENV); fi && \
+		$(BIN)/python -m pip install --quiet --disable-pip-version-check --require-hashes -r requirements/tools.txt && \
+		printf '%s\n' "$$hash" > $(VENV)/.stamp; \
+	fi
 
 # Recompile the pins; a release younger than three days is left out. The
 # header of the output records this command and Renovate reruns it from there,
