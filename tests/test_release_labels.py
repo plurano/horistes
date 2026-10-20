@@ -36,6 +36,7 @@ PENDING = "autorelease: pending"
 TAGGED = "autorelease: tagged"
 ONE = json.dumps([{"number": 10, "sha": COMMIT_A, "tag": "v1.0.0"}], separators=(",", ":"))
 MOVED = [("post_label", 10, [TAGGED]), ("delete_label", 10, PENDING)]
+HOLD = "hold,do-not-merge,planted"
 
 
 def module() -> str:
@@ -188,11 +189,14 @@ def run(
     )
 
 
-def settings(tmp_path: Path, forge: Forge) -> tuple[subprocess.CompletedProcess[str], str]:
+def settings(
+    tmp_path: Path, forge: Forge, source: str | None = None
+) -> tuple[subprocess.CompletedProcess[str], str]:
     """The settings command and the outputs it wrote."""
     out = tmp_path / "output"
     out.write_text("", encoding="utf-8")
-    done = run(tmp_path, "settings", {"GITHUB_API_URL": forge.url, "GITHUB_OUTPUT": str(out)})
+    env = {"GITHUB_API_URL": forge.url, "GITHUB_OUTPUT": str(out), "HOLD_LABELS": HOLD}
+    done = run(tmp_path, "settings", env, source)
     return done, out.read_text(encoding="utf-8")
 
 
@@ -228,7 +232,7 @@ def test_skipped_release_moves_the_label_and_writes_no_release(tmp_path, forge):
     forge.tags = {"v1.0.0": (COMMIT_A, "commit")}
     done, outputs = settings(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert outputs == f"skip=true\npending={ONE}\n"
+    assert outputs == f"skip=true\npending={ONE}\nfrozen=false\n"
     done = after(tmp_path, forge, "true", "skipped")
     assert done.returncode == 0, done.stdout + done.stderr
     assert (forge.writes, forge.release_writes) == (MOVED, [])
@@ -354,7 +358,7 @@ def test_skip_is_the_effective_value_of_every_package(tmp_path, forge, config, s
     forge.config = config
     done, outputs = settings(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert outputs == f"skip={skip}\npending=[]\n"
+    assert outputs == f"skip={skip}\npending=[]\nfrozen=false\n"
 
 
 def test_mixed_skip_is_an_error(tmp_path, forge):
@@ -388,7 +392,7 @@ def test_pending_pull_failing_a_release_check_is_named_not_listed(tmp_path, forg
     done, outputs = settings(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "::warning::pull #10 labelled autorelease: pending fails release checks" in done.stdout
-    assert outputs == "skip=false\npending=[]\n"
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
 
 
 def test_refused_read_is_an_error_line(tmp_path, forge):
@@ -415,7 +419,7 @@ def test_component_branch_is_a_release_pull(tmp_path, forge):
     component_release(forge)
     done, outputs = settings(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert outputs == f"skip=false\npending={ONE}\n"
+    assert outputs == f"skip=false\npending={ONE}\nfrozen=false\n"
 
 
 def test_component_branch_release_that_existed_is_done(tmp_path, forge):
@@ -423,7 +427,7 @@ def test_component_branch_release_that_existed_is_done(tmp_path, forge):
     component_release(forge)
     done, outputs = settings(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    pending = outputs.split("pending=", 1)[1].strip()
+    pending = outputs.split("pending=", 1)[1].split("\n", 1)[0]
     existing_release(forge)
     forge.pulls = [release_pull(labels=(TAGGED,), head={"ref": SANDBOX_HEAD})]
     done = after(tmp_path, forge, "false", "failure", pending)
@@ -441,7 +445,7 @@ def test_without_the_component_branch_the_release_stays_red(tmp_path, forge):
     env = {"GITHUB_API_URL": forge.url, "GITHUB_OUTPUT": str(settings_path)}
     done = run(tmp_path, "settings", env, source)
     assert "fails release checks" in done.stdout
-    pending = settings_path.read_text(encoding="utf-8").split("pending=", 1)[1].strip()
+    pending = settings_path.read_text(encoding="utf-8").split("pending=", 1)[1].split("\n", 1)[0]
     existing_release(forge)
     done = after(tmp_path, forge, "false", "failure", pending, source=source)
     assert done.returncode == 1
@@ -495,4 +499,57 @@ def test_title_release_please_would_not_read_is_named(tmp_path, forge, config, t
     done, outputs = settings(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "::warning::pull #10 labelled autorelease: pending fails release checks" in done.stdout
-    assert outputs == "skip=false\npending=[]\n"
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+
+
+def open_release_pull(
+    number: int, labels: tuple, head: str = "release-please--branches--main"
+) -> dict:
+    """One open release pull request as the pulls API answers it."""
+    return {
+        "number": number,
+        "state": "open",
+        "merged_at": None,
+        "base": {"ref": "main"},
+        "head": {"ref": head},
+        "title": "chore(main): release 1.0.0",
+        "labels": [{"name": name} for name in labels],
+    }
+
+
+@pytest.mark.parametrize(
+    ("labels", "frozen"),
+    [
+        ((PENDING, "autorelease: cut"), "true"),
+        ((PENDING, "hold"), "true"),
+        ((PENDING, "type:chore", "autorelease: cut", "hold"), "true"),
+        ((PENDING,), "false"),
+        ((PENDING, "type:chore"), "false"),
+    ],
+)
+def test_frozen_release_pull_request_is_not_updated(tmp_path, forge, labels, frozen):
+    """The planted case: an open release pull request a person cut or held stays as it is."""
+    forge.config = {}
+    forge.pulls = [open_release_pull(11, labels)]
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs.endswith(f"frozen={frozen}\n"), outputs
+    assert ("is frozen; not updated" in done.stdout) == (frozen == "true")
+
+
+def test_label_on_another_head_freezes_nothing(tmp_path, forge):
+    forge.config = {}
+    forge.pulls = [open_release_pull(11, (PENDING, "hold"), head="feat/change-1")]
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs.endswith("frozen=false\n"), outputs
+
+
+def test_without_the_frozen_read_the_cut_pull_request_is_updated(tmp_path, forge):
+    mutant = module().replace("named = sorted((labels & hold) | release)", "named = []")
+    assert mutant != module()
+    forge.config = {}
+    forge.pulls = [open_release_pull(11, (PENDING, "autorelease: cut", "hold"))]
+    done, outputs = settings(tmp_path, forge, mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs.endswith("frozen=false\n"), outputs

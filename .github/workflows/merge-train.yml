@@ -68,7 +68,11 @@
 # runs, so the release pull request gets its required checks and the release
 # starts the repository's `release: published` workflows. `switch: off` runs no
 # release job. A repository listed in `release_off` gets no release job even
-# when both release files are present (decision record 0045). At most 3 release
+# when both release files are present (decision record 0045). A release head or
+# a pull request with an `autorelease:` label is never updated by the sweep, and
+# an open release pull request with a hold label or a release label other than
+# `autorelease: pending` is not updated by the release job (decision record
+# 0049). At most 3 release
 # jobs run at once (`release_max_parallel`, a whole number from 1 to 3, default 3).
 #
 # CREDENTIAL. One repository holds the app's private key, as the secret
@@ -200,6 +204,8 @@ jobs:
           SUPERSEDED_BY = re.compile(r"\bsuperseded\s+by\s+#\d+", re.I)
           DRAFT_STEP = "Stop on a draft pull request"
           REFRESH_LABEL = "merge-train: refresh"
+          RELEASE_HEAD = "release-please--"
+          RELEASE_LABEL = "autorelease:"
           REFRESH_LIMIT = 3
           STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
 
@@ -284,7 +290,9 @@ jobs:
                   return "from another repository: a person lands it"
               if held:
                   return f"labelled {held[0]}"
-              if conf["person"] and pull["headRefName"].startswith(conf["person"]):
+              release = pull["headRefName"].startswith(RELEASE_HEAD)
+              release = release or any(name.startswith(RELEASE_LABEL) for name in labels)
+              if release or (conf["person"] and pull["headRefName"].startswith(conf["person"])):
                   return "release or reserved branch: a person lands it"
               young = too_young(pull, labels, conf, now)
               if young:
@@ -1548,6 +1556,8 @@ jobs:
 
           PENDING_LABEL = "autorelease: pending"
           TAGGED_LABEL = "autorelease: tagged"
+          RELEASE_HEAD = "release-please--"
+          RELEASE_LABEL = "autorelease:"
           TIMEOUT = 30
           MAX_BYTES = 1024 * 1024
 
@@ -1693,6 +1703,26 @@ jobs:
               return pending
 
 
+          def read_frozen(api_url, repo, token, hold):
+              """Open release pull requests a person froze: a hold label or a release label past pending."""
+              url = f"{api_url}/repos/{repo}/pulls?state=open&per_page=100"
+              _, pulls = call(url, token, method="GET")
+              if not isinstance(pulls, list):
+                  raise CallError(f"GET {url}: expected list of pulls")
+              frozen = []
+              for pull in pulls[:100]:
+                  if pull.get("state") != "open":
+                      continue
+                  if not pull.get("head", {}).get("ref", "").startswith(RELEASE_HEAD):
+                      continue
+                  labels = {lbl.get("name", "") for lbl in pull.get("labels", []) if isinstance(lbl, dict)}
+                  release = {n for n in labels if n.startswith(RELEASE_LABEL) and n != PENDING_LABEL}
+                  named = sorted((labels & hold) | release)
+                  if named:
+                      frozen.append(f"#{pull['number']} ({', '.join(named)})")
+              return frozen
+
+
           def cmd_settings(env):
               """Read release settings and emit skip and pending outputs."""
               api_url = env.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
@@ -1705,12 +1735,17 @@ jobs:
                   sys.stdout.write(f"::error::{err}\n")
                   return 1
               pending = read_pending(api_url, repo, token, config)
+              hold = frozenset(name for name in env.get("HOLD_LABELS", "").split(",") if name)
+              frozen = read_frozen(api_url, repo, token, hold)
+              for item in frozen:
+                  sys.stdout.write(f"::notice::release pull request {item} is frozen; not updated\n")
               out_file = env.get("GITHUB_OUTPUT")
               if out_file:
                   skip_str = "true" if skip else "false"
                   pending_str = json.dumps(pending, separators=(",", ":"))
+                  frozen_str = "true" if frozen else "false"
                   with open(out_file, "a", encoding="utf-8") as f:
-                      f.write(f"skip={skip_str}\npending={pending_str}\n")
+                      f.write(f"skip={skip_str}\npending={pending_str}\nfrozen={frozen_str}\n")
               return 0
 
 
@@ -1840,6 +1875,7 @@ jobs:
         env:
           TOKEN: ${{ steps.token.outputs.token }}
           REPO: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          HOLD_LABELS: ${{ inputs.hold_labels }}
         run: python3 "$RUNNER_TEMP/release_labels.py" settings
 
       - name: Create the releases of merged release pull requests
@@ -1865,6 +1901,7 @@ jobs:
         run: python3 "$RUNNER_TEMP/release_labels.py" after
 
       - name: Open or update the release pull request
+        if: steps.settings.outputs.frozen == 'false'
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ steps.token.outputs.token }}
