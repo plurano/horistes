@@ -163,7 +163,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.15"
 
       # The tool environment is built from the Python 3.12 that setup-python
       # put first on the path, so the tests below run on the floor.
@@ -203,7 +203,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.15"
 
       - name: Set up virtual environment
         run: |
