@@ -77,6 +77,7 @@ class Forge:
         self.releases: set[str] = set()
         self.writes: list[tuple] = []
         self.release_writes: list[str] = []
+        self.cut: list[int] = []
         self.url = ""
 
     def contents(self, _rest: str) -> tuple[int, object]:
@@ -108,6 +109,8 @@ class Forge:
         """The answer to one GET, by the part of the path after fleet/app."""
         rest = path.removeprefix("/repos/fleet/app/")
         if rest == "pulls":
+            if self.cut:
+                return 200, json.dumps(self.pulls).encode()[: self.cut.pop(0)]
             return 200, self.pulls
         routes = (
             ("contents/release-please-config.json", self.contents),
@@ -129,7 +132,7 @@ class Handler(BaseHTTPRequestHandler):
         del args
 
     def answer(self, code: int, body: object) -> None:
-        data = json.dumps(body).encode()
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -553,3 +556,23 @@ def test_without_the_frozen_read_the_cut_pull_request_is_updated(tmp_path, forge
     done, outputs = settings(tmp_path, forge, mutant)
     assert done.returncode == 0, done.stdout + done.stderr
     assert outputs.endswith("frozen=false\n"), outputs
+
+
+def test_truncated_read_is_retried(tmp_path, forge):
+    forge.config = {}
+    forge.pulls = [release_pull()]
+    forge.cut = [100]
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"pending={ONE}" in outputs
+    assert forge.cut == []
+
+
+def test_three_truncated_reads_fail_by_name(tmp_path, forge):
+    forge.config = {}
+    forge.pulls = [release_pull()]
+    forge.cut = [100, 100, 100, 100]
+    done, _ = settings(tmp_path, forge)
+    assert done.returncode == 1
+    assert "invalid JSON response after 3 attempts" in done.stdout
+    assert forge.cut == [100]
