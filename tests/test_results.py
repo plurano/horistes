@@ -225,3 +225,63 @@ def test_result_missing_on_a_side_is_never_equal(old, new, state, note):
     found = results.compare(old, new, re.compile("."))
     assert found[:2] == (state, "-")
     assert found[2].startswith(note)
+
+
+def test_deeply_nested_json_is_refused():
+    """Whether the parser gives up depends on the stack of the host; both ends are refused."""
+    with pytest.raises(results.ResultError):
+        results.from_sarif("[" * 100_000 + "]" * 100_000)
+
+
+def test_parser_out_of_stack_is_refused(monkeypatch):
+    def overflow(text):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(results.json, "loads", overflow)
+    with pytest.raises(results.ResultError, match=r"result file is not JSON \(nested too deep\)"):
+        results.from_sarif("[]")
+
+
+def test_result_with_non_list_locations_is_refused():
+    bad = GOOD.replace('"locations": [', '"locations": 5, "skipped": [')
+    with pytest.raises(results.ResultError, match="locations of a result are no list"):
+        results.from_sarif(bad)
+
+
+def test_run_with_falsy_non_list_results_is_refused():
+    bad = GOOD.replace('"results": [', '"results": {}, "other": [')
+    with pytest.raises(results.ResultError, match="rules or results of a run are no list"):
+        results.from_sarif(bad)
+
+
+@pytest.mark.parametrize(
+    ("replacement", "expected_prefix"),
+    [
+        (
+            (
+                '"artifactLocation": {"uri": ".github/workflows/planted.yml"}',
+                '"artifactLocation": "x"',
+            ),
+            "PinnedDependenciesID | -:7 |",
+        ),
+        (
+            ('"region": {"startLine": 7}', '"region": 3'),
+            "PinnedDependenciesID | .github/workflows/planted.yml: |",
+        ),
+        (
+            (
+                '"physicalLocation": {"artifactLocation":'
+                ' {"uri": ".github/workflows/planted.yml"}, "region": {"startLine": 7}}',
+                '"physicalLocation": {"artifactLocation": "x", "region": 3}',
+            ),
+            "PinnedDependenciesID | -: |",
+        ),
+    ],
+    ids=["non-dict-artifact", "non-dict-region", "non-dict-both"],
+)
+def test_non_dict_physical_location_fields_use_dash_placeholders(replacement, expected_prefix):
+    target, sub = replacement
+    bad = GOOD.replace(target, sub)
+    assert bad != GOOD
+    found = results.from_sarif(bad)["findings"][0]
+    assert found.startswith(expected_prefix)

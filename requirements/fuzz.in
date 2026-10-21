@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+#
+# The fuzzer for results.from_sarif. Compile with `make requirements-fuzz`;
+# it leaves out every release younger than three days.
+atheris

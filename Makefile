@@ -16,7 +16,7 @@ ACTIONLINT_VERSION := 1.7.12
 GITLEAKS ?= gitleaks
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
-.PHONY: verify verify-all tools requirements lint-yaml lint-python lint-workflows \
+.PHONY: verify verify-all tools requirements requirements-fuzz lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
 	interface-snapshot list-pins check-pins pin check-runners check-links
 
@@ -52,12 +52,16 @@ requirements:
 	uv pip compile --quiet --universal --python-version=3.12 --generate-hashes --exclude-newer=P3D \
 		requirements/tools.in --output-file=requirements/tools.txt
 
+requirements-fuzz:
+	uv pip compile --quiet --python-version=3.12 --python-platform=x86_64-manylinux_2_17 --generate-hashes --exclude-newer=P3D \
+		requirements/fuzz.in --output-file=requirements/fuzz.txt
+
 lint-yaml: tools
 	$(BIN)/yamllint --strict .
 
 lint-python: tools
-	$(BIN)/ruff check tools tests
-	$(BIN)/ruff format --check tools tests
+	$(BIN)/ruff check tools tests fuzz
+	$(BIN)/ruff format --check tools tests fuzz
 
 # actionlint reads .github/workflows by itself; zizmor is given the workflow
 # and the action directories and must find at least the workflows.

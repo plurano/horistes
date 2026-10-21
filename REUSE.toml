@@ -16,6 +16,7 @@ path = [
     "default.json",
     "interface.lock.json",
     "renovate.json",
+    "requirements/fuzz.txt",
     "requirements/tools.txt",
     "settings-sync.json",
 ]

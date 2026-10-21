@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Scorecard",
+          "rules": [
+            {
+              "id": "TokenPermissionsID"
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "TokenPermissionsID",
+          "message": {
+            "text": "score is 9: one workflow writes"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": ".github/workflows/ci.yml"
+                },
+                "region": {
+                  "startLine": 1
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
