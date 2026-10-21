@@ -45,6 +45,7 @@ SHARED = {
     "vulnerabilityAlerts",
     "automerge",
     "gitIgnoredAuthors",
+    "postUpdateOptions",
     "packageRules",
 }
 # The commit address of the merge-train app's bot user (numeric user id, then the
@@ -55,6 +56,10 @@ RULE = {"description", "matchManagers", "matchDepTypes", "enabled"}
 # A fix of a known vulnerability waits for no release age, and the block that
 # says so holds nothing else (ADR-0050).
 VULNERABILITY = {"minimumReleaseAge": None}
+# Renovate 44 runs `go mod tidy` after a gomod update only with this option
+# (lib/modules/manager/gomod/artifacts.ts); without it a go.sum misses the hash
+# of a newly needed module.
+TIDY = "gomodTidy"
 # The keys both files may hold: Renovate appends these lists, the repository's
 # entries behind the preset's.
 APPENDED = {"$schema", "extends", "packageRules"}
@@ -141,6 +146,14 @@ def held_vulnerability_fix(preset: dict) -> list[str]:
     if "minimumReleaseAge" not in alerts or alerts["minimumReleaseAge"] is not None:
         out.append("vulnerabilityAlerts.minimumReleaseAge")
     return out
+
+
+def untidy_go_update(preset: dict) -> list[str]:
+    """What leaves a Go module update without running go mod tidy."""
+    options = preset.get("postUpdateOptions")
+    if not isinstance(options, list) or TIDY not in options:
+        return ["postUpdateOptions"]
+    return []
 
 
 def said_twice(config: dict, preset: dict) -> list[str]:
@@ -261,6 +274,24 @@ def test_commits_of_the_bot_carry_the_sign_off_the_gate_asks_for():
 
 def test_generated_file_commits_of_the_train_do_not_mark_an_update_as_edited():
     assert PRESET["gitIgnoredAuthors"] == [TRAIN_BOT]
+
+
+def test_a_go_module_update_is_tidied():
+    assert untidy_go_update(PRESET) == []
+    assert PRESET["postUpdateOptions"] == [TIDY]
+
+
+@pytest.mark.parametrize(
+    "preset",
+    [
+        {key: value for key, value in PRESET.items() if key != "postUpdateOptions"},
+        {**PRESET, "postUpdateOptions": []},
+        {**PRESET, "postUpdateOptions": ["gomodVendor"]},
+        {**PRESET, "postUpdateOptions": TIDY},
+    ],
+)
+def test_planted_untidy_go_update_is_refused(preset):
+    assert untidy_go_update(preset) == ["postUpdateOptions"]
 
 
 def test_this_repository_extends_the_preset_and_nothing_else():
