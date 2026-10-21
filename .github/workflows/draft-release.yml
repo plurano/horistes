@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Draft release (reusable): creates a draft release for a pushed tag from an
+# artifact containing the release files. Its check is reported as
+# "<name of the calling job> / Store the files in a draft release".
+#
+# The caller grants `contents: write`; the job declares `contents: write`.
+# The tag is passed through the environment, never an unexpanded expression
+# in the run script.
+#
+# On a tag containing a hyphen, the release is marked as a prerelease.
+name: Draft release
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Label of the runner the job runs on.
+        type: string
+        required: false
+        default: ubuntu-26.04
+      artifact:
+        description: Name of the artifact holding the files for the release.
+        type: string
+        required: false
+        default: release-files
+
+permissions: {}
+
+jobs:
+  draft:
+    name: Store the files in a draft release
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: write # creates the draft release
+    steps:
+      - name: Refuse an artifact name that is not a plain name
+        shell: bash
+        env:
+          LC_ALL: C
+          ARTIFACT: ${{ inputs.artifact }}
+        run: |
+          case "$ARTIFACT" in
+            '' | -* | *[!A-Za-z0-9._-]*)
+              echo "::error title=Artifact refused::artifact must be a plain name, got '$ARTIFACT'"
+              exit 1
+              ;;
+          esac
+
+      - name: Fetch the release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: dist
+
+      - name: Create the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=(--draft --verify-tag --title "$TAG" --generate-notes)
+          case "$TAG" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" "${flags[@]}" dist/*
