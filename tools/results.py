@@ -45,8 +45,10 @@ def _location(entry: object) -> str:
     physical = entry.get("physicalLocation") if isinstance(entry, dict) else None
     if not isinstance(physical, dict):
         return "-"
-    uri = (physical.get("artifactLocation") or {}).get("uri", "-")
-    line = (physical.get("region") or {}).get("startLine", "")
+    artifact = physical.get("artifactLocation")
+    region = physical.get("region")
+    uri = artifact.get("uri", "-") if isinstance(artifact, dict) else "-"
+    line = region.get("startLine", "") if isinstance(region, dict) else ""
     return f"{uri}:{line}"
 
 
@@ -55,7 +57,10 @@ def _finding(result: object) -> tuple[str, str]:
     rule = result.get("ruleId") if isinstance(result, dict) else None
     if not isinstance(rule, str) or not rule:
         raise ResultError("a result names no rule")
-    places = sorted(_location(entry) for entry in result.get("locations") or []) or ["-"]
+    locations = result.get("locations") if isinstance(result, dict) else None
+    if locations is not None and not isinstance(locations, list):
+        raise ResultError("locations of a result are no list")
+    places = sorted(_location(entry) for entry in locations or []) or ["-"]
     message = result.get("message")
     text = message.get("text") if isinstance(message, dict) else None
     lines = text.splitlines() if isinstance(text, str) else []
@@ -69,8 +74,10 @@ def _run(run: object) -> tuple[str, set[str], set[str]]:
     driver = tool.get("driver") if isinstance(tool, dict) else None
     if not isinstance(driver, dict):
         raise ResultError("a run names no tool")
-    results = run.get("results") or []
-    rules = driver.get("rules") or []
+    results = run.get("results")
+    rules = driver.get("rules")
+    results = [] if results is None else results
+    rules = [] if rules is None else rules
     if not isinstance(results, list) or not isinstance(rules, list):
         raise ResultError("rules or results of a run are no list")
     if len(results) > MAX_RESULTS:
@@ -91,6 +98,8 @@ def from_sarif(text: bytes | str) -> dict:
     """The checks and findings of a SARIF log."""
     try:
         doc = json.loads(text)
+    except RecursionError as err:
+        raise ResultError("result file is not JSON (nested too deep)") from err
     except ValueError as err:
         raise ResultError(f"result file is not JSON ({err})") from err
     runs = doc.get("runs") if isinstance(doc, dict) else None

@@ -1,9 +1,9 @@
 # Security policy
 
-Report suspected vulnerabilities using the affected repository's GitHub **Report
-a vulnerability** action. Include the affected version, a minimal reproduction,
-and the impact. Do not include passwords, API secrets, tokens or private data in
-a report.
+Report suspected vulnerabilities using the affected repository's GitHub
+[**Report a vulnerability**](https://github.com/plurano/horistes/security/advisories/new)
+action. Include the affected version, a minimal reproduction, and the impact.
+Do not include passwords, API secrets, tokens or private data in a report.
 
 The current release of each active library and the default branch of each
 repository receive security fixes. Fixes ship as new versions; published releases

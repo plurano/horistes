@@ -47,6 +47,9 @@
             "context": "Python 3.12 floor"
           },
           {
+            "context": "Fuzz the result reader"
+          },
+          {
             "context": "Verification gate"
           },
           {
