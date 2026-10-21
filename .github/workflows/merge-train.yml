@@ -1546,10 +1546,12 @@ jobs:
           """Release settings and label handling for release-please."""
 
           import base64
+          import http.client
           import json
           import os
           import re
           import sys
+          import time
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -1560,6 +1562,8 @@ jobs:
           RELEASE_LABEL = "autorelease:"
           TIMEOUT = 30
           MAX_BYTES = 1024 * 1024
+          READ_ATTEMPTS = 3
+          READ_BACKOFF = 1
 
 
           class CallError(Exception):
@@ -1570,14 +1574,8 @@ jobs:
                   self.status = status
 
 
-          def call(url, token, method="GET", body=None, status_only=False):
-              """Execute one HTTP request to the forge, with bounded read and timeout."""
-              data = None if body is None else json.dumps(body).encode("utf-8")
-              req = urllib.request.Request(url, data=data, method=method)
-              if token:
-                  req.add_header("Authorization", f"Bearer {token}")
-              req.add_header("Accept", "application/vnd.github+json")
-              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+          def _read_once(req, method, url, status_only):
+              """Execute one attempt of an HTTP request, decoding JSON or returning raw body."""
               try:
                   with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                       raw = resp.read(MAX_BYTES + 1)
@@ -1585,11 +1583,7 @@ jobs:
                           raise CallError(f"{method} {url}: body exceeds {MAX_BYTES} bytes")
                       if status_only:
                           return resp.status, raw
-                      try:
-                          parsed = json.loads(raw.decode("utf-8")) if raw else {}
-                      except json.JSONDecodeError as err:
-                          raise CallError(f"{method} {url}: invalid JSON response: {err}") from err
-                      return resp.status, parsed
+                      return resp.status, json.loads(raw.decode("utf-8")) if raw else {}
               except urllib.error.HTTPError as err:
                   if status_only:
                       return err.code, b""
@@ -1598,6 +1592,29 @@ jobs:
                   raise CallError(f"{method} {url}: HTTP {err.code}: {detail}", err.code) from err
               except (urllib.error.URLError, TimeoutError) as err:
                   raise CallError(f"{method} {url}: connection error: {err}") from err
+
+
+          def call(url, token, method="GET", body=None, status_only=False):
+              """Execute one HTTP request to the forge, with bounded read and timeout."""
+              data = None if body is None else json.dumps(body).encode("utf-8")
+              req = urllib.request.Request(url, data=data, method=method)
+              if token:
+                  req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              can_retry = method == "GET" and not status_only
+              for attempt in range(1, READ_ATTEMPTS + 1):
+                  try:
+                      return _read_once(req, method, url, status_only)
+                  except (json.JSONDecodeError, UnicodeDecodeError, http.client.IncompleteRead) as err:
+                      if not can_retry:
+                          raise CallError(f"{method} {url}: invalid JSON response: {err}") from err
+                      if attempt < READ_ATTEMPTS:
+                          time.sleep(READ_BACKOFF * attempt)
+                          continue
+                      raise CallError(
+                          f"{method} {url}: invalid JSON response after {READ_ATTEMPTS} attempts: {err}"
+                      ) from err
 
 
           def read_config(api_url, repo, token):
