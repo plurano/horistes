@@ -61,6 +61,7 @@ of the same owner can call it
 | :--- | :--- | :--- | :--- | :--- |
 | `.github/workflows/licence.yml` | every file carries its licence information (`reuse lint`) | `runner` (label, default `ubuntu-26.04`, the newest working image); `root` (directory checked as the project root, default `.`) | `<calling job> / REUSE lint`; with another `root`, `<calling job> / REUSE lint (<root>)` ([ADR-0027](docs/adr/0027-a-narrowed-licence-run-is-named-for-its-folder.md)) | `docker.io` until 2026-12-31 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md)); the image is named by digest ([ADR-0008](docs/adr/0008-licence-tool-image-by-digest.md)) |
 | `.github/workflows/scorecard.yml` | the supply-chain checks of the OpenSSF Scorecard action, reported to code scanning and kept as the artifact `scorecard-result` | `outside_hosts` (boolean, default false: the run fails, [ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)); `publish` (boolean, default false) | `<calling job> / Public repository`, `<calling job> / Analysis`; with `outside_hosts` false, `Analysis` is the failed refusal and the analysis job reports as `Analysis (not started)` | with `outside_hosts`: `www.bestpractices.dev`, `api.deps.dev`, `api.osv.dev`, `oss-fuzz-build-logs.storage.googleapis.com`; with `publish`: `api.scorecard.dev`, `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
+| `.github/workflows/draft-release.yml` | creates a draft release for a pushed tag from an artifact holding the release files | `runner` (label, default `ubuntu-26.04`); `artifact` (name of the artifact holding the files, default `release-files`) | `<calling job> / Store the files in a draft release` | none |
 | `.github/workflows/merge-train.yml` | in every repository the merge-train app is installed on, lands one clean pull request (through the merge queue where the default branch has one) or updates the next one by merge ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md), [ADR-0034](docs/adr/0034-the-merge-train-queues-where-the-branch-has-a-merge-queue.md), [ADR-0037](docs/adr/0037-the-merge-train-writes-the-squash-message.md), [ADR-0039](docs/adr/0039-the-merge-train-closes-the-issues-its-merges-name.md), [ADR-0040](docs/adr/0040-the-merge-train-leaves-a-release-to-its-writer.md), [ADR-0041](docs/adr/0041-the-merge-train-refreshes-a-draft-stopped-pull-request.md)) | `app_client_id` (required); `runner` (required, needs python3 and openssl); `switch` (`on` or `off`); `merge_method` (`SQUASH` or `MERGE`); `accept_states` (`UNSTABLE`, `HAS_HOOKS`; default none); `min_age_days` (default 3); `hold_labels`, `dependency_branches`, `person_branches`, `security_labels`; secret `app_private_key` | `<calling job> / Merge train`, never a check of a pull request | none |
 
 The licence job reads the contents and takes no secret; the caller grants
@@ -88,6 +89,25 @@ The runner is no input: the Scorecard
 service takes a published result only from a job whose label is written out,
 and `make check-scorecard` holds the file to that and the service's other
 rules.
+
+The draft release workflow creates a draft release on a pushed tag from an
+artifact holding the release files. The caller grants `contents: write` and
+calls the workflow on tag push. `artifact` defaults to `release-files` and must
+be a plain name; anything with slashes, spaces, leading hyphens or shell
+metacharacters stops the job before files are fetched. When the tag contains a
+hyphen, the release is created with `--prerelease`
+([ADR-0052](docs/adr/0052-the-draft-release-job-is-shared.md)):
+
+```yaml
+  draft:
+    name: Draft release
+    needs: [build, verify]
+    permissions:
+      contents: write
+    uses: plurano/horistes/.github/workflows/draft-release.yml@<commit>
+    with:
+      artifact: release-files
+```
 
 The merge train runs from one caller in the fleet's operations repository
 and sweeps every repository the merge-train app is installed on; the

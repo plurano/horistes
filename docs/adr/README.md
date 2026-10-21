@@ -59,3 +59,4 @@ record that supersedes it.
 | [0049](0049-the-merge-train-leaves-a-frozen-release-pull-request-alone.md) | 2026-10-20 | The merge train leaves a frozen release pull request alone | Accepted |
 | [0050](0050-a-vulnerability-fix-skips-the-waiting-time.md) | 2026-10-21 | A vulnerability fix skips the waiting time | Accepted |
 | [0051](0051-a-go-module-update-is-tidied.md) | 2026-10-21 | A Go module update is tidied | Accepted |
+| [0052](0052-the-draft-release-job-is-shared.md) | 2026-10-21 | The draft release job is shared | Accepted |

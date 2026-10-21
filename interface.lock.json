@@ -3,6 +3,28 @@
   "interface_major": 0,
   "interface_minor": 2,
   "workflows": {
+    ".github/workflows/draft-release.yml": {
+      "inputs": {
+        "artifact": {
+          "default": "release-files",
+          "required": false,
+          "type": "string"
+        },
+        "runner": {
+          "default": "ubuntu-26.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "draft": "Store the files in a draft release"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": [
+        "contents"
+      ]
+    },
     ".github/workflows/licence.yml": {
       "inputs": {
         "root": {

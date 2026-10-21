@@ -30,6 +30,8 @@ forge = [
 "actions/checkout" = []
 # Mints and revokes an installation token through the forge's API.
 "actions/create-github-app-token" = []
+# Downloads from the forge's artifact storage, which the forge list names.
+"actions/download-artifact" = []
 # Takes the toolchain from the runner's cache or the forge-hosted manifest;
 # when both miss it downloads from the Go distribution site, which redirects.
 "actions/setup-go" = ["go.dev", "dl.google.com"]
