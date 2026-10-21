@@ -1,13 +1,17 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, and no proposal for the machine a job runs on."
+    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release except for a fix of a known vulnerability, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, and no proposal for the machine a job runs on."
   ],
   "extends": [
     "config:recommended",
     ":gitSignOff"
   ],
   "minimumReleaseAge": "3 days",
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": null
+  },
   "automerge": false,
   "gitIgnoredAuthors": [
     "342223998+plurano-merge-train[bot]@users.noreply.github.com"

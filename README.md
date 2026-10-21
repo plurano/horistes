@@ -485,8 +485,9 @@ from `renovate.json` and the preset it extends, `default.json`
 ([ADR-0019](docs/adr/0019-update-proposals-from-renovate-configured-here.md),
 [ADR-0020](docs/adr/0020-shared-update-bot-values-as-a-preset.md),
 [ADR-0036](docs/adr/0036-the-update-bot-moves-pinned-release-tools-and-checksums.md)).
-A proposal waits three days after the release, is never merged by the bot and
-has to pass the gate like any other pull request.
+A proposal waits three days after the release unless it fixes a known
+vulnerability, is never merged by the bot and has to pass the gate like any
+other pull request.
 
 | Read by the bot | Where | How it finds the release |
 | :--- | :--- | :--- |
@@ -515,9 +516,17 @@ and reports to the forge's code scanning ([ADR-0043](docs/adr/0043-codeql-report
 | :--- | :--- |
 | base | `config:recommended` |
 | commits of the bot | carry the sign-off line (`:gitSignOff`) |
-| waiting time after a release | three days |
+| waiting time after a release | three days; none for a fix of a known vulnerability |
 | merge by the bot | never |
 | the machine a job runs on | not proposed |
+
+A fix of a known vulnerability skips the waiting time
+([ADR-0050](docs/adr/0050-a-vulnerability-fix-skips-the-waiting-time.md)).
+Renovate learns of the vulnerability from the OSV database
+(`osvVulnerabilityAlerts`) and, where the repository has Dependabot alerts on,
+from the forge (`vulnerabilityAlerts`). For the Go standard library it reads the
+`toolchain` line of `go.mod`, not the `go` line: a Go repository without a
+`toolchain` line receives a standard-library fix only after the waiting time.
 
 A repository extends it by reference and keeps only what is its own (which
 managers run, which files they read):
