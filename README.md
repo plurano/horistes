@@ -518,6 +518,7 @@ and reports to the forge's code scanning ([ADR-0043](docs/adr/0043-codeql-report
 | commits of the bot | carry the sign-off line (`:gitSignOff`) |
 | waiting time after a release | three days; none for a fix of a known vulnerability |
 | merge by the bot | never |
+| after a Go module update | `go mod tidy` (`gomodTidy`) |
 | the machine a job runs on | not proposed |
 
 A fix of a known vulnerability skips the waiting time
@@ -527,6 +528,10 @@ Renovate learns of the vulnerability from the OSV database
 from the forge (`vulnerabilityAlerts`). For the Go standard library it reads the
 `toolchain` line of `go.mod`, not the `go` line: a Go repository without a
 `toolchain` line receives a standard-library fix only after the waiting time.
+
+After a Go module update Renovate runs `go mod tidy` (`postUpdateOptions`,
+[ADR-0051](docs/adr/0051-a-go-module-update-is-tidied.md)), so the proposal
+carries every module hash the build needs.
 
 A repository extends it by reference and keeps only what is its own (which
 managers run, which files they read):
