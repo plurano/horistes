@@ -57,3 +57,4 @@ record that supersedes it.
 | [0047](0047-the-pin-check-is-required-on-every-pull-request.md) | 2026-10-19 | The pin check runs on every pull request and is a required check | Accepted |
 | [0048](0048-the-python-floor-is-tested-in-ci.md) | 2026-10-19 | The Python floor is tested in CI | Accepted |
 | [0049](0049-the-merge-train-leaves-a-frozen-release-pull-request-alone.md) | 2026-10-20 | The merge train leaves a frozen release pull request alone | Accepted |
+| [0050](0050-a-vulnerability-fix-skips-the-waiting-time.md) | 2026-10-21 | A vulnerability fix skips the waiting time | Accepted |

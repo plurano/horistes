@@ -41,6 +41,8 @@ SHARED = {
     "description",
     "extends",
     "minimumReleaseAge",
+    "osvVulnerabilityAlerts",
+    "vulnerabilityAlerts",
     "automerge",
     "gitIgnoredAuthors",
     "packageRules",
@@ -50,6 +52,9 @@ SHARED = {
 # entry for equality before it reads it as a glob, so the brackets stay literal.
 TRAIN_BOT = "342223998+plurano-merge-train[bot]@users.noreply.github.com"
 RULE = {"description", "matchManagers", "matchDepTypes", "enabled"}
+# A fix of a known vulnerability waits for no release age, and the block that
+# says so holds nothing else (ADR-0050).
+VULNERABILITY = {"minimumReleaseAge": None}
 # The keys both files may hold: Renovate appends these lists, the repository's
 # entries behind the preset's.
 APPENDED = {"$schema", "extends", "packageRules"}
@@ -124,6 +129,17 @@ def outside_the_preset(preset: dict) -> list[str]:
     out = sorted(set(preset) - SHARED)
     for number, rule in enumerate(preset.get("packageRules", [])):
         out += [f"packageRules[{number}].{key}" for key in sorted(set(rule) - RULE)]
+    alerts = preset.get("vulnerabilityAlerts", {})
+    out += [f"vulnerabilityAlerts.{key}" for key in sorted(set(alerts) - set(VULNERABILITY))]
+    return out
+
+
+def held_vulnerability_fix(preset: dict) -> list[str]:
+    """What keeps a fix of a known vulnerability from arriving before the waiting time."""
+    out = [] if preset.get("osvVulnerabilityAlerts") is True else ["osvVulnerabilityAlerts"]
+    alerts = preset.get("vulnerabilityAlerts", {})
+    if "minimumReleaseAge" not in alerts or alerts["minimumReleaseAge"] is not None:
+        out.append("vulnerabilityAlerts.minimumReleaseAge")
     return out
 
 
@@ -202,6 +218,41 @@ def test_waiting_time_is_three_days_and_nothing_merges_itself():
     assert PRESET["minimumReleaseAge"] == "3 days"
     assert PRESET["automerge"] is False
     assert all("automerge" not in rule for rule in rules())
+
+
+def test_a_vulnerability_fix_skips_the_waiting_time():
+    assert held_vulnerability_fix(PRESET) == []
+    assert PRESET["vulnerabilityAlerts"] == VULNERABILITY
+    assert PRESET["minimumReleaseAge"] == "3 days"
+
+
+@pytest.mark.parametrize(
+    ("change", "held"),
+    [
+        ({"osvVulnerabilityAlerts": False}, ["osvVulnerabilityAlerts"]),
+        (
+            {"vulnerabilityAlerts": {"minimumReleaseAge": "3 days"}},
+            ["vulnerabilityAlerts.minimumReleaseAge"],
+        ),
+        ({"vulnerabilityAlerts": {}}, ["vulnerabilityAlerts.minimumReleaseAge"]),
+    ],
+)
+def test_planted_vulnerability_fix_held_by_the_waiting_time_is_refused(change, held):
+    assert held_vulnerability_fix({**PRESET, **change}) == held
+
+
+def test_planted_preset_without_the_vulnerability_keys_is_refused():
+    preset = {key: value for key, value in PRESET.items() if "ulnerabilityAlerts" not in key}
+    assert held_vulnerability_fix(preset) == [
+        "osvVulnerabilityAlerts",
+        "vulnerabilityAlerts.minimumReleaseAge",
+    ]
+
+
+def test_planted_extra_key_in_the_vulnerability_block_is_refused():
+    preset = copy.deepcopy(PRESET)
+    preset["vulnerabilityAlerts"]["automerge"] = True
+    assert outside_the_preset(preset) == ["vulnerabilityAlerts.automerge"]
 
 
 def test_commits_of_the_bot_carry_the_sign_off_the_gate_asks_for():
