@@ -228,8 +228,18 @@ def test_result_missing_on_a_side_is_never_equal(old, new, state, note):
 
 
 def test_deeply_nested_json_is_refused():
+    """Whether the parser gives up depends on the stack of the host; both ends are refused."""
+    with pytest.raises(results.ResultError):
+        results.from_sarif("[" * 100_000 + "]" * 100_000)
+
+
+def test_parser_out_of_stack_is_refused(monkeypatch):
+    def overflow(text):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(results.json, "loads", overflow)
     with pytest.raises(results.ResultError, match=r"result file is not JSON \(nested too deep\)"):
-        results.from_sarif("[" * 100_000)
+        results.from_sarif("[]")
 
 
 def test_result_with_non_list_locations_is_refused():
