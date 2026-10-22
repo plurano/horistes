@@ -163,6 +163,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
+          # Python floor; renovate.json leaves it alone.
           python-version: "3.12"
 
       # The tool environment is built from the Python 3.12 that setup-python
@@ -203,6 +204,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
+          # Atheris wheel limit; renovate.json leaves it alone.
           python-version: "3.12"
 
       - name: Set up virtual environment
