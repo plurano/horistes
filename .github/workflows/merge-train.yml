@@ -1509,9 +1509,10 @@ jobs:
     #
     # The job splits release creation and release pull request updates into
     # separate steps (decision records 0031, 0040): repositories that write
-    # their own releases skip release creation and have their labels moved once
-    # the tag is on the merge commit, while a pre-existing release is verified
-    # and accepted if already complete.
+    # their own releases (or run release-please themselves, treated as
+    # skip-github-release) skip release creation and have their labels moved
+    # once the tag is on the merge commit, while a pre-existing release is
+    # verified and accepted if already complete.
     name: Release pull request and release
     needs: train
     if: >-
@@ -1564,6 +1565,7 @@ jobs:
           MAX_BYTES = 1024 * 1024
           READ_ATTEMPTS = 3
           READ_BACKOFF = 1
+          OWN_RELEASE_ACTION = re.compile(r"^-?\s*uses:\s*[\"']?googleapis/release-please-action@")
 
 
           class CallError(Exception):
@@ -1627,6 +1629,40 @@ jobs:
                   return json.loads(decoded)
               except ValueError as err:
                   raise CallError(f"parse release-please-config.json: {err}") from err
+
+
+          def reads_own_release(api_url, repo, token):
+              """The workflow file name running release-please in this repository, or False."""
+              url = f"{api_url}/repos/{repo}/contents/.github/workflows"
+              try:
+                  _, entries = call(url, token, method="GET")
+              except CallError as err:
+                  if err.status == 404:
+                      return False
+                  raise
+              if not isinstance(entries, list):
+                  return False
+              workflows = [
+                  entry
+                  for entry in entries
+                  if isinstance(entry, dict)
+                  and entry.get("type") == "file"
+                  and isinstance(entry.get("name"), str)
+                  and (entry["name"].endswith(".yml") or entry["name"].endswith(".yaml"))
+              ][:100]
+              for entry in workflows:
+                  name = entry["name"]
+                  file_url = entry.get("url") or f"{api_url}/repos/{repo}/contents/.github/workflows/{name}"
+                  _, data = call(file_url, token, method="GET")
+                  raw = data.get("content", "") if isinstance(data, dict) else ""
+                  try:
+                      content = base64.b64decode(raw).decode("utf-8")
+                  except ValueError as err:
+                      raise CallError(f"decode {name}: {err}") from err
+                  for line in content.splitlines():
+                      if OWN_RELEASE_ACTION.search(line.strip()):
+                          return name
+              return False
 
 
           def evaluate_skip(config):
@@ -1747,10 +1783,15 @@ jobs:
               token = env["TOKEN"]
               config = read_config(api_url, repo, token)
               try:
-                  skip = evaluate_skip(config)
+                  skip = evaluate_skip(config) or reads_own_release(api_url, repo, token)
               except ValueError as err:
                   sys.stdout.write(f"::error::{err}\n")
                   return 1
+              if isinstance(skip, str):
+                  sys.stdout.write(
+                      f"::notice::{repo} runs release-please in its own workflow {skip}; "
+                      "the train creates no release\n"
+                  )
               pending = read_pending(api_url, repo, token, config)
               hold = frozenset(name for name in env.get("HOLD_LABELS", "").split(",") if name)
               frozen = read_frozen(api_url, repo, token, hold)
