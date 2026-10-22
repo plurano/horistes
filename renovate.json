@@ -84,6 +84,22 @@
         ".devcontainer/Dockerfile.praetor"
       ],
       "enabled": false
+    },
+    {
+      "description": "The Python versions in the CI workflow pin the test floor and the atheris wheel limit.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "uses-with"
+      ],
+      "matchDepNames": [
+        "python"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ci.yml"
+      ],
+      "enabled": false
     }
   ]
 }
