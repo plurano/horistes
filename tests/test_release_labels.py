@@ -71,6 +71,7 @@ class Forge:
 
     def __init__(self) -> None:
         self.config: dict | None = None
+        self.workflows: dict[str, str] | None = None
         self.pulls: list[dict] = []
         self.tags: dict[str, tuple[str, str]] = {}
         self.tag_objects: dict[str, tuple[str, str]] = {}
@@ -84,6 +85,26 @@ class Forge:
         if self.config is None:
             return 404, {"message": "Not Found"}
         content = base64.b64encode(json.dumps(self.config).encode()).decode()
+        return 200, {"type": "file", "encoding": "base64", "content": content}
+
+    def workflow_contents(self, rest: str) -> tuple[int, object]:
+        if self.workflows is None:
+            return 404, {"message": "Not Found"}
+        rest = rest.lstrip("/")
+        if not rest:
+            entries = [
+                {
+                    "name": name,
+                    "path": f".github/workflows/{name}",
+                    "type": "file",
+                    "url": f"{self.url}/repos/fleet/app/contents/.github/workflows/{name}",
+                }
+                for name in sorted(self.workflows)
+            ]
+            return 200, entries
+        if rest not in self.workflows:
+            return 404, {"message": "Not Found"}
+        content = base64.b64encode(self.workflows[rest].encode("utf-8")).decode("utf-8")
         return 200, {"type": "file", "encoding": "base64", "content": content}
 
     def pull(self, rest: str) -> tuple[int, object]:
@@ -114,6 +135,7 @@ class Forge:
             return 200, self.pulls
         routes = (
             ("contents/release-please-config.json", self.contents),
+            ("contents/.github/workflows", self.workflow_contents),
             ("pulls/", self.pull),
             ("git/matching-refs/tags/", self.matching_refs),
             ("git/tags/", self.tag_object),
@@ -576,3 +598,81 @@ def test_three_truncated_reads_fail_by_name(tmp_path, forge):
     assert done.returncode == 1
     assert "invalid JSON response after 3 attempts" in done.stdout
     assert forge.cut == [100]
+
+
+PLANTED_WORKFLOW = """name: Release
+on:
+  push:
+    branches: [main]
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+"""
+UNRELATED_WORKFLOW = """name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # mentions googleapis/release-please-action in a comment
+      - uses: actions/checkout@v4
+"""
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_planted_own_release_workflow_skips_release(tmp_path, forge, mutated):
+    """A repository running release-please in its own workflow sets skip=true."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "def reads_own_release(api_url, repo, token):",
+            "def reads_own_release(api_url, repo, token):\n    return False",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"release-please.yml": PLANTED_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert (
+        "::notice::fleet/app runs release-please in its own workflow release-please.yml; "
+        "the train creates no release\n" in done.stdout
+    ) is not mutated
+
+
+def test_unrelated_workflow_leaves_skip_false(tmp_path, forge):
+    """Workflows without release-please-action keep skip=false."""
+    forge.config = {}
+    forge.workflows = {"ci.yml": UNRELATED_WORKFLOW}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    assert "runs release-please in its own workflow" not in done.stdout
+
+
+def test_missing_workflows_directory_leaves_skip_false(tmp_path, forge):
+    """A 404 on .github/workflows leaves skip=false."""
+    forge.config = {}
+    forge.workflows = None
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    assert "runs release-please in its own workflow" not in done.stdout
+
+
+def test_without_reads_own_release_the_skip_stays_false(tmp_path, forge):
+    """The mutant where reads_own_release returns False leaves skip=false in the planted case."""
+    mutant = module().replace(
+        "def reads_own_release(api_url, repo, token):",
+        "def reads_own_release(api_url, repo, token):\n    return False",
+    )
+    assert mutant != module()
+    forge.config = {}
+    forge.workflows = {"release-please.yml": PLANTED_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    assert "runs release-please in its own workflow" not in done.stdout
