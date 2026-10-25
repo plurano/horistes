@@ -8,3 +8,12 @@
 self-hosted-runner:
   labels:
     - ubuntu-26.04
+# Accepted findings, one file per key; tools/exceptions.py fails the gate on an
+# entry without `# expires YYYY-MM-DD: reason` and on an expired one.
+paths:
+  # actionlint 1.7.12, the newest release, does not know the documented
+  # job.workflow_repository and job.workflow_sha (rhysd/actionlint#705); the
+  # train checks out its own script with them.
+  .github/workflows/merge-train.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20: actionlint lacks job.workflow_*

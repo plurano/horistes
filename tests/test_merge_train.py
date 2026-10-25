@@ -64,10 +64,16 @@ ISSUES = {"issues": "write"}
 BOT = "merge-train-app"
 
 
+SCRIPT = ROOT / "tools/merge_train.py"
+RUN = 'python3 "$GITHUB_WORKSPACE/merge-train-source/tools/merge_train.py"'
+
+
 def script() -> str:
+    """The sweep script the train step runs from the checkout of the workflow's commit."""
     steps = [s for s in ciwf.load(TRAIN)["jobs"]["train"]["steps"] if s.get("name") == STEP]
     assert len(steps) == 1, f"one step named {STEP!r}"
-    return steps[0]["run"]
+    assert steps[0]["run"].strip() == RUN, steps[0]["run"]
+    return SCRIPT.read_text(encoding="utf-8")
 
 
 MODULE_STEP = "Write the train rules module"
@@ -781,6 +787,61 @@ def queued(number: int) -> tuple:
 
 def updated(number: int) -> tuple:
     return ("update", number, f"{number:040x}")
+
+
+CHECKOUT = {
+    "repository": "${{ job.workflow_repository }}",
+    "ref": "${{ job.workflow_sha }}",
+    "path": "merge-train-source",
+    "persist-credentials": False,
+    "sparse-checkout": "tools/merge_train.py",
+}
+
+
+def is_checkout(step: dict) -> bool:
+    return str(step.get("uses", "")).startswith("actions/checkout@")
+
+
+def checkout_problems(doc: dict) -> list[str]:
+    """What is wrong with the checkout of the workflow's own commit before the train step."""
+    steps = doc["jobs"]["train"]["steps"]
+    train = next(i for i, s in enumerate(steps) if s.get("name") == STEP)
+    found = [s for s in steps[:train] if is_checkout(s)]
+    if len(found) != 1:
+        return [f"{len(found)} checkouts before the train step"]
+    given = found[0].get("with", {})
+    return [
+        f"{key}: {given.get(key)!r}" for key, want in CHECKOUT.items() if given.get(key) != want
+    ]
+
+
+def test_train_script_comes_from_the_workflow_commit():
+    assert checkout_problems(ciwf.load(TRAIN)) == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("repository", "${{ github.repository }}"),
+        ("ref", "${{ github.sha }}"),
+        ("persist-credentials", True),
+        ("sparse-checkout", "tools/"),
+    ],
+)
+def test_a_checkout_of_another_commit_is_refused(key, value):
+    doc = ciwf.load(TRAIN)
+    step = next(s for s in doc["jobs"]["train"]["steps"] if is_checkout(s))
+    step["with"][key] = value
+    assert checkout_problems(doc) == [f"{key}: {value!r}"]
+
+
+def test_a_checkout_after_the_train_step_is_refused():
+    doc = ciwf.load(TRAIN)
+    steps = doc["jobs"]["train"]["steps"]
+    checkout = next(s for s in steps if is_checkout(s))
+    steps.remove(checkout)
+    steps.append(checkout)
+    assert checkout_problems(doc) == ["0 checkouts before the train step"]
 
 
 def test_clean_pull_request_lands(tmp_path):
