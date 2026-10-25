@@ -4,8 +4,9 @@
 
 The module the step "Write the release labels module" writes is taken out of
 the reusable workflow and run with `python3 -I`, as the steps after it run it.
-A small HTTP server stands in for the forge's REST API: the config file, the
-closed pull requests, tags, releases and label writes, each write recorded.
+A small HTTP server stands in for the forge's REST API: the config file, tags,
+releases and label writes, each write recorded; and for its GraphQL API, which
+answers the closed and open pull requests with the fields the checks read.
 """
 
 from __future__ import annotations
@@ -79,6 +80,7 @@ class Forge:
         self.writes: list[tuple] = []
         self.release_writes: list[str] = []
         self.cut: list[int] = []
+        self.short: list[int] = []
         self.url = ""
 
     def contents(self, _rest: str) -> tuple[int, object]:
@@ -126,13 +128,34 @@ class Forge:
     def release(self, tag: str) -> tuple[int, object]:
         return (200, {"tag_name": tag}) if tag in self.releases else (404, {"message": "Not Found"})
 
+    def graphql(self, request: dict) -> tuple[int, object]:
+        """The pull request read: the closed and open lists, in the shape GraphQL answers."""
+        assert request["variables"] == {"owner": "fleet", "name": "app"}, request["variables"]
+        if self.config is None:
+            return 200, {"data": {"repository": None}, "errors": [{"type": "NOT_FOUND"}]}
+
+        def node(pull: dict) -> dict:
+            sha = pull.get("merge_commit_sha")
+            return {
+                "number": pull["number"],
+                "state": "OPEN" if pull.get("state") == "open" else "MERGED",
+                "title": pull.get("title"),
+                "mergedAt": pull.get("merged_at"),
+                "mergeCommit": {"oid": sha} if sha else None,
+                "baseRefName": (pull.get("base") or {}).get("ref"),
+                "headRefName": (pull.get("head") or {}).get("ref"),
+                "labels": {"nodes": pull.get("labels", [])},
+            }
+
+        opened = [node(p) for p in self.pulls if p.get("state") == "open"]
+        closed = [node(p) for p in self.pulls if p.get("state") != "open"]
+        repo = {"closed": {"nodes": closed}, "open": {"nodes": opened}}
+        body = json.dumps({"data": {"repository": repo}}).encode()
+        return 200, body[: self.cut.pop(0)] if self.cut else body
+
     def get(self, path: str) -> tuple[int, object]:
         """The answer to one GET, by the part of the path after fleet/app."""
         rest = path.removeprefix("/repos/fleet/app/")
-        if rest == "pulls":
-            if self.cut:
-                return 200, json.dumps(self.pulls).encode()[: self.cut.pop(0)]
-            return 200, self.pulls
         routes = (
             ("contents/release-please-config.json", self.contents),
             ("contents/.github/workflows", self.workflow_contents),
@@ -153,13 +176,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args: object) -> None:
         del args
 
-    def answer(self, code: int, body: object) -> None:
+    def answer(self, code: int, body: object, short: int | None = None) -> None:
+        """The body whole, or cut at `short` bytes under the whole length, as the forge cuts it."""
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(data if short is None else data[:short])
 
     def do_GET(self) -> None:
         self.answer(*self.server.forge.get(urlsplit(self.path).path))  # type: ignore[attr-defined]
@@ -167,11 +191,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         forge: Forge = self.server.forge  # type: ignore[attr-defined]
         path = urlsplit(self.path).path
+        length = int(self.headers.get("Content-Length", 0))
+        if path == "/graphql":
+            code, body = forge.graphql(json.loads(self.rfile.read(length)))
+            self.answer(code, body, forge.short.pop(0) if forge.short else None)
+            return
         if "/releases" in path:
             forge.release_writes.append(path)
             self.answer(405, {"message": "no release is written in these tests"})
             return
-        length = int(self.headers.get("Content-Length", 0))
         labels = json.loads(self.rfile.read(length) or b"{}").get("labels", [])
         number = int(path.split("/issues/")[1].removesuffix("/labels"))
         forge.writes.append(("post_label", number, labels))
@@ -203,10 +231,12 @@ def run(
     """The module run with python3 -I, as a step runs it."""
     path = tmp_path / "release_labels.py"
     path.write_text(source or module(), encoding="utf-8")
+    # A runner sets GITHUB_GRAPHQL_URL to the real forge; only the stand-in may answer.
+    host = {key: value for key, value in os.environ.items() if key != "GITHUB_GRAPHQL_URL"}
     return subprocess.run(
         [sys.executable, "-I", str(path), command],
         cwd=tmp_path,
-        env={**os.environ, "TOKEN": "planted", "REPO": "fleet/app", **env},
+        env={**host, "TOKEN": "planted", "REPO": "fleet/app", **env},
         capture_output=True,
         text=True,
         check=False,
@@ -220,7 +250,12 @@ def settings(
     """The settings command and the outputs it wrote."""
     out = tmp_path / "output"
     out.write_text("", encoding="utf-8")
-    env = {"GITHUB_API_URL": forge.url, "GITHUB_OUTPUT": str(out), "HOLD_LABELS": HOLD}
+    env = {
+        "GITHUB_API_URL": forge.url,
+        "GITHUB_GRAPHQL_URL": f"{forge.url}/graphql",
+        "GITHUB_OUTPUT": str(out),
+        "HOLD_LABELS": HOLD,
+    }
     done = run(tmp_path, "settings", env, source)
     return done, out.read_text(encoding="utf-8")
 
@@ -467,7 +502,11 @@ def test_without_the_component_branch_the_release_stays_red(tmp_path, forge):
     component_release(forge)
     settings_path = tmp_path / "output"
     settings_path.write_text("", encoding="utf-8")
-    env = {"GITHUB_API_URL": forge.url, "GITHUB_OUTPUT": str(settings_path)}
+    env = {
+        "GITHUB_API_URL": forge.url,
+        "GITHUB_GRAPHQL_URL": f"{forge.url}/graphql",
+        "GITHUB_OUTPUT": str(settings_path),
+    }
     done = run(tmp_path, "settings", env, source)
     assert "fails release checks" in done.stdout
     pending = settings_path.read_text(encoding="utf-8").split("pending=", 1)[1].split("\n", 1)[0]
@@ -598,6 +637,56 @@ def test_three_truncated_reads_fail_by_name(tmp_path, forge):
     assert done.returncode == 1
     assert "invalid JSON response after 3 attempts" in done.stdout
     assert forge.cut == [100]
+
+
+def test_cut_body_is_retried(tmp_path, forge):
+    """The forge's own cut: the whole length announced, the connection closed early."""
+    forge.config = {}
+    forge.pulls = [release_pull()]
+    forge.short = [100]
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"pending={ONE}" in outputs
+    assert forge.short == []
+
+
+def test_three_cut_bodies_fail_by_name(tmp_path, forge):
+    """The planted case of cordanaLLM/imago run 40041378238: a cut that repeats is named a cut."""
+    forge.config = {}
+    forge.pulls = [release_pull()]
+    forge.short = [100, 100, 100, 100]
+    done, _ = settings(tmp_path, forge)
+    assert done.returncode == 1
+    assert "/graphql: body cut after 3 attempts: 100 of " in done.stdout, done.stdout
+    assert forge.short == [100]
+
+
+def test_without_the_length_check_the_cut_is_not_named(tmp_path, forge):
+    check = "if length and length.isdigit() and len(raw) != int(length):"
+    mutant = module().replace(check, "if False:")
+    assert mutant != module()
+    forge.config = {}
+    forge.pulls = [release_pull()]
+    forge.short = [100, 100, 100]
+    done, _ = settings(tmp_path, forge, mutant)
+    assert done.returncode == 1
+    assert "body cut" not in done.stdout, done.stdout
+
+
+def test_large_page_of_full_pulls_reads_whole(tmp_path, forge):
+    """Twenty closed and a hundred open pulls, near 900 kB, read to the end."""
+    forge.config = {}
+    long_title = "chore: " + "x" * 7500
+    forge.pulls = [
+        release_pull(),
+        *(release_pull(20 + n, labels=(TAGGED,), title=long_title) for n in range(19)),
+        *(open_release_pull(100 + n, ("type:chore",), head=f"feat/{n}") for n in range(100)),
+    ]
+    for pull in forge.pulls[20:]:
+        pull["title"] = long_title
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip=false\npending={ONE}\nfrozen=false\n", outputs
 
 
 PLANTED_WORKFLOW = """name: Release

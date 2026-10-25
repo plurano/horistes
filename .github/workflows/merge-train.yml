@@ -1566,6 +1566,26 @@ jobs:
           READ_ATTEMPTS = 3
           READ_BACKOFF = 1
           OWN_RELEASE_ACTION = re.compile(r"^-?\s*uses:\s*[\"']?googleapis/release-please-action@")
+          # Only the fields the release checks read: the REST pull list carries two full repository
+          # objects per pull, about 480 kB for 20 pulls, and the forge cut that body short in 3 of 10
+          # reads. The order is that of the REST list: newest created first.
+          PULLS_QUERY = """
+          query($owner: String!, $name: String!) {
+            repository(owner: $owner, name: $name) {
+              closed: pullRequests(
+                states: [CLOSED, MERGED], first: 20, orderBy: {field: CREATED_AT, direction: DESC}
+              ) { nodes { ...release } }
+              open: pullRequests(
+                states: [OPEN], first: 100, orderBy: {field: CREATED_AT, direction: DESC}
+              ) { nodes { ...release } }
+            }
+          }
+          fragment release on PullRequest {
+            number state title mergedAt baseRefName headRefName
+            mergeCommit { oid }
+            labels(first: 100) { nodes { name } }
+          }
+          """
 
 
           class CallError(Exception):
@@ -1583,6 +1603,10 @@ jobs:
                       raw = resp.read(MAX_BYTES + 1)
                       if len(raw) > MAX_BYTES:
                           raise CallError(f"{method} {url}: body exceeds {MAX_BYTES} bytes")
+                      # read(amt) returns a body the peer closed early without an error; the length names it.
+                      length = resp.headers.get("Content-Length")
+                      if length and length.isdigit() and len(raw) != int(length):
+                          raise http.client.IncompleteRead(raw, int(length) - len(raw))
                       if status_only:
                           return resp.status, raw
                       return resp.status, json.loads(raw.decode("utf-8")) if raw else {}
@@ -1596,7 +1620,7 @@ jobs:
                   raise CallError(f"{method} {url}: connection error: {err}") from err
 
 
-          def call(url, token, method="GET", body=None, status_only=False):
+          def call(url, token, method="GET", body=None, status_only=False, read_only=False):
               """Execute one HTTP request to the forge, with bounded read and timeout."""
               data = None if body is None else json.dumps(body).encode("utf-8")
               req = urllib.request.Request(url, data=data, method=method)
@@ -1604,18 +1628,22 @@ jobs:
                   req.add_header("Authorization", f"Bearer {token}")
               req.add_header("Accept", "application/vnd.github+json")
               req.add_header("X-GitHub-Api-Version", "2022-11-28")
-              can_retry = method == "GET" and not status_only
+              can_retry = (method == "GET" or read_only) and not status_only
               for attempt in range(1, READ_ATTEMPTS + 1):
                   try:
                       return _read_once(req, method, url, status_only)
                   except (json.JSONDecodeError, UnicodeDecodeError, http.client.IncompleteRead) as err:
+                      what, detail = "invalid JSON response", str(err)
+                      if isinstance(err, http.client.IncompleteRead):
+                          whole = len(err.partial) + (err.expected or 0)
+                          what, detail = "body cut", f"{len(err.partial)} of {whole} bytes read"
                       if not can_retry:
-                          raise CallError(f"{method} {url}: invalid JSON response: {err}") from err
+                          raise CallError(f"{method} {url}: {what}: {detail}") from err
                       if attempt < READ_ATTEMPTS:
                           time.sleep(READ_BACKOFF * attempt)
                           continue
                       raise CallError(
-                          f"{method} {url}: invalid JSON response after {READ_ATTEMPTS} attempts: {err}"
+                          f"{method} {url}: {what} after {READ_ATTEMPTS} attempts: {detail}"
                       ) from err
 
 
@@ -1742,12 +1770,41 @@ jobs:
               return {"number": num, "sha": sha, "tag": tag}
 
 
-          def read_pending(api_url, repo, token, config):
+          def as_rest_pull(node):
+              """A GraphQL pull request node in the shape of the REST pulls API the checks read."""
+              return {
+                  "number": node.get("number"),
+                  "state": str(node.get("state") or "").lower(),
+                  "title": node.get("title"),
+                  "merged_at": node.get("mergedAt"),
+                  "merge_commit_sha": (node.get("mergeCommit") or {}).get("oid"),
+                  "base": {"ref": node.get("baseRefName") or ""},
+                  "head": {"ref": node.get("headRefName") or ""},
+                  "labels": list(((node.get("labels") or {}).get("nodes") or [])[:100]),
+              }
+
+
+          def read_pulls(graphql_url, repo, token):
+              """The 20 newest closed and the 100 newest open pull requests, needed fields only."""
+              owner, _, name = repo.partition("/")
+              body = {"query": PULLS_QUERY, "variables": {"owner": owner, "name": name}}
+              _, answer = call(graphql_url, token, method="POST", body=body, read_only=True)
+              data = answer.get("data") if isinstance(answer, dict) else None
+              found = (data or {}).get("repository")
+              if not isinstance(found, dict) or answer.get("errors"):
+                  errors = answer.get("errors") if isinstance(answer, dict) else answer
+                  raise CallError(f"POST {graphql_url}: pull request read failed: {json.dumps(errors)[:500]}")
+              lists = {}
+              for key, limit in (("closed", 20), ("open", 100)):
+                  nodes = (found.get(key) or {}).get("nodes")
+                  if not isinstance(nodes, list):
+                      raise CallError(f"POST {graphql_url}: expected list of {key} pulls")
+                  lists[key] = [as_rest_pull(node) for node in nodes[:limit] if isinstance(node, dict)]
+              return lists["closed"], lists["open"]
+
+
+          def read_pending(pulls, config):
               """List merged release pull requests still carrying autorelease: pending."""
-              url = f"{api_url}/repos/{repo}/pulls?state=closed&per_page=20"
-              _, pulls = call(url, token, method="GET")
-              if not isinstance(pulls, list):
-                  raise CallError(f"GET {url}: expected list of pulls")
               pending = []
               for pull in pulls[:20]:
                   item = parse_release_pull(pull, config)
@@ -1756,12 +1813,8 @@ jobs:
               return pending
 
 
-          def read_frozen(api_url, repo, token, hold):
+          def read_frozen(pulls, hold):
               """Open release pull requests a person froze: a hold label or a release label past pending."""
-              url = f"{api_url}/repos/{repo}/pulls?state=open&per_page=100"
-              _, pulls = call(url, token, method="GET")
-              if not isinstance(pulls, list):
-                  raise CallError(f"GET {url}: expected list of pulls")
               frozen = []
               for pull in pulls[:100]:
                   if pull.get("state") != "open":
@@ -1792,9 +1845,10 @@ jobs:
                       f"::notice::{repo} runs release-please in its own workflow {skip}; "
                       "the train creates no release\n"
                   )
-              pending = read_pending(api_url, repo, token, config)
+              closed, opened = read_pulls(env.get("GITHUB_GRAPHQL_URL", f"{api_url}/graphql"), repo, token)
+              pending = read_pending(closed, config)
               hold = frozenset(name for name in env.get("HOLD_LABELS", "").split(",") if name)
-              frozen = read_frozen(api_url, repo, token, hold)
+              frozen = read_frozen(opened, hold)
               for item in frozen:
                   sys.stdout.write(f"::notice::release pull request {item} is frozen; not updated\n")
               out_file = env.get("GITHUB_OUTPUT")
