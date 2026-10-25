@@ -184,3 +184,51 @@ def test_both_places_are_counted_and_a_finding_in_either_fails(tree):
     assert done.returncode == 0, done.stderr
     assert "1 accepted finding(s) and 1 exception(s)" in done.stdout
     assert tree.tool("exceptions.py", "check", "--today", "2027-01-01").stderr.count("expired") == 2
+
+
+LINTED = ".github/actionlint.yaml"
+WORKFLOW = ".github/workflows/train.yml"
+IGNORE = (
+    "---\npaths:\n  .github/workflows/train.yml:\n    ignore:\n"
+    "      - 'property \"x\" is not defined' # expires 2026-12-31: linter lacks x\n"
+)
+
+
+def linted(tree, text, today=TODAY):
+    tree.write({WORKFLOW: "---\n", LINTED: text})
+    return tree.tool("exceptions.py", "check", "--today", today)
+
+
+def test_actionlint_ignore_with_reason_and_a_day_ahead_passes(tree):
+    done = linted(tree, IGNORE)
+    assert done.returncode == 0, done.stderr
+    assert "1 accepted" in done.stdout
+
+
+def test_actionlint_ignore_fails_the_day_after_it_ends(tree):
+    assert linted(tree, IGNORE, "2026-12-31").returncode == 0
+    done = linted(tree, IGNORE, "2027-01-01")
+    assert done.returncode == 1
+    assert "expired on 2026-12-31" in done.stderr
+
+
+@pytest.mark.parametrize(
+    "old, new, said",
+    [
+        (" # expires 2026-12-31: linter lacks x", "", "has no `# expires"),
+        (": linter lacks x", ":", "has no `# expires"),
+        ("2026-12-31", "2027-03-01", "more than 90 days ahead"),
+        ("workflows/train.yml", "workflows/*.yml", "is no one file"),
+        ("    ignore:\n", "    other: 1\n    ignore:\n", "sets `other`"),
+    ],
+)
+def test_actionlint_ignore_without_its_bounds_fails(tree, old, new, said):
+    done = linted(tree, IGNORE.replace(old, new))
+    assert done.returncode == 1
+    assert said in done.stderr
+
+
+def test_actionlint_settings_without_paths_pass(tree):
+    done = linted(tree, "---\nself-hosted-runner:\n  labels:\n    - ubuntu-26.04\n")
+    assert done.returncode == 0, done.stderr
+    assert "0 accepted" in done.stdout

@@ -5,12 +5,17 @@
 
     exceptions.py check [--root DIR] [--today YYYY-MM-DD]
 
-Two places are read, and this tool is the only reader of both.
+Three places are read, and this tool is the only reader of them.
 
 .github/zizmor.yml holds accepted linter findings. Every entry of a rule's
 `ignore` list names one file and must end in `# expires YYYY-MM-DD: reason` on
 its own line. An entry without that comment and a rule that is switched off as
 a whole fail.
+
+.github/actionlint.yaml holds accepted actionlint findings under `paths`. Every
+key names one file of the repository, not a pattern, and every entry of its
+`ignore` list is a quoted message pattern that ends in the same
+`# expires YYYY-MM-DD: reason` comment on its own line.
 
 exceptions.yaml holds exceptions to rules no linter configuration can carry.
 An entry has the shape of the engine's own list, plus the issue that tracks
@@ -24,7 +29,7 @@ its cause:
         expires: "YYYY-MM-DD"
 
 An entry with a missing, empty or unknown field, a path that is no file of the
-repository, or a rule and path named twice fails. In both places an entry whose
+repository, or a rule and path named twice fails. In every place an entry whose
 day has passed fails, and so does a day more than 90 days ahead: an exception
 is one rule in one file for a time.
 
@@ -43,11 +48,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ciwf
 
 CONFIG = ".github/zizmor.yml"
+ACTIONLINT = ".github/actionlint.yaml"
 OWN = "exceptions.yaml"
 FIELDS = ("rule", "path", "issue", "reason", "expires")
 LONGEST = datetime.timedelta(days=90)
 ENTRY = re.compile(
     r"^\s+- (?P<file>[^\s#]+)\s+# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
+)
+PATTERN = re.compile(
+    r"^\s+- '(?P<pattern>[^']+)'\s+# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
 )
 ISSUE = re.compile(r"^[\w.-]+/[\w.-]+#[1-9]\d*$")
 
@@ -87,6 +96,35 @@ def _findings(root: Path, today: datetime.date) -> tuple[list[str], int]:
         if problem:
             found.append(f"{CONFIG}: {rule} for {entry} {problem}")
     return found, len(wanted)
+
+
+def _actionlint(root: Path, today: datetime.date) -> tuple[list[str], int]:
+    """What is wrong with the accepted actionlint findings, and how many entries were read."""
+    path = root / ACTIONLINT
+    if not path.exists():
+        return [], 0
+    files = ciwf.load(path).get("paths") or {}
+    stated = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = PATTERN.match(line)
+        if match:
+            stated[match["pattern"]] = datetime.date.fromisoformat(match["day"])
+    found = []
+    count = 0
+    for name, setting in sorted(files.items()):
+        where = f"{ACTIONLINT}: {name}"
+        if not _tracked_file(root, name):
+            found.append(f"{where} is no one file of the repository")
+        setting = setting or {}
+        found += [f"{where} sets `{key}`" for key in sorted(set(setting) - {"ignore"})]
+        for entry in setting.get("ignore") or []:
+            count += 1
+            if entry not in stated:
+                found.append(f"{where}: '{entry}' has no `# expires YYYY-MM-DD: reason`")
+                continue
+            problem = day_problem(stated[entry], today)
+            found += [f"{where}: '{entry}' {problem}"] if problem else []
+    return found, count
 
 
 def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str]:
@@ -148,10 +186,11 @@ def issues(root: Path, rule: str) -> list[str]:
 
 
 def problems(root: Path, today: datetime.date) -> tuple[list[str], int, int]:
-    """What is wrong in both places, and how many entries each holds."""
+    """What is wrong in the three places, and how many entries they hold."""
     findings, accepted = _findings(root, today)
+    linted, ignored = _actionlint(root, today)
     own, excepted = _own(root, today)
-    return findings + own, accepted, excepted
+    return findings + linted + own, accepted + ignored, excepted
 
 
 def main() -> int:
