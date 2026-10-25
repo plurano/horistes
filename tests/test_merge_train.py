@@ -225,6 +225,7 @@ class Forge:
         self.contents: dict[tuple[str, str, str], tuple[int, dict]] = {}
         self.artifacts: dict[tuple[str, str], list[dict]] = {}
         self.storage: dict[int, bytes] = {}
+        self.storage_cut: dict[int, int] = {}
         self.storage_auth_seen: list[str] = []
         self.users_auth_seen: list[str] = []
         self.artifact_redirect_locations: dict[int, str | None] = {}
@@ -591,6 +592,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
+        cut = self.server.forge.storage_cut.get(art_id)
+        if cut is not None:
+            self.wfile.write(data[:cut])
+            self.close_connection = True
+            return
         self.wfile.write(data)
 
     def _dispatch_app(self, path: str) -> bool:
@@ -2146,7 +2152,48 @@ def test_negative_artifact_size_above_bound(tmp_path):
     assert done.returncode == 0
     assert not any(w[0] == "commit" for w in forge.writes)
     assert "generated files refused:" in summary
-    assert "artifact exceeds" in summary
+    assert "response exceeds" in summary
+
+
+def cut_artifact_forge():
+    """A dependency pull whose artifact body the storage cuts in half under the full length."""
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    forge.storage_cut[101] = len(zip_bytes) // 2
+    return forge
+
+
+def test_cut_artifact_body_fails_by_name(tmp_path):
+    forge = cut_artifact_forge()
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "generated files refused:" in summary
+    assert "body cut:" in summary
+
+
+def test_without_the_length_check_the_cut_is_not_named(tmp_path):
+    """The planted mutant: without the length check the cut surfaces only as a bad zip."""
+    check = "if length.isdigit() and len(content) != int(length):"
+    mutant = script().replace(check, "if False:")
+    assert mutant != script()
+    forge = cut_artifact_forge()
+    done, summary = train(tmp_path, forge, mutant)
+    assert done.returncode == 0
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert "body cut" not in summary
+    assert "bad zip archive" in summary
 
 
 def test_negative_switch_off(tmp_path):

@@ -765,14 +765,17 @@ jobs:
               )
               try:
                   with opener.open(request, timeout=TIMEOUT) as answer:
+                      # The engine caps this script at 4096 words; comments are free, joined lines save one.
+                      content = answer.read(MAX_ARTIFACT_BYTES + 1)
+                      if len(content) > MAX_ARTIFACT_BYTES:
+                          raise RefusedError(f"{method} {url}: response exceeds {MAX_ARTIFACT_BYTES} bytes")
+                      # read(amt) returns a short body without error if the peer closes early.
+                      length = answer.headers.get("Content-Length", "")
+                      if length.isdigit() and len(content) != int(length):
+                          raise RefusedError(f"{method} {url}: body cut: {len(content)} of {length} bytes")
                       if raw:
-                          content = answer.read(MAX_ARTIFACT_BYTES + 1)
-                          if len(content) > MAX_ARTIFACT_BYTES:
-                              raise RefusedError(
-                                  f"{method} {url}: artifact exceeds {MAX_ARTIFACT_BYTES} bytes"
-                              )
                           return content
-                      text = answer.read().decode()
+                      text = content.decode()
               except urllib.error.HTTPError as err:
                   if not redirect and err.code in (301, 302, 303, 307, 308):
                       loc = err.headers.get("Location")
