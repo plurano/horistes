@@ -231,10 +231,12 @@ def run(
     """The module run with python3 -I, as a step runs it."""
     path = tmp_path / "release_labels.py"
     path.write_text(source or module(), encoding="utf-8")
+    # A runner sets GITHUB_GRAPHQL_URL to the real forge; only the stand-in may answer.
+    host = {key: value for key, value in os.environ.items() if key != "GITHUB_GRAPHQL_URL"}
     return subprocess.run(
         [sys.executable, "-I", str(path), command],
         cwd=tmp_path,
-        env={**os.environ, "TOKEN": "planted", "REPO": "fleet/app", **env},
+        env={**host, "TOKEN": "planted", "REPO": "fleet/app", **env},
         capture_output=True,
         text=True,
         check=False,
@@ -500,7 +502,11 @@ def test_without_the_component_branch_the_release_stays_red(tmp_path, forge):
     component_release(forge)
     settings_path = tmp_path / "output"
     settings_path.write_text("", encoding="utf-8")
-    env = {"GITHUB_API_URL": forge.url, "GITHUB_OUTPUT": str(settings_path)}
+    env = {
+        "GITHUB_API_URL": forge.url,
+        "GITHUB_GRAPHQL_URL": f"{forge.url}/graphql",
+        "GITHUB_OUTPUT": str(settings_path),
+    }
     done = run(tmp_path, "settings", env, source)
     assert "fails release checks" in done.stdout
     pending = settings_path.read_text(encoding="utf-8").split("pending=", 1)[1].split("\n", 1)[0]
