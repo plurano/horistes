@@ -144,6 +144,21 @@
         "id-token",
         "security-events"
       ]
+    },
+    ".github/workflows/secret-scan.yml": {
+      "inputs": {
+        "runner": {
+          "default": "ubuntu-26.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "scan": "Secret scan"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": []
     }
   }
 }
