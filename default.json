@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release except for a fix of a known vulnerability, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, go mod tidy after a Go module update, and no proposal for the machine a job runs on."
+    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release except for a fix of a known vulnerability, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, go mod tidy after a Go module update, and no proposal for the machine a job runs on; own releases of the family's organisations wait for no release age; forks of outside projects keep three days."
   ],
   "extends": [
     "config:recommended",
@@ -29,6 +29,56 @@
         "github-runner"
       ],
       "enabled": false
+    },
+    {
+      "description": "Own GitHub releases wait for no release age.",
+      "matchDatasources": [
+        "github-tags",
+        "github-releases",
+        "github-digest",
+        "github-release-attachments"
+      ],
+      "matchPackageNames": [
+        "/^(lusoris|cordanallm|golusoris|vmafx|tekmora|plurano|vidiko|jellysin|goph-arr)\\//i"
+      ],
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "Own Go modules wait for no release age.",
+      "matchDatasources": [
+        "go"
+      ],
+      "matchPackageNames": [
+        "/^github\\.com\\/(lusoris|cordanallm|golusoris|vmafx|tekmora|plurano|vidiko|jellysin|goph-arr)\\//i"
+      ],
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "Own container images wait for no release age.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "/^ghcr\\.io\\/(lusoris|cordanallm|golusoris|vmafx|tekmora|plurano|vidiko|jellysin|goph-arr)\\//i"
+      ],
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "Own npm packages wait for no release age.",
+      "matchDatasources": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "/^@(lusoris|cordanallm|golusoris|vmafx|tekmora|plurano|vidiko|jellysin|goph-arr)\\//i"
+      ],
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "Forks of outside projects keep the three-day release age.",
+      "matchPackageNames": [
+        "/^(github\\.com\\/|ghcr\\.io\\/)?(lusoris\\/(llama-swap|controller-tools|hindsight|vulkan-validationlayers|helm-charts|paperclip|model_server|paperclip-aperture)|vmafx\\/netflix-vmaf-contributions)(\\/|$)/i"
+      ],
+      "minimumReleaseAge": "3 days"
     }
   ]
 }

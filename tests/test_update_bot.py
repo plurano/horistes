@@ -52,7 +52,40 @@ SHARED = {
 # app slug), read from GET /users/plurano-merge-train[bot]. Renovate compares an
 # entry for equality before it reads it as a glob, so the brackets stay literal.
 TRAIN_BOT = "342223998+plurano-merge-train[bot]@users.noreply.github.com"
-RULE = {"description", "matchManagers", "matchDepTypes", "enabled"}
+RULE = {
+    "description",
+    "matchManagers",
+    "matchDepTypes",
+    "enabled",
+    "matchDatasources",
+    "matchPackageNames",
+    "minimumReleaseAge",
+}
+# The fleet organisations whose own releases wait for no release age.
+ORGS = (
+    "lusoris",
+    "cordanallm",
+    "golusoris",
+    "vmafx",
+    "tekmora",
+    "plurano",
+    "vidiko",
+    "jellysin",
+    "goph-arr",
+)
+# Forks of outside projects hosted in those organisations that keep the
+# three-day waiting time.
+FORKS = (
+    "lusoris/llama-swap",
+    "lusoris/controller-tools",
+    "lusoris/hindsight",
+    "lusoris/Vulkan-ValidationLayers",
+    "lusoris/helm-charts",
+    "lusoris/paperclip",
+    "lusoris/model_server",
+    "lusoris/paperclip-aperture",
+    "VMAFx/netflix-vmaf-contributions",
+)
 # A fix of a known vulnerability waits for no release age, and the block that
 # says so holds nothing else (ADR-0050).
 VULNERABILITY = {"minimumReleaseAge": None}
@@ -165,6 +198,63 @@ def outside_settings_sync(preset: dict) -> list[str]:
     """What a settings-sync preset holds beyond switching a listed manager off."""
     unknown = sorted(set(preset) - HELD - {"$schema", "description"})
     return unknown + sorted(f"{key} block" for key in HELD & set(preset) if preset[key] != SWITCH)
+
+
+def pattern_matches(pattern: str, package: str) -> bool:
+    """True when a package name matches a Renovate pattern."""
+    if pattern.startswith("/") and pattern.endswith("/i"):
+        return bool(re.search(pattern[1:-2], package, re.IGNORECASE))
+    if pattern.startswith("/") and pattern.endswith("/"):
+        return bool(re.search(pattern[1:-1], package))
+    return pattern.lower() == package.lower()
+
+
+def release_age(preset: dict, datasource: str, package: str) -> str | None:
+    """Emulate Renovate packageRules matching for minimumReleaseAge."""
+    current_age = preset.get("minimumReleaseAge")
+    for rule in preset.get("packageRules", [])[:50]:
+        if "enabled" in rule:
+            continue
+        if "matchDatasources" in rule and datasource not in rule["matchDatasources"]:
+            continue
+        if "matchPackageNames" in rule and not any(
+            pattern_matches(pattern, package) for pattern in rule["matchPackageNames"][:50]
+        ):
+            continue
+        if "minimumReleaseAge" in rule:
+            current_age = rule["minimumReleaseAge"]
+    return current_age
+
+
+def held_forks(preset: dict) -> list[str]:
+    """Forks of outside projects that are not held for three days."""
+    problems = []
+    for fork in FORKS[:20]:
+        for datasource, package in (
+            ("github-tags", fork),
+            ("go", f"github.com/{fork}"),
+            ("docker", f"ghcr.io/{fork}"),
+        ):
+            if release_age(preset, datasource, package) != "3 days":
+                problems.append(f"{datasource}:{package}")
+    return problems
+
+
+def own_pattern_problems(preset: dict) -> list[str]:
+    """Outside packages proposed early because an own rule matches too broadly."""
+    outside = (
+        ("github-tags", "notplurano/repo"),
+        ("github-tags", "evilplurano/x"),
+        ("github-tags", "lusoris-x/repo"),
+        ("go", "github.com/notplurano/repo"),
+        ("docker", "ghcr.io/notplurano/repo"),
+        ("npm", "@notplurano/repo"),
+    )
+    return [
+        f"{datasource}:{package}"
+        for datasource, package in outside[:20]
+        if release_age(preset, datasource, package) is None
+    ]
 
 
 def rules() -> list[dict]:
@@ -323,7 +413,7 @@ def test_planted_key_of_one_repository_is_refused_in_the_preset(key, value):
     assert outside_the_preset(preset) == [key]
 
 
-@pytest.mark.parametrize("key", ["matchFileNames", "matchPackageNames", "automerge"])
+@pytest.mark.parametrize("key", ["matchFileNames", "matchDepNames", "automerge"])
 def test_planted_rule_for_one_repository_is_refused_in_the_preset(key):
     preset = copy.deepcopy(PRESET)
     preset["packageRules"][0][key] = ["x"]
@@ -708,3 +798,103 @@ def test_planted_makefile_tool_pin_is_not_read(old, new):
         m for mgr, m in tool_matches(MAKEFILE, text) if mgr["depNameTemplate"] == "rhysd/actionlint"
     ]
     assert matches == []
+
+
+@pytest.mark.parametrize("org", ORGS)
+@pytest.mark.parametrize(
+    ("datasource", "template"),
+    [
+        ("github-tags", "{org}/repo"),
+        ("go", "github.com/{org}/repo/v2"),
+        ("docker", "ghcr.io/{org}/img"),
+        ("npm", "@{org}/pkg"),
+    ],
+)
+def test_own_releases_skip_the_waiting_time(org, datasource, template):
+    package = template.format(org=org)
+    assert release_age(PRESET, datasource, package) is None
+
+
+@pytest.mark.parametrize(
+    ("datasource", "package"),
+    [
+        ("github-tags", "actions/checkout"),
+        ("go", "golang.org/x/net"),
+        ("docker", "docker.io/library/python"),
+        ("npm", "@types/node"),
+        ("github-tags", "lusoris-x/repo"),
+        ("github-tags", "notplurano/repo"),
+        ("go", "github.com/plurano"),
+        ("docker", "ghcr.io/plurano"),
+    ],
+)
+def test_outside_releases_keep_the_waiting_time(datasource, package):
+    assert release_age(PRESET, datasource, package) == "3 days"
+
+
+@pytest.mark.parametrize("fork", FORKS)
+@pytest.mark.parametrize(
+    ("datasource", "template"),
+    [
+        ("github-tags", "{fork}"),
+        ("go", "github.com/{fork}"),
+        ("docker", "ghcr.io/{fork}"),
+    ],
+)
+def test_forks_of_outside_projects_keep_the_waiting_time(fork, datasource, template):
+    package = template.format(fork=fork)
+    assert release_age(PRESET, datasource, package) == "3 days"
+
+
+@pytest.mark.parametrize(
+    ("datasource", "package"),
+    [
+        ("github-tags", "LUSORIS/Llama-Swap"),
+        ("go", "github.com/LUSORIS/Llama-Swap"),
+        ("docker", "ghcr.io/LUSORIS/Llama-Swap"),
+    ],
+)
+def test_mixed_case_forks_keep_the_waiting_time(datasource, package):
+    assert release_age(PRESET, datasource, package) == "3 days"
+
+
+def test_forks_are_held_in_preset():
+    assert held_forks(PRESET) == []
+    assert own_pattern_problems(PRESET) == []
+
+
+def test_fork_rule_is_the_last_rule_and_holds_three_days():
+    last_rule = PRESET["packageRules"][-1]
+    assert last_rule["minimumReleaseAge"] == "3 days"
+    assert "matchDatasources" not in last_rule
+    assert any("llama-swap" in pattern for pattern in last_rule.get("matchPackageNames", []))
+
+
+def test_planted_fork_rule_before_own_rules_leaves_fork_unheld():
+    planted = copy.deepcopy(PRESET)
+    fork_rule = planted["packageRules"].pop()
+    planted["packageRules"].insert(1, fork_rule)
+    problems = held_forks(planted)
+    assert problems != []
+    assert "github-tags:lusoris/llama-swap" in problems
+    assert release_age(planted, "github-tags", "lusoris/llama-swap") is None
+
+
+def test_planted_unanchored_own_rule_is_refused():
+    planted = copy.deepcopy(PRESET)
+    patterns = planted["packageRules"][1]["matchPackageNames"]
+    planted["packageRules"][1]["matchPackageNames"] = [p.replace("/^", "/") for p in patterns]
+    problems = own_pattern_problems(planted)
+    assert "github-tags:evilplurano/x" in problems
+    assert release_age(planted, "github-tags", "evilplurano/x") is None
+
+
+def test_planted_missing_fork_in_fork_rule_is_refused():
+    planted = copy.deepcopy(PRESET)
+    patterns = planted["packageRules"][-1]["matchPackageNames"]
+    planted["packageRules"][-1]["matchPackageNames"] = [
+        p.replace("llama-swap|", "") for p in patterns
+    ]
+    problems = held_forks(planted)
+    assert "github-tags:lusoris/llama-swap" in problems
+    assert release_age(planted, "github-tags", "lusoris/llama-swap") is None

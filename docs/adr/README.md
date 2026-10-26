@@ -61,3 +61,4 @@ record that supersedes it.
 | [0051](0051-a-go-module-update-is-tidied.md) | 2026-10-21 | A Go module update is tidied | Accepted |
 | [0052](0052-the-draft-release-job-is-shared.md) | 2026-10-21 | The draft release job is shared | Accepted |
 | [0053](0053-the-train-sweep-is-a-checked-out-file.md) | 2026-10-25 | The train sweep is a checked-out file | Accepted |
+| [0054](0054-own-releases-skip-the-waiting-time.md) | 2026-10-26 | Own releases skip the waiting time | Accepted |
