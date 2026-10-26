@@ -28,6 +28,7 @@ WORKFLOWS = [
     ".github/workflows/image-age.yml",
     ".github/workflows/licence.yml",
     ".github/workflows/pins.yml",
+    ".github/workflows/secret-scan.yml",
 ]
 
 
