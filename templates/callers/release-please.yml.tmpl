@@ -1,0 +1,62 @@
+<%- /*
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+
+Caller of the shared release-please workflow, as a consumer keeps it in
+.github/workflows/release-please.yml. The rendered file is the whole of the
+consumer's release-please job: the steps live in
+.github/workflows/release-please.yml of the shared repository, named here by
+commit with the version as a comment; before the first release the comment
+carries no version (decision record 0024, decision record 0056).
+
+Required check: none. The job runs on push to the default branch, never on a pull
+request, and is no check of a pull request (cordanaLLM/praetor#1212 for the
+name the engine declares). No result job is needed (decision record 0030).
+
+The job acts through a GitHub App, not GITHUB_TOKEN: pull requests and
+releases created with GITHUB_TOKEN start no workflows. The caller passes the
+private key from its secret RELEASE_APP_PRIVATE_KEY and the client id from its
+variable RELEASE_APP_CLIENT_ID.
+
+Fields: .Shared.Repository, .Shared.Commit and .Shared.Version are working
+names until the engine renders caller templates (cordanaLLM/praetor#1211);
+.RunnerTag is the engine's own.
+
+Concurrency is set here and not in the shared workflow, so a consumer's group
+never collides with another caller's.
+
+Licence header: the rendered caller starts with the consumer's own header,
+written from .Licence (working names, as above), so the consumer's licence
+check accepts it (#3). The REUSE-IgnoreStart and REUSE-IgnoreEnd notes render
+as nothing and keep this repository's licence check from reading the field
+lines as tags.
+*/ -%>
+<%- /* REUSE-IgnoreStart */ -%>
+# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-License-Identifier: <% .Licence.Identifier %>
+<%/* REUSE-IgnoreEnd */ -%>
+---
+# Release please: proposes release pull requests and creates forge releases.
+# The job is the shared workflow of <% .Shared.Repository %>, named by commit.
+name: Release please
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release please
+    permissions: {}
+    uses: <% .Shared.Repository %>/.github/workflows/release-please.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      runner: <% .RunnerTag %>
+      app_client_id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+    secrets:
+      app_private_key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

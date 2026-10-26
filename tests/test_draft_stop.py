@@ -25,6 +25,7 @@ DRAFT_STEP = "Stop on a draft pull request"
 WORKFLOWS = [
     ".github/workflows/ci.yml",
     ".github/workflows/codeql.yml",
+    ".github/workflows/hook-copy.yml",
     ".github/workflows/image-age.yml",
     ".github/workflows/licence.yml",
     ".github/workflows/pins.yml",

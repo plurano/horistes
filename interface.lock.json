@@ -25,6 +25,26 @@
         "contents"
       ]
     },
+    ".github/workflows/hook-copy.yml": {
+      "inputs": {
+        "hooks_path": {
+          "default": ".config/hooks",
+          "required": false,
+          "type": "string"
+        },
+        "runner": {
+          "default": "ubuntu-26.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "check": "Hook copy"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": []
+    },
     ".github/workflows/licence.yml": {
       "inputs": {
         "root": {
@@ -111,6 +131,40 @@
       "jobs": {
         "release": "Release pull request and release",
         "train": "Merge train"
+      },
+      "outputs": [],
+      "secrets": {
+        "app_private_key": {
+          "required": true
+        }
+      },
+      "write_scopes": []
+    },
+    ".github/workflows/release-please.yml": {
+      "inputs": {
+        "app_client_id": {
+          "default": null,
+          "required": true,
+          "type": "string"
+        },
+        "config_file": {
+          "default": "release-please-config.json",
+          "required": false,
+          "type": "string"
+        },
+        "manifest_file": {
+          "default": ".release-please-manifest.json",
+          "required": false,
+          "type": "string"
+        },
+        "runner": {
+          "default": "ubuntu-26.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "release-please": "Release please"
       },
       "outputs": [],
       "secrets": {

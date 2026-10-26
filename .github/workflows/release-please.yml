@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Release please (reusable): proposes release pull requests and creates forge
+# releases from Conventional Commits. The caller runs it on push to its default
+# branch. The check is reported as "<name of the calling job> / Release please"
+# (decision record 0056).
+#
+# The job acts through a GitHub App, not GITHUB_TOKEN: pull requests and
+# releases created with GITHUB_TOKEN start no workflows, so release pull
+# requests got no CI and releases never started workflows.
+name: Release please
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Label of the runner the job runs on.
+        type: string
+        required: false
+        default: ubuntu-26.04
+      app_client_id:
+        description: Client id of the release app.
+        type: string
+        required: true
+      config_file:
+        description: Path to the release-please config file.
+        type: string
+        required: false
+        default: release-please-config.json
+      manifest_file:
+        description: Path to the release-please manifest file.
+        type: string
+        required: false
+        default: .release-please-manifest.json
+    secrets:
+      app_private_key:
+        description: Private key of the release app.
+        required: true
+
+permissions: {}
+
+jobs:
+  release-please:
+    name: Release please
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          client-id: ${{ inputs.app_client_id }}
+          private-key: ${{ secrets.app_private_key }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          # No release-type input: with it set the action ignores the config file
+          # (initial-version, bump-minor-pre-major) and proposes 1.0.0.
+          config-file: ${{ inputs.config_file }}
+          manifest-file: ${{ inputs.manifest_file }}
