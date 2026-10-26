@@ -17,3 +17,6 @@ paths:
   .github/workflows/merge-train.yml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20: actionlint lacks job.workflow_*
+  .github/workflows/secret-scan.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20: actionlint lacks job.workflow_*

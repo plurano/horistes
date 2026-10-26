@@ -54,9 +54,10 @@
     },
     {
       "customType": "regex",
-      "description": "The gitleaks release and checksum in the CI workflow.",
+      "description": "The gitleaks release and checksum in the CI and secret-scan workflows.",
       "managerFilePatterns": [
-        "/^\\.github/workflows/ci\\.yml$/"
+        "/^\\.github/workflows/ci\\.yml$/",
+        "/^\\.github/workflows/secret-scan\\.yml$/"
       ],
       "matchStrings": [
         "  GITLEAKS_VERSION: \"(?<currentValue>v[^\"]+)\"\\n  # SHA-256 of gitleaks_\\S+_linux_x64\\.tar\\.gz, from the release's checksum file\\.\\n  GITLEAKS_SHA256: \"(?<currentDigest>[0-9a-f]{64})\"\\n"
