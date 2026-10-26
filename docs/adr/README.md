@@ -63,3 +63,4 @@ record that supersedes it.
 | [0053](0053-the-train-sweep-is-a-checked-out-file.md) | 2026-10-25 | The train sweep is a checked-out file | Accepted |
 | [0054](0054-own-releases-skip-the-waiting-time.md) | 2026-10-26 | Own releases skip the waiting time | Accepted |
 | [0055](0055-a-shared-secret-scan-keeps-dated-exceptions.md) | 2026-10-26 | A shared secret scan keeps dated exceptions | Accepted |
+| [0056](0056-release-please-and-the-commit-hook-are-shared.md) | 2026-10-26 | Release-please and the commit hook are shared | Accepted |

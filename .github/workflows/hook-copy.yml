@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Hook copy (reusable): fails a caller whose local hook copies differ from the
+# horistes files at the pinned commit (checksum drift check).
+# The check is reported as "<name of the calling job> / Hook copy" (decision record 0056).
+name: Hook copy
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Label of the runner the job runs on.
+        type: string
+        required: false
+        default: ubuntu-26.04
+      hooks_path:
+        description: Path to the consumer's hooks directory.
+        type: string
+        required: false
+        default: .config/hooks
+
+permissions: {}
+
+jobs:
+  check:
+    name: Hook copy
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Check out the caller
+        if: github.event.pull_request.draft != true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check out the hook source
+        if: github.event.pull_request.draft != true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: hook-copy-source
+          persist-credentials: false
+          sparse-checkout: |
+            hooks/
+            tools/hook_copy.py
+          sparse-checkout-cone-mode: false
+
+      - name: Check hook copy for drift
+        if: github.event.pull_request.draft != true
+        env:
+          HOOKS_PATH: ${{ inputs.hooks_path }}
+        run: |
+          python3 -I hook-copy-source/tools/hook_copy.py check --source hook-copy-source/hooks --copy "$HOOKS_PATH"
+
+      - name: Test the hook
+        if: github.event.pull_request.draft != true
+        env:
+          HOOKS_PATH: ${{ inputs.hooks_path }}
+        run: |
+          sh "$HOOKS_PATH/commit-msg_test.sh" "$HOOKS_PATH/commit-msg.sh"

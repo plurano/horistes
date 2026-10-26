@@ -14,6 +14,9 @@ paths:
   # actionlint 1.7.12, the newest release, does not know the documented
   # job.workflow_repository and job.workflow_sha (rhysd/actionlint#705); the
   # train checks out its own script with them.
+  .github/workflows/hook-copy.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20: actionlint lacks job.workflow_*
   .github/workflows/merge-train.yml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20: actionlint lacks job.workflow_*
