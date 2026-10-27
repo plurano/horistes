@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+name: Verified download
+description: Bounded, digest-verified release download over HTTPS.
+
+inputs:
+  url:
+    description: HTTPS URL of the file to download.
+    required: true
+  sha256:
+    description: Expected SHA-256 digest of the downloaded file.
+    required: true
+  output:
+    description: Destination path for the downloaded file.
+    required: true
+  max-bytes:
+    description: Maximum download size in bytes.
+    required: false
+    default: "33554432"
+  timeout-seconds:
+    description: Maximum download time in seconds.
+    required: false
+    default: "120"
+
+outputs:
+  lib:
+    description: Absolute path of verified-download.sh so callers can source it directly.
+    value: ${{ steps.download.outputs.lib }}
+
+runs:
+  using: composite
+  steps:
+    - id: download
+      shell: bash
+      env:
+        DOWNLOAD_URL: ${{ inputs.url }}
+        DOWNLOAD_SHA256: ${{ inputs.sha256 }}
+        DOWNLOAD_OUTPUT: ${{ inputs.output }}
+        DOWNLOAD_MAX_BYTES: ${{ inputs.max-bytes }}
+        DOWNLOAD_TIMEOUT: ${{ inputs.timeout-seconds }}
+      run: |
+        echo "lib=${GITHUB_ACTION_PATH}/verified-download.sh" >> "$GITHUB_OUTPUT"
+        # shellcheck source=actions/verified-download/verified-download.sh
+        . "$GITHUB_ACTION_PATH/verified-download.sh"
+        fetch_verified "$DOWNLOAD_URL" "$DOWNLOAD_SHA256" "$DOWNLOAD_MAX_BYTES" "$DOWNLOAD_TIMEOUT" "$DOWNLOAD_OUTPUT"

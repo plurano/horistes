@@ -146,12 +146,19 @@ The app is one public app installed on every account
 of the fleet; its rights are in `apps/merge-train.json`, and a test holds them
 equal to what the train asks the forge for.
 
+## Actions
+
+| File | Purpose | Inputs | Outputs | Hosts beyond the forge |
+| :--- | :--- | :--- | :--- | :--- |
+| `actions/verified-download/action.yml` | bounded, digest-verified release download over HTTPS ([ADR-0058](docs/adr/0058-shared-installer-actions.md)) | `url` (required); `sha256` (required); `output` (required); `max-bytes` (default `33554432`); `timeout-seconds` (default `120`) | `lib` (absolute path of `verified-download.sh`) | host of `url` (HTTPS only) |
+| `actions/install-gitleaks/action.yml` | installs pinned Gitleaks release binary after SHA-256 verification on Linux/x86_64 ([ADR-0058](docs/adr/0058-shared-installer-actions.md)) | `version` (required, no leading `v`); `sha256` (required); `install-dir` (required) | `path` (absolute path of installed `gitleaks` binary) | `github.com` |
+
 ## Layout
 
 | Path | Content |
 | :--- | :--- |
 | `.github/workflows/` | reusable workflows, this repository's own gate (`ci.yml`), its callers (`licence-check.yml`) and scheduled checks (`codeql.yml`, `image-age.yml`, `pins.yml`) |
-| `actions/<name>/` | composite steps |
+| `actions/<name>/` | composite steps ([ADR-0058](docs/adr/0058-shared-installer-actions.md)) |
 | `hooks/` | files a consumer keeps as a copy, checked by hook-copy.yml ([ADR-0056](docs/adr/0056-release-please-and-the-commit-hook-are-shared.md)) |
 | `templates/callers/` | the caller a consumer keeps, one template per shared workflow ([ADR-0009](docs/adr/0009-caller-templates-in-the-engines-syntax.md)) |
 | `tools/` | the checks of the gate, the same-verdict check for a switch, the renderer of the caller templates, the release read-back, the check of action pins and runner labels, and the check of relative Markdown links |

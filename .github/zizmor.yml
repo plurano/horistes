@@ -11,3 +11,4 @@ rules:
     ignore:
       - licence-check.yml # expires 2026-12-31: actionlint refuses the `$/` form
       - scorecard-check.yml # expires 2026-12-31: actionlint refuses the `$/` form
+      - secret-scan.yml # expires 2026-12-31: the path is our checkout; `$/` names the caller
