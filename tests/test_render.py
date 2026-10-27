@@ -31,6 +31,7 @@ COMMIT = render.SAMPLE["Shared"]["Commit"]
 REAL = "templates/callers/licence.yml.tmpl"
 REAL_SCORECARD = "templates/callers/scorecard.yml.tmpl"
 REAL_TRAIN = "templates/callers/merge-train.yml.tmpl"
+REAL_WORKFLOW_CHECK = "templates/callers/workflow-check.yml.tmpl"
 TEMPLATE = "templates/callers/licence.yml.tmpl"
 CALLED = ".github/workflows/licence.yml"
 ISSUE = "cordanaLLM/praetor#1212"
@@ -265,8 +266,9 @@ def test_scorecard_template_renders_into_the_recorded_caller():
         (REAL, ".github/workflows/licence-check.yml"),
         (REAL_SCORECARD, ".github/workflows/scorecard-check.yml"),
         (REAL_TRAIN, ".github/workflows/merge-train.yml"),
+        (REAL_WORKFLOW_CHECK, ".github/workflows/workflow-check.yml"),
     ],
-    ids=["licence", "scorecard", "merge-train"],
+    ids=["licence", "scorecard", "merge-train", "workflow-check"],
 )
 def test_rendered_caller_passes_both_linters(tree, template, name):
     tree.write({name: rendered_real_template(template)})

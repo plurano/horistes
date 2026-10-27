@@ -27,9 +27,10 @@
     },
     {
       "customType": "regex",
-      "description": "The actionlint release and checksum in the CI workflow.",
+      "description": "The actionlint release and checksum in the CI and workflow-check workflows.",
       "managerFilePatterns": [
-        "/^\\.github/workflows/ci\\.yml$/"
+        "/^\\.github/workflows/ci\\.yml$/",
+        "/^\\.github/workflows/workflow-check\\.yml$/"
       ],
       "matchStrings": [
         "  ACTIONLINT_VERSION: \"(?<currentValue>v[^\"]+)\"\\n  # SHA-256 of actionlint_\\S+_linux_amd64\\.tar\\.gz, from the release's checksum file\\.\\n  ACTIONLINT_SHA256: \"(?<currentDigest>[0-9a-f]{64})\"\\n"

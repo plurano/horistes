@@ -97,6 +97,17 @@ reason = "index of the hash-pinned tools in requirements/tools.txt, installed by
 [files.".github/workflows/pins.yml"."files.pythonhosted.org"]
 reason = "files of those tools"
 
+# The shared workflow check installs the hash-pinned zizmor and PyYAML wheels from PyPI
+# (decision record 0057). It has no off switch: it is an exception with a day
+# it ends (decision record 0005).
+[files.".github/workflows/workflow-check.yml"."pypi.org"]
+reason = "index of the hash-pinned zizmor and PyYAML wheels in requirements/tools.txt"
+expires = 2027-01-20
+
+[files.".github/workflows/workflow-check.yml"."files.pythonhosted.org"]
+reason = "hash-pinned zizmor and PyYAML wheels in requirements/tools.txt"
+expires = 2027-01-20
+
 # The shared licence workflow runs the licence tool's public image, named by
 # digest (decision record 0008). The host has no off switch: it is an exception
 # with a day it ends (decision record 0005), and it leaves when a pinned image

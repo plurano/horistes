@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Workflow check (reusable): check the caller's workflows with actionlint and
+# verify action pins, release comments and undeclared inputs with tools/pins.py
+# (zizmor). Pins and comments are checked against live forge metadata using the
+# run's token.
+# The check is reported as "<name of the calling job> / Workflow check".
+name: Workflow check
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Label of the runner the job runs on.
+        type: string
+        required: false
+        default: ubuntu-26.04
+
+permissions: {}
+
+env:
+  ACTIONLINT_VERSION: "v1.7.12"
+  # SHA-256 of actionlint_1.7.12_linux_amd64.tar.gz, from the release's checksum file.
+  ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+
+jobs:
+  check:
+    name: Workflow check
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Check out the caller
+        if: github.event.pull_request.draft != true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the check tools
+        if: github.event.pull_request.draft != true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: workflow-check-source
+          persist-credentials: false
+          sparse-checkout: |
+            tools/pins.py
+            tools/ciwf.py
+            tools/forge.py
+            tools/results.py
+            requirements/tools.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python
+        if: github.event.pull_request.draft != true
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # pins.py needs zizmor and PyYAML; both come from the hashed entries of
+      # requirements/tools.txt, nothing else of that file is installed.
+      - name: Install the pinned zizmor and PyYAML
+        if: github.event.pull_request.draft != true
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          python3 -I - "workflow-check-source/requirements/tools.txt" "$RUNNER_TEMP/check-requirements.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          wanted = {"zizmor", "pyyaml"}
+          text = Path(sys.argv[1]).read_text(encoding="utf-8")
+          entries = [e for e in re.split(r"\n(?=\S)", text) if not e.startswith("#")]
+          picked = [e.rstrip() for e in entries if e.split("==", 1)[0].strip().lower() in wanted]
+          names = {e.split("==", 1)[0].strip().lower() for e in picked}
+          if names != wanted or any("--hash=sha256:" not in e for e in picked):
+              sys.exit(f"pinned entries missing in requirements/tools.txt: {sorted(wanted - names)}")
+          Path(sys.argv[2]).write_text("\n".join(picked) + "\n", encoding="utf-8")
+          PY
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
+            --require-hashes -r "$RUNNER_TEMP/check-requirements.txt"
+          ln -s "$RUNNER_TEMP/venv/bin/zizmor" "$RUNNER_TEMP/bin/zizmor"
+
+      - name: Install the pinned actionlint
+        if: github.event.pull_request.draft != true
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --silent --show-error --location --max-time 120 --retry 2 \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" actionlint
+
+      - name: Run actionlint on caller workflows
+        if: github.event.pull_request.draft != true
+        run: |
+          "$RUNNER_TEMP/bin/actionlint"
+
+      - name: Check action pins and comments
+        if: github.event.pull_request.draft != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIZMOR: ${{ runner.temp }}/bin/zizmor
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -I workflow-check-source/tools/pins.py check --root .

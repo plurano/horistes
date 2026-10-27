@@ -30,6 +30,7 @@ WORKFLOWS = [
     ".github/workflows/licence.yml",
     ".github/workflows/pins.yml",
     ".github/workflows/secret-scan.yml",
+    ".github/workflows/workflow-check.yml",
 ]
 
 
