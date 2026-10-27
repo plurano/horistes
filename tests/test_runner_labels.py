@@ -306,25 +306,43 @@ def test_caller_passing_pinned_runner_is_accepted_and_floating_label_is_refused(
     ) in done.stderr
 
 
-def test_caller_without_runner_input_relies_on_pinned_workflow_default(tree):
+@pytest.mark.parametrize(
+    ("workflow_file", "template_file", "caller_file"),
+    [
+        (
+            ".github/workflows/licence.yml",
+            "templates/callers/licence.yml.tmpl",
+            ".github/workflows/licence-check.yml",
+        ),
+        (
+            ".github/workflows/workflow-check.yml",
+            "templates/callers/workflow-check.yml.tmpl",
+            ".github/workflows/workflow-check.yml",
+        ),
+    ],
+    ids=["licence", "workflow-check"],
+)
+def test_caller_without_runner_input_relies_on_pinned_workflow_default(
+    tree, workflow_file: str, template_file: str, caller_file: str
+):
     """A caller omitting the runner input relies on the workflow's pinned default."""
-    licence_path = ROOT / ".github/workflows/licence.yml"
-    doc = ciwf.load(licence_path)
+    workflow_path = ROOT / workflow_file
+    doc = ciwf.load(workflow_path)
     inputs = doc["on"]["workflow_call"]["inputs"]
     assert inputs["runner"].get("required") is not True
     default = inputs["runner"]["default"]
     assert default == "ubuntu-26.04"
 
     # A caller omitting the runner input passes while the workflow default is pinned.
-    tmpl = (ROOT / "templates/callers/licence.yml.tmpl").read_text(encoding="utf-8")
-    caller = render.render(tmpl, render.SAMPLE, "licence.yml.tmpl")
+    tmpl = (ROOT / template_file).read_text(encoding="utf-8")
+    caller = render.render(tmpl, render.SAMPLE, template_file)
     without_runner = caller.replace(f"    with:\n      runner: {default}\n", "")
     assert without_runner != caller
-    licence_text = licence_path.read_text(encoding="utf-8")
+    workflow_text = workflow_path.read_text(encoding="utf-8")
     tree.write(
         {
-            ".github/workflows/licence.yml": licence_text,
-            ".github/workflows/licence-check.yml": without_runner,
+            workflow_file: workflow_text,
+            caller_file: without_runner,
         }
     )
     done = tree.tool("pins.py", "runners")
@@ -332,9 +350,9 @@ def test_caller_without_runner_input_relies_on_pinned_workflow_default(tree):
     assert "no floating runner label" in done.stdout
 
     # Planted negative: when the workflow default is floating, the check refuses it.
-    planted_licence = licence_text.replace(f"default: {default}", "default: ubuntu-latest")
-    assert planted_licence != licence_text
-    tree.write({".github/workflows/licence.yml": planted_licence})
+    planted_workflow = workflow_text.replace(f"default: {default}", "default: ubuntu-latest")
+    assert planted_workflow != workflow_text
+    tree.write({workflow_file: planted_workflow})
     done = tree.tool("pins.py", "runners")
     assert done.returncode == 1, done.stdout
     assert (

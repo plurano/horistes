@@ -213,6 +213,21 @@
       "outputs": [],
       "secrets": {},
       "write_scopes": []
+    },
+    ".github/workflows/workflow-check.yml": {
+      "inputs": {
+        "runner": {
+          "default": "ubuntu-26.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "check": "Workflow check"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": []
     }
   }
 }

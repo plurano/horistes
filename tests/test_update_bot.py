@@ -105,6 +105,7 @@ TOOLS = "requirements/tools.txt"
 LICENCE = ".github/workflows/licence.yml"
 GATE = ".github/workflows/ci.yml"
 SECRET_SCAN = ".github/workflows/secret-scan.yml"
+WORKFLOW_CHECK = ".github/workflows/workflow-check.yml"
 MAKEFILE = "Makefile"
 ACTIONLINT_SHA = "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
 GITLEAKS_SHA = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
@@ -663,10 +664,24 @@ def test_gitleaks_is_read_with_release_and_checksum_in_secret_scan():
     assert re.fullmatch(r"[0-9a-f]{64}", gitleaks["currentDigest"])
 
 
+def test_actionlint_is_read_with_release_and_checksum_in_workflow_check():
+    text = (ROOT / WORKFLOW_CHECK).read_text(encoding="utf-8")
+    matches = [
+        groups
+        for mgr, groups in tool_matches(WORKFLOW_CHECK, text)
+        if mgr["depNameTemplate"] == "rhysd/actionlint"
+    ]
+    assert len(matches) == 1
+    actionlint = matches[0]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", actionlint["currentValue"])
+    assert re.fullmatch(r"[0-9a-f]{64}", actionlint["currentDigest"])
+
+
 @pytest.mark.parametrize(
     ("dep_name", "path", "new_version"),
     [
         ("rhysd/actionlint", GATE, "v1.7.13"),
+        ("rhysd/actionlint", WORKFLOW_CHECK, "v1.7.13"),
         ("rhysd/actionlint", MAKEFILE, "1.7.13"),
         ("gitleaks/gitleaks", GATE, "v8.30.2"),
         ("gitleaks/gitleaks", SECRET_SCAN, "v8.30.2"),

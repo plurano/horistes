@@ -20,6 +20,8 @@ CALLERS = [
     ("templates/callers/licence.yml.tmpl", ".github/workflows/licence-check.yml"),
     ("templates/callers/scorecard.yml.tmpl", ".github/workflows/scorecard-check.yml"),
     ("templates/callers/merge-train.yml.tmpl", ".github/workflows/merge-train.yml"),
+    ("templates/callers/secret-scan.yml.tmpl", ".github/workflows/secret-scan.yml"),
+    ("templates/callers/workflow-check.yml.tmpl", ".github/workflows/workflow-check.yml"),
 ]
 
 
@@ -36,7 +38,7 @@ def lint(root: Path, *args: str) -> subprocess.CompletedProcess:
 @pytest.mark.parametrize(
     ("template", "name"),
     CALLERS,
-    ids=["licence", "scorecard", "merge-train"],
+    ids=["licence", "scorecard", "merge-train", "secret-scan", "workflow-check"],
 )
 def test_rendered_caller_passes_reuse_lint(tmp_path: Path, template: str, name: str) -> None:
     source = (ROOT / template).read_text(encoding="utf-8")
