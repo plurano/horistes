@@ -241,6 +241,7 @@ class Forge:
         self.commit_counts: dict[int, int] = {}
         self.merged_pulls: dict[str, list[dict]] = {}
         self.issue_right = True
+        self.ungranted: set[int] = set()
         self.jobs: dict[int, list[dict]] = {}
         self.jobs_calls: list[int] = []
         self.label_missing = False
@@ -337,6 +338,10 @@ class Forge:
         if names is None and body["permissions"] == {"metadata": "read"}:
             token = f"list-token-{number}"
             self.tokens[token] = ("list", number, None)
+        elif names is not None and number in self.ungranted:
+            return 422, {
+                "message": "The permissions requested are not granted to this installation."
+            }
         elif "issues" in body["permissions"] and not self.issue_right:
             return 422, {"message": "The permissions requested are not granted."}
         elif names and len(names) == 1 and names[0] in inst["repos"]:
@@ -1531,6 +1536,42 @@ def test_refusal_in_one_repository_does_not_stop_the_others(tmp_path):
     assert "::error title=Merge train refused::fleet/app: " in done.stdout
     assert "| fleet | 1 | 0 | 0 | 1 |" in summary
     assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def ungranted_forge() -> Forge:
+    """sweep_forge plus the account denied, whose installation 13 has not accepted the rights."""
+    forge = sweep_forge()
+    forge.install(13, "denied", x=[repository(pull(5, "CLEAN"))], y=[repository(pull(6, "CLEAN"))])
+    forge.ungranted.add(13)
+    return forge
+
+
+def test_installation_without_the_rights_is_skipped_and_the_others_run(tmp_path):
+    forge = ungranted_forge()
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert ("fleet/app", landed(1)) in forge.where
+    assert ("other/b", updated(2)) in forge.where
+    assert [m for m in forge.minted if m[0] == 13 and "repositories" in m[1]] == [
+        (13, {"permissions": WRITE, "repositories": ["x"]})
+    ]
+    refusal = (
+        "::error title=Merge train refused::denied: installation 13 has not accepted "
+        "the rights the train asks for; 2 repositories skipped: "
+    )
+    assert refusal in done.stdout
+    assert "| denied | 2 | 0 | 0 | 2 |" in summary
+    assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_without_the_installation_skip_each_repository_asks_again(tmp_path):
+    mutant = script().replace("except UngrantedError as err:", "except KeyError as err:")
+    assert mutant != script()
+    forge = ungranted_forge()
+    done, _ = train(tmp_path, forge, mutant)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert len([m for m in forge.minted if m[0] == 13 and "repositories" in m[1]]) == 2
+    assert "installation 13 has not accepted" not in done.stdout
 
 
 def test_without_collecting_refusals_one_repository_stops_the_sweep(tmp_path):

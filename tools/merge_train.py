@@ -71,6 +71,7 @@ ACCEPTABLE = ("UNSTABLE", "HAS_HOOKS")
 NO_NEW_COMMITS = "There are no new commits on the base branch."
 CONFLICT = "merge conflict between base and head"
 MERGE_IN_PROGRESS = "Merge already in progress"
+UNGRANTED = "The permissions requested are not granted"
 
 
 class RefusedError(Exception):
@@ -79,6 +80,10 @@ class RefusedError(Exception):
 
 class MergeInProgressError(RefusedError):
     """The forge answered that it is already merging the pull request."""
+
+
+class UngrantedError(RefusedError):
+    """The installation has not accepted the rights the train asks for; none of it can run."""
 
 
 class InvalidSettingError(Exception):
@@ -688,7 +693,12 @@ def mint(env, conf, installation, rights, repositories=None):
     if repositories is not None:
         body["repositories"] = repositories
     url = f"{env['GITHUB_API_URL']}/app/installations/{installation['id']}/access_tokens"
-    return call(url, app_jwt(env, conf), "POST", body)["token"]
+    try:
+        return call(url, app_jwt(env, conf), "POST", body)["token"]
+    except RefusedError as err:
+        if "HTTP 422 " in str(err) and UNGRANTED in str(err):
+            raise UngrantedError(str(err)) from err
+        raise
 
 
 def revoke(env, token):
@@ -783,7 +793,7 @@ def sweep(env, conf, started):
             continue
         tally = {"repositories": 0, "landed": 0, "updated": 0, "refused": 0}
         accounts[account] = tally
-        for target in targets:
+        for index, target in enumerate(targets):
             if time.monotonic() - started > SWEEP_SECONDS:
                 skipped.append(target["full_name"])
                 continue
@@ -793,6 +803,15 @@ def sweep(env, conf, started):
                 outcome, section, moved, release = one(
                     env, {**conf, **identity}, installation, target, now
                 )
+            except UngrantedError as err:
+                rest = len(targets) - index
+                tally["repositories"] += rest - 1
+                tally["refused"] += rest
+                refusals.append(
+                    f"{account}: installation {installation['id']} has not accepted the rights "
+                    f"the train asks for; {rest} repositories skipped: {err}"
+                )
+                break
             except RefusedError as err:
                 tally["refused"] += 1
                 refusals.append(f"{target['full_name']}: {err}")

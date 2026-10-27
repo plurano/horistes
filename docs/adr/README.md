@@ -66,3 +66,4 @@ record that supersedes it.
 | [0056](0056-release-please-and-the-commit-hook-are-shared.md) | 2026-10-26 | Release-please and the commit hook are shared | Accepted |
 | [0057](0057-a-shared-workflow-check.md) | 2026-10-27 | A shared workflow check | Accepted |
 | [0058](0058-shared-installer-actions.md) | 2026-10-27 | Shared installer actions | Accepted |
+| [0059](0059-the-merge-train-skips-an-installation-without-its-rights.md) | 2026-10-27 | The merge train skips an installation that has not accepted its rights | Accepted |
