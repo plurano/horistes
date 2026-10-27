@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+name: Install Gitleaks
+description: Installs the pinned Gitleaks release binary after SHA-256 verification on Linux/x86_64.
+
+inputs:
+  version:
+    description: Gitleaks version (no leading v).
+    required: true
+  sha256:
+    description: Expected SHA-256 digest of the gitleaks_<version>_linux_x64.tar.gz archive.
+    required: true
+  install-dir:
+    description: Directory where the gitleaks binary will be installed.
+    required: true
+
+outputs:
+  path:
+    description: Absolute path of the installed gitleaks binary.
+    value: ${{ steps.install.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        GITLEAKS_VERSION: ${{ inputs.version }}
+        GITLEAKS_SHA256: ${{ inputs.sha256 }}
+        INSTALL_DIR: ${{ inputs.install-dir }}
+      run: |
+        version="${GITLEAKS_VERSION#v}"
+        "$GITHUB_ACTION_PATH/install-gitleaks.sh" "$version" "$GITLEAKS_SHA256" "$INSTALL_DIR"
+        abs_dir="$(cd "$INSTALL_DIR" && pwd)"
+        echo "path=${abs_dir}/gitleaks" >> "$GITHUB_OUTPUT"

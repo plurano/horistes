@@ -1,5 +1,52 @@
 {
-  "actions": {},
+  "actions": {
+    "actions/install-gitleaks/action.yml": {
+      "inputs": {
+        "install-dir": {
+          "default": null,
+          "required": true
+        },
+        "sha256": {
+          "default": null,
+          "required": true
+        },
+        "version": {
+          "default": null,
+          "required": true
+        }
+      },
+      "outputs": [
+        "path"
+      ]
+    },
+    "actions/verified-download/action.yml": {
+      "inputs": {
+        "max-bytes": {
+          "default": "33554432",
+          "required": false
+        },
+        "output": {
+          "default": null,
+          "required": true
+        },
+        "sha256": {
+          "default": null,
+          "required": true
+        },
+        "timeout-seconds": {
+          "default": "120",
+          "required": false
+        },
+        "url": {
+          "default": null,
+          "required": true
+        }
+      },
+      "outputs": [
+        "lib"
+      ]
+    }
+  },
   "interface_major": 0,
   "interface_minor": 2,
   "workflows": {

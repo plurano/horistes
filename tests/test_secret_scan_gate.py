@@ -239,7 +239,7 @@ def test_workflow_script_checkout_parameters() -> None:
     assert with_block["ref"] == "${{ job.workflow_sha }}"
     assert with_block["path"] == "secret-scan-source"
     assert with_block["persist-credentials"] is False
-    assert with_block["sparse-checkout"] == "tools/secret_scan.py"
+    assert with_block["sparse-checkout"].splitlines() == ["actions/", "tools/secret_scan.py"]
     assert with_block["sparse-checkout-cone-mode"] is False
 
 
