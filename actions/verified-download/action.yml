@@ -6,14 +6,17 @@ description: Bounded, digest-verified release download over HTTPS.
 
 inputs:
   url:
-    description: HTTPS URL of the file to download.
-    required: true
+    description: HTTPS URL of the file to download; leave url, sha256 and output empty to get only the lib output.
+    required: false
+    default: ""
   sha256:
     description: Expected SHA-256 digest of the downloaded file.
-    required: true
+    required: false
+    default: ""
   output:
     description: Destination path for the downloaded file.
-    required: true
+    required: false
+    default: ""
   max-bytes:
     description: Maximum download size in bytes.
     required: false
@@ -41,6 +44,13 @@ runs:
         DOWNLOAD_TIMEOUT: ${{ inputs.timeout-seconds }}
       run: |
         echo "lib=${GITHUB_ACTION_PATH}/verified-download.sh" >> "$GITHUB_OUTPUT"
+        if [[ -z "$DOWNLOAD_URL$DOWNLOAD_SHA256$DOWNLOAD_OUTPUT" ]]; then
+          exit 0
+        fi
+        if [[ -z "$DOWNLOAD_URL" || -z "$DOWNLOAD_SHA256" || -z "$DOWNLOAD_OUTPUT" ]]; then
+          printf 'verified-download: url, sha256 and output are set together or not at all\n' >&2
+          exit 1
+        fi
         # shellcheck source=actions/verified-download/verified-download.sh
         . "$GITHUB_ACTION_PATH/verified-download.sh"
         fetch_verified "$DOWNLOAD_URL" "$DOWNLOAD_SHA256" "$DOWNLOAD_MAX_BYTES" "$DOWNLOAD_TIMEOUT" "$DOWNLOAD_OUTPUT"

@@ -11,6 +11,7 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+import yaml
 from conftest import ROOT
 
 INSTALL_GITLEAKS_SH = ROOT / "actions/install-gitleaks/install-gitleaks.sh"
@@ -389,3 +390,68 @@ def test_install_gitleaks_version_mismatch_fails(tmp_path: Path) -> None:
     assert res.returncode == 1
     assert "gitleaks reports version 9.9.9, want 8.30.1" in res.stderr
     assert not (install_dir / "gitleaks").exists()
+
+
+# ---------------------------------------------------------------------------
+# verified-download action.yml run step
+# ---------------------------------------------------------------------------
+
+
+def run_download_step(
+    tmp_path: Path, bin_dir: Path, inputs: dict[str, str]
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run the action's composite step as the runner would and return its output file."""
+    action = yaml.safe_load(ACTION_VERIFIED_DOWNLOAD_YML.read_text(encoding="utf-8"))
+    step = action["runs"]["steps"][0]
+    out_file = tmp_path / "github_output"
+    out_file.write_text("", encoding="utf-8")
+    env = {
+        "GITHUB_ACTION_PATH": str(VERIFIED_DOWNLOAD_SH.parent),
+        "GITHUB_OUTPUT": str(out_file),
+        "DOWNLOAD_URL": inputs.get("url", ""),
+        "DOWNLOAD_SHA256": inputs.get("sha256", ""),
+        "DOWNLOAD_OUTPUT": inputs.get("output", ""),
+        "DOWNLOAD_MAX_BYTES": "1048576",
+        "DOWNLOAD_TIMEOUT": "60",
+        "FIXTURE_ARCHIVE": inputs.get("fixture", ""),
+    }
+    res = run_bash_cmd(["bash", "-eo", "pipefail", "-c", step["run"]], bin_dir, env_extra=env)
+    return res, out_file.read_text(encoding="utf-8")
+
+
+def test_action_lib_only_mode_skips_download(tmp_path: Path) -> None:
+    """With url, sha256 and output empty the step only reports the library path."""
+    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
+    res, outputs = run_download_step(tmp_path, bin_dir, {})
+    assert res.returncode == 0, res.stderr
+    assert outputs == f"lib={VERIFIED_DOWNLOAD_SH}\n"
+    assert not (logs_dir / "curl.log").exists()
+
+
+def test_action_partial_inputs_fail(tmp_path: Path) -> None:
+    """A url without sha256 and output is refused before any download."""
+    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
+    res, _ = run_download_step(tmp_path, bin_dir, {"url": "https://example.com/asset"})
+    assert res.returncode != 0
+    assert "set together or not at all" in res.stderr
+    assert not (logs_dir / "curl.log").exists()
+
+
+def test_action_full_inputs_download(tmp_path: Path) -> None:
+    """With all three inputs the step downloads and verifies the file."""
+    bin_dir, _, _ = setup_fake_environment(tmp_path)
+    fixture_file = tmp_path / "data.txt"
+    fixture_file.write_bytes(b"action payload\n")
+    output_file = tmp_path / "downloaded.txt"
+    res, _ = run_download_step(
+        tmp_path,
+        bin_dir,
+        {
+            "url": "https://example.com/asset",
+            "sha256": sha256_of(fixture_file),
+            "output": str(output_file),
+            "fixture": str(fixture_file),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    assert output_file.read_bytes() == fixture_file.read_bytes()

@@ -26,20 +26,20 @@
           "required": false
         },
         "output": {
-          "default": null,
-          "required": true
+          "default": "",
+          "required": false
         },
         "sha256": {
-          "default": null,
-          "required": true
+          "default": "",
+          "required": false
         },
         "timeout-seconds": {
           "default": "120",
           "required": false
         },
         "url": {
-          "default": null,
-          "required": true
+          "default": "",
+          "required": false
         }
       },
       "outputs": [
