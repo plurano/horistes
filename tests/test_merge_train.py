@@ -382,8 +382,16 @@ class Forge:
             or "enqueuePullRequest" in query
             or "enablePullRequestAutoMerge" in query
             or "createCommitOnBranch" in query
+            or "convertPullRequestToDraft" in query
+            or "markPullRequestReadyForReview" in query
         ):
             assert rights == WRITE, rights
+        if "convertPullRequestToDraft" in query:
+            self.write(full, ("draft", variables["id"]))
+            return {"data": {"convertPullRequestToDraft": {"pullRequest": {"isDraft": True}}}}
+        if "markPullRequestReadyForReview" in query:
+            self.write(full, ("ready", variables["id"]))
+            return {"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}}}
         if "enqueuePullRequest" in query:
             self.write(full, ("enqueue", variables["id"], variables["oid"]))
             entry = {"state": "QUEUED"} if self.merged else None
@@ -3382,3 +3390,93 @@ def test_security_pull_request_is_updated_before_an_older_armed_one(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert armed(2) in forge.writes and updated(2) in forge.writes, forge.writes
     assert updated(1) not in forge.writes, forge.writes
+
+
+HOLD = "merge-train: security hold"
+LINEAR = ("REQUIRED_SIGNATURES", "REQUIRED_LINEAR_HISTORY")
+
+
+def held_pair() -> tuple[dict, dict]:
+    """A dependency update armed and CLEAN, and a security fix one commit behind it."""
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps", autoMergeRequest={"enabledAt": OLD})
+    fix = pull(2, "BEHIND", headRefName="renovate/x-net", title="fix(deps): x/net [security]")
+    return update, fix
+
+
+def test_dependency_update_is_held_as_a_draft_while_a_security_update_is_open(tmp_path):
+    """Neither auto-merge nor the update bot merges a draft (decision record 0062)."""
+    forge = Forge(repository(*held_pair(), rules=LINEAR))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, HOLD), ("draft", "PR_1")], forge.writes
+    assert "held as a draft: security update #2 is open" in summary, summary
+
+
+def test_planted_hold_that_holds_nothing_lands_the_update_ahead_of_the_fix(tmp_path):
+    helper = module().replace("return fixes[0], hold, []", "return fixes[0], [], []")
+    forge = Forge(repository(*held_pair(), rules=LINEAR))
+    done, _ = train(tmp_path, forge, helper=helper)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert landed(1) in forge.writes, forge.writes
+    assert ("draft", "PR_1") not in forge.writes, forge.writes
+
+
+def test_held_update_is_released_when_no_security_update_is_open(tmp_path):
+    held = pull(1, "CLEAN", headRefName="renovate/go-snaps", isDraft=True, labels=(HOLD,))
+    forge = Forge(repository(held))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("ready", "PR_1"), ("unlabel", 1, HOLD)], forge.writes
+    assert "released from the security hold" in summary, summary
+
+
+def test_held_update_a_person_marked_ready_is_not_held_again(tmp_path):
+    ready = pull(1, "BLOCKED", headRefName="renovate/go-snaps", labels=(HOLD,))
+    fix = pull(2, "BEHIND", headRefName="renovate/x-net", labels=("security",))
+    forge = Forge(repository(ready, fix, rules=LINEAR))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not [w for w in forge.writes if w[0] in ("label", "draft", "unlabel")], forge.writes
+
+
+def test_release_of_an_update_already_ready_only_removes_the_label(tmp_path):
+    ready = pull(1, "BLOCKED", headRefName="renovate/go-snaps", labels=(HOLD,))
+    forge = Forge(repository(ready))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("unlabel", 1, HOLD)], forge.writes
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        {"headRefName": "feat/change-1"},
+        {"headRefName": "renovate/go-snaps", "isDraft": True},
+        {"headRefName": "renovate/go-snaps", "isCrossRepository": True},
+        {"headRefName": "renovate/go-snaps", "baseRefName": "next"},
+        {"headRefName": "renovate/y-crypto", "labels": ("security",)},
+    ],
+    ids=["person", "draft", "fork", "other-base", "security"],
+)
+def test_security_hold_leaves_other_pull_requests_alone(tmp_path, other):
+    fix = pull(2, "BEHIND", headRefName="renovate/x-net", labels=("security",))
+    forge = Forge(repository(pull(1, "BLOCKED", **other), fix, rules=LINEAR))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not [w for w in forge.writes if w[0] in ("label", "draft")], forge.writes
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        {"isDraft": True, "labels": ("security",)},
+        {"labels": ("security", "hold")},
+    ],
+    ids=["draft-fix", "held-fix"],
+)
+def test_a_security_update_the_train_does_not_serve_holds_nothing(tmp_path, fix):
+    update = pull(1, "BLOCKED", headRefName="renovate/go-snaps")
+    forge = Forge(repository(update, pull(2, "BEHIND", headRefName="renovate/x-net", **fix)))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not [w for w in forge.writes if w[0] in ("label", "draft")], forge.writes

@@ -43,6 +43,13 @@
 #   write per run goes to the dependency update whose head has waited longest,
 #   so an update re-pushed on every default-branch push cannot keep the write
 #   from one never served (decision record 0060).
+# - Security hold: while a security update the train serves is open, every
+#   other dependency update to the default branch is turned into a draft and
+#   labelled "merge-train: security hold", so neither the forge's auto-merge
+#   nor the update bot's own merge moves the default branch ahead of the fix.
+#   Once no such security update is open, the train marks the held pull
+#   requests ready again and removes the label. A held pull request a person
+#   marks ready keeps the label and is not held again (decision record 0062).
 # - After that write, it closes the open issues that the pull requests it
 #   merged in the last 7 days name as closed (`Closes #N` and the forge's
 #   other closing forms): the forge leaves them open when the app merges, and
@@ -212,6 +219,7 @@ jobs:
           SUPERSEDED_BY = re.compile(r"\bsuperseded\s+by\s+#\d+", re.I)
           DRAFT_STEP = "Stop on a draft pull request"
           REFRESH_LABEL = "merge-train: refresh"
+          SECURITY_HOLD_LABEL = "merge-train: security hold"
           RELEASE_HEAD = "release-please--"
           RELEASE_LABEL = "autorelease:"
           REFRESH_LIMIT = 3
@@ -272,6 +280,40 @@ jobs:
               The sort is stable, so within each group the query's oldest-first order stays.
               """
               return sorted(rows, key=lambda row: not is_security(row[0], conf))
+
+
+          def label_names(pull):
+              """The names of a pull request's labels."""
+              return frozenset(label["name"] for label in pull["labels"]["nodes"])
+
+
+          def security_hold(rows, default_branch, conf):
+              """(open security update or None, pull requests to hold, pull requests to release).
+
+              While the train serves a security update, a dependency update merged by the
+              forge's auto-merge or the update bot moves the default branch and leaves the
+              fix behind (decision record 0062). A draft cannot be merged by either.
+              """
+              served = ("land", "behind", "red")
+              fixes = [
+                  pull
+                  for pull, reason in rows
+                  if is_security(pull, conf) and (reason in served or reason.startswith("merge state"))
+              ]
+              marked = [pull for pull, _ in rows if SECURITY_HOLD_LABEL in label_names(pull)]
+              if not fixes:
+                  return None, [], marked
+              hold = [
+                  pull
+                  for pull, _ in rows
+                  if pull["headRefName"].startswith(conf["dependency"])
+                  and not is_security(pull, conf)
+                  and not pull["isDraft"]
+                  and not pull["isCrossRepository"]
+                  and pull["baseRefName"] == default_branch
+                  and SECURITY_HOLD_LABEL not in label_names(pull)
+              ]
+              return fixes[0], hold, []
 
 
           def too_young(pull, labels, conf, now):
@@ -618,6 +660,20 @@ jobs:
                       commitHeadline: $headline, commitBody: $body}
             ) {
               pullRequest { autoMergeRequest { enabledAt } }
+            }
+          }
+          """
+          DRAFT = """
+          mutation($id: ID!) {
+            convertPullRequestToDraft(input: {pullRequestId: $id}) {
+              pullRequest { isDraft }
+            }
+          }
+          """
+          READY = """
+          mutation($id: ID!) {
+            markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+              pullRequest { isDraft }
             }
           }
           """
