@@ -68,3 +68,4 @@ record that supersedes it.
 | [0058](0058-shared-installer-actions.md) | 2026-10-27 | Shared installer actions | Accepted |
 | [0059](0059-the-merge-train-skips-an-installation-without-its-rights.md) | 2026-10-27 | The merge train skips an installation that has not accepted its rights | Accepted |
 | [0060](0060-the-merge-train-serves-security-updates-first.md) | 2026-10-28 | The merge train serves security updates first | Accepted |
+| [0061](0061-a-vulnerability-fix-is-rebased-when-behind.md) | 2026-10-28 | A vulnerability fix is rebased when it falls behind | Accepted |

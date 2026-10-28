@@ -89,7 +89,11 @@ FORKS = (
 # A fix of a known vulnerability waits for no release age (ADR-0050) and carries
 # the label the merge train serves first (ADR-0060); the block holds nothing else.
 SECURITY_LABEL = "security"
-VULNERABILITY = {"minimumReleaseAge": None, "addLabels": [SECURITY_LABEL]}
+# Renovate's default (`auto`) rebases only a conflicted branch unless it automerges
+# or reads a required up-to-date branch; a linear-history ruleset is neither, and the
+# train never updates there (ADR-0044), so the fix would wait for a person.
+REBASE = "behind-base-branch"
+VULNERABILITY = {"minimumReleaseAge": None, "addLabels": [SECURITY_LABEL], "rebaseWhen": REBASE}
 # Renovate 44 runs `go mod tidy` after a gomod update only with this option
 # (lib/modules/manager/gomod/artifacts.ts); without it a go.sum misses the hash
 # of a newly needed module.
@@ -188,6 +192,12 @@ def unlabelled_vulnerability_fix(preset: dict) -> list[str]:
     """What keeps a fix of a known vulnerability from carrying the security label."""
     labels = preset.get("vulnerabilityAlerts", {}).get("addLabels", [])
     return [] if SECURITY_LABEL in labels else ["vulnerabilityAlerts.addLabels"]
+
+
+def stale_vulnerability_fix(preset: dict) -> list[str]:
+    """What leaves a fix of a known vulnerability behind its base branch."""
+    rebase = preset.get("vulnerabilityAlerts", {}).get("rebaseWhen")
+    return [] if rebase == REBASE else ["vulnerabilityAlerts.rebaseWhen"]
 
 
 def untidy_go_update(preset: dict) -> list[str]:
@@ -365,6 +375,19 @@ def test_a_vulnerability_fix_carries_the_security_label():
 def test_planted_vulnerability_fix_without_the_security_label_is_refused(alerts):
     preset = {**PRESET, "vulnerabilityAlerts": alerts}
     assert unlabelled_vulnerability_fix(preset) == ["vulnerabilityAlerts.addLabels"]
+
+
+def test_a_vulnerability_fix_is_rebased_when_behind():
+    assert stale_vulnerability_fix(PRESET) == []
+
+
+@pytest.mark.parametrize("rebase", [None, "auto", "conflicted"], ids=["unset", "auto", "conflict"])
+def test_planted_vulnerability_fix_left_behind_is_refused(rebase):
+    alerts = {k: v for k, v in PRESET["vulnerabilityAlerts"].items() if k != "rebaseWhen"}
+    if rebase:
+        alerts["rebaseWhen"] = rebase
+    preset = {**PRESET, "vulnerabilityAlerts": alerts}
+    assert stale_vulnerability_fix(preset) == ["vulnerabilityAlerts.rebaseWhen"]
 
 
 def test_planted_preset_without_the_vulnerability_keys_is_refused():
