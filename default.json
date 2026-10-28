@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release except for a fix of a known vulnerability, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, go mod tidy after a Go module update, and no proposal for the machine a job runs on; own releases of the family's organisations wait for no release age; forks of outside projects keep three days."
+    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release except for a fix of a known vulnerability, which carries the label security for the merge train, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, go mod tidy after a Go module update, and no proposal for the machine a job runs on; own releases of the family's organisations wait for no release age; forks of outside projects keep three days."
   ],
   "extends": [
     "config:recommended",
@@ -10,7 +10,10 @@
   "minimumReleaseAge": "3 days",
   "osvVulnerabilityAlerts": true,
   "vulnerabilityAlerts": {
-    "minimumReleaseAge": null
+    "minimumReleaseAge": null,
+    "addLabels": [
+      "security"
+    ]
   },
   "automerge": false,
   "gitIgnoredAuthors": [

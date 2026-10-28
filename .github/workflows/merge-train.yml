@@ -38,7 +38,7 @@
 #   request's own non-merge commits and their sign-offs (decision record 0037),
 #   without Co-authored-by trailers.
 # - Order: a security update (a label in `security_labels`, or "[SECURITY]"
-#   in the title as Renovate writes it) goes before every other pull request
+#   in the title in any letter case, as Renovate writes it) goes before every other pull request
 #   in each of these steps, then the oldest first. The one generated-files
 #   write per run goes to the dependency update whose head has waited longest,
 #   so an update re-pushed on every default-branch push cannot keep the write
@@ -58,7 +58,8 @@
 # person's act), dependency updates younger than `min_age_days` (3 days,
 # the fleet's minimum age: age counts from the pull request's opening; a
 # rebase or a new version pushed onto an open update does not restart it;
-# a security label or "[SECURITY]" in the title skips the wait), and
+# a security label or "[SECURITY]" in the title, in any letter case, skips
+# the wait), and
 # archived repositories. A repository leaves the train when the app is
 # uninstalled from it.
 #
@@ -253,9 +254,9 @@ jobs:
 
 
           def is_security(pull, conf):
-              """A security update: a security label, or "[SECURITY]" in the title as Renovate writes it."""
+              """A security update: a security label, or "[SECURITY]" in the title in any letter case."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
-              return bool(labels & conf["security"]) or "[SECURITY]" in pull["title"]
+              return bool(labels & conf["security"]) or "[security]" in pull["title"].casefold()
 
 
           def head_since(pull):
