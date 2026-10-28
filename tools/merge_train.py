@@ -35,9 +35,11 @@ from train_rules import (
     REFRESH_LABEL,
     check_release_off,
     check_release_parallel,
+    head_since,
     in_flight,
     issues_to_close,
     refresh,
+    serving_order,
     squash_message,
     superseded,
     updatable,
@@ -297,7 +299,7 @@ def update(env, pull):
 
 def advance(env, conf, repo, rows, notes):
     """Update the first pull request `updatable` names, arming it first where it says."""
-    for pull, arming in updatable(repo, rows, notes):
+    for pull, arming in updatable(repo, rows, notes, conf):
         if arming:
             arm(env, conf, pull)
             notes[pull["number"]] = "armed, updated from the default branch"
@@ -570,12 +572,18 @@ def is_candidate(pull, reason, default_branch, conf):
 
 
 def regenerate(env, conf, repo, rows, notes):
-    """Commit regenerated files for the oldest candidate dependency update, or None."""
+    """Commit regenerated files for one candidate dependency update, or None.
+
+    Security updates go first, then the head that has waited longest: a head the
+    update tool or the train pushed since is served after one never served.
+    """
     if repo["defaultBranchRef"] is None:
         # An empty repository has no default branch and no pull requests.
         return None
     default_branch = repo["defaultBranchRef"]["name"]
     candidates = [pull for pull, reason in rows if is_candidate(pull, reason, default_branch, conf)]
+    candidates.sort(key=head_since)
+    candidates = [pull for pull, _ in serving_order([(pull, None) for pull in candidates], conf)]
     if not candidates:
         return None
     allowlist = allowlist_paths(env, default_branch)
@@ -607,22 +615,23 @@ def run(env, conf, repo, now):
     notes = {pull["number"]: reason for pull, reason in rows}
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
-    outcome = regenerate(env, conf, repo, rows, notes)
+    served = serving_order(rows, conf)
+    outcome = regenerate(env, conf, repo, served, notes)
     if outcome:
         return rows, notes, outcome
-    for pull, reason in rows:
+    for pull, reason in served:
         if reason == "land":
             done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
             return rows, notes, f"{done} #{pull['number']}"
-    holding = [pull["number"] for pull, reason in rows if in_flight(pull, reason)]
+    holding = [pull["number"] for pull, reason in served if in_flight(pull, reason)]
     if holding:
         return rows, notes, f"#{holding[0]} is armed and in flight"
     outcome = refresh(
-        rows, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull)
+        served, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull)
     )
     if outcome:
         return rows, notes, outcome
-    advance(env, conf, repo, rows, notes)
+    advance(env, conf, repo, served, notes)
     return rows, notes, "no pull request at a mergeable state"
 
 

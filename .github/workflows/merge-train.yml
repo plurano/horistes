@@ -37,6 +37,12 @@
 # - When squashing, the train writes the squash commit message from the pull
 #   request's own non-merge commits and their sign-offs (decision record 0037),
 #   without Co-authored-by trailers.
+# - Order: a security update (a label in `security_labels`, or "[SECURITY]"
+#   in the title as Renovate writes it) goes before every other pull request
+#   in each of these steps, then the oldest first. The one generated-files
+#   write per run goes to the dependency update whose head has waited longest,
+#   so an update re-pushed on every default-branch push cannot keep the write
+#   from one never served (decision record 0060).
 # - After that write, it closes the open issues that the pull requests it
 #   merged in the last 7 days name as closed (`Closes #N` and the forge's
 #   other closing forms): the forge leaves them open when the app merges, and
@@ -246,6 +252,27 @@ jobs:
               return any(suite["conclusion"] in RED for suite in newest_suites(suites).values())
 
 
+          def is_security(pull, conf):
+              """A security update: a security label, or "[SECURITY]" in the title as Renovate writes it."""
+              labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
+              return bool(labels & conf["security"]) or "[SECURITY]" in pull["title"]
+
+
+          def head_since(pull):
+              """When the head commit was made, or the pull request's opening where the query has none."""
+              nodes = pull["latest"]["nodes"]
+              when = nodes[-1]["commit"].get("committedDate") if nodes else None
+              return datetime.fromisoformat(when or pull["createdAt"])
+
+
+          def serving_order(rows, conf):
+              """Rows in the order the train serves them: security updates first, then oldest first.
+
+              The sort is stable, so within each group the query's oldest-first order stays.
+              """
+              return sorted(rows, key=lambda row: not is_security(row[0], conf))
+
+
           def too_young(pull, labels, conf, now):
               """Why a dependency update waits for its minimum age, or None.
 
@@ -254,7 +281,7 @@ jobs:
               """
               if not pull["headRefName"].startswith(conf["dependency"]):
                   return None
-              if labels & conf["security"] or "[SECURITY]" in pull["title"]:
+              if is_security(pull, conf):
                   return None
               created = datetime.fromisoformat(pull["createdAt"])
               if now - created < conf["min_age"]:
@@ -313,10 +340,11 @@ jobs:
               return any(rule["type"] == "REQUIRED_LINEAR_HISTORY" for rule in rules["nodes"])
 
 
-          def updatable(repo, rows, notes):
+          def updatable(repo, rows, notes, conf):
               """BEHIND pull requests the train may update, armed ones first, each with whether to arm it.
 
-              An armed pull request goes first: it already waits for the forge to merge it.
+              A security update goes before every other; within each group an armed pull
+              request goes first: it already waits for the forge to merge it.
               Only an armed pull request is updated, and none where the default branch
               demands linear history (decision record 0044); `notes` says why one is skipped.
               """
@@ -325,7 +353,7 @@ jobs:
                   for pull in behind:
                       notes[pull["number"]] = "behind: linear history, a person rebases"
                   return []
-              behind.sort(key=lambda pull: not pull["autoMergeRequest"])
+              behind.sort(key=lambda pull: (not is_security(pull, conf), not pull["autoMergeRequest"]))
               picked = []
               for pull in behind:
                   if pull["autoMergeRequest"] or repo["autoMergeAllowed"]:
@@ -509,6 +537,7 @@ jobs:
                   latest: commits(last: 1) {
                     nodes {
                       commit {
+                        committedDate
                         checkSuites(first: 30) {
                           nodes {
                             databaseId

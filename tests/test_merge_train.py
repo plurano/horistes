@@ -3053,7 +3053,7 @@ STOPPED = [
 ]
 REFRESH_CALL = (
     "outcome = refresh(\n"
-    "        rows, notes, lambda run: run_jobs(env, run),"
+    "        served, notes, lambda run: run_jobs(env, run),"
     " lambda pull: toggle_refresh(env, pull)\n"
     "    )"
 )
@@ -3289,3 +3289,79 @@ def test_without_the_release_check_the_sweep_updates_it(tmp_path, fields):
     done, _ = train(tmp_path, forge, helper=mutant, person_branches="")
     assert done.returncode == 0, done.stdout + done.stderr
     assert updated(1) in forge.writes
+
+
+def head_at(node: dict, when: str) -> dict:
+    """The pull request with its head commit committed at `when`."""
+    node["latest"]["nodes"][0]["commit"]["committedDate"] = when
+    return node
+
+
+def regenerable(forge: Forge, *nodes: dict) -> None:
+    """A changed generated file in an artifact of each pull request's head."""
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    for node in nodes:
+        head = node["headRefOid"]
+        forge.add_artifact(
+            "fleet/app",
+            100 + node["number"],
+            f"regenerated-{head}",
+            make_artifact_zip(head, {"notices.txt": b"licenses"}),
+            head_sha=head,
+            head_branch=node["headRefName"],
+            workflow_run_id=400 + node["number"],
+            html_url=f"https://github.com/fleet/app/actions/runs/{400 + node['number']}",
+        )
+
+
+def test_security_update_gets_the_generated_files_write_before_an_older_digest(tmp_path):
+    # Golusoris, 2026-10-28: a digest update re-pushed on every main push took every write.
+    digest = head_at(pull(1, "BEHIND", headRefName="renovate/self-digest"), YOUNG)
+    fix = head_at(
+        pull(2, "BEHIND", headRefName="renovate/x-net", labels=("security",), createdAt=YOUNG),
+        OLD,
+    )
+    forge = Forge(repository(digest, fix))
+    regenerable(forge, digest, fix)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert [w[1] for w in forge.writes if w[0] == "commit"] == ["renovate/x-net"]
+    assert "### fleet/app: committed generated files to #2" in summary
+
+
+def test_security_title_counts_like_the_label_for_the_generated_files_write(tmp_path):
+    digest = pull(1, "BEHIND", headRefName="renovate/self-digest")
+    fix = pull(2, "BEHIND", headRefName="renovate/x-net", title="fix(deps): x/net [SECURITY]")
+    forge = Forge(repository(digest, fix))
+    regenerable(forge, digest, fix)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "### fleet/app: committed generated files to #2" in summary
+
+
+def test_generated_files_write_serves_the_longest_waiting_head_first(tmp_path):
+    # The older update's head moved last: the newer one has waited longer and goes first.
+    moved = head_at(pull(1, "BEHIND", headRefName="renovate/self-digest"), YOUNG)
+    waiting = head_at(pull(2, "BEHIND", headRefName="renovate/other-dep"), OLD)
+    forge = Forge(repository(moved, waiting))
+    regenerable(forge, moved, waiting)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "### fleet/app: committed generated files to #2" in summary
+
+
+def test_security_pull_request_lands_before_an_older_clean_one(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN"), pull(2, "CLEAN", labels=("security",))))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes[0] == landed(2), forge.writes
+
+
+def test_security_pull_request_is_updated_before_an_older_armed_one(tmp_path):
+    older = pull(1, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    fix = pull(2, "BEHIND", labels=("security",))
+    forge = Forge(repository(older, fix))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert armed(2) in forge.writes and updated(2) in forge.writes, forge.writes
+    assert updated(1) not in forge.writes, forge.writes
