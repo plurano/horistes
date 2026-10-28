@@ -28,17 +28,21 @@ from train_rules import (
     ARM,
     COMMIT_MUTATION,
     COMMITS,
+    DRAFT,
     ENQUEUE,
     MERGE,
     MERGED,
     QUERY,
+    READY,
     REFRESH_LABEL,
+    SECURITY_HOLD_LABEL,
     check_release_off,
     check_release_parallel,
     head_since,
     in_flight,
     issues_to_close,
     refresh,
+    security_hold,
     serving_order,
     squash_message,
     superseded,
@@ -330,6 +334,33 @@ def toggle_refresh(env, pull):
             raise
 
 
+def hold_for_security(env, repo, rows, notes, conf):
+    """Turn dependency updates into drafts while a security update is open; release them after.
+
+    Returns the numbers held in this run: the rest of the run leaves them alone.
+    """
+    if repo["defaultBranchRef"] is None:
+        return frozenset()
+    fix, hold, release = security_hold(rows, repo["defaultBranchRef"]["name"], conf)
+    api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
+    for pull in hold:
+        url = f"{api}/issues/{pull['number']}/labels"
+        call(url, env["TRAIN_TOKEN"], "POST", {"labels": [SECURITY_HOLD_LABEL]})
+        graphql(env, DRAFT, {"id": pull["id"]})
+        notes[pull["number"]] = f"held as a draft: security update #{fix['number']} is open"
+    for pull in release:
+        if pull["isDraft"]:
+            graphql(env, READY, {"id": pull["id"]})
+        name = urllib.parse.quote(SECURITY_HOLD_LABEL, safe="")
+        try:
+            call(f"{api}/issues/{pull['number']}/labels/{name}", env["TRAIN_TOKEN"], "DELETE")
+        except RefusedError as err:
+            if "HTTP 404" not in str(err):
+                raise
+        notes[pull["number"]] = "released from the security hold"
+    return frozenset(pull["number"] for pull in hold)
+
+
 def bot_identity(env, conf, token):
     """The app's bot login and numeric id; the user lookup carries an installation token.
 
@@ -616,6 +647,11 @@ def run(env, conf, repo, now):
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
     served = serving_order(rows, conf)
+    held = hold_for_security(env, repo, served, notes, conf)
+    served = [
+        (pull, f"labelled {SECURITY_HOLD_LABEL}" if pull["number"] in held else reason)
+        for pull, reason in served
+    ]
     outcome = regenerate(env, conf, repo, served, notes)
     if outcome:
         return rows, notes, outcome
@@ -775,7 +811,7 @@ def one(env, conf, installation, target, now):
     finally:
         revoke(env, token)
     moved = any(
-        note.startswith(("armed", "updated", "queued", "refreshed"))
+        note.startswith(("armed", "updated", "queued", "refreshed", "held", "released"))
         or note == "generated files committed"
         for note in notes.values()
     )
