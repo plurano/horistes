@@ -554,7 +554,10 @@ and reports to the forge's code scanning ([ADR-0043](docs/adr/0043-codeql-report
 | the machine a job runs on | not proposed |
 
 A fix of a known vulnerability skips the waiting time
-([ADR-0050](docs/adr/0050-a-vulnerability-fix-skips-the-waiting-time.md)).
+([ADR-0050](docs/adr/0050-a-vulnerability-fix-skips-the-waiting-time.md)) and is
+rebased as soon as it falls behind its base branch, so it also lands where the
+default branch demands linear history
+([ADR-0061](docs/adr/0061-a-vulnerability-fix-is-rebased-when-behind.md)).
 Renovate learns of the vulnerability from the OSV database
 (`osvVulnerabilityAlerts`) and, where the repository has Dependabot alerts on,
 from the forge (`vulnerabilityAlerts`). For the Go standard library it reads the
