@@ -1089,8 +1089,9 @@ def test_accepted_state_lands_only_when_declared(tmp_path):
         (OLD, {}, True),
         (YOUNG, {"labels": ("security",)}, True),
         (YOUNG, {"title": "fix(deps): update x [SECURITY]"}, True),
+        (YOUNG, {"title": "fix(deps): update x to v0.62.0 [security]"}, True),
     ],
-    ids=["young", "old", "label", "title"],
+    ids=["young", "old", "label", "title", "title-lowercase"],
 )
 def test_dependency_update_waits_for_the_minimum_age(tmp_path, created, fields, lands):
     update = pull(1, "CLEAN", headRefName="renovate/tool-1.x", createdAt=created, **fields)
@@ -3353,6 +3354,22 @@ def test_generated_files_write_serves_the_longest_waiting_head_first(tmp_path):
 def test_security_pull_request_lands_before_an_older_clean_one(tmp_path):
     forge = Forge(repository(pull(1, "CLEAN"), pull(2, "CLEAN", labels=("security",))))
     done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes[0] == landed(2), forge.writes
+
+
+def test_lowercase_security_title_lands_young_before_an_older_clean_one(tmp_path):
+    # The golusoris x/net update: Renovate lowercases the marker, no label.
+    older = pull(1, "CLEAN")
+    fix = pull(
+        2,
+        "CLEAN",
+        headRefName="renovate/x-net",
+        createdAt=YOUNG,
+        title="fix(deps): x/net [security]",
+    )
+    forge = Forge(repository(older, fix))
+    done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes[0] == landed(2), forge.writes
 

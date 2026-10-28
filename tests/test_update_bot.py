@@ -86,9 +86,10 @@ FORKS = (
     "lusoris/paperclip-aperture",
     "VMAFx/netflix-vmaf-contributions",
 )
-# A fix of a known vulnerability waits for no release age, and the block that
-# says so holds nothing else (ADR-0050).
-VULNERABILITY = {"minimumReleaseAge": None}
+# A fix of a known vulnerability waits for no release age (ADR-0050) and carries
+# the label the merge train serves first (ADR-0060); the block holds nothing else.
+SECURITY_LABEL = "security"
+VULNERABILITY = {"minimumReleaseAge": None, "addLabels": [SECURITY_LABEL]}
 # Renovate 44 runs `go mod tidy` after a gomod update only with this option
 # (lib/modules/manager/gomod/artifacts.ts); without it a go.sum misses the hash
 # of a newly needed module.
@@ -181,6 +182,12 @@ def held_vulnerability_fix(preset: dict) -> list[str]:
     if "minimumReleaseAge" not in alerts or alerts["minimumReleaseAge"] is not None:
         out.append("vulnerabilityAlerts.minimumReleaseAge")
     return out
+
+
+def unlabelled_vulnerability_fix(preset: dict) -> list[str]:
+    """What keeps a fix of a known vulnerability from carrying the security label."""
+    labels = preset.get("vulnerabilityAlerts", {}).get("addLabels", [])
+    return [] if SECURITY_LABEL in labels else ["vulnerabilityAlerts.addLabels"]
 
 
 def untidy_go_update(preset: dict) -> list[str]:
@@ -344,6 +351,20 @@ def test_a_vulnerability_fix_skips_the_waiting_time():
 )
 def test_planted_vulnerability_fix_held_by_the_waiting_time_is_refused(change, held):
     assert held_vulnerability_fix({**PRESET, **change}) == held
+
+
+def test_a_vulnerability_fix_carries_the_security_label():
+    assert unlabelled_vulnerability_fix(PRESET) == []
+
+
+@pytest.mark.parametrize(
+    "alerts",
+    [{"minimumReleaseAge": None}, {"minimumReleaseAge": None, "addLabels": ["dependencies"]}],
+    ids=["no-labels", "other-label"],
+)
+def test_planted_vulnerability_fix_without_the_security_label_is_refused(alerts):
+    preset = {**PRESET, "vulnerabilityAlerts": alerts}
+    assert unlabelled_vulnerability_fix(preset) == ["vulnerabilityAlerts.addLabels"]
 
 
 def test_planted_preset_without_the_vulnerability_keys_is_refused():

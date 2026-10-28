@@ -27,8 +27,16 @@ places:
 ## Decision
 
 - `is_security` in the train rules decides a security update: a label in
-  `security_labels`, or "[SECURITY]" in the title. The minimum-age skip uses the same
-  test.
+  `security_labels`, or "[SECURITY]" in the title in any letter case (a repository's
+  Renovate setting can write it in lower case). The minimum-age skip uses the same test.
+- The shared Renovate preset (`default.json`) adds the label `security` to every fix
+  of a known vulnerability (`vulnerabilityAlerts.addLabels`; `addLabels` appends, so a
+  repository's own labels stay). Renovate lowercases the title of a semantic commit
+  (`commitMessageLowerCase: auto`), which turns its "[SECURITY]" suffix into
+  "[security]"; the label does not depend on that setting.
+- Every decision on a security update goes through `is_security`: the minimum-age
+  skip, `serving_order` (landing, the in-flight hold, the refresh), `updatable` and
+  the generated-files write.
 - `serving_order` puts security updates first and keeps the oldest-first order within
   each group. Landing, the in-flight hold, the refresh and the update read the rows in
   that order; the job summary keeps the query's order.
@@ -51,3 +59,6 @@ plants the golusoris case; with the old order the digest update gets the write.
 `test_security_pull_request_lands_before_an_older_clean_one` and
 `test_security_pull_request_is_updated_before_an_older_armed_one` cover the other
 paths; all five fail without the change.
+`test_lowercase_security_title_lands_young_before_an_older_clean_one` and the
+`title-lowercase` case of the minimum-age test plant the lower-case marker without a
+label; `test_a_vulnerability_fix_carries_the_security_label` holds the preset label.
