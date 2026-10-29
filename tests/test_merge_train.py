@@ -2827,6 +2827,46 @@ def test_pull_without_sign_off_is_refused_before_any_write(tmp_path, state):
     assert "fleet/app: #1: no Signed-off-by on its commits" in summary
 
 
+@pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
+def test_unsigned_dependency_update_is_skipped_and_the_run_stays_green(tmp_path, state):
+    forge = Forge(repository(pull(1, state, headRefName="renovate/configure")))
+    forge.commits[1] = [("chore: configure renovate", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        f"| #1 | {state} | skipped: dependency update without Signed-off-by, a person lands it |"
+        in summary
+    )
+
+
+def test_after_an_unsigned_dependency_update_the_next_clean_pull_lands(tmp_path):
+    forge = Forge(
+        repository(
+            pull(1, "CLEAN", headRefName="renovate/configure"),
+            pull(2, "CLEAN"),
+        )
+    )
+    forge.commits[1] = [("chore: configure renovate", 1)]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+
+
+def test_without_the_bot_skip_the_unsigned_update_fails_the_run(tmp_path):
+    """The planted case: without the skip, an unsigned bot update fails the run."""
+    flow = script().replace(
+        'if pull["headRefName"].startswith(conf["dependency"]):',
+        "if False:",
+    )
+    assert flow != script(), "the dependency skip condition is where the test expects it"
+    forge = Forge(repository(pull(1, "CLEAN", headRefName="renovate/configure")))
+    forge.commits[1] = [("chore: configure renovate", 1)]
+    done, summary = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "no Signed-off-by on its commits" in summary + done.stdout
+
+
 def test_pull_with_more_than_100_commits_is_refused(tmp_path):
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.commit_counts[1] = 101
