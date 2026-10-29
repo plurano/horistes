@@ -377,14 +377,16 @@ class Forge:
 
     def graphql(self, header: str, query: str, variables: dict) -> dict:
         full, rights = self.repo_of(header)
-        if (
-            "mergePullRequest" in query
-            or "enqueuePullRequest" in query
-            or "enablePullRequestAutoMerge" in query
-            or "createCommitOnBranch" in query
-            or "convertPullRequestToDraft" in query
-            or "markPullRequestReadyForReview" in query
-        ):
+        mutations = (
+            "mergePullRequest",
+            "enqueuePullRequest",
+            "enablePullRequestAutoMerge",
+            "disablePullRequestAutoMerge",
+            "createCommitOnBranch",
+            "convertPullRequestToDraft",
+            "markPullRequestReadyForReview",
+        )
+        if any(name in query for name in mutations):
             assert rights == WRITE, rights
         if "convertPullRequestToDraft" in query:
             self.write(full, ("draft", variables["id"]))
@@ -392,6 +394,11 @@ class Forge:
         if "markPullRequestReadyForReview" in query:
             self.write(full, ("ready", variables["id"]))
             return {"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}}}
+        if "disablePullRequestAutoMerge" in query:
+            self.write(full, ("disarm", variables["id"]))
+            return {
+                "data": {"disablePullRequestAutoMerge": {"pullRequest": {"autoMergeRequest": None}}}
+            }
         if "enqueuePullRequest" in query:
             self.write(full, ("enqueue", variables["id"], variables["oid"]))
             entry = {"state": "QUEUED"} if self.merged else None
@@ -792,6 +799,10 @@ def landed(number: int) -> tuple:
 
 def armed(number: int) -> tuple:
     return ("arm", f"PR_{number}", f"{number:040x}", "SQUASH")
+
+
+def disarmed(number: int) -> tuple:
+    return ("disarm", f"PR_{number}")
 
 
 def queued(number: int) -> tuple:
@@ -3480,3 +3491,129 @@ def test_a_security_update_the_train_does_not_serve_holds_nothing(tmp_path, fix)
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert not [w for w in forge.writes if w[0] in ("label", "draft")], forge.writes
+
+
+def armed_squash(headline: str = "old title (#1)", method: str = "SQUASH") -> dict:
+    return {"enabledAt": OLD, "commitHeadline": headline, "mergeMethod": method}
+
+
+def test_retitled_armed_pull_request_is_re_armed_with_new_headline(tmp_path):
+    """An armed pull request retitled after arming is disarmed and armed again (ADR-0064)."""
+    retitled = pull(
+        1,
+        "BLOCKED",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1), armed(1)], forge.writes
+    assert forge.messages == [
+        (
+            "arm",
+            "PR_1",
+            "chore(deps): update tool to v2 (#1)",
+            "body 1\n\nSigned-off-by: Dev <dev@example.org>",
+        )
+    ]
+    assert "### fleet/app: re-armed #1" in summary, summary
+    assert "| #1 | BLOCKED | re-armed: title changed after arming |" in summary, summary
+
+
+def test_planted_drifted_that_never_fires_leaves_stale_headline_armed(tmp_path):
+    helper = module().replace(
+        "return armed.get(\"commitHeadline\") != f\"{pull['title']} (#{pull['number']})\"",
+        "return False",
+    )
+    assert helper != module()
+    retitled = pull(
+        1,
+        "BLOCKED",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    done, _ = train(tmp_path, forge, helper=helper)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [], forge.writes
+    assert forge.messages == [], forge.messages
+
+
+def test_armed_pull_request_with_matching_headline_is_not_re_armed(tmp_path):
+    matching = pull(
+        1,
+        "BLOCKED",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v2 (#1)"),
+    )
+    forge = Forge(repository(matching))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [], forge.writes
+    assert forge.messages == [], forge.messages
+    assert "#1 is armed and in flight" in summary, summary
+
+
+def test_merge_method_merge_does_not_re_arm_retitled_pull_request(tmp_path):
+    retitled = pull(
+        1,
+        "BLOCKED",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    done, _ = train(tmp_path, forge, merge_method="merge")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [], forge.writes
+    assert forge.messages == [], forge.messages
+
+
+def test_switched_off_does_not_re_arm_retitled_pull_request(tmp_path):
+    retitled = pull(
+        1,
+        "BLOCKED",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    done, summary = train(tmp_path, forge, switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [], forge.writes
+    assert forge.messages == [], forge.messages
+    assert "switched off" in summary, summary
+
+
+def test_retitled_armed_pull_request_held_for_security_is_not_re_armed(tmp_path):
+    """A retitled update held as a draft for security is not disarmed and re-armed (ADR-0064)."""
+    update = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/go-snaps",
+        title="chore(deps): update go-snaps to v2",
+        autoMergeRequest=armed_squash("chore(deps): update go-snaps to v1 (#1)"),
+    )
+    fix = pull(2, "BEHIND", headRefName="renovate/x-net", title="fix(deps): x/net [security]")
+    forge = Forge(repository(update, fix, rules=LINEAR))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert ("label", 1, HOLD) in forge.writes and ("draft", "PR_1") in forge.writes, forge.writes
+    assert disarmed(1) not in forge.writes and armed(1) not in forge.writes, forge.writes
+    assert "held as a draft: security update #2 is open" in summary, summary
+
+
+@pytest.mark.parametrize(
+    ("conf_method", "auto_merge", "expected"),
+    [
+        ("SQUASH", armed_squash("old (#1)", "SQUASH"), True),
+        ("SQUASH", armed_squash("change 1 (#1)", "SQUASH"), False),
+        ("MERGE", armed_squash("old (#1)", "SQUASH"), False),
+        ("SQUASH", armed_squash("old (#1)", "MERGE"), False),
+        ("SQUASH", None, False),
+    ],
+    ids=["drifted", "matching", "conf-merge", "armed-merge", "unarmed"],
+)
+def test_drifted_rule(tmp_path, conf_method, auto_merge, expected):
+    rules = load_rules(tmp_path)
+    node = pull(1, "BLOCKED", title="change 1", autoMergeRequest=auto_merge)
+    assert rules.drifted(node, {"method": conf_method}) is expected

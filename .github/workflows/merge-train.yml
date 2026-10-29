@@ -37,6 +37,8 @@
 # - When squashing, the train writes the squash commit message from the pull
 #   request's own non-merge commits and their sign-offs (decision record 0037),
 #   without Co-authored-by trailers.
+# - An armed pull request whose title changed since it was armed is re-armed
+#   with the new squash headline (decision record 0064).
 # - Order: a security update (a label in `security_labels`, or "[SECURITY]"
 #   in the title in any letter case, as Renovate writes it) goes before every other pull request
 #   in each of these steps, then the oldest first. The one generated-files
@@ -535,6 +537,14 @@ jobs:
               return headline, full_body
 
 
+          def drifted(pull, conf):
+              """Whether an armed squash pull request's headline no longer matches its title."""
+              armed = pull.get("autoMergeRequest")
+              if conf["method"] != "SQUASH" or not armed or armed.get("mergeMethod") != "SQUASH":
+                  return False
+              return armed.get("commitHeadline") != f"{pull['title']} (#{pull['number']})"
+
+
           def check_release_off(raw, error_cls=ValueError):
               """Repositories opted out of release runs, lowercased frozenset of 'owner/name'."""
               repos = set()
@@ -572,7 +582,7 @@ jobs:
                 nodes {
                   number id title body createdAt isDraft isCrossRepository baseRefName headRefName headRefOid
                   mergeStateStatus isInMergeQueue
-                  autoMergeRequest { enabledAt }
+                  autoMergeRequest { enabledAt commitHeadline mergeMethod }
                   labels(first: 50) { nodes { name } }
                   refreshes: timelineItems(itemTypes: [UNLABELED_EVENT], last: 5) {
                     nodes { ... on UnlabeledEvent { createdAt label { name } } }
@@ -659,6 +669,13 @@ jobs:
               input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
                       commitHeadline: $headline, commitBody: $body}
             ) {
+              pullRequest { autoMergeRequest { enabledAt } }
+            }
+          }
+          """
+          DISARM = """
+          mutation($id: ID!) {
+            disablePullRequestAutoMerge(input: {pullRequestId: $id}) {
               pullRequest { autoMergeRequest { enabledAt } }
             }
           }

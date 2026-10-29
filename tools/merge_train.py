@@ -28,6 +28,7 @@ from train_rules import (
     ARM,
     COMMIT_MUTATION,
     COMMITS,
+    DISARM,
     DRAFT,
     ENQUEUE,
     MERGE,
@@ -38,6 +39,7 @@ from train_rules import (
     SECURITY_HOLD_LABEL,
     check_release_off,
     check_release_parallel,
+    drifted,
     head_since,
     in_flight,
     issues_to_close,
@@ -655,6 +657,12 @@ def run(env, conf, repo, now):
     outcome = regenerate(env, conf, repo, served, notes)
     if outcome:
         return rows, notes, outcome
+    for pull, _ in served:
+        if pull["number"] not in held and drifted(pull, conf):
+            graphql(env, DISARM, {"id": pull["id"]})
+            arm(env, conf, pull)
+            notes[pull["number"]] = "re-armed: title changed after arming"
+            return rows, notes, f"re-armed #{pull['number']}"
     for pull, reason in served:
         if reason == "land":
             done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
@@ -811,7 +819,7 @@ def one(env, conf, installation, target, now):
     finally:
         revoke(env, token)
     moved = any(
-        note.startswith(("armed", "updated", "queued", "refreshed", "held", "released"))
+        note.startswith(("armed", "re-armed", "updated", "queued", "refreshed", "held", "released"))
         or note == "generated files committed"
         for note in notes.values()
     )
