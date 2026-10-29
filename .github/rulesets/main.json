@@ -53,6 +53,9 @@
             "context": "Verification gate"
           },
           {
+            "context": "CodeQL"
+          },
+          {
             "context": "Licence"
           },
           {
