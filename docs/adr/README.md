@@ -70,4 +70,5 @@ record that supersedes it.
 | [0060](0060-the-merge-train-serves-security-updates-first.md) | 2026-10-28 | The merge train serves security updates first | Accepted |
 | [0061](0061-a-vulnerability-fix-is-rebased-when-behind.md) | 2026-10-28 | A vulnerability fix is rebased when it falls behind | Accepted |
 | [0062](0062-dependency-updates-wait-while-a-security-update-is-open.md) | 2026-10-28 | Dependency updates wait while a security update is open | Accepted |
+| [0063](0063-codeql-runs-on-every-pull-request.md) | 2026-10-29 | CodeQL runs on every pull request | Accepted |
 | [0064](0064-an-armed-pull-request-is-re-armed-when-retitled.md) | 2026-10-29 | An armed pull request is re-armed when retitled | Accepted |

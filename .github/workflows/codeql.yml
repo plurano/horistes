@@ -4,18 +4,13 @@
 # Code scanning: CodeQL analyses the workflows and the Python tools of this
 # repository and uploads the findings to the forge's code scanning (decision
 # record 0043). Neither language is built, so the analysis asks no host
-# beyond the forge. The job is no part of the verification gate and no
-# required check; it runs on a pull request that changes what it analyses, on
-# main, once a week and by hand.
+# beyond the forge. The job is no part of the verification gate; it runs on
+# every pull request, on main, once a week and by hand (decision record 0063).
 name: Code scanning
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "**/*.py"
-      - .github/workflows/**
-      - actions/**
   push:
     branches: [main]
   schedule:

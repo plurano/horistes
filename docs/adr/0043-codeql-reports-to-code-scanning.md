@@ -5,7 +5,7 @@ SPDX-License-Identifier: EUPL-1.2
 
 # ADR-0043: CodeQL analyses the workflows and the Python tools and reports to code scanning
 
-- **Status**: Accepted
+- **Status**: Accepted; trigger clause superseded by [ADR-0063](0063-codeql-runs-on-every-pull-request.md)
 - **Date**: 2026-10-18
 - **Authors**: Lusoris
 
