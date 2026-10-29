@@ -37,6 +37,7 @@ from train_rules import (
     READY,
     REFRESH_LABEL,
     SECURITY_HOLD_LABEL,
+    NoSignOffError,
     check_release_off,
     check_release_parallel,
     drifted,
@@ -80,10 +81,15 @@ NO_NEW_COMMITS = "There are no new commits on the base branch."
 CONFLICT = "merge conflict between base and head"
 MERGE_IN_PROGRESS = "Merge already in progress"
 UNGRANTED = "The permissions requested are not granted"
+SKIP_UNSIGNED = "skipped: dependency update without Signed-off-by, a person lands it"
 
 
 class RefusedError(Exception):
     """A forge call that failed or was refused."""
+
+
+class UnsignedBotError(RefusedError):
+    """A dependency update whose commits carry no sign-off; the train skips it."""
 
 
 class MergeInProgressError(RefusedError):
@@ -255,6 +261,10 @@ def commit_variables(env, conf, pull):
     messages = pull_commits(env, pull["number"])
     try:
         headline, body = squash_message(pull["title"], pull["number"], messages)
+    except NoSignOffError as err:
+        if pull["headRefName"].startswith(conf["dependency"]):
+            raise UnsignedBotError(f"#{pull['number']}: {err}") from err
+        raise RefusedError(f"#{pull['number']}: {err}") from err
     except ValueError as err:
         raise RefusedError(f"#{pull['number']}: {err}") from err
     return {**base, "headline": headline, "body": body}
@@ -307,7 +317,11 @@ def advance(env, conf, repo, rows, notes):
     """Update the first pull request `updatable` names, arming it first where it says."""
     for pull, arming in updatable(repo, rows, notes, conf):
         if arming:
-            arm(env, conf, pull)
+            try:
+                arm(env, conf, pull)
+            except UnsignedBotError:
+                notes[pull["number"]] = SKIP_UNSIGNED
+                continue
             notes[pull["number"]] = "armed, updated from the default branch"
         else:
             notes[pull["number"]] = "updated from the default branch"
@@ -665,7 +679,11 @@ def run(env, conf, repo, now):
             return rows, notes, f"re-armed #{pull['number']}"
     for pull, reason in served:
         if reason == "land":
-            done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
+            try:
+                done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
+            except UnsignedBotError:
+                notes[pull["number"]] = SKIP_UNSIGNED
+                continue
             return rows, notes, f"{done} #{pull['number']}"
     holding = [pull["number"] for pull, reason in served if in_flight(pull, reason)]
     if holding:

@@ -228,6 +228,10 @@ jobs:
           STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
 
 
+          class NoSignOffError(ValueError):
+              """The commits of a pull request carry no Signed-off-by trailer."""
+
+
           def suite_key(suite):
               """Key grouping check suites of the same workflow or app."""
               run = suite.get("workflowRun")
@@ -527,7 +531,7 @@ jobs:
                   else:
                       entries.append(f"* {subject}\n\n{body}" if body else f"* {subject}")
               if not sign_offs:
-                  raise ValueError("no Signed-off-by on its commits")
+                  raise NoSignOffError("no Signed-off-by on its commits")
               headline = f"{title} (#{number})"
               prefix = "\n\n".join(e for e in entries if e)
               full_body = f"{prefix}\n\n" + "\n".join(sign_offs) if prefix else "\n".join(sign_offs)
