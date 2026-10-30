@@ -175,12 +175,16 @@ def merged_pull(number: int, *issues: tuple, by: str = BOT, at: str = YOUNG, **f
     }
 
 
+_ABSENT = object()
+
+
 def repository(
     *pulls: dict,
     auto_merge: bool = True,
     release: tuple = (False, False),
     queue: bool = False,
     rules: tuple | None = (),
+    lease: object = _ABSENT,
 ) -> dict:
     """One repository as the query reads it; `release` says which release-please files it has.
 
@@ -193,6 +197,7 @@ def repository(
         "defaultBranchRef": {"name": "main", "rules": read},
         "autoMergeAllowed": auto_merge,
         "mergeQueue": {"id": "MQ_planted"} if queue else None,
+        "landerLease": None if lease is _ABSENT else {"description": lease},
         "releaseConfig": {"oid": "c" * 40} if config else None,
         "releaseManifest": {"oid": "d" * 40} if manifest else None,
         "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": list(pulls)},
@@ -3657,3 +3662,129 @@ def test_drifted_rule(tmp_path, conf_method, auto_merge, expected):
     rules = load_rules(tmp_path)
     node = pull(1, "BLOCKED", title="change 1", autoMergeRequest=auto_merge)
     assert rules.drifted(node, {"method": conf_method}) is expected
+
+
+def test_query_includes_lander_lease():
+    assert 'landerLease: label(name: "merge-train: lander lease") { description }' in module()
+
+
+def test_planted_overtake_yields_to_live_lander_lease(tmp_path):
+    future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    forge = Forge(repository(pull(1, "CLEAN"), lease=f"until={future}"))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "the lander holds the landing order until" in summary
+    assert f"the lander holds the landing order until {future}" in summary
+
+
+def test_without_the_lease_call_the_overtake_lands(tmp_path):
+    future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    call_text = "lease = lease_until(repo, now)"
+    mutant = script().replace(call_text, "lease = None")
+    assert mutant != script()
+    forge = Forge(repository(pull(1, "CLEAN"), lease=f"until={future}"))
+    done, _ = train(tmp_path, forge, text=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+
+
+def test_expired_lease_lands(tmp_path):
+    past = (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    forge = Forge(repository(pull(1, "CLEAN"), lease=f"until={past}"))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+
+
+def test_absent_lease_label_lands(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+
+
+@pytest.mark.parametrize(
+    "bad_desc",
+    [
+        "",
+        "until=tomorrow",
+        "until=2026-10-30T23:00:00Z extra",
+        "hold",
+        "until=2026-13-45T00:00:00Z",
+        None,
+    ],
+)
+def test_bad_lease_description_refuses_repo_and_serves_next(tmp_path, bad_desc):
+    forge = Forge(repository(pull(1, "CLEAN"), lease=bad_desc))
+    forge.install(9, "other", b=[repository(pull(2, "CLEAN"))])
+    done, summary = train(tmp_path, forge)
+    assert done.returncode != 0
+    assert forge.writes == []
+    assert forge.where == [("other/b", landed(2))]
+    assert "fleet/app" in done.stdout
+    assert "### other/b: landed #2" in summary
+
+
+def test_security_update_lands_under_live_lease(tmp_path):
+    future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    plain = pull(1, "CLEAN")
+    sec = pull(2, "CLEAN", title="fix(deps): update [SECURITY]")
+    forge = Forge(repository(plain, sec, lease=f"until={future}"))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert f"| #1 | CLEAN | the lander holds the landing order until {future} |" in summary
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_behind_pull_on_non_linear_repo_under_live_lease_is_not_armed_or_updated(tmp_path):
+    future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    behind_pull = pull(1, "BEHIND")
+    forge = Forge(repository(behind_pull, rules=(), lease=f"until={future}"))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | BEHIND | the lander holds the landing order until {future} |" in summary
+    assert f"### fleet/app: the lander holds the landing order until {future}" in summary
+
+
+def test_bad_lease_description_with_security_hold_writes_nothing(tmp_path):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps", autoMergeRequest={"enabledAt": OLD})
+    fix = pull(2, "BEHIND", headRefName="renovate/x-net", title="fix(deps): x/net [security]")
+    forge = Forge(repository(update, fix, rules=LINEAR, lease="hold"))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode != 0
+    assert forge.writes == []
+
+
+def test_security_hold_under_live_lease_still_drafts_dependency_updates(tmp_path):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps", autoMergeRequest={"enabledAt": OLD})
+    fix = pull(2, "BEHIND", headRefName="renovate/x-net", title="fix(deps): x/net [security]")
+    future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    forge = Forge(repository(update, fix, rules=LINEAR, lease=f"until={future}"))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, HOLD), ("draft", "PR_1")]
+    assert "held as a draft: security update #2 is open" in summary
+
+
+def test_switched_off_with_live_lease_stays_switched_off(tmp_path):
+    future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    forge = Forge(repository(pull(1, "CLEAN"), lease=f"until={future}"))
+    done, summary = train(tmp_path, forge, switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "switched off: nothing landed or updated" in summary
+
+
+def test_lease_until_boundary_equal_stamp_returns_none(tmp_path):
+    rules = load_rules(tmp_path)
+    now = datetime(2026, 10, 30, 23, 0, 0, tzinfo=UTC)
+    stamp = "2026-10-30T23:00:00Z"
+    repo = {"landerLease": {"description": f"until={stamp}"}}
+    assert rules.lease_until(repo, now) is None
+    before = datetime(2026, 10, 30, 22, 59, 59, tzinfo=UTC)
+    assert rules.lease_until(repo, before) == stamp
+    after = datetime(2026, 10, 30, 23, 0, 1, tzinfo=UTC)
+    assert rules.lease_until(repo, after) is None

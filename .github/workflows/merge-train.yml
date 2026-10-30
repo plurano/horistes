@@ -39,6 +39,10 @@
 #   without Co-authored-by trailers.
 # - An armed pull request whose title changed since it was armed is re-armed
 #   with the new squash headline (decision record 0064).
+# - When a repository label "merge-train: lander lease" carries an unexpired
+#   UTC expiry stamp "until=YYYY-MM-DDTHH:MM:SSZ", the train yields its landing
+#   order to a lander (a landing queue outside the forge) and lands only security
+#   updates until the lease expires (decision record 0065).
 # - Order: a security update (a label in `security_labels`, or "[SECURITY]"
 #   in the title in any letter case, as Renovate writes it) goes before every other pull request
 #   in each of these steps, then the oldest first. The one generated-files
@@ -219,6 +223,7 @@ jobs:
               r"\bsupersedes\s+(#\d+(?:(?:\s*,\s*|\s*,?\s*and\s+|\s+)#\d+)*)", re.I
           )
           SUPERSEDED_BY = re.compile(r"\bsuperseded\s+by\s+#\d+", re.I)
+          LEASE_DESC = re.compile(r"until=([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)")
           DRAFT_STEP = "Stop on a draft pull request"
           REFRESH_LABEL = "merge-train: refresh"
           SECURITY_HOLD_LABEL = "merge-train: security hold"
@@ -549,6 +554,35 @@ jobs:
               return armed.get("commitHeadline") != f"{pull['title']} (#{pull['number']})"
 
 
+          def lease_until(repo, now):
+              """The live lander lease expiry stamp if one holds the queue, or None."""
+              label = repo.get("landerLease")
+              if not label:
+                  return None
+              raw = label.get("description")
+              desc = raw or ""
+              match = LEASE_DESC.fullmatch(desc)
+              if not match:
+                  raise ValueError(f"lander lease description {raw!r} is invalid")
+              stamp = match.group(1)
+              try:
+                  until = datetime.fromisoformat(stamp)
+              except ValueError as err:
+                  raise ValueError(f"lander lease description {raw!r} is invalid") from err
+              return stamp if until > now else None
+
+
+          def yield_to_lander(served, notes, conf, lease):
+              """Keep only security updates while a lander lease is live; record why others yield."""
+              kept = []
+              for pull, reason in served:
+                  if is_security(pull, conf):
+                      kept.append((pull, reason))
+                  elif reason in ("land", "behind"):
+                      notes[pull["number"]] = f"the lander holds the landing order until {lease}"
+              return kept
+
+
           def check_release_off(raw, error_cls=ValueError):
               """Repositories opted out of release runs, lowercased frozenset of 'owner/name'."""
               repos = set()
@@ -578,6 +612,7 @@ jobs:
               defaultBranchRef { name rules(first: 50) { nodes { type } } }
               autoMergeAllowed
               mergeQueue { id }
+              landerLease: label(name: "merge-train: lander lease") { description }
               releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
               releaseManifest: object(expression: "HEAD:.release-please-manifest.json") { oid }
               pullRequests(states: OPEN, first: 25, after: $after,

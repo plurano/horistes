@@ -44,6 +44,7 @@ from train_rules import (
     head_since,
     in_flight,
     issues_to_close,
+    lease_until,
     refresh,
     security_hold,
     serving_order,
@@ -51,6 +52,7 @@ from train_rules import (
     superseded,
     updatable,
     verdict,
+    yield_to_lander,
 )
 
 TIMEOUT = 30
@@ -655,28 +657,19 @@ def regenerate(env, conf, repo, rows, notes):
     return None
 
 
-def run(env, conf, repo, now):
-    pulls = repo["pullRequests"]["nodes"]
-    replaced = superseded(pulls)
-    rows = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
-    notes = {pull["number"]: reason for pull, reason in rows}
-    if conf["switch"] == "off":
-        return rows, notes, "switched off: nothing landed or updated"
-    served = serving_order(rows, conf)
-    held = hold_for_security(env, repo, served, notes, conf)
-    served = [
-        (pull, f"labelled {SECURITY_HOLD_LABEL}" if pull["number"] in held else reason)
-        for pull, reason in served
-    ]
-    outcome = regenerate(env, conf, repo, served, notes)
-    if outcome:
-        return rows, notes, outcome
+def re_arm_drifted(env, conf, served, held, notes):
+    """Re-arm an armed squash pull request whose headline drifted from its title."""
     for pull, _ in served:
         if pull["number"] not in held and drifted(pull, conf):
             graphql(env, DISARM, {"id": pull["id"]})
             arm(env, conf, pull)
             notes[pull["number"]] = "re-armed: title changed after arming"
-            return rows, notes, f"re-armed #{pull['number']}"
+            return f"re-armed #{pull['number']}"
+    return None
+
+
+def land_clean(env, conf, repo, served, notes):
+    """Land or enqueue the oldest clean pull request, or None."""
     for pull, reason in served:
         if reason == "land":
             try:
@@ -684,7 +677,44 @@ def run(env, conf, repo, now):
             except UnsignedBotError:
                 notes[pull["number"]] = SKIP_UNSIGNED
                 continue
-            return rows, notes, f"{done} #{pull['number']}"
+            return f"{done} #{pull['number']}"
+    return None
+
+
+def lander_lease(repo, now):
+    """The live lander lease expiry stamp or None; raise RefusedError on invalid lease."""
+    try:
+        lease = lease_until(repo, now)
+        return lease
+    except ValueError as err:
+        raise RefusedError(f"{err}") from err
+
+
+def run(env, conf, repo, now):
+    pulls = repo["pullRequests"]["nodes"]
+    replaced = superseded(pulls)
+    rows = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
+    notes = {pull["number"]: reason for pull, reason in rows}
+    if conf["switch"] == "off":
+        return rows, notes, "switched off: nothing landed or updated"
+    lease = lander_lease(repo, now)
+    served = serving_order(rows, conf)
+    held = hold_for_security(env, repo, served, notes, conf)
+    served = [
+        (pull, f"labelled {SECURITY_HOLD_LABEL}" if pull["number"] in held else reason)
+        for pull, reason in served
+    ]
+    if lease:
+        served = yield_to_lander(served, notes, conf, lease)
+    outcome = regenerate(env, conf, repo, served, notes)
+    if outcome:
+        return rows, notes, outcome
+    re_armed = re_arm_drifted(env, conf, served, held, notes)
+    if re_armed:
+        return rows, notes, re_armed
+    landed_pr = land_clean(env, conf, repo, served, notes)
+    if landed_pr:
+        return rows, notes, landed_pr
     holding = [pull["number"] for pull, reason in served if in_flight(pull, reason)]
     if holding:
         return rows, notes, f"#{holding[0]} is armed and in flight"
@@ -694,7 +724,12 @@ def run(env, conf, repo, now):
     if outcome:
         return rows, notes, outcome
     advance(env, conf, repo, served, notes)
-    return rows, notes, "no pull request at a mergeable state"
+    outcome = (
+        f"the lander holds the landing order until {lease}"
+        if lease
+        else "no pull request at a mergeable state"
+    )
+    return rows, notes, outcome
 
 
 def report(name, repo, rows, notes, outcome):
