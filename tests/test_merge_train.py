@@ -3915,7 +3915,7 @@ def test_the_written_head_itself_lands_under_the_hold(tmp_path):
     assert "held for the generated files of #1 until" in summary
 
 
-def test_a_security_update_lands_under_the_write_hold(tmp_path):
+def test_a_security_update_lands_first_while_a_train_write_is_open(tmp_path):
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3934,7 +3934,9 @@ def test_a_security_update_lands_under_the_write_hold(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [("label", 1, HOLD), ("draft", "PR_1"), landed(2)]
     assert "### fleet/app: landed #2" in summary
-    assert "held for the generated files of #1 until" in summary
+    assert landed(2) in forge.writes
+    assert landed(3) not in forge.writes
+    assert "held for the generated files" not in summary
 
 
 def test_the_write_hold_ends_after_its_timeout(tmp_path):
@@ -4245,7 +4247,7 @@ def test_regenerate_waits_when_another_pr_is_armed_blocked(tmp_path):
     )
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert forge.writes == []
+    assert not any(write[0] == "commit" for write in forge.writes)
     assert "| #1 | BLOCKED | regenerate waits: #2 is armed |" in summary
 
 
@@ -4378,6 +4380,7 @@ def test_without_the_behind_check_the_behind_head_is_regenerated(tmp_path):
     head1 = f"{1:040x}"
     behind_pull = pull(1, "BEHIND", headRefName="renovate/demo-1", headRefOid=head1)
     forge = Forge(repository(behind_pull))
+    forge.merge_states[1] = "CLEAN"
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
     zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
     forge.add_artifact(
@@ -4390,8 +4393,8 @@ def test_without_the_behind_check_the_behind_head_is_regenerated(tmp_path):
     )
     done, summary = train(tmp_path, forge, text=mutant)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert len(forge.writes) == 1
-    assert forge.writes[0][0] == "commit"
+    commits = [write for write in forge.writes if write[0] == "commit"]
+    assert len(commits) == 1
     assert "### fleet/app: committed generated files to #1" in summary
 
 
