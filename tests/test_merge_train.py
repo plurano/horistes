@@ -4282,6 +4282,37 @@ def test_regenerate_proceeds_when_another_pr_is_armed_behind(tmp_path):
     assert "### fleet/app: committed generated files to #1" in summary
 
 
+def test_regenerate_proceeds_when_another_pr_is_armed_red(tmp_path):
+    head1 = f"{1:040x}"
+    candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
+    armed_other = pull(
+        2,
+        "BLOCKED",
+        headRefName="feat/armed-feature",
+        autoMergeRequest={
+            "enabledAt": NOW.isoformat(),
+            "commitHeadline": "feat",
+            "mergeMethod": "SQUASH",
+        },
+        suites=["FAILURE"],
+    )
+    forge = Forge(repository(candidate, armed_other))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert sum(1 for write in forge.writes if write[0] == "commit") == 1
+    assert "regenerate waits" not in summary
+
+
 def test_regenerate_proceeds_when_another_pr_is_armed_security(tmp_path):
     head1 = f"{1:040x}"
     candidate = pull(

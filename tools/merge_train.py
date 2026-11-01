@@ -45,6 +45,7 @@ from train_rules import (
     drifted,
     head_since,
     in_flight,
+    is_red,
     is_security,
     issues_to_close,
     lease_until,
@@ -661,6 +662,7 @@ def regenerate(env, conf, repo, rows, notes):
             if other["number"] != pull["number"]
             and other["baseRefName"] == default_branch
             and not is_security(other, conf)
+            and not is_red(other)
             and other.get("autoMergeRequest")
             and reason != "behind"
         ]
