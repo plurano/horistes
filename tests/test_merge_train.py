@@ -104,15 +104,17 @@ def app_key(which: str = "app") -> tuple[str, bytes]:
     return private.decode(), openssl("pkey", "-pubout", data=private)
 
 
-def pull(number: int, state: str, **fields) -> dict:
-    """One open pull request as the query reads it."""
-    commits = fields.pop("commits", None)
-    suites = fields.pop("suites", ["SUCCESS"])
-    labels = fields.pop("labels", ())
+_ABSENT = object()
+
+
+def build_commit_node(number: int, suites: list, **fields) -> dict:
+    """The latest commit node of one pull request."""
     author = fields.pop("author", f"author-{number}@example.com")
     headline = fields.pop("messageHeadline", f"commit {number}")
     created_at = fields.pop("createdAt", OLD)
     commit_date = fields.pop("committedDate", created_at)
+    signature = fields.pop("signature", _ABSENT)
+    user = fields.pop("user", _ABSENT)
     suite_nodes = []
     base_time = datetime(2026, 10, 18, 0, 0, 0, tzinfo=UTC)
     for i, item in enumerate(suites):
@@ -129,12 +131,36 @@ def pull(number: int, state: str, **fields) -> dict:
                     "workflowRun": {"workflow": {"databaseId": 100 + i}},
                 }
             )
-    commit_node = {
+    author_node = dict(author) if isinstance(author, dict) else {"email": author}
+    is_regenerate = headline == "chore(deps): regenerate generated files"
+    if user is not _ABSENT:
+        author_node["user"] = {"login": user} if isinstance(user, str) else user
+    elif "user" not in author_node and is_regenerate:
+        author_node["user"] = {"login": f"{BOT}[bot]"}
+
+    if signature is not _ABSENT:
+        sig_node = signature
+    elif is_regenerate:
+        sig_node = {"wasSignedByGitHub": True}
+    else:
+        sig_node = None
+
+    return {
         "committedDate": commit_date,
         "messageHeadline": headline,
-        "author": author if isinstance(author, dict) else {"email": author},
+        "author": author_node,
+        "signature": sig_node,
         "checkSuites": {"nodes": suite_nodes},
     }
+
+
+def pull(number: int, state: str, **fields) -> dict:
+    """One open pull request as the query reads it."""
+    commits = fields.pop("commits", None)
+    suites = fields.pop("suites", ["SUCCESS"])
+    labels = fields.pop("labels", ())
+    created_at = fields.get("createdAt", OLD)
+    commit_node = build_commit_node(number, suites, **fields)
     node = {
         "number": number,
         "id": f"PR_{number}",
@@ -183,9 +209,6 @@ def merged_pull(number: int, *issues: tuple, by: str = BOT, at: str = YOUNG, **f
         "mergeCommit": {"oid": f"{number:x}" * 40},
         "closingIssuesReferences": {"nodes": nodes},
     }
-
-
-_ABSENT = object()
 
 
 def repository(
@@ -253,6 +276,7 @@ class Forge:
         self.refuse_commit = False
         self.messages: list[tuple[str, str, str | None, str | None]] = []
         self.commits: dict[int, list[tuple[str, int]]] = {}
+        self.merge_states: dict[int, str] = {}
         self.commit_counts: dict[int, int] = {}
         self.merged_pulls: dict[str, list[dict]] = {}
         self.issue_right = True
@@ -435,6 +459,8 @@ class Forge:
             return {"data": {"enablePullRequestAutoMerge": {"pullRequest": armed}}}
         if "createCommitOnBranch" in query:
             return self._handle_commit_mutation(full, variables)
+        if "mergeStateStatus" in query and "pullRequest(" in query:
+            return self.pull_merge_state(full, variables)
         if "pullRequest(" in query:
             return self.pull_commits(full, variables)
         if "states: MERGED" in query:
@@ -458,6 +484,18 @@ class Forge:
                 "repository": {"pullRequest": {"commits": {"totalCount": total, "nodes": nodes}}}
             }
         }
+
+    def pull_merge_state(self, full: str, variables: dict) -> dict:
+        owner, name = full.split("/")
+        number = variables["number"]
+        assert variables == {"owner": owner, "name": name, "number": number}, variables
+        if number in self.merge_states:
+            state = self.merge_states[number]
+        else:
+            nodes = self.active_reads.get(full, {}).get("pullRequests", {}).get("nodes", [])
+            matches = [p["mergeStateStatus"] for p in nodes if p["number"] == number]
+            state = matches[0] if matches else "CLEAN"
+        return {"data": {"repository": {"pullRequest": {"mergeStateStatus": state}}}}
 
     def pull_page(self, full: str, query: str, variables: dict) -> dict:
         owner, name = full.split("/")
@@ -3992,10 +4030,344 @@ def test_a_commit_of_another_author_with_the_headline_holds_nothing(tmp_path):
     assert "### fleet/app: landed #2" in summary
 
 
-def test_the_query_reads_the_head_commit_headline_and_author():
-    doc = module()
-    assert "messageHeadline" in doc
-    assert "author { email }" in doc
+def test_the_query_reads_the_head_commit_headline_and_author(tmp_path):
+    rules = load_rules(tmp_path)
+    assert "messageHeadline" in rules.QUERY
+    assert "author { email user { login } }" in rules.QUERY
+    assert "signature { wasSignedByGitHub }" in rules.QUERY
+
+
+def test_a_young_train_written_head_holds_nothing(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    young_written = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+        createdAt=YOUNG,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(young_written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_a_draft_train_written_head_holds_nothing(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    draft_written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+        isDraft=True,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(draft_written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_a_labelled_train_written_head_holds_nothing(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    labelled_written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+        labels=("hold",),
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(labelled_written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_a_cross_repository_train_written_head_holds_nothing(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cross_written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+        isCrossRepository=True,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(cross_written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_a_behind_train_written_head_holds_nothing(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    behind_written = pull(
+        1,
+        "BEHIND",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(behind_written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_an_unsigned_regenerate_commit_holds_nothing(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    unsigned = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+        signature=None,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(unsigned, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_a_regenerate_commit_of_another_login_holds_nothing(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    imposter = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        user="someone-else",
+        committedDate=recent,
+        signature={"wasSignedByGitHub": True},
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(imposter, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_a_future_dated_regenerate_commit_skew_bounds(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    far_future = (datetime.now(UTC) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    future_pull = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=far_future,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(future_pull, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+    near_future = (datetime.now(UTC) + timedelta(minutes=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    skew_pull = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=near_future,
+    )
+    forge_skew = Forge(repository(skew_pull, other))
+    done_skew, summary_skew = train(tmp_path, forge_skew)
+    assert done_skew.returncode == 0, done_skew.stdout + done_skew.stderr
+    assert forge_skew.writes == []
+    assert "held for the generated files of #1 until" in summary_skew
+
+
+def test_regenerate_waits_when_another_pr_is_armed_blocked(tmp_path):
+    head1 = f"{1:040x}"
+    candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
+    armed_other = pull(
+        2,
+        "BLOCKED",
+        headRefName="feat/armed-feature",
+        autoMergeRequest={
+            "enabledAt": NOW.isoformat(),
+            "commitHeadline": "feat",
+            "mergeMethod": "SQUASH",
+        },
+    )
+    forge = Forge(repository(candidate, armed_other))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | BLOCKED | regenerate waits: #2 is armed |" in summary
+
+
+def test_regenerate_proceeds_when_another_pr_is_armed_behind(tmp_path):
+    head1 = f"{1:040x}"
+    candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
+    armed_behind = pull(
+        2,
+        "BEHIND",
+        headRefName="feat/armed-behind",
+        autoMergeRequest={
+            "enabledAt": NOW.isoformat(),
+            "commitHeadline": "feat",
+            "mergeMethod": "SQUASH",
+        },
+    )
+    forge = Forge(repository(candidate, armed_behind))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(forge.writes) == 1
+    assert forge.writes[0][0] == "commit"
+    assert "### fleet/app: committed generated files to #1" in summary
+
+
+def test_regenerate_proceeds_when_another_pr_is_armed_security(tmp_path):
+    head1 = f"{1:040x}"
+    candidate = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/patch-1",
+        title="fix(deps): security fix 1 [SECURITY]",
+        headRefOid=head1,
+    )
+    armed_sec = pull(
+        2,
+        "BLOCKED",
+        headRefName="renovate/patch-2",
+        title="fix(deps): security fix 2 [SECURITY]",
+        autoMergeRequest={
+            "enabledAt": NOW.isoformat(),
+            "commitHeadline": "sec",
+            "mergeMethod": "SQUASH",
+        },
+    )
+    forge = Forge(repository(candidate, armed_sec))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/patch-1",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(forge.writes) == 1
+    assert forge.writes[0][0] == "commit"
+    assert "### fleet/app: committed generated files to #1" in summary
+
+
+def test_another_blocked_candidate_gets_no_write_during_hold(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/held-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+    )
+    head2 = f"{2:040x}"
+    other_candidate = pull(2, "BLOCKED", headRefName="renovate/other-dep", headRefOid=head2)
+    forge = Forge(repository(written, other_candidate))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip2 = make_artifact_zip(head2, {"notices.txt": b"two"})
+    forge.add_artifact(
+        "fleet/app",
+        102,
+        f"regenerated-{head2}",
+        zip2,
+        head_sha=head2,
+        head_branch="renovate/other-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #2 | BLOCKED | merge state BLOCKED |" in summary
+
+
+def test_newly_behind_between_read_and_write_skips_commit(tmp_path):
+    head1 = f"{1:040x}"
+    candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
+    forge = Forge(repository(candidate))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | BLOCKED | behind since the read: not regenerated |" in summary
 
 
 def test_without_the_behind_check_the_behind_head_is_regenerated(tmp_path):

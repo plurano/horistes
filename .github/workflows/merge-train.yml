@@ -219,6 +219,7 @@ jobs:
           from datetime import datetime, timedelta
 
           WRITE_HOLD_MINUTES = 60
+          CLOCK_SKEW_MINUTES = 5
           REGENERATE_HEADLINE = "chore(deps): regenerate generated files"
           RED = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
           SUPERSEDES = re.compile(
@@ -593,16 +594,26 @@ jobs:
               """
               email = f"{conf['bot_id']}+{conf['bot_login']}@users.noreply.github.com"
               held = []
-              for pull, _ in served:
+              for pull, reason in served:
+                  if reason != "land" and not reason.startswith("merge state "):
+                      continue
                   nodes = pull["latest"]["nodes"]
                   commit = nodes[-1]["commit"] if nodes else {}
                   if commit.get("messageHeadline") != REGENERATE_HEADLINE:
                       continue
-                  if (commit.get("author") or {}).get("email") != email:
+                  author = commit.get("author") or {}
+                  if author.get("email") != email:
                       continue
-                  until = datetime.fromisoformat(commit["committedDate"]) + timedelta(
-                      minutes=WRITE_HOLD_MINUTES
-                  )
+                  user = author.get("user") or {}
+                  if user.get("login") != conf["bot_login"]:
+                      continue
+                  signature = commit.get("signature") or {}
+                  if signature.get("wasSignedByGitHub") is not True:
+                      continue
+                  committed = datetime.fromisoformat(commit["committedDate"])
+                  if committed > now + timedelta(minutes=CLOCK_SKEW_MINUTES):
+                      continue
+                  until = committed + timedelta(minutes=WRITE_HOLD_MINUTES)
                   if until > now and not is_red(pull):
                       held.append((until, pull))
               if not held:
@@ -612,7 +623,7 @@ jobs:
 
 
           def yield_to_write(served, notes, conf, hold):
-              """Keep the held pull request and security updates; drop other land/behind rows."""
+              """Keep only the held pull request and security updates in served; drop other rows."""
               held_pull, stamp = hold
               n = held_pull["number"]
               kept = []
@@ -672,7 +683,8 @@ jobs:
                       commit {
                         committedDate
                         messageHeadline
-                        author { email }
+                        author { email user { login } }
+                        signature { wasSignedByGitHub }
                         checkSuites(first: 30) {
                           nodes {
                             databaseId
@@ -686,6 +698,15 @@ jobs:
                     }
                   }
                 }
+              }
+            }
+          }
+          """
+          MERGE_STATE = """
+          query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                mergeStateStatus
               }
             }
           }

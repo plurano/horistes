@@ -32,6 +32,7 @@ from train_rules import (
     DRAFT,
     ENQUEUE,
     MERGE,
+    MERGE_STATE,
     MERGED,
     QUERY,
     READY,
@@ -44,6 +45,7 @@ from train_rules import (
     drifted,
     head_since,
     in_flight,
+    is_security,
     issues_to_close,
     lease_until,
     refresh,
@@ -256,6 +258,14 @@ def pull_commits(env, number):
         for node in commits["nodes"]
         if node["commit"]["parents"]["totalCount"] == 1
     ]
+
+
+def pull_merge_state(env, number):
+    """The live mergeStateStatus of one pull request."""
+    owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+    data = graphql(env, MERGE_STATE, {"owner": owner, "name": name, "number": number})
+    pr = (data.get("repository") or {}).get("pullRequest") or {}
+    return pr.get("mergeStateStatus")
 
 
 def commit_variables(env, conf, pull):
@@ -645,6 +655,18 @@ def regenerate(env, conf, repo, rows, notes):
     if allowlist is None:
         return None
     for pull in candidates:
+        armed = [
+            other
+            for other, reason in rows
+            if other["number"] != pull["number"]
+            and other["baseRefName"] == default_branch
+            and not is_security(other, conf)
+            and other.get("autoMergeRequest")
+            and reason != "behind"
+        ]
+        if armed:
+            notes[pull["number"]] = f"regenerate waits: #{armed[0]['number']} is armed"
+            continue
         try:
             art = find_artifact(env, pull)
             if not art:
@@ -656,6 +678,9 @@ def regenerate(env, conf, repo, rows, notes):
             notes[pull["number"]] = f"generated files refused: {err}"[:200]
             continue
         if not changed:
+            continue
+        if pull_merge_state(env, pull["number"]) == "BEHIND":
+            notes[pull["number"]] = "behind since the read: not regenerated"
             continue
         commit_generated_files(env, conf, pull, art, changed)
         notes[pull["number"]] = "generated files committed"
