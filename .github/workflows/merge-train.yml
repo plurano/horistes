@@ -216,8 +216,10 @@ jobs:
           """Merge train rules: verdicts, issues to close, squash message, GraphQL documents."""
 
           import re
-          from datetime import datetime
+          from datetime import datetime, timedelta
 
+          WRITE_HOLD_MINUTES = 60
+          REGENERATE_HEADLINE = "chore(deps): regenerate generated files"
           RED = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
           SUPERSEDES = re.compile(
               r"\bsupersedes\s+(#\d+(?:(?:\s*,\s*|\s*,?\s*and\s+|\s+)#\d+)*)", re.I
@@ -583,6 +585,45 @@ jobs:
               return kept
 
 
+          def write_hold(served, conf, now):
+              """The pull request a fresh regenerate commit of the train holds the order for, or None.
+
+              Decision record 0066: the head commit is the train's own regenerate commit,
+              younger than WRITE_HOLD_MINUTES, on a head that is not red; with its expiry stamp.
+              """
+              email = f"{conf['bot_id']}+{conf['bot_login']}@users.noreply.github.com"
+              held = []
+              for pull, _ in served:
+                  nodes = pull["latest"]["nodes"]
+                  commit = nodes[-1]["commit"] if nodes else {}
+                  if commit.get("messageHeadline") != REGENERATE_HEADLINE:
+                      continue
+                  if (commit.get("author") or {}).get("email") != email:
+                      continue
+                  until = datetime.fromisoformat(commit["committedDate"]) + timedelta(
+                      minutes=WRITE_HOLD_MINUTES
+                  )
+                  if until > now and not is_red(pull):
+                      held.append((until, pull))
+              if not held:
+                  return None
+              until, pull = min(held, key=lambda item: item[0])
+              return pull, until.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+          def yield_to_write(served, notes, conf, hold):
+              """Keep the held pull request and security updates; drop other land/behind rows."""
+              held_pull, stamp = hold
+              n = held_pull["number"]
+              kept = []
+              for pull, reason in served:
+                  if pull["number"] == n or is_security(pull, conf):
+                      kept.append((pull, reason))
+                  elif reason in ("land", "behind"):
+                      notes[pull["number"]] = f"held for the generated files of #{n} until {stamp}"
+              return kept
+
+
           def check_release_off(raw, error_cls=ValueError):
               """Repositories opted out of release runs, lowercased frozenset of 'owner/name'."""
               repos = set()
@@ -630,6 +671,8 @@ jobs:
                     nodes {
                       commit {
                         committedDate
+                        messageHeadline
+                        author { email }
                         checkSuites(first: 30) {
                           nodes {
                             databaseId

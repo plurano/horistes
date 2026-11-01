@@ -109,28 +109,38 @@ def pull(number: int, state: str, **fields) -> dict:
     commits = fields.pop("commits", None)
     suites = fields.pop("suites", ["SUCCESS"])
     labels = fields.pop("labels", ())
+    author = fields.pop("author", f"author-{number}@example.com")
+    headline = fields.pop("messageHeadline", f"commit {number}")
+    created_at = fields.pop("createdAt", OLD)
+    commit_date = fields.pop("committedDate", created_at)
     suite_nodes = []
     base_time = datetime(2026, 10, 18, 0, 0, 0, tzinfo=UTC)
     for i, item in enumerate(suites):
         if isinstance(item, dict):
             suite_nodes.append(item)
         else:
-            created_at = (base_time + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            created_at_suite = (base_time + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
             suite_nodes.append(
                 {
                     "databaseId": 1000 + i,
                     "conclusion": item,
-                    "createdAt": created_at,
+                    "createdAt": created_at_suite,
                     "app": {"slug": "github-actions"},
                     "workflowRun": {"workflow": {"databaseId": 100 + i}},
                 }
             )
+    commit_node = {
+        "committedDate": commit_date,
+        "messageHeadline": headline,
+        "author": author if isinstance(author, dict) else {"email": author},
+        "checkSuites": {"nodes": suite_nodes},
+    }
     node = {
         "number": number,
         "id": f"PR_{number}",
         "title": fields.pop("title", f"change {number}"),
         "body": fields.pop("body", ""),
-        "createdAt": fields.pop("createdAt", OLD),
+        "createdAt": created_at,
         "isDraft": False,
         "isCrossRepository": False,
         "baseRefName": "main",
@@ -140,7 +150,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "autoMergeRequest": None,
         "labels": {"nodes": [{"name": name} for name in labels]},
         "refreshes": {"nodes": []},
-        "latest": {"nodes": [{"commit": {"checkSuites": {"nodes": suite_nodes}}}]},
+        "latest": {"nodes": [{"commit": commit_node}]},
     }
     if commits is not None:
         node["history"] = {
@@ -2078,7 +2088,7 @@ def make_oversize_member_zip(
 
 def test_dependency_pull_with_valid_artifact_commits_generated_files(tmp_path):
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
     forge.set_allowlist("fleet/app", "main", ["notices.txt", "wasm/module.wasm"])
     zip_bytes = make_artifact_zip(
@@ -2112,13 +2122,13 @@ def test_dependency_pull_with_valid_artifact_commits_generated_files(tmp_path):
     )
     assert not any(w[0] == "merge" for w in forge.writes)
     assert "### fleet/app: committed generated files to #1" in summary
-    assert "| #1 | BEHIND | generated files committed |" in summary
+    assert "| #1 | BLOCKED | generated files committed |" in summary
     assert "| fleet | 1 | 0 | 1 | 0 |" in summary
 
 
 def test_negative_no_allowlist_file(tmp_path):
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
     zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
     forge.add_artifact(
@@ -2179,7 +2189,7 @@ def test_negative_manifest_head_mismatch(tmp_path):
 
 def test_negative_artifact_from_another_head_branch(tmp_path):
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
     zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
@@ -2325,7 +2335,7 @@ def test_without_the_length_check_the_cut_is_not_named(tmp_path):
 
 def test_negative_switch_off(tmp_path):
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
     zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
@@ -2363,7 +2373,7 @@ def test_negative_non_dependency_branch(tmp_path):
 
 def test_negative_held_label(tmp_path):
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep", labels=["hold"])
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep", labels=["hold"])
     forge = Forge(repository(dep_pull))
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
     zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
@@ -2406,7 +2416,7 @@ def test_without_the_allowlist_check_the_unallowed_path_would_be_committed(tmp_p
     mutant = script().replace("or p not in allowlist", "or False")
     assert mutant != script()
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
     forge.set_allowlist("fleet/app", "main", ["allowed.txt"])
     zip_bytes = make_artifact_zip(head, {"planted.txt": b"unallowed content"})
@@ -2427,7 +2437,7 @@ def test_without_the_allowlist_check_the_unallowed_path_would_be_committed(tmp_p
 
 def test_rights_token_carries_actions_read_and_storage_url_never_receives_authorization(tmp_path):
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
     zip_bytes = make_artifact_zip(head, {"notices.txt": b"content"})
@@ -2557,7 +2567,7 @@ def test_negative_zip_duplicate_member_names(tmp_path):
 
 def test_positive_zip_directory_entry_accepted(tmp_path):
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
     zip_bytes = make_artifact_zip(head, {"notices.txt": b"content"}, extra_members={"files/": b""})
@@ -2650,8 +2660,8 @@ def test_negative_manifest_duplicate_path(tmp_path):
 def test_first_candidate_bad_second_good_commits_second(tmp_path):
     head1 = f"{1:040x}"
     head2 = f"{2:040x}"
-    p1 = pull(1, "BEHIND", headRefName="renovate/demo-1", headRefOid=head1)
-    p2 = pull(2, "BEHIND", headRefName="renovate/demo-2", headRefOid=head2)
+    p1 = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
+    p2 = pull(2, "BLOCKED", headRefName="renovate/demo-2", headRefOid=head2)
     forge = Forge(repository(p1, p2))
     forge.set_allowlist("fleet/app", "main", ["allowed.txt"])
     zip1 = make_artifact_zip(head1, {"forbidden.txt": b"bad"})
@@ -2678,16 +2688,16 @@ def test_first_candidate_bad_second_good_commits_second(tmp_path):
     assert forge.writes[0][0] == "commit"
     assert forge.writes[0][1] == "renovate/demo-2"
     assert (
-        "| #1 | BEHIND | generated files refused: fleet/app #1: path 'forbidden.txt' not allowed |"
+        "| #1 | BLOCKED | generated files refused: fleet/app #1: path 'forbidden.txt' not allowed |"
         in summary
     )
-    assert "| #2 | BEHIND | generated files committed |" in summary
+    assert "| #2 | BLOCKED | generated files committed |" in summary
     assert "### fleet/app: committed generated files to #2" in summary
 
 
 def test_refused_artifact_falls_through_to_land_clean_pull(tmp_path):
     head1 = f"{1:040x}"
-    p1 = pull(1, "BEHIND", headRefName="renovate/demo-1", headRefOid=head1)
+    p1 = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
     p2 = pull(2, "CLEAN", headRefName="feat/other-change")
     forge = Forge(repository(p1, p2))
     forge.set_allowlist("fleet/app", "main", ["allowed.txt"])
@@ -2704,7 +2714,7 @@ def test_refused_artifact_falls_through_to_land_clean_pull(tmp_path):
     assert done.returncode == 0
     assert forge.writes == [landed(2)]
     assert (
-        "| #1 | BEHIND | generated files refused: fleet/app #1: path 'forbidden.txt' not allowed |"
+        "| #1 | BLOCKED | generated files refused: fleet/app #1: path 'forbidden.txt' not allowed |"
         in summary
     )
     assert "| #2 | CLEAN | landed |" in summary
@@ -2713,7 +2723,7 @@ def test_refused_artifact_falls_through_to_land_clean_pull(tmp_path):
 
 def test_commit_mutation_refusal_fails_repository_run(tmp_path):
     head = f"{1:040x}"
-    dep_pull = pull(1, "BEHIND", headRefName="renovate/demo-dep")
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
     forge.refuse_commit = True
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
@@ -2733,7 +2743,7 @@ def test_commit_mutation_refusal_fails_repository_run(tmp_path):
 
 def test_regenerate_excludes_person_branch(tmp_path):
     head = f"{1:040x}"
-    rel_pull = pull(1, "BEHIND", headRefName="release-please--branches--main")
+    rel_pull = pull(1, "BLOCKED", headRefName="release-please--branches--main")
     forge = Forge(repository(rel_pull))
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
     zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
@@ -3381,9 +3391,9 @@ def regenerable(forge: Forge, *nodes: dict) -> None:
 
 def test_security_update_gets_the_generated_files_write_before_an_older_digest(tmp_path):
     # Golusoris, 2026-10-28: a digest update re-pushed on every main push took every write.
-    digest = head_at(pull(1, "BEHIND", headRefName="renovate/self-digest"), YOUNG)
+    digest = head_at(pull(1, "BLOCKED", headRefName="renovate/self-digest"), YOUNG)
     fix = head_at(
-        pull(2, "BEHIND", headRefName="renovate/x-net", labels=("security",), createdAt=YOUNG),
+        pull(2, "BLOCKED", headRefName="renovate/x-net", labels=("security",), createdAt=YOUNG),
         OLD,
     )
     forge = Forge(repository(digest, fix))
@@ -3395,8 +3405,8 @@ def test_security_update_gets_the_generated_files_write_before_an_older_digest(t
 
 
 def test_security_title_counts_like_the_label_for_the_generated_files_write(tmp_path):
-    digest = pull(1, "BEHIND", headRefName="renovate/self-digest")
-    fix = pull(2, "BEHIND", headRefName="renovate/x-net", title="fix(deps): x/net [SECURITY]")
+    digest = pull(1, "BLOCKED", headRefName="renovate/self-digest")
+    fix = pull(2, "BLOCKED", headRefName="renovate/x-net", title="fix(deps): x/net [SECURITY]")
     forge = Forge(repository(digest, fix))
     regenerable(forge, digest, fix)
     done, summary = train(tmp_path, forge)
@@ -3406,8 +3416,8 @@ def test_security_title_counts_like_the_label_for_the_generated_files_write(tmp_
 
 def test_generated_files_write_serves_the_longest_waiting_head_first(tmp_path):
     # The older update's head moved last: the newer one has waited longer and goes first.
-    moved = head_at(pull(1, "BEHIND", headRefName="renovate/self-digest"), YOUNG)
-    waiting = head_at(pull(2, "BEHIND", headRefName="renovate/other-dep"), OLD)
+    moved = head_at(pull(1, "BLOCKED", headRefName="renovate/self-digest"), YOUNG)
+    waiting = head_at(pull(2, "BLOCKED", headRefName="renovate/other-dep"), OLD)
     forge = Forge(repository(moved, waiting))
     regenerable(forge, moved, waiting)
     done, summary = train(tmp_path, forge)
@@ -3788,3 +3798,249 @@ def test_lease_until_boundary_equal_stamp_returns_none(tmp_path):
     assert rules.lease_until(repo, before) == stamp
     after = datetime(2026, 10, 30, 23, 0, 1, tzinfo=UTC)
     assert rules.lease_until(repo, after) is None
+
+
+def test_a_behind_head_is_not_regenerated(tmp_path):
+    head1 = f"{1:040x}"
+    head2 = f"{2:040x}"
+    behind_pull = pull(1, "BEHIND", headRefName="renovate/demo-1", headRefOid=head1)
+    up_to_date_pull = pull(2, "BLOCKED", headRefName="renovate/demo-2", headRefOid=head2)
+    forge = Forge(repository(behind_pull, up_to_date_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    zip2 = make_artifact_zip(head2, {"notices.txt": b"two"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    forge.add_artifact(
+        "fleet/app",
+        102,
+        f"regenerated-{head2}",
+        zip2,
+        head_sha=head2,
+        head_branch="renovate/demo-2",
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(forge.writes) == 1
+    assert forge.writes[0][0] == "commit"
+    assert forge.writes[0][1] == "renovate/demo-2"
+    assert "| #1 | BEHIND | generated files" not in summary
+    assert "| #2 | BLOCKED | generated files committed |" in summary
+    assert "### fleet/app: committed generated files to #2" in summary
+
+
+def test_a_fresh_train_write_holds_other_landings(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = (datetime.fromisoformat(recent) + timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #2 | CLEAN | held for the generated files of #1 until {until} |" in summary
+
+
+def test_the_written_head_itself_lands_under_the_hold(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    written = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+    assert "held for the generated files of #1 until" in summary
+
+
+def test_a_security_update_lands_under_the_write_hold(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+    )
+    sec = pull(2, "CLEAN", headRefName="renovate/patch", title="fix(deps): security fix [SECURITY]")
+    other = pull(3, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(written, sec, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, HOLD), ("draft", "PR_1"), landed(2)]
+    assert "### fleet/app: landed #2" in summary
+    assert "held for the generated files of #1 until" in summary
+
+
+def test_the_write_hold_ends_after_its_timeout(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    past = (datetime.now(UTC) - timedelta(minutes=61)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=past,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+    now = datetime(2026, 11, 1, 12, 0, 0, tzinfo=UTC)
+    exact_60 = (now - timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    boundary_pull = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=exact_60,
+    )
+    conf = {"bot_id": "123456", "bot_login": f"{BOT}[bot]"}
+    assert rules.write_hold([(boundary_pull, "merge state BLOCKED")], conf, now) is None
+    just_before = now - timedelta(minutes=59, seconds=59)
+    assert rules.write_hold([(boundary_pull, "merge state BLOCKED")], conf, just_before) is not None
+
+
+def test_a_red_written_head_releases_the_hold(tmp_path):
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    red_written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+        suites=["FAILURE"],
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(red_written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_a_rebased_head_releases_the_hold(tmp_path):
+    rules = load_rules(tmp_path)
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rebased = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author={"email": "bot@renovateapp.com"},
+        committedDate=recent,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(rebased, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_a_commit_of_another_author_with_the_headline_holds_nothing(tmp_path):
+    rules = load_rules(tmp_path)
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    attacker = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author={"email": "attacker@example.com"},
+        committedDate=recent,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(attacker, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
+
+
+def test_the_query_reads_the_head_commit_headline_and_author():
+    doc = module()
+    assert "messageHeadline" in doc
+    assert "author { email }" in doc
+
+
+def test_without_the_behind_check_the_behind_head_is_regenerated(tmp_path):
+    """The planted case: without the behind check, the behind head commits generated files."""
+    check = 'if pull["mergeStateStatus"] == "BEHIND":'
+    mutant = script().replace(check, "if False:")
+    assert mutant != script()
+    head1 = f"{1:040x}"
+    behind_pull = pull(1, "BEHIND", headRefName="renovate/demo-1", headRefOid=head1)
+    forge = Forge(repository(behind_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    done, summary = train(tmp_path, forge, text=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(forge.writes) == 1
+    assert forge.writes[0][0] == "commit"
+    assert "### fleet/app: committed generated files to #1" in summary
+
+
+def test_without_the_write_hold_other_pull_request_lands(tmp_path):
+    """The planted case: without the write hold, another clean pull request lands."""
+    mutant = script().replace("hold = write_hold(served, conf, now)", "hold = None")
+    assert mutant != script()
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(written, other))
+    done, summary = train(tmp_path, forge, text=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary

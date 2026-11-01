@@ -36,6 +36,7 @@ from train_rules import (
     QUERY,
     READY,
     REFRESH_LABEL,
+    REGENERATE_HEADLINE,
     SECURITY_HOLD_LABEL,
     NoSignOffError,
     check_release_off,
@@ -52,7 +53,9 @@ from train_rules import (
     superseded,
     updatable,
     verdict,
+    write_hold,
     yield_to_lander,
+    yield_to_write,
 )
 
 TIMEOUT = 30
@@ -597,7 +600,7 @@ def commit_generated_files(env, conf, pull, art, changed):
             "expectedHeadOid": pull["headRefOid"],
             "fileChanges": {"additions": additions},
             "message": {
-                "headline": "chore(deps): regenerate generated files",
+                "headline": REGENERATE_HEADLINE,
                 "body": body,
             },
         }
@@ -609,6 +612,9 @@ def commit_generated_files(env, conf, pull, art, changed):
 
 def is_candidate(pull, reason, default_branch, conf):
     """Whether a pull request is a candidate for generated file regeneration."""
+    if pull["mergeStateStatus"] == "BEHIND":
+        # The update tool rebases a behind head next and drops a commit on it (record 0066).
+        return False
     if not pull["headRefName"].startswith(conf["dependency"]):
         return False
     if pull["isDraft"] or pull["isCrossRepository"]:
@@ -706,6 +712,9 @@ def run(env, conf, repo, now):
     ]
     if lease:
         served = yield_to_lander(served, notes, conf, lease)
+    hold = write_hold(served, conf, now)
+    if hold:
+        served = yield_to_write(served, notes, conf, hold)
     outcome = regenerate(env, conf, repo, served, notes)
     if outcome:
         return rows, notes, outcome
