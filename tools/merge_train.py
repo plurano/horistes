@@ -681,9 +681,13 @@ def regenerate(env, conf, repo, rows, notes):
             continue
         if not changed:
             continue
-        if pull_merge_state(env, pull["number"]) == "BEHIND":
+        state = pull_merge_state(env, pull["number"])
+        if state == "BEHIND":
             notes[pull["number"]] = "behind since the read: not regenerated"
             continue
+        if state in (None, "UNKNOWN"):
+            notes[pull["number"]] = f"merge state {state or 'missing'}: not regenerated"
+            return f"#{pull['number']} merge state {state or 'missing'}: regenerate waits"
         commit_generated_files(env, conf, pull, art, changed)
         notes[pull["number"]] = "generated files committed"
         return f"committed generated files to #{pull['number']}"
@@ -724,6 +728,7 @@ def lander_lease(repo, now):
 
 
 def run(env, conf, repo, now):
+    """Execute one merge train cycle across served pull requests."""
     pulls = repo["pullRequests"]["nodes"]
     replaced = superseded(pulls)
     rows = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
