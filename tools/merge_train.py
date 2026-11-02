@@ -662,7 +662,7 @@ def regenerate(env, conf, repo, rows, notes):
             if other["number"] != pull["number"]
             and other["baseRefName"] == default_branch
             and not is_security(other, conf)
-            and not is_red(other)
+            and not (reason == "merge state BLOCKED" and is_red(other))
             and other.get("autoMergeRequest")
             and reason != "behind"
         ]
