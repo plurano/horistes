@@ -4046,6 +4046,28 @@ def test_an_unstable_train_write_with_a_red_check_still_holds(tmp_path):
     assert "held for the generated files of #1 until" in summary
 
 
+def test_an_unknown_train_write_with_a_red_check_still_holds(tmp_path):
+    """An UNKNOWN train write with a red check stays held: it can still land."""
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    unknown_written = pull(
+        1,
+        "UNKNOWN",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+        suites=["FAILURE"],
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(unknown_written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert landed(2) not in forge.writes
+    assert "held for the generated files of #1 until" in summary
+
+
 def test_a_rebased_head_releases_the_hold(tmp_path):
     """Rebasing the head commit by another author releases the train write hold."""
     rules = load_rules(tmp_path)
@@ -4524,6 +4546,7 @@ def test_regenerate_skips_when_the_live_merge_state_is_unknown(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert not any(write[0] == "commit" for write in forge.writes)
     assert "| #1 | BLOCKED | merge state UNKNOWN: not regenerated |" in summary
+    assert "### fleet/app: #1 merge state UNKNOWN: regenerate waits" in summary
 
 
 def test_regenerate_skips_when_the_live_merge_state_is_missing(tmp_path):
@@ -4546,6 +4569,32 @@ def test_regenerate_skips_when_the_live_merge_state_is_missing(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert not any(write[0] == "commit" for write in forge.writes)
     assert "| #1 | BLOCKED | merge state missing: not regenerated |" in summary
+    assert "### fleet/app: #1 merge state missing: regenerate waits" in summary
+
+
+def test_an_unknown_live_state_lands_nothing_in_the_same_sweep(tmp_path):
+    """An UNKNOWN live merge state halts the sweep without landing any pull request."""
+    head1 = f"{1:040x}"
+    candidate = pull(1, "CLEAN", headRefName="renovate/demo-1", headRefOid=head1)
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(candidate, other))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    forge.merge_states[1] = "UNKNOWN"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(write[0] in ("commit", "merge", "enqueue") for write in forge.writes)
+    assert forge.writes == []
+    assert "regenerate waits" in summary
+    assert "### fleet/app: #1 merge state UNKNOWN: regenerate waits" in summary
 
 
 def test_without_the_behind_check_the_behind_head_is_regenerated(tmp_path):

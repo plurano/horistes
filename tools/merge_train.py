@@ -682,13 +682,12 @@ def regenerate(env, conf, repo, rows, notes):
         if not changed:
             continue
         state = pull_merge_state(env, pull["number"])
-        if state in (None, "UNKNOWN", "BEHIND"):
-            notes[pull["number"]] = (
-                "behind since the read: not regenerated"
-                if state == "BEHIND"
-                else f"merge state {state or 'missing'}: not regenerated"
-            )
+        if state == "BEHIND":
+            notes[pull["number"]] = "behind since the read: not regenerated"
             continue
+        if state in (None, "UNKNOWN"):
+            notes[pull["number"]] = f"merge state {state or 'missing'}: not regenerated"
+            return f"#{pull['number']} merge state {state or 'missing'}: regenerate waits"
         commit_generated_files(env, conf, pull, art, changed)
         notes[pull["number"]] = "generated files committed"
         return f"committed generated files to #{pull['number']}"
