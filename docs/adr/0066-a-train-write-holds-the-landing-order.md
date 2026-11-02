@@ -39,7 +39,7 @@ The numbers were measured across the fleet organisations over a one-week sample 
 - `yield_to_write()` keeps only the held pull request and every security update (`is_security`) in `served`; all other rows are dropped. Notes change only for rows whose reason is `"land"` or `"behind"` (`f"held for the generated files of #{n} until {stamp}"`).
 - The hold is stateless and ends automatically when:
   1. The written head lands (it is no longer an open pull request).
-  2. The written head turns red and is not UNSTABLE.
+  2. The written head turns red and its state is neither `UNSTABLE` nor `UNKNOWN`.
   3. The written head is rebased by Renovate (the latest commit author is no longer the train bot).
   4. 60 minutes elapse from the commit date.
 - Security updates bypass the write hold so critical patches never wait behind generated file runs.
