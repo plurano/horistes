@@ -587,10 +587,11 @@ jobs:
 
 
           def write_hold(served, conf, now):
-              """The pull request a fresh regenerate commit of the train holds the order for, or None.
+              """The pull request a fresh train regenerate commit holds the order for, or None.
 
               Decision record 0066: the head commit is the train's own regenerate commit,
-              younger than WRITE_HOLD_MINUTES, on a head that is not red; with its expiry stamp.
+              younger than WRITE_HOLD_MINUTES, on a head that is not red (an UNSTABLE write
+              stays held); with its expiry stamp.
               """
               email = f"{conf['bot_id']}+{conf['bot_login']}@users.noreply.github.com"
               held = []
@@ -614,7 +615,7 @@ jobs:
                   if committed > now + timedelta(minutes=CLOCK_SKEW_MINUTES):
                       continue
                   until = committed + timedelta(minutes=WRITE_HOLD_MINUTES)
-                  if until > now and not is_red(pull):
+                  if until > now and (pull["mergeStateStatus"] == "UNSTABLE" or not is_red(pull)):
                       held.append((until, pull))
               if not held:
                   return None

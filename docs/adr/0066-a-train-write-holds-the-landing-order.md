@@ -34,12 +34,12 @@ The numbers were measured across the fleet organisations over a one-week sample 
   1. Hold only a pull request that can still land: `write_hold()` iterates `(pull, reason)` and considers a row only when `reason == "land"` or `reason.startswith("merge state ")`. This drops behind, red, draft, labelled, too-young, from-another-repository, superseded, and release rows.
   2. Future dates: ignore a commit whose `committedDate` is more than 5 minutes after `now` (`CLOCK_SKEW_MINUTES = 5`).
   3. Armed rows cannot merge past the hold: `regenerate()` does not write while another non-security pull request on the default branch has `autoMergeRequest` set and a reason other than `"behind"` (the forge's auto-merge could merge it during the hold). The candidate is annotated with note `regenerate waits: #N is armed`.
-  4. Newly behind between read and write: immediately before `commit_generated_files`, re-read that pull request's `mergeStateStatus` via a GraphQL query by number and skip the write when it is `BEHIND`, with a note `behind since the read: not regenerated`.
-- A train write holds the landing order for 60 minutes (`WRITE_HOLD_MINUTES = 60`): `write_hold()` identifies valid written heads whose `committedDate` is newer than `now - 60 minutes`, and which are not red (`is_red(pull)` is False).
+  4. Newly behind between read and write: immediately before `commit_generated_files`, re-read that pull request's `mergeStateStatus` via a GraphQL query by number and skip the write when it is `BEHIND` (note `behind since the read: not regenerated`), `UNKNOWN` or missing (note `merge state UNKNOWN: not regenerated` or `merge state missing: not regenerated`); the forge reports `UNKNOWN` while it recalculates after the base moves.
+- A train write holds the landing order for 60 minutes (`WRITE_HOLD_MINUTES = 60`): `write_hold()` identifies valid written heads whose `committedDate` is newer than `now - 60 minutes`, and releases a write only when it is red and not `UNSTABLE` (`is_red()` counts non-required checks; an `UNSTABLE` head can still land, so it stays held).
 - `yield_to_write()` keeps only the held pull request and every security update (`is_security`) in `served`; all other rows are dropped. Notes change only for rows whose reason is `"land"` or `"behind"` (`f"held for the generated files of #{n} until {stamp}"`).
 - The hold is stateless and ends automatically when:
   1. The written head lands (it is no longer an open pull request).
-  2. The written head turns red.
+  2. The written head turns red and is not UNSTABLE.
   3. The written head is rebased by Renovate (the latest commit author is no longer the train bot).
   4. 60 minutes elapse from the commit date.
 - Security updates bypass the write hold so critical patches never wait behind generated file runs.

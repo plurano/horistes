@@ -486,6 +486,7 @@ class Forge:
         }
 
     def pull_merge_state(self, full: str, variables: dict) -> dict:
+        """Return the mock mergeStateStatus GraphQL response for a pull request."""
         owner, name = full.split("/")
         number = variables["number"]
         assert variables == {"owner": owner, "name": name, "number": number}, variables
@@ -2125,6 +2126,7 @@ def make_oversize_member_zip(
 
 
 def test_dependency_pull_with_valid_artifact_commits_generated_files(tmp_path):
+    """A candidate dependency pull request with a valid artifact commits generated files."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2165,6 +2167,7 @@ def test_dependency_pull_with_valid_artifact_commits_generated_files(tmp_path):
 
 
 def test_negative_no_allowlist_file(tmp_path):
+    """Regeneration is refused when no allowlist file exists on the default branch."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2204,6 +2207,7 @@ def test_negative_path_not_in_allowlist(tmp_path):
 
 
 def test_negative_manifest_head_mismatch(tmp_path):
+    """Regeneration is refused when the artifact manifest head does not match the pull request."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2226,6 +2230,7 @@ def test_negative_manifest_head_mismatch(tmp_path):
 
 
 def test_negative_artifact_from_another_head_branch(tmp_path):
+    """Artifacts produced for a different head branch are refused."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2372,6 +2377,7 @@ def test_without_the_length_check_the_cut_is_not_named(tmp_path):
 
 
 def test_negative_switch_off(tmp_path):
+    """When switch is off, no candidate is regenerated or landed."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2391,6 +2397,7 @@ def test_negative_switch_off(tmp_path):
 
 
 def test_negative_non_dependency_branch(tmp_path):
+    """Regeneration ignores pull requests whose branch does not start with the dependency prefix."""
     head = f"{1:040x}"
     pull_req = pull(1, "BEHIND", headRefName="feat/demo-feature")
     forge = Forge(repository(pull_req))
@@ -2410,6 +2417,7 @@ def test_negative_non_dependency_branch(tmp_path):
 
 
 def test_negative_held_label(tmp_path):
+    """A pull request with a hold label is skipped by regeneration."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep", labels=["hold"])
     forge = Forge(repository(dep_pull))
@@ -2429,6 +2437,7 @@ def test_negative_held_label(tmp_path):
 
 
 def test_negative_content_already_equal(tmp_path):
+    """Regeneration is skipped when the regenerated file contents already match the branch."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2451,6 +2460,7 @@ def test_negative_content_already_equal(tmp_path):
 
 
 def test_without_the_allowlist_check_the_unallowed_path_would_be_committed(tmp_path):
+    """The planted case: without the allowlist check, unallowed paths are committed."""
     mutant = script().replace("or p not in allowlist", "or False")
     assert mutant != script()
     head = f"{1:040x}"
@@ -2474,6 +2484,7 @@ def test_without_the_allowlist_check_the_unallowed_path_would_be_committed(tmp_p
 
 
 def test_rights_token_carries_actions_read_and_storage_url_never_receives_authorization(tmp_path):
+    """Artifact downloads pass authorization only to GitHub API, not storage URLs."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2581,6 +2592,7 @@ def test_negative_zip_oversize_declared_file_size(tmp_path):
 
 
 def test_negative_zip_duplicate_member_names(tmp_path):
+    """Regeneration refuses an artifact zip containing duplicate member filenames."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2604,6 +2616,7 @@ def test_negative_zip_duplicate_member_names(tmp_path):
 
 
 def test_positive_zip_directory_entry_accepted(tmp_path):
+    """Artifact zip archives containing directory entries are accepted."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2670,6 +2683,7 @@ def test_negative_manifest_non_dict_file_entry(tmp_path):
 
 
 def test_negative_manifest_duplicate_path(tmp_path):
+    """Regeneration refuses an artifact manifest with duplicate file paths."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2696,6 +2710,7 @@ def test_negative_manifest_duplicate_path(tmp_path):
 
 
 def test_first_candidate_bad_second_good_commits_second(tmp_path):
+    """A refused artifact on the first candidate falls through to regenerate the second."""
     head1 = f"{1:040x}"
     head2 = f"{2:040x}"
     p1 = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
@@ -2734,6 +2749,7 @@ def test_first_candidate_bad_second_good_commits_second(tmp_path):
 
 
 def test_refused_artifact_falls_through_to_land_clean_pull(tmp_path):
+    """A refused artifact on a candidate falls through to land an eligible clean pull request."""
     head1 = f"{1:040x}"
     p1 = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
     p2 = pull(2, "CLEAN", headRefName="feat/other-change")
@@ -2760,6 +2776,7 @@ def test_refused_artifact_falls_through_to_land_clean_pull(tmp_path):
 
 
 def test_commit_mutation_refusal_fails_repository_run(tmp_path):
+    """A GraphQL error on createCommitOnBranch fails the train run for the repository."""
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2780,6 +2797,7 @@ def test_commit_mutation_refusal_fails_repository_run(tmp_path):
 
 
 def test_regenerate_excludes_person_branch(tmp_path):
+    """A release or person branch is excluded from regeneration candidate selection."""
     head = f"{1:040x}"
     rel_pull = pull(1, "BLOCKED", headRefName="release-please--branches--main")
     forge = Forge(repository(rel_pull))
@@ -3428,6 +3446,7 @@ def regenerable(forge: Forge, *nodes: dict) -> None:
 
 
 def test_security_update_gets_the_generated_files_write_before_an_older_digest(tmp_path):
+    """A security update takes precedence for generated files write over an older digest."""
     # Golusoris, 2026-10-28: a digest update re-pushed on every main push took every write.
     digest = head_at(pull(1, "BLOCKED", headRefName="renovate/self-digest"), YOUNG)
     fix = head_at(
@@ -3443,6 +3462,7 @@ def test_security_update_gets_the_generated_files_write_before_an_older_digest(t
 
 
 def test_security_title_counts_like_the_label_for_the_generated_files_write(tmp_path):
+    """A [SECURITY] title prefix prioritizes generated files write like the label."""
     digest = pull(1, "BLOCKED", headRefName="renovate/self-digest")
     fix = pull(2, "BLOCKED", headRefName="renovate/x-net", title="fix(deps): x/net [SECURITY]")
     forge = Forge(repository(digest, fix))
@@ -3453,6 +3473,7 @@ def test_security_title_counts_like_the_label_for_the_generated_files_write(tmp_
 
 
 def test_generated_files_write_serves_the_longest_waiting_head_first(tmp_path):
+    """Candidates are regenerated in longest-waiting order based on head commit timestamp."""
     # The older update's head moved last: the newer one has waited longer and goes first.
     moved = head_at(pull(1, "BLOCKED", headRefName="renovate/self-digest"), YOUNG)
     waiting = head_at(pull(2, "BLOCKED", headRefName="renovate/other-dep"), OLD)
@@ -3807,6 +3828,7 @@ def test_bad_lease_description_with_security_hold_writes_nothing(tmp_path):
 
 
 def test_security_hold_under_live_lease_still_drafts_dependency_updates(tmp_path):
+    """A live lander lease with an open security update drafts other dependency updates."""
     update = pull(1, "CLEAN", headRefName="renovate/go-snaps", autoMergeRequest={"enabledAt": OLD})
     fix = pull(2, "BEHIND", headRefName="renovate/x-net", title="fix(deps): x/net [security]")
     future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3818,6 +3840,7 @@ def test_security_hold_under_live_lease_still_drafts_dependency_updates(tmp_path
 
 
 def test_switched_off_with_live_lease_stays_switched_off(tmp_path):
+    """When switch is off, an active lander lease does not trigger landing or updates."""
     future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     forge = Forge(repository(pull(1, "CLEAN"), lease=f"until={future}"))
     done, summary = train(tmp_path, forge, switch="off")
@@ -3827,6 +3850,7 @@ def test_switched_off_with_live_lease_stays_switched_off(tmp_path):
 
 
 def test_lease_until_boundary_equal_stamp_returns_none(tmp_path):
+    """A lander lease expiring at exactly the boundary time returns None."""
     rules = load_rules(tmp_path)
     now = datetime(2026, 10, 30, 23, 0, 0, tzinfo=UTC)
     stamp = "2026-10-30T23:00:00Z"
@@ -3839,6 +3863,7 @@ def test_lease_until_boundary_equal_stamp_returns_none(tmp_path):
 
 
 def test_a_behind_head_is_not_regenerated(tmp_path):
+    """A behind pull request is never regenerated because Renovate rebases it next."""
     head1 = f"{1:040x}"
     head2 = f"{2:040x}"
     behind_pull = pull(1, "BEHIND", headRefName="renovate/demo-1", headRefOid=head1)
@@ -3874,6 +3899,7 @@ def test_a_behind_head_is_not_regenerated(tmp_path):
 
 
 def test_a_fresh_train_write_holds_other_landings(tmp_path):
+    """A fresh train regenerate commit holds other pull requests from landing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3895,6 +3921,7 @@ def test_a_fresh_train_write_holds_other_landings(tmp_path):
 
 
 def test_the_written_head_itself_lands_under_the_hold(tmp_path):
+    """The written pull request itself remains eligible to land while holding others."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3916,6 +3943,7 @@ def test_the_written_head_itself_lands_under_the_hold(tmp_path):
 
 
 def test_a_security_update_lands_first_while_a_train_write_is_open(tmp_path):
+    """A security update bypasses an active train write hold and lands immediately."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3940,6 +3968,7 @@ def test_a_security_update_lands_first_while_a_train_write_is_open(tmp_path):
 
 
 def test_the_write_hold_ends_after_its_timeout(tmp_path):
+    """A train write hold expires after WRITE_HOLD_MINUTES elapse."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     past = (datetime.now(UTC) - timedelta(minutes=61)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3974,6 +4003,7 @@ def test_the_write_hold_ends_after_its_timeout(tmp_path):
 
 
 def test_a_red_written_head_releases_the_hold(tmp_path):
+    """A red check on a BLOCKED written head releases the hold immediately."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3994,7 +4024,30 @@ def test_a_red_written_head_releases_the_hold(tmp_path):
     assert "### fleet/app: landed #2" in summary
 
 
+def test_an_unstable_train_write_with_a_red_check_still_holds(tmp_path):
+    """An UNSTABLE train write with a red check stays held: it can still land."""
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    unstable_written = pull(
+        1,
+        "UNSTABLE",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+        suites=["FAILURE"],
+    )
+    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
+    forge = Forge(repository(unstable_written, other))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert landed(2) not in forge.writes
+    assert "held for the generated files of #1 until" in summary
+
+
 def test_a_rebased_head_releases_the_hold(tmp_path):
+    """Rebasing the head commit by another author releases the train write hold."""
     rules = load_rules(tmp_path)
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rebased = pull(
@@ -4014,6 +4067,7 @@ def test_a_rebased_head_releases_the_hold(tmp_path):
 
 
 def test_a_commit_of_another_author_with_the_headline_holds_nothing(tmp_path):
+    """A regenerate headline authored by someone other than the bot holds nothing."""
     rules = load_rules(tmp_path)
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     attacker = pull(
@@ -4033,6 +4087,7 @@ def test_a_commit_of_another_author_with_the_headline_holds_nothing(tmp_path):
 
 
 def test_the_query_reads_the_head_commit_headline_and_author(tmp_path):
+    """The GraphQL pull query requests the head commit headline, author, and signature."""
     rules = load_rules(tmp_path)
     assert "messageHeadline" in rules.QUERY
     assert "author { email user { login } }" in rules.QUERY
@@ -4040,6 +4095,7 @@ def test_the_query_reads_the_head_commit_headline_and_author(tmp_path):
 
 
 def test_a_young_train_written_head_holds_nothing(tmp_path):
+    """A train write on a pull request younger than min_age_days holds nothing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4061,6 +4117,7 @@ def test_a_young_train_written_head_holds_nothing(tmp_path):
 
 
 def test_a_draft_train_written_head_holds_nothing(tmp_path):
+    """A train write on a draft pull request holds nothing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4082,6 +4139,7 @@ def test_a_draft_train_written_head_holds_nothing(tmp_path):
 
 
 def test_a_labelled_train_written_head_holds_nothing(tmp_path):
+    """A train write on a pull request with a hold label holds nothing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4103,6 +4161,7 @@ def test_a_labelled_train_written_head_holds_nothing(tmp_path):
 
 
 def test_a_cross_repository_train_written_head_holds_nothing(tmp_path):
+    """A train write on a cross-repository fork pull request holds nothing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4124,6 +4183,7 @@ def test_a_cross_repository_train_written_head_holds_nothing(tmp_path):
 
 
 def test_a_behind_train_written_head_holds_nothing(tmp_path):
+    """A train write on a behind pull request holds nothing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4144,6 +4204,7 @@ def test_a_behind_train_written_head_holds_nothing(tmp_path):
 
 
 def test_an_unsigned_regenerate_commit_holds_nothing(tmp_path):
+    """A regenerate commit without a GitHub signature holds nothing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4165,6 +4226,7 @@ def test_an_unsigned_regenerate_commit_holds_nothing(tmp_path):
 
 
 def test_a_regenerate_commit_of_another_login_holds_nothing(tmp_path):
+    """A regenerate commit authored by another GitHub login holds nothing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4187,6 +4249,7 @@ def test_a_regenerate_commit_of_another_login_holds_nothing(tmp_path):
 
 
 def test_a_future_dated_regenerate_commit_skew_bounds(tmp_path):
+    """A regenerate commit dated beyond allowed clock skew holds nothing."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     far_future = (datetime.now(UTC) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4222,6 +4285,7 @@ def test_a_future_dated_regenerate_commit_skew_bounds(tmp_path):
 
 
 def test_regenerate_waits_when_another_pr_is_armed_blocked(tmp_path):
+    """Regeneration waits when another non-behind pull request is armed for auto-merge."""
     head1 = f"{1:040x}"
     candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
     armed_other = pull(
@@ -4252,6 +4316,7 @@ def test_regenerate_waits_when_another_pr_is_armed_blocked(tmp_path):
 
 
 def test_regenerate_proceeds_when_another_pr_is_armed_behind(tmp_path):
+    """Regeneration proceeds when an armed pull request is behind default branch."""
     head1 = f"{1:040x}"
     candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
     armed_behind = pull(
@@ -4283,6 +4348,7 @@ def test_regenerate_proceeds_when_another_pr_is_armed_behind(tmp_path):
 
 
 def test_regenerate_proceeds_when_another_pr_is_armed_red(tmp_path):
+    """Regeneration proceeds when an armed pull request is red and BLOCKED."""
     head1 = f"{1:040x}"
     candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
     armed_other = pull(
@@ -4314,6 +4380,7 @@ def test_regenerate_proceeds_when_another_pr_is_armed_red(tmp_path):
 
 
 def test_regenerate_waits_when_another_pr_is_armed_red_but_unstable(tmp_path):
+    """Regeneration waits when an armed pull request is red but UNSTABLE."""
     head1 = f"{1:040x}"
     candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
     armed_other = pull(
@@ -4345,6 +4412,7 @@ def test_regenerate_waits_when_another_pr_is_armed_red_but_unstable(tmp_path):
 
 
 def test_regenerate_proceeds_when_another_pr_is_armed_security(tmp_path):
+    """Regeneration proceeds when an armed pull request is a security update."""
     head1 = f"{1:040x}"
     candidate = pull(
         1,
@@ -4383,6 +4451,7 @@ def test_regenerate_proceeds_when_another_pr_is_armed_security(tmp_path):
 
 
 def test_another_blocked_candidate_gets_no_write_during_hold(tmp_path):
+    """Another blocked candidate does not receive a regenerate write during a hold."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4414,6 +4483,7 @@ def test_another_blocked_candidate_gets_no_write_during_hold(tmp_path):
 
 
 def test_newly_behind_between_read_and_write_skips_commit(tmp_path):
+    """Regeneration skips committing when the head becomes behind between read and write."""
     head1 = f"{1:040x}"
     candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
     forge = Forge(repository(candidate))
@@ -4432,6 +4502,50 @@ def test_newly_behind_between_read_and_write_skips_commit(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
     assert "| #1 | BLOCKED | behind since the read: not regenerated |" in summary
+
+
+def test_regenerate_skips_when_the_live_merge_state_is_unknown(tmp_path):
+    """Regeneration skips when the live merge state re-read returns UNKNOWN."""
+    head1 = f"{1:040x}"
+    candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
+    forge = Forge(repository(candidate))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    forge.merge_states[1] = "UNKNOWN"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(write[0] == "commit" for write in forge.writes)
+    assert "| #1 | BLOCKED | merge state UNKNOWN: not regenerated |" in summary
+
+
+def test_regenerate_skips_when_the_live_merge_state_is_missing(tmp_path):
+    """Regeneration skips when the live merge state re-read returns None."""
+    head1 = f"{1:040x}"
+    candidate = pull(1, "BLOCKED", headRefName="renovate/demo-1", headRefOid=head1)
+    forge = Forge(repository(candidate))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    zip1 = make_artifact_zip(head1, {"notices.txt": b"one"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head1}",
+        zip1,
+        head_sha=head1,
+        head_branch="renovate/demo-1",
+    )
+    forge.merge_states[1] = None
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(write[0] == "commit" for write in forge.writes)
+    assert "| #1 | BLOCKED | merge state missing: not regenerated |" in summary
 
 
 def test_without_the_behind_check_the_behind_head_is_regenerated(tmp_path):
