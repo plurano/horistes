@@ -1,7 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release except for a fix of a known vulnerability, which carries the label security for the merge train and is rebased as soon as it falls behind, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, go mod tidy after a Go module update, and no proposal for the machine a job runs on; own releases of the family's organisations wait for no release age; forks of outside projects keep three days."
+    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release except for a fix of a known vulnerability, which carries the label security for the merge train and is rebased as soon as it falls behind, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, go mod tidy after a Go module update, and no proposal for the machine a job runs on; own releases of the family's organisations wait for no release age; forks of outside projects keep three days.",
+    "The PR header carries the repository template's description and verification checklist, with every box unticked; CI runs the required checks."
   ],
   "extends": [
     "config:recommended",
@@ -23,6 +24,7 @@
   "postUpdateOptions": [
     "gomodTidy"
   ],
+  "prHeader": "## Description\n\nRenovate proposes this dependency update under the family preset. The table below lists each package and its version change, and the release notes follow.\n\n## Pre-Merge Verification Checklist\n\nThe bot leaves every box unticked; CI runs these checks through the required checks on this pull request.\n\n- [ ] Local verification passed: `make verify-all`\n- [ ] No new HISS / NASA Power-of-10 infractions (all new/modified functions\n  $\\le 60$ LOC)\n- [ ] 3D Tests included (Positive, Negative, Boundary) for public APIs\n- [ ] Agent contexts in sync: `standardsctl compile-context --verify`\n- [ ] Commit messages adhere to Conventional Commits format\n\n",
   "packageRules": [
     {
       "description": "Which release of a hosted machine a job runs on is decided in the repository, not proposed.",
