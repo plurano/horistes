@@ -27,6 +27,10 @@ from conftest import ROOT
 
 CONFIG = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
 PRESET = json.loads((ROOT / "default.json").read_text(encoding="utf-8"))
+PR_TEMPLATE = (ROOT / ".github/pull_request_template.md").read_text(encoding="utf-8")
+PR_HEADINGS = re.findall(r"^## .+$", PR_TEMPLATE, re.MULTILINE)
+PR_CHECKBOX = re.compile(r"^- \[ \] [^\n]+(?:\n[ \t]+[^\n]+)*", re.MULTILINE)
+PR_CHECKLIST = PR_CHECKBOX.findall(PR_TEMPLATE)
 PLANTED_PRESET = "tests/fixtures/update-bot/planted-preset.json"
 SYNCED = json.loads((ROOT / "settings-sync.json").read_text(encoding="utf-8"))
 PLANTED_SYNCED = "tests/fixtures/update-bot/planted-settings-sync.json"
@@ -46,6 +50,7 @@ SHARED = {
     "automerge",
     "gitIgnoredAuthors",
     "postUpdateOptions",
+    "prHeader",
     "packageRules",
 }
 # The commit address of the merge-train app's bot user (numeric user id, then the
@@ -433,6 +438,47 @@ def test_planted_untidy_go_update_is_refused(preset):
 def test_this_repository_extends_the_preset_and_nothing_else():
     assert CONFIG["extends"] == [REFERENCE]
     assert (ROOT / "default.json").is_file()
+
+
+def pr_header_problems(preset: dict) -> list[str]:
+    """Missing template sections or claims of verification made by the bot."""
+    header = preset.get("prHeader")
+    if not isinstance(header, str) or not header.strip():
+        return ["prHeader"]
+    problems = [heading for heading in PR_HEADINGS if heading not in header.splitlines()]
+    checklist = PR_CHECKBOX.findall(header)
+    items = {" ".join(item.split()) for item in checklist}
+    problems.extend(item for item in PR_CHECKLIST if " ".join(item.split()) not in items)
+    if re.search(r"\[[xX]\]", header):
+        problems.append("ticked box")
+    return problems
+
+
+def test_preset_pr_header_carries_the_repository_template():
+    assert PR_HEADINGS and PR_CHECKLIST
+    assert pr_header_problems(PRESET) == []
+
+
+def test_planted_preset_without_a_pr_header_is_refused():
+    preset = {key: value for key, value in PRESET.items() if key != "prHeader"}
+    assert pr_header_problems(preset) == ["prHeader"]
+
+
+@pytest.mark.parametrize("mark", ["x", "X"])
+def test_planted_ticked_pr_header_is_refused(mark):
+    header = PR_TEMPLATE + f"\n- [{mark}] Verification claimed by the bot\n"
+    assert pr_header_problems({**PRESET, "prHeader": header}) == ["ticked box"]
+
+
+@pytest.mark.parametrize("missing", PR_HEADINGS + PR_CHECKLIST)
+def test_planted_incomplete_pr_header_is_refused(missing):
+    header = PR_TEMPLATE.replace(missing, "")
+    assert pr_header_problems({**PRESET, "prHeader": header}) == [missing]
+
+
+def test_pr_header_accepts_a_folded_checklist_item():
+    header = re.sub(r"\n[ \t]+", " ", PR_TEMPLATE)
+    assert pr_header_problems({**PRESET, "prHeader": header}) == []
 
 
 def test_preset_holds_only_what_is_the_same_in_every_repository():
