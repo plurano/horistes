@@ -551,7 +551,7 @@ and reports to the forge's code scanning ([ADR-0043](docs/adr/0043-codeql-report
 | waiting time after a release | three days; none for a fix of a known vulnerability |
 | merge by the bot | never |
 | after a Go module update | `go mod tidy` (`gomodTidy`) |
-| pull request body | `prHeader` adds the description and verification checklist; every box stays unticked |
+| pull request body | `prHeader` adds the description and verification checklist; every box stays unticked. The header matches the template that `praetorctl adopt` ships. A repository with a different template sets its own `prHeader` in its `renovate.json`. |
 | the machine a job runs on | not proposed |
 
 A fix of a known vulnerability skips the waiting time
