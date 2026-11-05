@@ -11,6 +11,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 from conftest import ROOT
@@ -232,7 +233,7 @@ def test_no_release_tags_on_hub_fails_with_exit_3(capsys: pytest.CaptureFixture[
 def test_fetch_hub_tags_parses_json(monkeypatch: pytest.MonkeyPatch):
     """fetch_hub_tags successfully parses and bounds valid Docker Hub JSON."""
     raw_json = json.dumps(
-        {"results": [{"name": "1.2.3", "tag_last_pushed": "2025-10-27T15:28:22Z"}]}
+        {"results": [{"name": "parser-fixture", "tag_last_pushed": "2025-10-27T15:28:22Z"}]}
     ).encode("utf-8")
 
     class FakeResponse:
@@ -248,7 +249,7 @@ def test_fetch_hub_tags_parses_json(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: FakeResponse())
     results = image_age.fetch_hub_tags("https://hub.example/tags")
     assert len(results) == 1
-    assert results[0]["name"] == "1.2.3"
+    assert results[0]["name"] == "parser-fixture"
 
 
 def test_fetch_hub_tags_http_error(monkeypatch: pytest.MonkeyPatch):
@@ -297,23 +298,55 @@ def test_pin_matches_an_independent_read_of_the_licence_workflow():
     assert OLDER_VERSION != PINNED_VERSION
 
 
+PIN_READERS = ("read_pin(", "# release ")
+
+
 def pin_literals(text: str) -> list[str]:
-    """The live pin's release or digest as they appear literally in a test source."""
-    found = re.findall(rf"(?<![\d.]){re.escape(PINNED_VERSION)}(?![\d.])", text)
-    return found + re.findall(re.escape(PINNED_DIGEST.split(":", 1)[1]), text)
+    """The live pin's digest, and its release in a test that reads the pin, spelt literally.
+
+    The digest is unique, so it is looked for everywhere. A release number such as 7.0.8
+    can also be test data of an unrelated tool, so it only counts in a test whose
+    expectations follow the pin: one that reads the licence workflow's pin itself.
+    """
+    found = re.findall(re.escape(PINNED_DIGEST.split(":", 1)[1]), text)
+    if any(reader in text for reader in PIN_READERS):
+        found += re.findall(rf"(?<![\d.]){re.escape(PINNED_VERSION)}(?![\d.])", text)
+    return found
+
+
+def pin_offenders(tests: Path) -> dict[str, list[str]]:
+    """Every Python source under tests, sub-folders included, that spells the live pin."""
+    found = {
+        path.relative_to(tests).as_posix(): pin_literals(path.read_text(encoding="utf-8"))
+        for path in sorted(tests.rglob("*.py"))
+    }
+    return {name: hits for name, hits in found.items() if hits}
 
 
 def test_no_test_names_the_live_pin_literally():
     """A release update rewrites the pin, so a test that spells it out breaks on every update."""
-    offenders = {
-        path.name: pin_literals(path.read_text(encoding="utf-8"))
-        for path in sorted((ROOT / "tests").glob("*.py"))
-    }
-    assert {name: hits for name, hits in offenders.items() if hits} == {}
+    assert pin_offenders(ROOT / "tests") == {}
 
 
 def test_planted_pin_literal_is_found():
-    """Planted: a test source that spells the live release or digest is reported."""
-    assert pin_literals(f'make_tag("{PINNED_VERSION}", ...)') == [PINNED_VERSION]
+    """Planted: a pin-reading test that spells the live release or digest is reported."""
+    reader = "PINNED = image_age.read_pin(ROOT)\n"
+    assert pin_literals(f'{reader}make_tag("{PINNED_VERSION}", ...)') == [PINNED_VERSION]
     assert pin_literals(f"digest = '{PINNED_DIGEST}'") == [PINNED_DIGEST.split(":", 1)[1]]
-    assert pin_literals(f'make_tag("1{PINNED_VERSION}.9", ...)') == []
+
+
+def test_unrelated_release_number_is_not_a_pin_literal():
+    """Boundary: the same number in a test that never reads the pin, or inside a longer one."""
+    assert pin_literals(f'other_tool = "{PINNED_VERSION}"') == []
+    reader = "PINNED = image_age.read_pin(ROOT)\n"
+    assert pin_literals(f'{reader}make_tag("1{PINNED_VERSION}.9", ...)') == []
+
+
+def test_nested_test_source_is_scanned(tmp_path: Path):
+    """The guard walks sub-folders of tests, where fixtures live."""
+    nested = tmp_path / "fixtures" / "deep"
+    nested.mkdir(parents=True)
+    (nested / "planted.py").write_text(f"DIGEST = '{PINNED_DIGEST}'\n", encoding="utf-8")
+    (tmp_path / "clean.py").write_text("VALUE = 1\n", encoding="utf-8")
+    digest_hex = PINNED_DIGEST.split(":", 1)[1]
+    assert pin_offenders(tmp_path) == {"fixtures/deep/planted.py": [digest_hex]}
