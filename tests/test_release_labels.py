@@ -765,8 +765,8 @@ def test_planted_reusable_release_workflow_skips_release(tmp_path, forge, mutate
     source = module()
     if mutated:
         source = source.replace(
-            '+ "".join("|" + re.escape(w) for w in KNOWN_RELEASE_WORKFLOWS)',
-            "",
+            "any(target.startswith(w) for w in KNOWN_RELEASE_WORKFLOWS)",
+            "False",
         )
         assert source != module()
     forge.config = {}
@@ -784,14 +784,226 @@ def test_planted_reusable_release_workflow_skips_release(tmp_path, forge, mutate
     ) is not mutated
 
 
-def test_unrelated_reusable_workflow_leaves_skip_false(tmp_path, forge):
+# The repository's own .github/workflows/release-please.yml shape: workflow_call only.
+WORKFLOW_CALL_ONLY_WORKFLOW = """name: Release please
+on:
+  workflow_call:
+    inputs:
+      runner:
+        default: ubuntu-26.04
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
+"""
+BLOCK_SCALAR_WORKFLOW = f"""name: CI
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          uses: googleapis/release-please-action@{HELPER_SHA}
+"""
+STEP_REUSABLE_WORKFLOW = f"""name: Release
+on: [push]
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+"""
+STEP_TWO_LINE_REUSABLE_WORKFLOW = f"""name: Release
+on: [push]
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call
+        uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+"""
+# The common two-line step shape: name first, the action on the step's second line.
+TWO_LINE_ACTION_WORKFLOW = """name: Release please
+on:
+  push:
+    branches: [main]
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
+"""
+DORMANT_REUSABLE_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    if: false
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+"""
+CUSTOM_CONFIG_REUSABLE_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+    with:
+      config_file: other-config.json
+"""
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_workflow_call_only_leaves_skip_false(tmp_path, forge, mutated):
+    """A workflow triggered only by workflow_call does not count."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "if not workflow_has_allowed_trigger(content):",
+            "if False:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"release-please.yml": WORKFLOW_CALL_ONLY_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert ("runs release-please in its own workflow" in done.stdout) is mutated
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_block_scalar_reusable_workflow_leaves_skip_false(tmp_path, forge, mutated):
+    """Uses line inside a block scalar does not count."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "if block_indent is not None and indent > block_indent:",
+            "if False and indent > block_indent:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"ci.yml": BLOCK_SCALAR_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert ("runs release-please in its own workflow" in done.stdout) is mutated
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_step_level_reusable_workflow_leaves_skip_false(tmp_path, forge, mutated):
+    """A reusable workflow called as a step rather than job-level does not count."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            'elif own_level and clean.startswith("uses:"):',
+            'elif clean.removeprefix("- ").startswith("uses:"):',
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release.yml": STEP_REUSABLE_WORKFLOW,
+        "release-two-line.yml": STEP_TWO_LINE_REUSABLE_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert ("runs release-please in its own workflow" in done.stdout) is mutated
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_dormant_job_reusable_workflow_leaves_skip_false(tmp_path, forge, mutated):
+    """A job whose own if: is literal false does not count."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            'if is_literal_false(clean.split(":", 1)[1]):',
+            "if False:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"release-automation.yml": DORMANT_REUSABLE_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert ("runs release-please in its own workflow" in done.stdout) is mutated
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_custom_config_reusable_workflow_leaves_skip_false(tmp_path, forge, mutated):
+    """A reusable call with non-default config_file does not count."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "return bool(reusable_call and not custom_config)",
+            "return bool(reusable_call and True)",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"release-automation.yml": CUSTOM_CONFIG_REUSABLE_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert ("runs release-please in its own workflow" in done.stdout) is mutated
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_unrelated_reusable_workflow_leaves_skip_false(tmp_path, forge, mutated):
     """Job-level uses of an unrelated reusable workflow leaves skip=false."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "any(target.startswith(w) for w in KNOWN_RELEASE_WORKFLOWS)",
+            '"/.github/workflows/" in target',
+        )
+        assert source != module()
     forge.config = {}
     forge.workflows = {"ci.yml": UNRELATED_REUSABLE_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert ("runs release-please in its own workflow" in done.stdout) is mutated
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_two_line_action_step_skips_release(tmp_path, forge, mutated):
+    """The action named on a step's second line, under - name:, sets skip=true."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            'r"^(?:-\\s+)?uses:',
+            'r"^-\\s+uses:',
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"release-please.yml": TWO_LINE_ACTION_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert ("runs release-please in its own workflow" in done.stdout) is not mutated
+
+
+def test_workflow_count_exceeding_bound_fails(tmp_path, forge):
+    """More than 100 workflow files fails naming the bound of 100."""
+    forge.config = {}
+    forge.workflows = {f"wf{n:03d}.yml": UNRELATED_WORKFLOW for n in range(101)}
+    done, _ = settings(tmp_path, forge)
+    assert done.returncode != 0
+    assert "100" in done.stdout
+
+
+def test_workflow_count_at_bound_succeeds(tmp_path, forge):
+    """Exactly 100 workflow files does not trigger the bound error."""
+    forge.config = {}
+    forge.workflows = {f"wf{n:03d}.yml": UNRELATED_WORKFLOW for n in range(100)}
     done, outputs = settings(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert outputs == "skip=false\npending=[]\nfrozen=false\n"
-    assert "runs release-please in its own workflow" not in done.stdout
 
 
 def test_unrelated_workflow_leaves_skip_false(tmp_path, forge):

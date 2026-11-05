@@ -926,11 +926,9 @@ jobs:
               "plurano/horistes/.github/workflows/release-please.yml@",
               "plurano/horistes/.github/workflows/release-please.yaml@",
           )
-          OWN_RELEASE_ACTION = re.compile(
-              r"^-?\s*uses:\s*[\"']?(?:googleapis/release-please-action@"
-              + "".join("|" + re.escape(w) for w in KNOWN_RELEASE_WORKFLOWS)
-              + ")"
-          )
+          ALLOWED_TRIGGERS = ("push", "workflow_dispatch", "schedule", "workflow_run")
+          ACTION_STEP_RE = re.compile(r"^(?:-\s+)?uses:\s*[\"']?googleapis/release-please-action@")
+          BLOCK_SCALAR_RE = re.compile(r":\s*[|>][-+0-9]*(?:\s*#.*)?$")
           # Only the fields the release checks read: the REST pull list carries two full repository
           # objects per pull, about 480 kB for 20 pulls, and the forge cut that body short in 3 of 10
           # reads. The order is that of the REST list: newest created first.
@@ -1024,6 +1022,201 @@ jobs:
                   raise CallError(f"parse release-please-config.json: {err}") from err
 
 
+          def is_literal_false(val):
+              """Whether an if: condition is a literal false (quoted, expression, or raw)."""
+              val = re.sub(r"\s+#.*$", "", val).strip()
+              for _ in range(2):
+                  if (val.startswith("'") and val.endswith("'")) or (
+                      val.startswith('"') and val.endswith('"')
+                  ):
+                      val = val[1:-1].strip()
+              if val.startswith("$" + "{{") and val.endswith("}}"):
+                  val = val[3:-2].strip()
+                  for _ in range(2):
+                      if (val.startswith("'") and val.endswith("'")) or (
+                          val.startswith('"') and val.endswith('"')
+                      ):
+                          val = val[1:-1].strip()
+              return val.lower() == "false"
+
+
+          def has_custom_config(lines):
+              """Whether with: sets config or manifest path away from default."""
+              for line in lines[:100]:
+                  clean = re.sub(r"\s+#.*$", "", line).strip()
+                  items = (
+                      clean.strip("{}").split(",")
+                      if (clean.startswith("{") and clean.endswith("}"))
+                      else [clean]
+                  )
+                  for item in items[:10]:
+                      match = re.match(r"^([a-zA-Z0-9_-]+)\s*:\s*(.*)$", item.strip())
+                      if not match:
+                          continue
+                      key = match.group(1).replace("_", "-")
+                      val = match.group(2).strip().strip("'\"")
+                      if key == "config-file" and val != "release-please-config.json":
+                          return True
+                      if key == "manifest-file" and val != ".release-please-manifest.json":
+                          return True
+              return False
+
+
+          def workflow_has_allowed_trigger(content):
+              """Whether top-level on: includes at least one allowed trigger."""
+              lines = content.splitlines()[:5000]
+              in_on = False
+              on_indent = None
+              block_indent = None
+              for line in lines:
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  indent = len(line) - len(line.lstrip(" "))
+                  if block_indent is not None:
+                      if indent > block_indent:
+                          continue
+                      block_indent = None
+                  if stripped.startswith("#"):
+                      continue
+                  if BLOCK_SCALAR_RE.search(line):
+                      block_indent = indent
+                  if indent == 0:
+                      if in_on:
+                          return False
+                      if re.match(r"^on:\s*(.*)$", stripped):
+                          rest = stripped.split(":", 1)[1].strip()
+                          rest = re.sub(r"\s+#.*$", "", rest).strip()
+                          if rest:
+                              if rest.startswith("[") and rest.endswith("]"):
+                                  parts = [s.strip().strip("'\"") for s in rest[1:-1].split(",")]
+                                  return any(item in ALLOWED_TRIGGERS for item in parts if item)
+                              return rest.strip("'\"") in ALLOWED_TRIGGERS
+                          in_on = True
+                          on_indent = None
+                      continue
+                  if not in_on:
+                      continue
+                  if on_indent is None:
+                      on_indent = indent
+                  if indent == on_indent:
+                      clean = re.sub(r"\s+#.*$", "", stripped)
+                      key_m = re.match(r"^([a-zA-Z0-9_-]+):", clean)
+                      if key_m and key_m.group(1) in ALLOWED_TRIGGERS:
+                          return True
+                      seq_m = re.match(r"^-\s*([a-zA-Z0-9_-]+)", clean)
+                      if seq_m and seq_m.group(1) in ALLOWED_TRIGGERS:
+                          return True
+              return False
+
+
+          def job_direct_indent(job_lines):
+              """Indent of a job's own keys: its first line that is neither blank nor a comment."""
+              for line in job_lines[:1000]:
+                  stripped = line.strip()
+                  if stripped and not stripped.startswith("#"):
+                      return len(line) - len(line.lstrip(" "))
+              return None
+
+
+          def job_key(clean, own_level, flags):
+              """Record what one job line sets in flags; True when the line opens a with: block."""
+              if own_level and clean.startswith("if:"):
+                  if is_literal_false(clean.split(":", 1)[1]):
+                      flags["dormant"] = True
+              elif own_level and clean.startswith("uses:"):
+                  target = clean.split(":", 1)[1].strip().strip("'\"")
+                  if any(target.startswith(w) for w in KNOWN_RELEASE_WORKFLOWS):
+                      flags["reusable"] = True
+              elif own_level and clean.startswith("with:"):
+                  rest = clean.split(":", 1)[1].strip()
+                  if not rest:
+                      return True
+                  flags["custom"] = flags["custom"] or has_custom_config([rest])
+              if ACTION_STEP_RE.search(clean):
+                  flags["action"] = True
+              return False
+
+
+          def job_runs_release(job_lines):
+              """Whether a single job runs release-please action or reusable workflow."""
+              direct_indent = job_direct_indent(job_lines)
+              if direct_indent is None:
+                  return False
+              flags = {"dormant": False, "reusable": False, "action": False, "custom": False}
+              block_indent = None
+              in_with = False
+              with_lines = []
+              for line in job_lines[:1000]:
+                  indent = len(line) - len(line.lstrip(" "))
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if block_indent is not None and indent > block_indent:
+                      continue
+                  block_indent = None
+                  if stripped.startswith("#"):
+                      continue
+                  if BLOCK_SCALAR_RE.search(line):
+                      block_indent = indent
+                  if in_with and indent > direct_indent:
+                      with_lines.append(line)
+                      continue
+                  in_with = False
+                  clean = re.sub(r"\s+#.*$", "", stripped)
+                  if job_key(clean, indent == direct_indent, flags):
+                      in_with = True
+              custom_config = flags["custom"] or has_custom_config(with_lines)
+              reusable_call = flags["reusable"]
+              if flags["dormant"]:
+                  return False
+              if flags["action"]:
+                  return True
+              return bool(reusable_call and not custom_config)
+
+
+          def workflow_runs_release(content):
+              """Whether workflow triggers and jobs structure run release-please."""
+              if not workflow_has_allowed_trigger(content):
+                  return False
+              in_jobs = False
+              job_indent = None
+              current_job = []
+              lines = content.splitlines()[:5000]
+              for line in lines:
+                  stripped = line.strip()
+                  if not stripped:
+                      if current_job:
+                          current_job.append(line)
+                      continue
+                  indent = len(line) - len(line.lstrip(" "))
+                  if indent == 0:
+                      if in_jobs:
+                          if current_job and job_runs_release(current_job):
+                              return True
+                          current_job = []
+                          in_jobs = False
+                      if re.match(r"^jobs:\s*(?:#.*)?$", stripped):
+                          in_jobs = True
+                          job_indent = None
+                      continue
+                  if not in_jobs:
+                      continue
+                  if stripped.startswith("#"):
+                      if current_job:
+                          current_job.append(line)
+                      continue
+                  if job_indent is None:
+                      job_indent = indent
+                  if indent == job_indent and re.match(r"^[a-zA-Z0-9_-]+:\s*(?:#.*)?$", stripped):
+                      if current_job and job_runs_release(current_job):
+                          return True
+                      current_job = []
+                  elif current_job is not None:
+                      current_job.append(line)
+              return bool(in_jobs and current_job and job_runs_release(current_job))
+
+
           def reads_own_release(api_url, repo, token):
               """The workflow file name running release-please in this repository, or False."""
               url = f"{api_url}/repos/{repo}/contents/.github/workflows"
@@ -1042,19 +1235,21 @@ jobs:
                   and entry.get("type") == "file"
                   and isinstance(entry.get("name"), str)
                   and (entry["name"].endswith(".yml") or entry["name"].endswith(".yaml"))
-              ][:100]
-              for entry in workflows:
+              ]
+              if len(workflows) > 100:
+                  raise CallError(f"workflow count {len(workflows)} exceeds bound of 100")
+              for entry in workflows[:100]:
                   name = entry["name"]
-                  file_url = entry.get("url") or f"{api_url}/repos/{repo}/contents/.github/workflows/{name}"
+                  u = f"{api_url}/repos/{repo}/contents/.github/workflows/{name}"
+                  file_url = entry.get("url") or u
                   _, data = call(file_url, token, method="GET")
                   raw = data.get("content", "") if isinstance(data, dict) else ""
                   try:
                       content = base64.b64decode(raw).decode("utf-8")
                   except ValueError as err:
                       raise CallError(f"decode {name}: {err}") from err
-                  for line in content.splitlines():
-                      if OWN_RELEASE_ACTION.search(line.strip()):
-                          return name
+                  if workflow_runs_release(content):
+                      return name
               return False
 
 
