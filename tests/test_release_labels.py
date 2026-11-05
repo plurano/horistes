@@ -708,6 +708,33 @@ jobs:
       # mentions googleapis/release-please-action in a comment
       - uses: actions/checkout@v4
 """
+HELPER_SHA = "0c04f543518359a7fc56dfca10ed918ac9919d08"
+# The jellysin/.github v0.1.0 shape: a job-level call of the shared release-please workflow.
+PLANTED_REUSABLE_WORKFLOW = f"""name: Release automation
+on:
+  push:
+    branches: [main]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA} # v1.6.2
+    secrets: inherit
+"""
+PLANTED_PUBLISH_WORKFLOW = """name: Release
+on:
+  release:
+    types: [published]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: jellysin/release-helper/actions/publish@0c04f543518359a7fc56dfca10ed918ac9919d08
+"""
+UNRELATED_REUSABLE_WORKFLOW = """name: CI
+on: [push]
+jobs:
+  test:
+    uses: fleet/ci/.github/workflows/test.yml@0c04f543518359a7fc56dfca10ed918ac9919d08
+"""
 
 
 @pytest.mark.parametrize("mutated", [False, True])
@@ -730,6 +757,41 @@ def test_planted_own_release_workflow_skips_release(tmp_path, forge, mutated):
         "::notice::fleet/app runs release-please in its own workflow release-please.yml; "
         "the train creates no release\n" in done.stdout
     ) is not mutated
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_planted_reusable_release_workflow_skips_release(tmp_path, forge, mutated):
+    """A repository running reusable release-please workflow sets skip=true."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            '+ "".join("|" + re.escape(w) for w in KNOWN_RELEASE_WORKFLOWS)',
+            "",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": PLANTED_REUSABLE_WORKFLOW,
+        "release.yml": PLANTED_PUBLISH_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert (
+        "::notice::fleet/app runs release-please in its own workflow release-automation.yml; "
+        "the train creates no release\n" in done.stdout
+    ) is not mutated
+
+
+def test_unrelated_reusable_workflow_leaves_skip_false(tmp_path, forge):
+    """Job-level uses of an unrelated reusable workflow leaves skip=false."""
+    forge.config = {}
+    forge.workflows = {"ci.yml": UNRELATED_REUSABLE_WORKFLOW}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    assert "runs release-please in its own workflow" not in done.stdout
 
 
 def test_unrelated_workflow_leaves_skip_false(tmp_path, forge):

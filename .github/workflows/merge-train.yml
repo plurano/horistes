@@ -864,10 +864,10 @@ jobs:
     #
     # The job splits release creation and release pull request updates into
     # separate steps (decision records 0031, 0040): repositories that write
-    # their own releases (or run release-please themselves, treated as
-    # skip-github-release) skip release creation and have their labels moved
-    # once the tag is on the merge commit, while a pre-existing release is
-    # verified and accepted if already complete.
+    # their own releases (or run release-please action or reusable workflow
+    # themselves, treated as skip-github-release) skip release creation and
+    # have their labels moved once the tag is on the merge commit, while a
+    # pre-existing release is verified and accepted if already complete.
     name: Release pull request and release
     needs: train
     if: >-
@@ -920,7 +920,17 @@ jobs:
           MAX_BYTES = 1024 * 1024
           READ_ATTEMPTS = 3
           READ_BACKOFF = 1
-          OWN_RELEASE_ACTION = re.compile(r"^-?\s*uses:\s*[\"']?googleapis/release-please-action@")
+          KNOWN_RELEASE_WORKFLOWS = (
+              "jellysin/release-helper/.github/workflows/release-please.yml@",
+              "jellysin/release-helper/.github/workflows/release-please.yaml@",
+              "plurano/horistes/.github/workflows/release-please.yml@",
+              "plurano/horistes/.github/workflows/release-please.yaml@",
+          )
+          OWN_RELEASE_ACTION = re.compile(
+              r"^-?\s*uses:\s*[\"']?(?:googleapis/release-please-action@"
+              + "".join("|" + re.escape(w) for w in KNOWN_RELEASE_WORKFLOWS)
+              + ")"
+          )
           # Only the fields the release checks read: the REST pull list carries two full repository
           # objects per pull, about 480 kB for 20 pulls, and the forge cut that body short in 3 of 10
           # reads. The order is that of the REST list: newest created first.
