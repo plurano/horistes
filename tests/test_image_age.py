@@ -7,6 +7,7 @@ from __future__ import annotations
 import datetime
 import io
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -17,8 +18,12 @@ from conftest import ROOT
 sys.path.insert(0, str(ROOT / "tools"))
 import image_age
 
-PINNED_VERSION = "6.2.0"
-PINNED_DIGEST = "sha256:85462a75c0f8efda09ddd190b92816b70e7662577c8427429e11e1b9f25a992e"
+# The pin the update bot last wrote; every version below is derived from it,
+# so a release update of the licence image keeps these tests valid.
+PINNED_VERSION, PINNED_DIGEST, _DEP = image_age.read_pin(ROOT)
+MAJOR, MINOR, PATCH = (int(part) for part in PINNED_VERSION.split("."))
+NEWER_VERSION = f"{MAJOR}.{MINOR + 1}.0"
+OLDER_VERSION = "0.0.0"
 TODAY = datetime.date(2026, 10, 16)
 
 
@@ -33,9 +38,9 @@ def test_up_to_date_passes(capsys: pytest.CaptureFixture[str]):
     rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=lambda: tags)
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Pinned release: 6.2.0" in out
-    assert "Newest release: 6.2.0" in out
-    assert "PASS: pinned release 6.2.0 is up to date." in out
+    assert f"Pinned release: {PINNED_VERSION}" in out
+    assert f"Newest release: {PINNED_VERSION}" in out
+    assert f"PASS: pinned release {PINNED_VERSION} is up to date." in out
 
 
 def test_planted_newer_release_older_than_14_days_fails(capsys: pytest.CaptureFixture[str]):
@@ -43,7 +48,7 @@ def test_planted_newer_release_older_than_14_days_fails(capsys: pytest.CaptureFi
     # 2026-10-01 is 15 days before 2026-10-16 (> 14 days)
     tags = [
         make_tag(
-            "6.3.0",
+            NEWER_VERSION,
             "2026-10-01T00:00:00Z",
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         ),
@@ -52,11 +57,11 @@ def test_planted_newer_release_older_than_14_days_fails(capsys: pytest.CaptureFi
     rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=lambda: tags)
     assert rc == 1
     captured = capsys.readouterr()
-    assert "Pinned release: 6.2.0" in captured.out
-    assert "Newest release: 6.3.0" in captured.out
+    assert f"Pinned release: {PINNED_VERSION}" in captured.out
+    assert f"Newest release: {NEWER_VERSION}" in captured.out
     assert (
-        "FAIL: newest release 6.3.0 is 15 days old (> 14 days), but pinned release is 6.2.0."
-        in captured.err
+        f"FAIL: newest release {NEWER_VERSION} is 15 days old (> 14 days), "
+        f"but pinned release is {PINNED_VERSION}." in captured.err
     )
 
 
@@ -65,7 +70,7 @@ def test_planted_newer_release_younger_than_14_days_passes(capsys: pytest.Captur
     # 2026-10-10 is 6 days before 2026-10-16 (<= 14 days)
     tags = [
         make_tag(
-            "6.3.0",
+            NEWER_VERSION,
             "2026-10-10T00:00:00Z",
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         ),
@@ -74,10 +79,10 @@ def test_planted_newer_release_younger_than_14_days_passes(capsys: pytest.Captur
     rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=lambda: tags)
     assert rc == 0
     captured = capsys.readouterr()
-    assert "Pinned release: 6.2.0" in captured.out
-    assert "Newest release: 6.3.0" in captured.out
+    assert f"Pinned release: {PINNED_VERSION}" in captured.out
+    assert f"Newest release: {NEWER_VERSION}" in captured.out
     assert (
-        "PASS: newer release 6.3.0 is 6 day(s) old (Renovate proposes it after 3 days)."
+        f"PASS: newer release {NEWER_VERSION} is 6 day(s) old (Renovate proposes it after 3 days)."
         in captured.out
     )
 
@@ -127,7 +132,7 @@ def test_moved_digest_fails_with_exit_1(capsys: pytest.CaptureFixture[str]):
     rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=lambda: tags)
     assert rc == 1
     captured = capsys.readouterr()
-    assert "FAIL: pinned release 6.2.0 tag digest on Docker Hub moved" in captured.err
+    assert f"FAIL: pinned release {PINNED_VERSION} tag digest on Docker Hub moved" in captured.err
     assert PINNED_DIGEST in captured.err
     assert moved_digest in captured.err
 
@@ -136,9 +141,13 @@ def test_moved_digest_fails_with_exit_1(capsys: pytest.CaptureFixture[str]):
     ("date_str", "expected_code", "expected_status"),
     [
         # Exactly 14 days old: 2026-10-02 -> 14 days old -> PASS (not > 14 days)
-        ("2026-10-02T00:00:00Z", 0, "PASS: newer release 6.3.0 is 14 day(s) old"),
+        ("2026-10-02T00:00:00Z", 0, f"PASS: newer release {NEWER_VERSION} is 14 day(s) old"),
         # Exactly 15 days old: 2026-10-01 -> 15 days old -> FAIL (> 14 days)
-        ("2026-10-01T00:00:00Z", 1, "FAIL: newest release 6.3.0 is 15 days old (> 14 days)"),
+        (
+            "2026-10-01T00:00:00Z",
+            1,
+            f"FAIL: newest release {NEWER_VERSION} is 15 days old (> 14 days)",
+        ),
     ],
 )
 def test_boundary_exactly_14_days(
@@ -147,7 +156,7 @@ def test_boundary_exactly_14_days(
     """Boundary test: older than 14 days means strictly > 14 days."""
     tags = [
         make_tag(
-            "6.3.0",
+            NEWER_VERSION,
             date_str,
             "sha256:2222222222222222222222222222222222222222222222222222222222222222",
         ),
@@ -161,19 +170,19 @@ def test_boundary_exactly_14_days(
 
 
 def test_non_release_tags_ignored(capsys: pytest.CaptureFixture[str]):
-    """Tags not matching release regex (e.g. 6.2, latest, 6.2.0-debian) are ignored."""
+    """Tags not matching the release regex (two-part, latest, suffixed, pre-release) are ignored."""
     tags = [
         make_tag("latest", "2026-10-15T00:00:00Z"),
-        make_tag("6.2", "2026-10-15T00:00:00Z"),
-        make_tag("6.2.0-debian", "2026-10-15T00:00:00Z"),
-        make_tag("7.0.0-rc1", "2026-10-15T00:00:00Z"),
+        make_tag(f"{MAJOR}.{MINOR}", "2026-10-15T00:00:00Z"),
+        make_tag(f"{PINNED_VERSION}-debian", "2026-10-15T00:00:00Z"),
+        make_tag(f"{MAJOR + 1}.0.0-rc1", "2026-10-15T00:00:00Z"),
         make_tag(PINNED_VERSION, "2025-10-27T15:28:22Z"),
     ]
     rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=lambda: tags)
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Newest release: 6.2.0" in out
-    assert "PASS: pinned release 6.2.0 is up to date." in out
+    assert f"Newest release: {PINNED_VERSION}" in out
+    assert f"PASS: pinned release {PINNED_VERSION} is up to date." in out
 
 
 def test_renovate_regex_mismatch_fails_with_exit_3(tree, capsys: pytest.CaptureFixture[str]):
@@ -204,11 +213,11 @@ def test_renovate_regex_mismatch_fails_with_exit_3(tree, capsys: pytest.CaptureF
 
 def test_pinned_release_missing_on_hub_fails_with_exit_3(capsys: pytest.CaptureFixture[str]):
     """When the pinned release is absent on Docker Hub, fails with exit 3."""
-    tags = [make_tag("6.1.0", "2025-05-01T00:00:00Z")]
+    tags = [make_tag(OLDER_VERSION, "2025-05-01T00:00:00Z")]
     rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=lambda: tags)
     assert rc == 3
     err = capsys.readouterr().err
-    assert "pinned release 6.2.0 missing on Docker Hub" in err
+    assert f"pinned release {PINNED_VERSION} missing on Docker Hub" in err
 
 
 def test_no_release_tags_on_hub_fails_with_exit_3(capsys: pytest.CaptureFixture[str]):
@@ -223,7 +232,7 @@ def test_no_release_tags_on_hub_fails_with_exit_3(capsys: pytest.CaptureFixture[
 def test_fetch_hub_tags_parses_json(monkeypatch: pytest.MonkeyPatch):
     """fetch_hub_tags successfully parses and bounds valid Docker Hub JSON."""
     raw_json = json.dumps(
-        {"results": [{"name": "6.2.0", "tag_last_pushed": "2025-10-27T15:28:22Z"}]}
+        {"results": [{"name": "1.2.3", "tag_last_pushed": "2025-10-27T15:28:22Z"}]}
     ).encode("utf-8")
 
     class FakeResponse:
@@ -239,7 +248,7 @@ def test_fetch_hub_tags_parses_json(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: FakeResponse())
     results = image_age.fetch_hub_tags("https://hub.example/tags")
     assert len(results) == 1
-    assert results[0]["name"] == "6.2.0"
+    assert results[0]["name"] == "1.2.3"
 
 
 def test_fetch_hub_tags_http_error(monkeypatch: pytest.MonkeyPatch):
@@ -273,4 +282,38 @@ def test_main_cli(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     )
     assert asked == ["https://hub.example/tags"]
     assert rc == 0
-    assert "PASS: pinned release 6.2.0 is up to date." in capsys.readouterr().out
+    assert f"PASS: pinned release {PINNED_VERSION} is up to date." in capsys.readouterr().out
+
+
+def test_pin_matches_an_independent_read_of_the_licence_workflow():
+    """read_pin returns the release and digest the licence workflow carries."""
+    text = (ROOT / image_age.LICENCE_FILE).read_text(encoding="utf-8")
+    (found,) = re.findall(
+        r"^ +# release (\d+\.\d+\.\d+)\n +uses: docker://(\S+)@(sha256:[0-9a-f]{64})$",
+        text,
+        flags=re.MULTILINE,
+    )
+    assert found == (PINNED_VERSION, _DEP, PINNED_DIGEST)
+    assert OLDER_VERSION != PINNED_VERSION
+
+
+def pin_literals(text: str) -> list[str]:
+    """The live pin's release or digest as they appear literally in a test source."""
+    found = re.findall(rf"(?<![\d.]){re.escape(PINNED_VERSION)}(?![\d.])", text)
+    return found + re.findall(re.escape(PINNED_DIGEST.split(":", 1)[1]), text)
+
+
+def test_no_test_names_the_live_pin_literally():
+    """A release update rewrites the pin, so a test that spells it out breaks on every update."""
+    offenders = {
+        path.name: pin_literals(path.read_text(encoding="utf-8"))
+        for path in sorted((ROOT / "tests").glob("*.py"))
+    }
+    assert {name: hits for name, hits in offenders.items() if hits} == {}
+
+
+def test_planted_pin_literal_is_found():
+    """Planted: a test source that spells the live release or digest is reported."""
+    assert pin_literals(f'make_tag("{PINNED_VERSION}", ...)') == [PINNED_VERSION]
+    assert pin_literals(f"digest = '{PINNED_DIGEST}'") == [PINNED_DIGEST.split(":", 1)[1]]
+    assert pin_literals(f'make_tag("1{PINNED_VERSION}.9", ...)') == []
