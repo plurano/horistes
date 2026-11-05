@@ -12,7 +12,7 @@ SPDX-License-Identifier: EUPL-1.2
 ## Context
 
 Two consumer repositories, `lusoris/SnatchArr` and
-`lusoris/jellyfin-plugin-snatcharr`, carry byte-identical copies of two
+`jellysin/plugin-snatcharr`, carry byte-identical copies of two
 pieces. A deduplication scan across the fleet (`praetorctl dedupe scan
 --across`) found them as `DX-3ef96d6491-github-workflows-1` and
 `DX-3ef96d6491-config-hooks-1`:
