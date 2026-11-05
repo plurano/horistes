@@ -927,6 +927,7 @@ jobs:
               "plurano/horistes/.github/workflows/release-please.yaml@",
           )
           ALLOWED_TRIGGERS = ("push", "workflow_dispatch", "schedule", "workflow_run")
+          LOCAL_WORKFLOW_PREFIX = "./.github/workflows/"
           ACTION_STEP_RE = re.compile(r"^(?:-\s+)?uses:\s*[\"']?googleapis/release-please-action@")
           BLOCK_SCALAR_RE = re.compile(r":\s*[|>][-+0-9]*(?:\s*#.*)?$")
           # Only the fields the release checks read: the REST pull list carries two full repository
@@ -1062,6 +1063,29 @@ jobs:
               return False
 
 
+          def inline_triggers(rest):
+              """Event names of an inline on: value: a name, a [list] or a {mapping}."""
+              if not (rest[:1] in "[{" and rest[-1:] in "]}"):
+                  return [rest.strip("'\"")]
+              ends = ":" if rest.startswith("{") else ",]"
+              names = []
+              depth = 0
+              token = ""
+              for char in rest[:2000]:
+                  if char in "[{":
+                      depth += 1
+                  elif char in "]}":
+                      depth -= 1
+                  if depth == 1 and char not in "[{]},:":
+                      token += char
+                      continue
+                  if depth <= 1 and char in ends and token.strip():
+                      names.append(token.strip().strip("'\""))
+                  if depth <= 1 and char in ",:]}[{":
+                      token = ""
+              return names
+
+
           def workflow_has_allowed_trigger(content):
               """Whether top-level on: includes at least one allowed trigger."""
               lines = content.splitlines()[:5000]
@@ -1088,10 +1112,7 @@ jobs:
                           rest = stripped.split(":", 1)[1].strip()
                           rest = re.sub(r"\s+#.*$", "", rest).strip()
                           if rest:
-                              if rest.startswith("[") and rest.endswith("]"):
-                                  parts = [s.strip().strip("'\"") for s in rest[1:-1].split(",")]
-                                  return any(item in ALLOWED_TRIGGERS for item in parts if item)
-                              return rest.strip("'\"") in ALLOWED_TRIGGERS
+                              return any(t in ALLOWED_TRIGGERS for t in inline_triggers(rest))
                           in_on = True
                           on_indent = None
                       continue
@@ -1128,6 +1149,8 @@ jobs:
                   target = clean.split(":", 1)[1].strip().strip("'\"")
                   if any(target.startswith(w) for w in KNOWN_RELEASE_WORKFLOWS):
                       flags["reusable"] = True
+                  if target.removeprefix(LOCAL_WORKFLOW_PREFIX) in flags["local"]:
+                      flags["reusable"] = True
               elif own_level and clean.startswith("with:"):
                   rest = clean.split(":", 1)[1].strip()
                   if not rest:
@@ -1138,12 +1161,13 @@ jobs:
               return False
 
 
-          def job_runs_release(job_lines):
+          def job_runs_release(job_lines, local):
               """Whether a single job runs release-please action or reusable workflow."""
               direct_indent = job_direct_indent(job_lines)
               if direct_indent is None:
                   return False
               flags = {"dormant": False, "reusable": False, "action": False, "custom": False}
+              flags["local"] = local
               block_indent = None
               in_with = False
               with_lines = []
@@ -1175,10 +1199,19 @@ jobs:
               return bool(reusable_call and not custom_config)
 
 
-          def workflow_runs_release(content):
+          def workflow_runs_release(content, local=frozenset()):
               """Whether workflow triggers and jobs structure run release-please."""
               if not workflow_has_allowed_trigger(content):
                   return False
+              return jobs_run_release(content, local)
+
+
+          def jobs_run_release(content, local):
+              """Whether a job of the workflow runs release-please, triggers aside.
+
+              local names the workflow files of this repository that run it themselves,
+              so a job-level call of ./.github/workflows/<name> counts too.
+              """
               in_jobs = False
               job_indent = None
               current_job = []
@@ -1192,7 +1225,7 @@ jobs:
                   indent = len(line) - len(line.lstrip(" "))
                   if indent == 0:
                       if in_jobs:
-                          if current_job and job_runs_release(current_job):
+                          if current_job and job_runs_release(current_job, local):
                               return True
                           current_job = []
                           in_jobs = False
@@ -1209,12 +1242,12 @@ jobs:
                   if job_indent is None:
                       job_indent = indent
                   if indent == job_indent and re.match(r"^[a-zA-Z0-9_-]+:\s*(?:#.*)?$", stripped):
-                      if current_job and job_runs_release(current_job):
+                      if current_job and job_runs_release(current_job, local):
                           return True
                       current_job = []
                   elif current_job is not None:
                       current_job.append(line)
-              return bool(in_jobs and current_job and job_runs_release(current_job))
+              return bool(in_jobs and current_job and job_runs_release(current_job, local))
 
 
           def reads_own_release(api_url, repo, token):
@@ -1238,6 +1271,7 @@ jobs:
               ]
               if len(workflows) > 100:
                   raise CallError(f"workflow count {len(workflows)} exceeds bound of 100")
+              contents = {}
               for entry in workflows[:100]:
                   name = entry["name"]
                   u = f"{api_url}/repos/{repo}/contents/.github/workflows/{name}"
@@ -1248,7 +1282,10 @@ jobs:
                       content = base64.b64decode(raw).decode("utf-8")
                   except ValueError as err:
                       raise CallError(f"decode {name}: {err}") from err
-                  if workflow_runs_release(content):
+                  contents[name] = content
+              local = frozenset(n for n, c in contents.items() if jobs_run_release(c, frozenset()))
+              for name, content in contents.items():
+                  if workflow_runs_release(content, local):
                       return name
               return False
 

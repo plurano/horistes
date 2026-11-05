@@ -988,6 +988,88 @@ def test_two_line_action_step_skips_release(tmp_path, forge, mutated):
     assert ("runs release-please in its own workflow" in done.stdout) is not mutated
 
 
+INLINE_MAPPING_WORKFLOW = """name: Release please
+on: {push: {branches: [main]}}
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
+"""
+LOCAL_CALLER_WORKFLOW = """name: Release automation
+on:
+  push:
+    branches: [main]
+jobs:
+  release-please:
+    uses: ./.github/workflows/release-please.yml
+    secrets: inherit
+"""
+LOCAL_UNRELATED_CALLER_WORKFLOW = """name: CI
+on: [push]
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+"""
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_inline_mapping_trigger_skips_release(tmp_path, forge, mutated):
+    """An inline on: {push: ...} mapping counts as a push trigger."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            'ends = ":" if rest.startswith("{") else ",]"',
+            'ends = ",]"',
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"release-please.yml": INLINE_MAPPING_WORKFLOW}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert ("runs release-please in its own workflow" in done.stdout) is not mutated
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_local_call_of_release_workflow_skips_release(tmp_path, forge, mutated):
+    """A job-level call of a local workflow that runs release-please sets skip=true."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            'if target.removeprefix(LOCAL_WORKFLOW_PREFIX) in flags["local"]:',
+            "if False:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": LOCAL_CALLER_WORKFLOW,
+        "release-please.yml": WORKFLOW_CALL_ONLY_WORKFLOW,
+        "ci.yml": LOCAL_UNRELATED_CALLER_WORKFLOW,
+        "test.yml": UNRELATED_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert (
+        "runs release-please in its own workflow release-automation.yml;" in done.stdout
+    ) is not mutated
+
+
+def test_local_call_of_unrelated_workflow_leaves_skip_false(tmp_path, forge):
+    """A job-level call of a local workflow without release-please leaves skip=false."""
+    forge.config = {}
+    forge.workflows = {
+        "ci.yml": LOCAL_UNRELATED_CALLER_WORKFLOW,
+        "test.yml": UNRELATED_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+
+
 def test_workflow_count_exceeding_bound_fails(tmp_path, forge):
     """More than 100 workflow files fails naming the bound of 100."""
     forge.config = {}
