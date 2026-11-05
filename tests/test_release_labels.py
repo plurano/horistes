@@ -1058,6 +1058,55 @@ def test_local_call_of_release_workflow_skips_release(tmp_path, forge, mutated):
     ) is not mutated
 
 
+INTERMEDIATE_WORKFLOW = """name: Intermediate
+on:
+  workflow_call:
+jobs:
+  release:
+    uses: ./.github/workflows/release-please.yml
+"""
+NESTED_CALLER_WORKFLOW = """name: Release automation
+on: [push]
+jobs:
+  release:
+    uses: ./.github/workflows/intermediate.yml
+"""
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_nested_local_call_of_release_workflow_skips_release(tmp_path, forge, mutated):
+    """A push workflow reaching release-please through two local calls sets skip=true."""
+    source = module()
+    if mutated:
+        source = source.replace("for _ in range(10):", "for _ in range(1):")
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": NESTED_CALLER_WORKFLOW,
+        "intermediate.yml": INTERMEDIATE_WORKFLOW,
+        "release-please.yml": WORKFLOW_CALL_ONLY_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+    assert (
+        "runs release-please in its own workflow release-automation.yml;" in done.stdout
+    ) is not mutated
+
+
+def test_local_call_cycle_leaves_skip_false(tmp_path, forge):
+    """Two local workflows calling each other, neither running release-please, end."""
+    forge.config = {}
+    forge.workflows = {
+        "a.yml": NESTED_CALLER_WORKFLOW.replace("intermediate.yml", "b.yml"),
+        "b.yml": INTERMEDIATE_WORKFLOW.replace("release-please.yml", "a.yml"),
+    }
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+
+
 def test_local_call_of_unrelated_workflow_leaves_skip_false(tmp_path, forge):
     """A job-level call of a local workflow without release-please leaves skip=false."""
     forge.config = {}

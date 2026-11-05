@@ -1250,6 +1250,21 @@ jobs:
               return bool(in_jobs and current_job and job_runs_release(current_job, local))
 
 
+          def local_release_workflows(contents):
+              """Local workflow files that run release-please, directly or through local calls.
+
+              Grows the set level by level; GitHub connects at most ten levels of workflows
+              and permits no loops, so ten rounds reach every chain and a cycle cannot spin.
+              """
+              local = frozenset()
+              for _ in range(10):
+                  grown = frozenset(n for n, c in contents.items() if jobs_run_release(c, local))
+                  if grown == local:
+                      break
+                  local = grown
+              return local
+
+
           def reads_own_release(api_url, repo, token):
               """The workflow file name running release-please in this repository, or False."""
               url = f"{api_url}/repos/{repo}/contents/.github/workflows"
@@ -1283,7 +1298,7 @@ jobs:
                   except ValueError as err:
                       raise CallError(f"decode {name}: {err}") from err
                   contents[name] = content
-              local = frozenset(n for n, c in contents.items() if jobs_run_release(c, frozenset()))
+              local = local_release_workflows(contents)
               for name, content in contents.items():
                   if workflow_runs_release(content, local):
                       return name
