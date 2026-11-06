@@ -113,6 +113,13 @@ HELD = {"rust-toolchain"}
 SWITCH = {"enabled": False}
 TOOLS = "requirements/tools.txt"
 LICENCE = ".github/workflows/licence.yml"
+# The release the update bot last wrote into the licence workflow. The planted
+# lines below are built from it, so a release update keeps them valid.
+(PINNED_RELEASE,) = re.findall(
+    r"^ +# release (\d+\.\d+\.\d+)$",
+    (ROOT / LICENCE).read_text(encoding="utf-8"),
+    flags=re.MULTILINE,
+)
 GATE = ".github/workflows/ci.yml"
 SECRET_SCAN = ".github/workflows/secret-scan.yml"
 WORKFLOW_CHECK = ".github/workflows/workflow-check.yml"
@@ -648,9 +655,9 @@ def planted_licence(old: str, new: str) -> str:
 @pytest.mark.parametrize(
     ("old", "new"),
     [
-        ("        # release 6.2.0\n", ""),
-        ("        # release 6.2.0\n", "        # the release is 6.2.0\n"),
-        ("docker.io/fsfe/reuse@sha256:", "docker.io/fsfe/reuse:6.2.0@sha256:"),
+        (f"        # release {PINNED_RELEASE}\n", ""),
+        (f"        # release {PINNED_RELEASE}\n", f"        # the release is {PINNED_RELEASE}\n"),
+        ("docker.io/fsfe/reuse@sha256:", f"docker.io/fsfe/reuse:{PINNED_RELEASE}@sha256:"),
         ("docker.io/fsfe/reuse@", "docker.io/other/reuse@"),
         ("        uses: docker://", "        env: {}\n        uses: docker://"),
     ],
