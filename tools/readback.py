@@ -737,7 +737,8 @@ def _parse_version(version: str) -> tuple[int, int, int]:
 
 def _prerequisites(world) -> str:
     """Check Python >= 3.12, git on PATH, and cosign >= 2.6.3; return cosign version string."""
-    if sys.version_info[:2] < (3, 12):  # noqa: UP036 — standalone tool, guards older runtimes
+    minimum_python = (3, 12)
+    if sys.version_info[:2] < minimum_python:
         raise ReadError(
             f"Python 3.12 or newer is required, found {sys.version_info[0]}.{sys.version_info[1]}"
         )
