@@ -27,6 +27,8 @@ its cause:
         issue: <owner/name#number>
         reason: <why, and what ends it>
         expires: "YYYY-MM-DD"
+        category: C            # optional: A, B, C or D
+        entered: "YYYY-MM-DD"  # optional: when the exception was created
 
 An entry with a missing, empty or unknown field, a path that is no file of the
 repository, or a rule and path named twice fails. In every place an entry whose
@@ -51,6 +53,7 @@ CONFIG = ".github/zizmor.yml"
 ACTIONLINT = ".github/actionlint.yaml"
 OWN = "exceptions.yaml"
 FIELDS = ("rule", "path", "issue", "reason", "expires")
+ALLOWED = set(FIELDS) | {"category", "entered"}
 LONGEST = datetime.timedelta(days=90)
 ENTRY = re.compile(
     r"^\s+- (?P<file>[^\s#]+)\s+# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
@@ -131,7 +134,8 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
     """What is wrong with one entry of the repository's own list."""
     if not isinstance(entry, dict):
         return ["is no mapping"]
-    found = [f"has the unknown field `{key}`" for key in sorted(set(entry) - set(FIELDS))]
+    unknown = sorted(set(entry) - ALLOWED)
+    found = [f"has the unknown field `{key}`" for key in unknown]
     empty = [key for key in FIELDS if not isinstance(entry.get(key), str) or not entry[key].strip()]
     found += [f"has no `{key}` (a text that is not empty)" for key in empty]
     if "issue" not in empty and not ISSUE.match(entry["issue"]):
