@@ -31,7 +31,7 @@ verify-all: verify
 # This repository's own checks; they need no engine.
 verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-exceptions check-templates \
 	check-scorecard check-runners check-links check-examples test verify-reuse
-	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, runner labels, markdown links, tests and licence headers.'
+	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, runner labels, markdown links, fenced examples, tests and licence headers.'
 
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.

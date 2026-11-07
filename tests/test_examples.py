@@ -25,6 +25,7 @@ def test_current_repository_examples_pass():
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     assert done.returncode == 0, done.stderr
     assert "PASS:" in done.stdout
@@ -104,5 +105,6 @@ def test_mutation_without_tomllib_loads_planted_case_passes_proving_guard(tree: 
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     assert done.returncode == 0, done.stderr

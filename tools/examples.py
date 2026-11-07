@@ -18,9 +18,9 @@ import tomllib
 from pathlib import Path
 
 try:
-    from yaml import YAMLError, safe_load
+    from yaml import YAMLError, safe_load_all
 except ImportError:
-    safe_load = None
+    safe_load_all = None
     YAMLError = Exception
 
 FENCE_START = re.compile(r"^(\s{0,3})(`{3,}|~{3,})(.*)")
@@ -32,10 +32,6 @@ def say(line: str) -> None:
 
 
 def complain(line: str) -> None:
-    sys.stderr.write(line + "\n")
-
-
-def warn(line: str) -> None:
     sys.stderr.write(line + "\n")
 
 
@@ -80,12 +76,12 @@ def check_examples(root: Path, paths: list[Path]) -> tuple[list[str], int]:
         text = path.read_text(encoding="utf-8")
         for start_line, lang, content in fenced_blocks(text):
             if lang in ("yaml", "yml"):
-                if safe_load is None:
-                    warn(f"WARN: {rel_md}:{start_line}: PyYAML not available, skipping YAML block")
+                if safe_load_all is None:
+                    problems.append(f"{rel_md}:{start_line}: {lang}: PyYAML not installed")
                     continue
                 count += 1
                 try:
-                    safe_load(content)
+                    list(safe_load_all(content))
                 except (YAMLError, ValueError) as err:
                     problems.append(f"{rel_md}:{start_line}: {lang}: {err}")
             elif lang == "toml":
