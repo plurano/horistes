@@ -65,12 +65,16 @@ PATTERN = re.compile(
 ISSUE = re.compile(r"^[\w.-]+/[\w.-]+#[1-9]\d*$")
 
 
-def day_problem(day: datetime.date, today: datetime.date) -> str:
+def day_problem(
+    day: datetime.date,
+    today: datetime.date,
+    longest: datetime.timedelta = LONGEST,
+) -> str:
     """Why a day an exception ends on is refused, in every list; empty when it holds."""
     if day < today:
         return f"expired on {day}"
-    if day - today > LONGEST:
-        return f"ends on {day}, more than {LONGEST.days} days ahead"
+    if day - today > longest:
+        return f"ends on {day}, more than {longest.days} days ahead"
     return ""
 
 
@@ -143,10 +147,13 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
         found.append(f"names the issue `{entry['issue']}`, not as owner/name#number")
     if "path" not in empty and not _tracked_file(root, entry["path"]):
         found.append(f"names `{entry['path']}`, which is no file of the repository")
-    if "expires" not in empty:
-        problem = day_problem(datetime.date.fromisoformat(entry["expires"]), today)
-        found += [problem] if problem else []
     cat = entry.get("category")
+    cap = LONGEST
+    if isinstance(cat, str) and cat in CATEGORY_DAYS:
+        cap = max(LONGEST, datetime.timedelta(days=CATEGORY_DAYS[cat]))
+    if "expires" not in empty:
+        problem = day_problem(datetime.date.fromisoformat(entry["expires"]), today, longest=cap)
+        found += [problem] if problem else []
     if "category" in entry and cat not in ("A", "B", "C", "D"):
         found.append(f"names `{cat}` as category, not one of A, B, C, D")
     valid_entered = False
@@ -160,7 +167,8 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
                 valid_entered = True
             except ValueError:
                 found.append(f"names `{entered}` as entered, not YYYY-MM-DD")
-    if cat in CATEGORY_DAYS and "expires" not in empty and "entered" in entry and valid_entered:
+    has_interval = isinstance(cat, str) and cat in CATEGORY_DAYS
+    if has_interval and "expires" not in empty and "entered" in entry and valid_entered:
         interval = datetime.timedelta(days=CATEGORY_DAYS[cat])
         expected = datetime.date.fromisoformat(entered) + interval
         actual = datetime.date.fromisoformat(entry["expires"])

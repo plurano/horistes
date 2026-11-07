@@ -212,6 +212,18 @@ def test_category_a_skips_interval_check(tree):
     assert done.returncode == 0, done.stderr
 
 
+def test_category_d_plus_120_days_ok(tree):
+    done = own(tree, _with_category("D", "2026-10-01", "2027-01-29"))
+    assert done.returncode == 0, done.stderr
+
+
+def test_category_d_wrong_interval_refused(tree):
+    done = own(tree, _with_category("D", "2026-10-01", "2027-01-30"))
+    assert done.returncode == 1, done.stdout
+    assert "category D" in done.stderr
+    assert "2027-01-29" in done.stderr
+
+
 def test_mutation_empty_category_days_lets_wrong_interval_pass(tree):
     source = (ROOT / "tools" / "exceptions.py").read_text(encoding="utf-8")
     mutated = source.replace('CATEGORY_DAYS = {"B": 3, "C": 10, "D": 120}', "CATEGORY_DAYS = {}")
