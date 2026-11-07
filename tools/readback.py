@@ -62,9 +62,10 @@ Lines: `PASS accept`, `PASS refuse`, `FAIL ...`, `NOTE ...`. Exit codes:
 0 every line passed, 1 a check failed or a control was accepted, 3 the
 parameters, the tag or an answer of the forge could not be read.
 
-Read with cosign v2.6.3. The forge's API is asked once for the assets of the
-release and once for each attestation the listed files need (one, where one
-attestation names them all); without credentials it answers 60 requests an
+Read with cosign v2.6.3 (prerequisites verified at start: Python >= 3.12, git
+on PATH, and cosign >= 2.6.3). The forge's API is asked once for the assets of
+the release and once for each attestation the listed files need (one, where
+one attestation names them all); without credentials it answers 60 requests an
 hour per address.
 """
 
@@ -306,6 +307,10 @@ def _cosign() -> list[str]:
     return shlex.split(os.environ.get("COSIGN", "cosign"))
 
 
+def _git() -> list[str]:
+    return shlex.split(os.environ.get("GIT", "git"))
+
+
 def _prove(report: Report, world, label: str, command, claim: Claim, others, reading=None):
     """One call that must be accepted and its controls; the output of the accepted call, or None.
 
@@ -331,7 +336,7 @@ def _json(path: Path, what: str) -> object:
 def _commit(world, repository: str, tag: str) -> str:
     """The commit the tag names on the forge now; of an annotated tag, the commit it points at."""
     ref = f"refs/tags/{tag}"
-    git = shlex.split(os.environ.get("GIT", "git"))
+    git = _git()
     code, out, err = world.run([*git, "ls-remote", f"{FORGE}/{repository}", ref, f"{ref}^{{}}"])
     if code != 0:
         raise ReadError(f"git ls-remote {repository}: {_tail(err) or code}")
@@ -722,6 +727,41 @@ def _image(report: Report, world, claim: Claim, reference: str, others) -> None:
     _prove(report, world, label, attested, claim, others, lambda out: _attested(out, digest))
 
 
+def _parse_version(version: str) -> tuple[int, int, int]:
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
+    if not match:
+        raise ReadError(f"cannot parse cosign version from {version!r}")
+    patch = int(match.group(3)) if match.group(3) is not None else 0
+    return int(match.group(1)), int(match.group(2)), patch
+
+
+def _prerequisites(world) -> str:
+    """Check Python >= 3.12, git on PATH, and cosign >= 2.6.3; return cosign version string."""
+    if sys.version_info[:2] < (3, 12):  # noqa: UP036 — standalone tool, guards older runtimes
+        raise ReadError(
+            f"Python 3.12 or newer is required, found {sys.version_info[0]}.{sys.version_info[1]}"
+        )
+    git_bin = _git()[0] if _git() else "git"
+    if not shutil.which(git_bin):
+        raise ReadError(f"git is required on PATH: {git_bin} not found")
+    code, out, err = world.run([*_cosign(), "version"])
+    if code != 0:
+        raise ReadError(f"the signature tool does not run: {_tail(err) or code}")
+    version = ""
+    for line in out.splitlines()[:64]:
+        if line.startswith("GitVersion"):
+            version = line.split()[-1]
+            break
+    if not version:
+        raise ReadError("the signature tool did not report a GitVersion")
+    if _parse_version(version) < (2, 6, 3):
+        raise ReadError(f"cosign v2.6.3 or newer is required, found {version}")
+    return version
+
+
+prerequisites = _prerequisites
+
+
 def verify(
     params: Params,
     tag: str,
@@ -731,10 +771,7 @@ def verify(
     local: Path | None = None,
 ) -> None:
     """Read one release back; the lines go to the report."""
-    code, out, err = world.run([*_cosign(), "version"])
-    if code != 0:
-        raise ReadError(f"the signature tool does not run: {_tail(err) or code}")
-    version = [line.split()[-1] for line in out.splitlines() if line.startswith("GitVersion")]
+    cosign_version = _prerequisites(world)
     commit = _commit(world, params.repository, tag)
     ref = f"refs/tags/{tag}"
     claim = Claim(_identity(params.repository, params.signer, ref), params.repository, ref, commit)
@@ -745,7 +782,7 @@ def verify(
         else Published(world, params.repository, tag)
     )
     report.note(source.note(commit))
-    report.note(f"signer {claim.identity}; cosign {' '.join(version) or 'of unknown version'}")
+    report.note(f"signer {claim.identity}; cosign {cosign_version}")
     assets = source.assets(work)
     if params.blobs:
         _blobs(report, world, params, tag, claim, assets, work, others, source)

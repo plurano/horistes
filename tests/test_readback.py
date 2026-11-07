@@ -109,6 +109,7 @@ class World:
         self.broken: dict[str, int] = {}
         self.tags = [f"{COMMIT}\t{REF}\n"]
         self.codes: dict[str, int | None] = {"ls-remote": 0, "version": 0}
+        self.cosign_version = "v2.6.3"
         self.lenient = self.silent = False
         self.calls: list[list[str]] = []
         self.relist(FILES)
@@ -161,7 +162,11 @@ class World:
         self.calls.append(command)
         verb = command[1]
         if verb in self.codes:
-            out = "".join(self.tags) if verb == "ls-remote" else "GitVersion:    v2.6.3\n"
+            out = (
+                "".join(self.tags)
+                if verb == "ls-remote"
+                else f"GitVersion:    {self.cosign_version}\n"
+            )
             return self.codes[verb], out, "no answer" if self.codes[verb] else ""
         if self.silent:
             return None, "", "timed out after 240 seconds"
@@ -926,3 +931,64 @@ def test_cli_boundary_rejects_missing_required_arguments(tmp_path):
     missing_tag = cli("verify", "--params", str(params_file))
     assert missing_tag.returncode == 3
     assert "ERROR: --tag '' is not a plain tag name" in missing_tag.stderr
+
+
+def test_missing_cosign_raises_read_error(read):
+    """Missing cosign tool (exit code != 0) raises ReadError."""
+    world = World()
+    world.codes["version"] = 1
+    with pytest.raises(readback.ReadError, match="the signature tool does not run"):
+        readback.prerequisites(world)
+    code, _, err = read(world)
+    assert code == 3
+    assert "the signature tool does not run" in err
+
+
+def test_cosign_version_below_minimum_raises_read_error(read):
+    """Cosign version < 2.6.3 raises ReadError naming the version."""
+    world = World()
+    world.cosign_version = "v2.6.2"
+    with pytest.raises(readback.ReadError, match="cosign v2.6.3 or newer is required"):
+        readback.prerequisites(world)
+    code, _, err = read(world)
+    assert code == 3
+    assert "cosign v2.6.3 or newer is required, found v2.6.2" in err
+
+
+def test_cosign_version_at_or_above_minimum_passes():
+    """Cosign version >= 2.6.3 passes prerequisite check."""
+    world = World()
+    world.cosign_version = "v2.6.3"
+    assert readback.prerequisites(world) == "v2.6.3"
+
+    world.cosign_version = "v3.1.3+dirty"
+    assert readback.prerequisites(world) == "v3.1.3+dirty"
+
+
+def test_python_version_below_minimum_raises_read_error(read, monkeypatch):
+    """Python version < 3.12 raises ReadError naming found version."""
+    world = World()
+    monkeypatch.setattr(readback.sys, "version_info", (3, 11, 5, "final", 0))
+    with pytest.raises(readback.ReadError, match="Python 3.12 or newer is required, found 3.11"):
+        readback.prerequisites(world)
+    code, _, err = read(world)
+    assert code == 3
+    assert "Python 3.12 or newer is required, found 3.11" in err
+
+
+def test_python_version_at_or_above_minimum_passes(monkeypatch):
+    """Python version >= 3.12 passes prerequisite check."""
+    world = World()
+    monkeypatch.setattr(readback.sys, "version_info", (3, 12, 0, "final", 0))
+    assert readback.prerequisites(world) == "v2.6.3"
+
+
+def test_missing_git_raises_read_error(read, monkeypatch):
+    """Missing git on PATH raises ReadError."""
+    world = World()
+    monkeypatch.setattr(readback.shutil, "which", lambda cmd: None)
+    with pytest.raises(readback.ReadError, match="git is required on PATH"):
+        readback.prerequisites(world)
+    code, _, err = read(world)
+    assert code == 3
+    assert "git is required on PATH" in err
