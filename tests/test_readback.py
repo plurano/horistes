@@ -992,3 +992,19 @@ def test_missing_git_raises_read_error(read, monkeypatch):
     code, _, err = read(world)
     assert code == 3
     assert "git is required on PATH" in err
+
+
+def test_cosign_prerelease_raises_read_error():
+    """Prerelease cosign (e.g. v2.6.3-rc.1) is refused."""
+    world = World()
+    world.cosign_version = "v2.6.3-rc.1"
+    with pytest.raises(readback.ReadError, match="prerelease"):
+        readback.prerequisites(world)
+
+
+def test_cosign_empty_git_version_line_raises_read_error():
+    """GitVersion line with no value raises ReadError."""
+    world = World()
+    world.cosign_version = ""
+    with pytest.raises(readback.ReadError, match="did not report a GitVersion"):
+        readback.prerequisites(world)

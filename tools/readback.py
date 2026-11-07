@@ -727,12 +727,15 @@ def _image(report: Report, world, claim: Claim, reference: str, others) -> None:
     _prove(report, world, label, attested, claim, others, lambda out: _attested(out, digest))
 
 
+_VERSION_RE = re.compile(r"^v?(\d{1,5})\.(\d{1,5})\.(\d{1,5})(?:$|[+\s])")
+_PRERELEASE_RE = re.compile(r"^v?\d+\.\d+\.\d+-")
+
+
 def _parse_version(version: str) -> tuple[int, int, int]:
-    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
+    match = _VERSION_RE.search(version)
     if not match:
         raise ReadError(f"cannot parse cosign version from {version!r}")
-    patch = int(match.group(3)) if match.group(3) is not None else 0
-    return int(match.group(1)), int(match.group(2)), patch
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
 def _prerequisites(world) -> str:
@@ -742,19 +745,24 @@ def _prerequisites(world) -> str:
         raise ReadError(
             f"Python 3.12 or newer is required, found {sys.version_info[0]}.{sys.version_info[1]}"
         )
-    git_bin = _git()[0] if _git() else "git"
-    if not shutil.which(git_bin):
-        raise ReadError(f"git is required on PATH: {git_bin} not found")
+    git_parts = _git()
+    git_bin = git_parts[0] if git_parts else "git"
+    if not git_bin or not shutil.which(git_bin):
+        raise ReadError(f"git is required on PATH: {git_bin!r} not found")
     code, out, err = world.run([*_cosign(), "version"])
     if code != 0:
         raise ReadError(f"the signature tool does not run: {_tail(err) or code}")
     version = ""
     for line in out.splitlines()[:64]:
         if line.startswith("GitVersion"):
-            version = line.split()[-1]
+            parts = line.split()
+            if len(parts) >= 2:
+                version = parts[-1]
             break
     if not version:
         raise ReadError("the signature tool did not report a GitVersion")
+    if _PRERELEASE_RE.search(version):
+        raise ReadError(f"cosign v2.6.3 or newer release is required, found prerelease {version}")
     if _parse_version(version) < (2, 6, 3):
         raise ReadError(f"cosign v2.6.3 or newer is required, found {version}")
     return version
