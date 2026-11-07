@@ -241,9 +241,10 @@ def main() -> int:
         ciwf.complain(f"FAIL: {line}")
     if found:
         return 1
+    max_days = max(LONGEST.days, *(CATEGORY_DAYS.values() or [LONGEST.days]))
     ciwf.say(
         f"PASS: {accepted} accepted finding(s) and {excepted} exception(s), "
-        f"each with a reason and a day at most {LONGEST.days} days ahead"
+        f"each with a reason and a day at most {max_days} days ahead"
     )
     return 0
 
