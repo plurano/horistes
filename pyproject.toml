@@ -3,6 +3,9 @@
 
 # No package is built here: the product is workflow files. This file only
 # configures the test runner of the checks under tools/.
+[tool.bandit]
+skips = ["B404", "B603", "B607"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"

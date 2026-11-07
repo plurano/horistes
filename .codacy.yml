@@ -1,32 +1,16 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 ---
-# Codacy configuration: exclude patterns that duplicate the repository's own
-# gate (make verify-all) or that fire false positives on internal tooling.
+# Codacy configuration.
 #
-# Bandit B404/B603/B607: subprocess usage with hardcoded arguments in tools/
-# and tests/ is the standard pattern for calling git and pytest; the arguments
-# are static strings, not user input. The repo has 20+ files with subprocess.
-# The skips apply globally because every subprocess call in the repo uses static
-# argument lists; limiting to specific paths would need updating every time a
-# new tool or test is added.
+# Bandit B404/B603/B607 and Opengrep dangerous-subprocess-use-audit fire on
+# every subprocess call in the repository; all 20+ call sites use static
+# argument lists, not user input. Per-rule skipping is not available in
+# .codacy.yml (it must be configured in the Codacy UI under Code patterns).
+# The exclude_paths below keep non-source directories out of analysis.
 #
 # Ruff: the repository runs its own ruff (ruff check + ruff format --check)
-# with a project ruff.toml; Codacy's default ruff configuration disagrees on
-# import ordering inside try/except blocks. Excluding Codacy's Ruff avoids
-# false divergence.
-#
-# Opengrep/Semgrep dangerous-subprocess-use-audit: same class as Bandit B603,
-# fires on subprocess.run with any non-literal argument (Path objects count as
-# non-literal); all calls use hardcoded paths.
+# with a project ruff.toml. Codacy's default Ruff disagrees on import ordering
+# inside try/except blocks. Disabling Ruff must be done in the Codacy UI.
 exclude_paths:
   - ".workingdir/**"
-engines:
-  bandit:
-    options:
-      skips: "B404,B603,B607"
-  ruff:
-    enabled: false
-  semgrep:
-    options:
-      skips: "python.lang.security.audit.dangerous-subprocess-use-audit"
