@@ -6,4 +6,11 @@
 # issue that tracks its cause, a reason and a day it ends, at most 90 days
 # ahead. tools/exceptions.py is the only reader and fails the gate on an entry
 # that is incomplete, expired or longer.
-exceptions: []
+exceptions:
+  - rule: CIIBestPracticesID
+    path: .bestpractices.json
+    issue: plurano/horistes#116
+    reason: >-
+      project answers are in .bestpractices.json but the project is not yet
+      registered on bestpractices.dev; registration is a manual step
+    expires: "2026-12-07"
