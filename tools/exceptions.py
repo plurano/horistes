@@ -55,6 +55,7 @@ OWN = "exceptions.yaml"
 FIELDS = ("rule", "path", "issue", "reason", "expires")
 ALLOWED = set(FIELDS) | {"category", "entered"}
 LONGEST = datetime.timedelta(days=90)
+CATEGORY_DAYS = {"B": 3, "C": 10, "D": 120}
 ENTRY = re.compile(
     r"^\s+- (?P<file>[^\s#]+)\s+# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
 )
@@ -64,12 +65,16 @@ PATTERN = re.compile(
 ISSUE = re.compile(r"^[\w.-]+/[\w.-]+#[1-9]\d*$")
 
 
-def day_problem(day: datetime.date, today: datetime.date) -> str:
+def day_problem(
+    day: datetime.date,
+    today: datetime.date,
+    longest: datetime.timedelta = LONGEST,
+) -> str:
     """Why a day an exception ends on is refused, in every list; empty when it holds."""
     if day < today:
         return f"expired on {day}"
-    if day - today > LONGEST:
-        return f"ends on {day}, more than {LONGEST.days} days ahead"
+    if day - today > longest:
+        return f"ends on {day}, more than {longest.days} days ahead"
     return ""
 
 
@@ -142,13 +147,16 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
         found.append(f"names the issue `{entry['issue']}`, not as owner/name#number")
     if "path" not in empty and not _tracked_file(root, entry["path"]):
         found.append(f"names `{entry['path']}`, which is no file of the repository")
+    cat = entry.get("category")
+    cap = LONGEST
+    if isinstance(cat, str) and cat in CATEGORY_DAYS:
+        cap = max(LONGEST, datetime.timedelta(days=CATEGORY_DAYS[cat]))
     if "expires" not in empty:
-        problem = day_problem(datetime.date.fromisoformat(entry["expires"]), today)
+        problem = day_problem(datetime.date.fromisoformat(entry["expires"]), today, longest=cap)
         found += [problem] if problem else []
-    if "category" in entry:
-        cat = entry["category"]
-        if cat not in ("A", "B", "C", "D"):
-            found.append(f"names `{cat}` as category, not one of A, B, C, D")
+    if "category" in entry and cat not in ("A", "B", "C", "D"):
+        found.append(f"names `{cat}` as category, not one of A, B, C, D")
+    valid_entered = False
     if "entered" in entry:
         entered = entry["entered"]
         if not isinstance(entered, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", entered):
@@ -156,8 +164,16 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
         else:
             try:
                 datetime.date.fromisoformat(entered)
+                valid_entered = True
             except ValueError:
                 found.append(f"names `{entered}` as entered, not YYYY-MM-DD")
+    has_interval = isinstance(cat, str) and cat in CATEGORY_DAYS
+    if has_interval and "expires" not in empty and "entered" in entry and valid_entered:
+        interval = datetime.timedelta(days=CATEGORY_DAYS[cat])
+        expected = datetime.date.fromisoformat(entered) + interval
+        actual = datetime.date.fromisoformat(entry["expires"])
+        if actual != expected:
+            found.append(f"expires {actual} but category {cat} entered {entered} gives {expected}")
     return found
 
 
@@ -225,9 +241,10 @@ def main() -> int:
         ciwf.complain(f"FAIL: {line}")
     if found:
         return 1
+    max_days = max(LONGEST.days, *(CATEGORY_DAYS.values() or [LONGEST.days]))
     ciwf.say(
         f"PASS: {accepted} accepted finding(s) and {excepted} exception(s), "
-        f"each with a reason and a day at most {LONGEST.days} days ahead"
+        f"each with a reason and a day at most {max_days} days ahead"
     )
     return 0
 
