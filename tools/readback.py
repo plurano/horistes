@@ -308,7 +308,8 @@ def _cosign() -> list[str]:
 
 
 def _git() -> list[str]:
-    return shlex.split(os.environ.get("GIT", "git"))
+    parts = shlex.split(os.environ.get("GIT", "git"))
+    return parts if parts else ["git"]
 
 
 def _prove(report: Report, world, label: str, command, claim: Claim, others, reading=None):
@@ -745,9 +746,8 @@ def _prerequisites(world) -> str:
         raise ReadError(
             f"Python 3.12 or newer is required, found {sys.version_info[0]}.{sys.version_info[1]}"
         )
-    git_parts = _git()
-    git_bin = git_parts[0] if git_parts else "git"
-    if not git_bin or not shutil.which(git_bin):
+    git_bin = _git()[0]
+    if not shutil.which(git_bin):
         raise ReadError(f"git is required on PATH: {git_bin!r} not found")
     code, out, err = world.run([*_cosign(), "version"])
     if code != 0:
