@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Codacy configuration: exclude patterns that duplicate the repository's own
+# gate (make verify-all) or that fire false positives on internal tooling.
+#
+# Bandit B404/B603/B607: subprocess usage with hardcoded arguments in tools/
+# and tests/ is the standard pattern for calling git and pytest; the arguments
+# are static strings, not user input. The repo has 20+ files with subprocess.
+#
+# Ruff: the repository runs its own ruff (ruff check + ruff format --check)
+# with a project ruff.toml; Codacy's default ruff configuration disagrees on
+# import ordering inside try/except blocks. Excluding Codacy's Ruff avoids
+# false divergence.
+#
+# Opengrep dangerous-subprocess-use-audit: same as Bandit B603, fires on
+# subprocess.run with any non-literal argument (Path objects count as
+# non-literal); all calls use hardcoded paths.
+exclude_paths:
+  - ".workingdir/**"
+engines:
+  bandit:
+    exclude_paths:
+      - "tests/**"
+    options:
+      skips: "B404,B603,B607"
+  ruff:
+    enabled: false
