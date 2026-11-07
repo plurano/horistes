@@ -1,16 +1,28 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 ---
-# Codacy configuration.
-#
-# Bandit B404/B603/B607 and Opengrep dangerous-subprocess-use-audit fire on
-# every subprocess call in the repository; all 20+ call sites use static
-# argument lists, not user input. Per-rule skipping is not available in
-# .codacy.yml (it must be configured in the Codacy UI under Code patterns).
-# The exclude_paths below keep non-source directories out of analysis.
-#
-# Ruff: the repository runs its own ruff (ruff check + ruff format --check)
-# with a project ruff.toml. Codacy's default Ruff disagrees on import ordering
-# inside try/except blocks. Disabling Ruff must be done in the Codacy UI.
+engines:
+  bandit:
+    # tools/examples.py:15 B404 import subprocess — static argument lists only
+    # tools/examples.py:97 B603/B607 subprocess.run — static argument lists only
+    # tests/test_examples.py:7 B404 import subprocess — test helper, static args
+    # tests/test_examples.py:23 B603 subprocess.run — test helper, static args
+    # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
+    exclude_paths:
+      - "tools/examples.py"
+      - "tests/test_examples.py"
+  opengrep:
+    # tests/test_examples.py:23 dangerous-subprocess-use-audit — test helper,
+    # subprocess.run with static argument list, not user input
+    # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
+    exclude_paths:
+      - "tests/test_examples.py"
+  ruff:
+    # tools/examples.py:18 I001 import ordering — local ruff 0.16.10 passes,
+    # Codacy Ruff disagrees on try/except import block ordering despite
+    # usesConfigurationFile: true; version skew, not a rule gap
+    # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
+    exclude_paths:
+      - "tools/examples.py"
 exclude_paths:
   - ".workingdir/**"
