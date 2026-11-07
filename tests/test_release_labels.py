@@ -784,6 +784,27 @@ def test_planted_reusable_release_workflow_skips_release(tmp_path, forge, mutate
     ) is not mutated
 
 
+@pytest.mark.parametrize("mutated", [False, True])
+def test_forwarded_config_expression_skips_release(tmp_path, forge, mutated):
+    """A reusable call forwarding config_file via expression is not treated as custom."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            'if ("$" + "{{") in val:',
+            "if False:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": FORWARDED_CONFIG_REUSABLE_WORKFLOW,
+        "release.yml": PLANTED_PUBLISH_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+
+
 # The repository's own .github/workflows/release-please.yml shape: workflow_call only.
 WORKFLOW_CALL_ONLY_WORKFLOW = """name: Release please
 on:
@@ -849,6 +870,14 @@ jobs:
     uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
     with:
       config_file: other-config.json
+"""
+FORWARDED_CONFIG_REUSABLE_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+    with:
+      config_file: ${{{{ inputs.config_file }}}}
 """
 
 

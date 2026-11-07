@@ -1056,9 +1056,13 @@ jobs:
                           continue
                       key = match.group(1).replace("_", "-")
                       val = match.group(2).strip().strip("'\"")
-                      if key == "config-file" and val != "release-please-config.json":
-                          return True
-                      if key == "manifest-file" and val != ".release-please-manifest.json":
+                      if ("$" + "{{") in val:
+                          continue
+                      defaults = {
+                          "config-file": "release-please-config.json",
+                          "manifest-file": ".release-please-manifest.json",
+                      }
+                      if key in defaults and val != defaults[key]:
                           return True
               return False
 
