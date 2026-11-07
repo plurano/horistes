@@ -10,7 +10,9 @@ exceptions:
   - rule: CIIBestPracticesID
     path: .bestpractices.json
     issue: plurano/horistes#116
+    category: C
+    entered: "2026-11-07"
     reason: >-
-      project answers are in .bestpractices.json but the project is not yet
-      registered on bestpractices.dev; registration is a manual step
-    expires: "2026-12-07"
+      project answers are in .bestpractices.json; registration on
+      bestpractices.dev approved, waiting for completion
+    expires: "2026-11-17"
