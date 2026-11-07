@@ -2526,7 +2526,18 @@ def test_negative_unauthenticated_bot_identity_lookup_is_rate_limited(tmp_path):
     assert not forge.writes
 
 
-def test_negative_artifact_storage_scheme_mismatch(tmp_path):
+@pytest.mark.parametrize(
+    ("redirect", "expected_msg"),
+    [
+        pytest.param(
+            "ftp://storage.example.com/evil.zip",
+            "storage URL scheme 'ftp' != 'http'",
+            id="scheme_mismatch",
+        ),
+        pytest.param("", "expected 302 redirect to storage URL", id="location_empty"),
+    ],
+)
+def test_negative_artifact_storage_location(tmp_path, redirect, expected_msg):
     head = f"{1:040x}"
     dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep_pull))
@@ -2540,34 +2551,12 @@ def test_negative_artifact_storage_scheme_mismatch(tmp_path):
         head_sha=head,
         head_branch="renovate/demo-dep",
     )
-    forge.artifact_redirect_locations[101] = "ftp://storage.example.com/evil.zip"
+    forge.artifact_redirect_locations[101] = redirect
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0
     assert not any(w[0] == "commit" for w in forge.writes)
     assert "generated files refused:" in summary
-    assert "storage URL scheme 'ftp' != 'http'" in summary
-
-
-def test_negative_artifact_storage_location_empty(tmp_path):
-    head = f"{1:040x}"
-    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
-    forge = Forge(repository(dep_pull))
-    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
-    zip_bytes = make_artifact_zip(head, {"notices.txt": b"content"})
-    forge.add_artifact(
-        "fleet/app",
-        101,
-        f"regenerated-{head}",
-        zip_bytes,
-        head_sha=head,
-        head_branch="renovate/demo-dep",
-    )
-    forge.artifact_redirect_locations[101] = ""
-    done, summary = train(tmp_path, forge)
-    assert done.returncode == 0
-    assert not any(w[0] == "commit" for w in forge.writes)
-    assert "generated files refused:" in summary
-    assert "expected 302 redirect to storage URL" in summary
+    assert expected_msg in summary
 
 
 def test_negative_zip_oversize_declared_file_size(tmp_path):
@@ -4024,14 +4013,15 @@ def test_a_red_written_head_releases_the_hold(tmp_path):
     assert "### fleet/app: landed #2" in summary
 
 
-def test_an_unstable_train_write_with_a_red_check_still_holds(tmp_path):
-    """An UNSTABLE train write with a red check stays held: it can still land."""
+@pytest.mark.parametrize("state", ["UNSTABLE", "UNKNOWN"])
+def test_a_train_write_with_a_red_check_still_holds(tmp_path, state):
+    """A train write in a non-terminal state with a red check stays held."""
     rules = load_rules(tmp_path)
     bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    unstable_written = pull(
+    written = pull(
         1,
-        "UNSTABLE",
+        state,
         headRefName="renovate/demo-dep",
         messageHeadline=rules.REGENERATE_HEADLINE,
         author=bot_email,
@@ -4039,69 +4029,34 @@ def test_an_unstable_train_write_with_a_red_check_still_holds(tmp_path):
         suites=["FAILURE"],
     )
     other = pull(2, "CLEAN", headRefName="feat/clean-feature")
-    forge = Forge(repository(unstable_written, other))
+    forge = Forge(repository(written, other))
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert landed(2) not in forge.writes
     assert "held for the generated files of #1 until" in summary
 
 
-def test_an_unknown_train_write_with_a_red_check_still_holds(tmp_path):
-    """An UNKNOWN train write with a red check stays held: it can still land."""
-    rules = load_rules(tmp_path)
-    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
-    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    unknown_written = pull(
-        1,
-        "UNKNOWN",
-        headRefName="renovate/demo-dep",
-        messageHeadline=rules.REGENERATE_HEADLINE,
-        author=bot_email,
-        committedDate=recent,
-        suites=["FAILURE"],
-    )
-    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
-    forge = Forge(repository(unknown_written, other))
-    done, summary = train(tmp_path, forge)
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert landed(2) not in forge.writes
-    assert "held for the generated files of #1 until" in summary
-
-
-def test_a_rebased_head_releases_the_hold(tmp_path):
-    """Rebasing the head commit by another author releases the train write hold."""
+@pytest.mark.parametrize(
+    "author_email",
+    [
+        pytest.param("bot@renovateapp.com", id="rebased_head"),
+        pytest.param("attacker@example.com", id="other_author"),
+    ],
+)
+def test_non_bot_author_with_regenerate_headline_does_not_hold(tmp_path, author_email):
+    """A regenerate headline from a non-bot author does not hold the train."""
     rules = load_rules(tmp_path)
     recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rebased = pull(
+    pr = pull(
         1,
         "BLOCKED",
         headRefName="renovate/demo-dep",
         messageHeadline=rules.REGENERATE_HEADLINE,
-        author={"email": "bot@renovateapp.com"},
+        author={"email": author_email},
         committedDate=recent,
     )
     other = pull(2, "CLEAN", headRefName="feat/clean-feature")
-    forge = Forge(repository(rebased, other))
-    done, summary = train(tmp_path, forge)
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert forge.writes == [landed(2)]
-    assert "### fleet/app: landed #2" in summary
-
-
-def test_a_commit_of_another_author_with_the_headline_holds_nothing(tmp_path):
-    """A regenerate headline authored by someone other than the bot holds nothing."""
-    rules = load_rules(tmp_path)
-    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    attacker = pull(
-        1,
-        "BLOCKED",
-        headRefName="renovate/demo-dep",
-        messageHeadline=rules.REGENERATE_HEADLINE,
-        author={"email": "attacker@example.com"},
-        committedDate=recent,
-    )
-    other = pull(2, "CLEAN", headRefName="feat/clean-feature")
-    forge = Forge(repository(attacker, other))
+    forge = Forge(repository(pr, other))
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(2)]

@@ -43,28 +43,20 @@ def test_exact_copy_passes(tmp_path: Path) -> None:
     assert status == 0
 
 
-def test_planted_drift_in_commit_msg_fails_with_digests(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    "filename",
+    [
+        pytest.param("commit-msg.sh", id="commit_msg"),
+        pytest.param("commit-msg_test.sh", id="commit_msg_test"),
+    ],
+)
+def test_planted_drift_fails_with_digests(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], filename: str
 ) -> None:
-    """Drift in commit-msg.sh fails with exit 1 and prints both digests."""
+    """Drift in a hook file fails with exit 1 and prints both digests."""
     copy_dir = tmp_path / "hooks"
     shutil.copytree(ROOT / "hooks", copy_dir)
-    target = copy_dir / "commit-msg.sh"
-    target.write_bytes(target.read_bytes() + b"\n")
-    status = hook_copy.main(["check", "--source", str(ROOT / "hooks"), "--copy", str(copy_dir)])
-    assert status == 1
-    captured = capsys.readouterr()
-    assert "source sha256:" in captured.err
-    assert "copy   sha256:" in captured.err
-
-
-def test_planted_drift_in_commit_msg_test_fails_with_digests(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Drift in commit-msg_test.sh fails with exit 1 and prints both digests."""
-    copy_dir = tmp_path / "hooks"
-    shutil.copytree(ROOT / "hooks", copy_dir)
-    target = copy_dir / "commit-msg_test.sh"
+    target = copy_dir / filename
     target.write_bytes(target.read_bytes() + b"\n")
     status = hook_copy.main(["check", "--source", str(ROOT / "hooks"), "--copy", str(copy_dir)])
     assert status == 1
