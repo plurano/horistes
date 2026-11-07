@@ -1205,6 +1205,8 @@ jobs:
                   if not stripped:
                       continue
                   if block_indent is not None and indent > block_indent:
+                      if in_with:
+                          with_lines.append(line)
                       continue
                   block_indent = None
                   if stripped.startswith("#"):
