@@ -868,6 +868,48 @@ def test_block_scalar_forwarded_config_skips_release(tmp_path, forge, mutated):
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
 
 
+@pytest.mark.parametrize("mutated", [False, True])
+def test_block_scalar_custom_config_is_detected(tmp_path, forge, mutated):
+    """A block-scalar config_file with a custom literal path is treated as custom."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "if in_with:",
+            "if False:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": BLOCK_SCALAR_CUSTOM_CONFIG_WORKFLOW,
+        "release.yml": PLANTED_PUBLISH_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_block_scalar_default_then_runner_not_misclassified(tmp_path, forge, mutated):
+    """A runner key after a block-scalar config_file is not mistaken for the config value."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "if in_with:",
+            "if False:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": BLOCK_SCALAR_DEFAULT_THEN_RUNNER_WORKFLOW,
+        "release.yml": PLANTED_PUBLISH_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+
+
 # The repository's own .github/workflows/release-please.yml shape: workflow_call only.
 WORKFLOW_CALL_ONLY_WORKFLOW = """name: Release please
 on:
@@ -966,6 +1008,25 @@ jobs:
     with:
       config_file: >-
         ${{{{ inputs.config_file }}}}
+"""
+BLOCK_SCALAR_CUSTOM_CONFIG_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+    with:
+      config_file: |-
+        custom.json
+"""
+BLOCK_SCALAR_DEFAULT_THEN_RUNNER_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+    with:
+      config_file: >-
+        ${{{{ inputs.config_file }}}}
+      runner: ubuntu-latest
 """
 
 
