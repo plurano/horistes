@@ -735,43 +735,23 @@ def test_actionlint_is_read_with_release_and_checksum_in_gate_and_makefile():
     assert ci_actionlint["currentValue"] == "v" + make_actionlint["currentValue"]
 
 
-def test_gitleaks_is_read_with_release_and_checksum_in_gate():
-    gate_text = (ROOT / GATE).read_text(encoding="utf-8")
-    ci_matches = [
-        groups
-        for mgr, groups in tool_matches(GATE, gate_text)
-        if mgr["depNameTemplate"] == "gitleaks/gitleaks"
-    ]
-    assert len(ci_matches) == 1
-    ci_gitleaks = ci_matches[0]
-    assert re.fullmatch(r"v\d+\.\d+\.\d+", ci_gitleaks["currentValue"])
-    assert re.fullmatch(r"[0-9a-f]{64}", ci_gitleaks["currentDigest"])
-
-
-def test_gitleaks_is_read_with_release_and_checksum_in_secret_scan():
-    text = (ROOT / SECRET_SCAN).read_text(encoding="utf-8")
+@pytest.mark.parametrize(
+    ("path", "dep_name"),
+    [
+        pytest.param(GATE, "gitleaks/gitleaks", id="gitleaks_in_gate"),
+        pytest.param(SECRET_SCAN, "gitleaks/gitleaks", id="gitleaks_in_secret_scan"),
+        pytest.param(WORKFLOW_CHECK, "rhysd/actionlint", id="actionlint_in_workflow_check"),
+    ],
+)
+def test_tool_is_read_with_release_and_checksum(path, dep_name):
+    text = (ROOT / path).read_text(encoding="utf-8")
     matches = [
-        groups
-        for mgr, groups in tool_matches(SECRET_SCAN, text)
-        if mgr["depNameTemplate"] == "gitleaks/gitleaks"
+        groups for mgr, groups in tool_matches(path, text) if mgr["depNameTemplate"] == dep_name
     ]
     assert len(matches) == 1
-    gitleaks = matches[0]
-    assert re.fullmatch(r"v\d+\.\d+\.\d+", gitleaks["currentValue"])
-    assert re.fullmatch(r"[0-9a-f]{64}", gitleaks["currentDigest"])
-
-
-def test_actionlint_is_read_with_release_and_checksum_in_workflow_check():
-    text = (ROOT / WORKFLOW_CHECK).read_text(encoding="utf-8")
-    matches = [
-        groups
-        for mgr, groups in tool_matches(WORKFLOW_CHECK, text)
-        if mgr["depNameTemplate"] == "rhysd/actionlint"
-    ]
-    assert len(matches) == 1
-    actionlint = matches[0]
-    assert re.fullmatch(r"v\d+\.\d+\.\d+", actionlint["currentValue"])
-    assert re.fullmatch(r"[0-9a-f]{64}", actionlint["currentDigest"])
+    tool = matches[0]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", tool["currentValue"])
+    assert re.fullmatch(r"[0-9a-f]{64}", tool["currentDigest"])
 
 
 @pytest.mark.parametrize(

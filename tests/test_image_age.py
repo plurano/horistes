@@ -88,42 +88,38 @@ def test_planted_newer_release_younger_than_14_days_passes(capsys: pytest.Captur
     )
 
 
-def test_planted_timeout_fails_with_exit_3(capsys: pytest.CaptureFixture[str]):
-    """Planted (3) timeout: reading registry times out, fails with exit 3."""
+@pytest.mark.parametrize(
+    ("message", "expected_substr"),
+    [
+        pytest.param(
+            "Docker Hub request timed out after 20s",
+            "Docker Hub request timed out after 20s",
+            id="timeout",
+        ),
+        pytest.param(
+            "Docker Hub HTTP 500: Server Error",
+            "Docker Hub HTTP 500: Server Error",
+            id="http_500",
+        ),
+        pytest.param(
+            "Docker Hub returned malformed JSON: Expecting value: line 1 column 1 (char 0)",
+            "Docker Hub returned malformed JSON",
+            id="garbage_json",
+        ),
+    ],
+)
+def test_planted_read_error_fails_with_exit_3(
+    capsys: pytest.CaptureFixture[str], message, expected_substr
+):
+    """Planted (3) ReadError: registry failure fails with exit 3."""
 
-    def raise_timeout():
-        raise image_age.ReadError("Docker Hub request timed out after 20s")
+    def raise_err():
+        raise image_age.ReadError(message)
 
-    rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=raise_timeout)
+    rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=raise_err)
     assert rc == 3
     err = capsys.readouterr().err
-    assert "ERROR: Docker Hub request timed out after 20s" in err
-
-
-def test_planted_http_500_fails_with_exit_3(capsys: pytest.CaptureFixture[str]):
-    """Planted (3) HTTP error: registry returns HTTP 500, fails with exit 3."""
-
-    def raise_http():
-        raise image_age.ReadError("Docker Hub HTTP 500: Server Error")
-
-    rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=raise_http)
-    assert rc == 3
-    err = capsys.readouterr().err
-    assert "ERROR: Docker Hub HTTP 500: Server Error" in err
-
-
-def test_planted_garbage_json_fails_with_exit_3(capsys: pytest.CaptureFixture[str]):
-    """Planted (3) garbage JSON: registry returns invalid JSON, fails with exit 3."""
-
-    def raise_json():
-        raise image_age.ReadError(
-            "Docker Hub returned malformed JSON: Expecting value: line 1 column 1 (char 0)"
-        )
-
-    rc = image_age.check(root=ROOT, today=TODAY, fetch_fn=raise_json)
-    assert rc == 3
-    err = capsys.readouterr().err
-    assert "ERROR: Docker Hub returned malformed JSON" in err
+    assert f"ERROR: {expected_substr}" in err
 
 
 def test_moved_digest_fails_with_exit_1(capsys: pytest.CaptureFixture[str]):
