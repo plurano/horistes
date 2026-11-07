@@ -19,10 +19,13 @@ engines:
     # subprocess.run with static argument list, not user input
     # tests/test_exceptions.py:244 dangerous-subprocess-use-audit — test helper,
     # subprocess.run with static argument list, not user input
+    # tests/test_merge_guard.py:21 dangerous-subprocess-use-audit — test mock,
+    # CompletedProcess constructor with static args
     # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
     exclude_paths:
       - "tests/test_examples.py"
       - "tests/test_exceptions.py"
+      - "tests/test_merge_guard.py"
   ruff:
     # tools/examples.py:18 I001 import ordering — local ruff 0.16.10 passes,
     # Codacy Ruff disagrees on try/except import block ordering despite
