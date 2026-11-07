@@ -4,7 +4,11 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
+from conftest import ROOT
 
 CONFIG = ".github/zizmor.yml"
 GOOD = (
@@ -184,6 +188,55 @@ def test_both_places_are_counted_and_a_finding_in_either_fails(tree):
     assert done.returncode == 0, done.stderr
     assert "1 accepted finding(s) and 1 exception(s)" in done.stdout
     assert tree.tool("exceptions.py", "check", "--today", "2027-01-01").stderr.count("expired") == 2
+
+
+def _with_category(cat: str, entered: str, expires: str) -> str:
+    replacement = f'    category: {cat}\n    entered: "{entered}"\n    expires: "{expires}"\n'
+    return "---\nexceptions:\n" + ENTRY.replace('    expires: "2026-12-31"\n', replacement)
+
+
+def test_category_c_plus_eleven_days_refused(tree):
+    done = own(tree, _with_category("C", "2026-10-11", "2026-10-22"))
+    assert done.returncode == 1, done.stdout
+    assert "category C" in done.stderr
+    assert "2026-10-21" in done.stderr
+
+
+def test_category_c_plus_ten_days_ok(tree):
+    done = own(tree, _with_category("C", "2026-10-11", "2026-10-21"))
+    assert done.returncode == 0, done.stderr
+
+
+def test_category_a_skips_interval_check(tree):
+    done = own(tree, _with_category("A", "2026-10-11", "2026-12-31"))
+    assert done.returncode == 0, done.stderr
+
+
+def test_mutation_empty_category_days_lets_wrong_interval_pass(tree):
+    source = (ROOT / "tools" / "exceptions.py").read_text(encoding="utf-8")
+    mutated = source.replace('CATEGORY_DAYS = {"B": 3, "C": 10, "D": 120}', "CATEGORY_DAYS = {}")
+    assert mutated != source
+    mutant = tree.root / "tools" / "mutant_exceptions.py"
+    mutant.parent.mkdir(parents=True, exist_ok=True)
+    mutant.write_text(mutated, encoding="utf-8")
+    for dep in ("ciwf.py",):
+        src = ROOT / "tools" / dep
+        if src.exists():
+            dst = tree.root / "tools" / dep
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    files = {
+        OWN: _with_category("C", "2026-10-11", "2026-10-22"),
+        SUBJECT: "{}\n",
+    }
+    tree.write(files)
+    done = subprocess.run(
+        [sys.executable, "-B", str(mutant), "check", "--root", str(tree.root), "--today", TODAY],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
 
 
 LINTED = ".github/actionlint.yaml"

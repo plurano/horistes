@@ -55,6 +55,7 @@ OWN = "exceptions.yaml"
 FIELDS = ("rule", "path", "issue", "reason", "expires")
 ALLOWED = set(FIELDS) | {"category", "entered"}
 LONGEST = datetime.timedelta(days=90)
+CATEGORY_DAYS = {"B": 3, "C": 10, "D": 120}
 ENTRY = re.compile(
     r"^\s+- (?P<file>[^\s#]+)\s+# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
 )
@@ -145,10 +146,10 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
     if "expires" not in empty:
         problem = day_problem(datetime.date.fromisoformat(entry["expires"]), today)
         found += [problem] if problem else []
-    if "category" in entry:
-        cat = entry["category"]
-        if cat not in ("A", "B", "C", "D"):
-            found.append(f"names `{cat}` as category, not one of A, B, C, D")
+    cat = entry.get("category")
+    if "category" in entry and cat not in ("A", "B", "C", "D"):
+        found.append(f"names `{cat}` as category, not one of A, B, C, D")
+    valid_entered = False
     if "entered" in entry:
         entered = entry["entered"]
         if not isinstance(entered, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", entered):
@@ -156,8 +157,15 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
         else:
             try:
                 datetime.date.fromisoformat(entered)
+                valid_entered = True
             except ValueError:
                 found.append(f"names `{entered}` as entered, not YYYY-MM-DD")
+    if cat in CATEGORY_DAYS and "expires" not in empty and "entered" in entry and valid_entered:
+        interval = datetime.timedelta(days=CATEGORY_DAYS[cat])
+        expected = datetime.date.fromisoformat(entered) + interval
+        actual = datetime.date.fromisoformat(entry["expires"])
+        if actual != expected:
+            found.append(f"expires {actual} but category {cat} entered {entered} gives {expected}")
     return found
 
 
