@@ -145,6 +145,15 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
     if "expires" not in empty:
         problem = day_problem(datetime.date.fromisoformat(entry["expires"]), today)
         found += [problem] if problem else []
+    cat = entry.get("category")
+    if cat is not None and cat not in ("A", "B", "C", "D"):
+        found.append(f"names `{cat}` as category, not one of A, B, C, D")
+    entered = entry.get("entered")
+    if entered is not None:
+        try:
+            datetime.date.fromisoformat(entered)
+        except (TypeError, ValueError):
+            found.append(f"names `{entered}` as entered, not YYYY-MM-DD")
     return found
 
 
