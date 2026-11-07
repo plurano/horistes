@@ -1041,10 +1041,35 @@ jobs:
               return val.lower() == "false"
 
 
+          def is_custom_config_val(val, default):
+              """Whether val is a non-default config path, resolving literal expressions."""
+              expr_open = "$" + "{{"
+              if expr_open not in val:
+                  return val != default
+              stripped = val.strip()
+              if not (stripped.startswith(expr_open) and stripped.endswith("}}")):
+                  return True
+              inner = stripped[len(expr_open) : -2].strip()
+              lit = re.match(r"^['\"](.+)['\"]$", inner)
+              if lit:
+                  return lit.group(1) != default
+              return False
+
+
           def has_custom_config(lines):
               """Whether with: sets config or manifest path away from default."""
+              defaults = {
+                  "config-file": "release-please-config.json",
+                  "manifest-file": ".release-please-manifest.json",
+              }
+              pending_key = None
               for line in lines[:100]:
                   clean = re.sub(r"\s+#.*$", "", line).strip()
+                  if pending_key is not None:
+                      key, pending_key = pending_key, None
+                      if is_custom_config_val(clean.strip("'\""), defaults[key]):
+                          return True
+                      continue
                   items = (
                       clean.strip("{}").split(",")
                       if (clean.startswith("{") and clean.endswith("}"))
@@ -1056,13 +1081,12 @@ jobs:
                           continue
                       key = match.group(1).replace("_", "-")
                       val = match.group(2).strip().strip("'\"")
-                      if ("$" + "{{") in val:
+                      if key not in defaults:
                           continue
-                      defaults = {
-                          "config-file": "release-please-config.json",
-                          "manifest-file": ".release-please-manifest.json",
-                      }
-                      if key in defaults and val != defaults[key]:
+                      if val in (">", ">-", "|", "|-"):
+                          pending_key = key
+                          continue
+                      if is_custom_config_val(val, defaults[key]):
                           return True
               return False
 
