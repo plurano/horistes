@@ -784,6 +784,90 @@ def test_planted_reusable_release_workflow_skips_release(tmp_path, forge, mutate
     ) is not mutated
 
 
+@pytest.mark.parametrize("mutated", [False, True])
+def test_forwarded_config_expression_skips_release(tmp_path, forge, mutated):
+    """A reusable call forwarding config_file via expression is not treated as custom."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "if expr_open not in val:",
+            "if True:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": FORWARDED_CONFIG_REUSABLE_WORKFLOW,
+        "release.yml": PLANTED_PUBLISH_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_embedded_expression_is_custom_config(tmp_path, forge, mutated):
+    """An expression embedded in a literal path is treated as custom config."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            'stripped.startswith(expr_open) and stripped.endswith("}}")',
+            "True",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": EMBEDDED_EXPR_CONFIG_WORKFLOW,
+        "release.yml": PLANTED_PUBLISH_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_literal_string_expression_is_custom_config(tmp_path, forge, mutated):
+    """A literal string expression resolving to a non-default path is custom."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            "return lit.group(1) != default",
+            "return False",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": LITERAL_EXPR_CONFIG_WORKFLOW,
+        "release.yml": PLANTED_PUBLISH_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "true" if mutated else "false"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize("mutated", [False, True])
+def test_block_scalar_forwarded_config_skips_release(tmp_path, forge, mutated):
+    """A block-scalar forwarded config_file expression is not treated as custom."""
+    source = module()
+    if mutated:
+        source = source.replace(
+            'if val in (">", ">-", "|", "|-"):',
+            "if False:",
+        )
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {
+        "release-automation.yml": BLOCK_SCALAR_FORWARDED_CONFIG_WORKFLOW,
+        "release.yml": PLANTED_PUBLISH_WORKFLOW,
+    }
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected_skip = "false" if mutated else "true"
+    assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
+
+
 # The repository's own .github/workflows/release-please.yml shape: workflow_call only.
 WORKFLOW_CALL_ONLY_WORKFLOW = """name: Release please
 on:
@@ -849,6 +933,39 @@ jobs:
     uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
     with:
       config_file: other-config.json
+"""
+FORWARDED_CONFIG_REUSABLE_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+    with:
+      config_file: ${{{{ inputs.config_file }}}}
+"""
+EMBEDDED_EXPR_CONFIG_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+    with:
+      config_file: path/${{{{ github.ref_name }}}}/release-please-config.json
+"""
+LITERAL_EXPR_CONFIG_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+    with:
+      config_file: ${{{{ 'other-config.json' }}}}
+"""
+BLOCK_SCALAR_FORWARDED_CONFIG_WORKFLOW = f"""name: Release automation
+on: [push]
+jobs:
+  release-please:
+    uses: jellysin/release-helper/.github/workflows/release-please.yml@{HELPER_SHA}
+    with:
+      config_file: >-
+        ${{{{ inputs.config_file }}}}
 """
 
 

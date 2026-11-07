@@ -47,14 +47,11 @@ jobs:
     steps:
       - name: Require a Linux runner
         if: runner.os != 'Linux'
-        shell: bash
-        env:
-          TITLE: Wrong runner OS
-          MESSAGE: >-
-            The licence step is a container action and needs
-            a Linux runner.
+        shell: pwsh
         run: |
-          echo "::error title=$TITLE::$MESSAGE Got $RUNNER_OS."
+          $title = "Wrong runner OS"
+          $msg   = "The licence step is a container action and needs a Linux runner. Got $env:RUNNER_OS."
+          Write-Output "::error title=${title}::${msg}"
           exit 1
 
       - name: Stop on a draft pull request
