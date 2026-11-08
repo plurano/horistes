@@ -73,7 +73,9 @@ def fetch_hub_tags(url: str, timeout: int = DEADLINE_SECONDS) -> list[dict]:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
-        raise ReadError(f"Docker Hub HTTP {err.code}: {err.reason}") from err
+        code, reason = err.code, err.reason
+        err.close()
+        raise ReadError(f"Docker Hub HTTP {code}: {reason}") from err
     except (urllib.error.URLError, TimeoutError, OSError) as err:
         raise ReadError(f"Docker Hub request failed: {err}") from err
     except json.JSONDecodeError as err:

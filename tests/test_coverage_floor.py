@@ -19,13 +19,16 @@ FLOOR = 94
 RCFILE = "--rcfile=pyproject.toml"
 DATA_FILE = '--data-file="$$data/.coverage"'
 COVERAGE = ["$(BIN)/python", "-B", "-m", "coverage"]
+# The suite runs in Python's development mode (tests/test_dev_mode.py).
+DEV_COVERAGE = ["$(BIN)/python", "-X", "dev", "-B", "-m", "coverage"]
 STRICT = ["--precision=10", "--format=total"]
 # The Makefile test recipe runs these coverage commands in this order, each
-# reading pyproject.toml only and writing data files to $$data. The last step
-# compares the unrounded total with the floor at ten decimals.
+# reading pyproject.toml only and writing data files to $$data. The run step
+# starts Python in development mode; the last step compares the unrounded
+# total with the floor at ten decimals.
 # Environment assignments may come first.
 GATE_COVERAGE = [
-    [*COVERAGE, "run", RCFILE, DATA_FILE, "-m", "pytest"],
+    [*DEV_COVERAGE, "run", RCFILE, DATA_FILE, "-m", "pytest"],
     [*COVERAGE, "combine", RCFILE, DATA_FILE],
     [*COVERAGE, "report", RCFILE, DATA_FILE],
     [*COVERAGE, "report", RCFILE, DATA_FILE, *STRICT],
