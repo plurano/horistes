@@ -14,9 +14,9 @@ call passed; the engine reads it as covering the calling job
 a run narrowed to a folder is reported as "Licence / REUSE lint (<root>)" and
 never stands in for the whole repository (decision record 0027).
 
-On a draft the call job is skipped and the result job fails with the draft
-annotation, so the required check stays red and no runner is spent until the
-ready_for_review run (PR 47).
+On a draft the licence call is skipped and spends no runner; the result job
+still takes one runner briefly to report the draft; the check turns red again
+when a ready pull request is converted to a draft (PR 47).
 
 Fields: .Shared.Repository, .Shared.Commit and .Shared.Version are working
 names until the engine renders caller templates (cordanaLLM/praetor#1211);
@@ -43,7 +43,7 @@ name: Licence check
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
   merge_group:
@@ -55,8 +55,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # A draft skips this job, and the result job below fails for it, so the
-  # required check stays red on a draft until the ready_for_review run.
+  # On a draft the licence call is skipped and spends no runner; the result job
+  # still takes one runner briefly to report the draft; the check turns red
+  # again when a ready pull request is converted to a draft.
   licence:
     name: Licence
     if: >-
