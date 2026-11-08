@@ -82,6 +82,10 @@ exceptions:
     reason: the engine declares a name no run reports
     expires: "2026-12-31"
 """
+DRAFT_ERROR = (
+    'echo "::error title=Gate not run on a draft::The gate did not run because '
+    'the pull request is a draft. It runs when the pull request is marked ready for review."'
+)
 RENDERED = f"""\
 # SPDX-FileCopyrightText: 2026 Owner <owner@example.org>
 # SPDX-License-Identifier: EUPL-1.2
@@ -92,7 +96,7 @@ name: Licence check
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
   merge_group:
@@ -104,8 +108,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # On a draft the licence call is skipped and spends no runner; the result job
+  # still takes one runner briefly to report the draft; the check turns red
+  # again when a ready pull request is converted to a draft.
   licence:
     name: Licence
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.draft == false
     permissions:
       contents: read
     uses: owner/shared/{CALLED}@{COMMIT} # v1.2.3
@@ -113,9 +123,10 @@ jobs:
       runner: ubuntu-26.04
 
   # The forge reports the calling job above only as "Licence / REUSE lint",
-  # never as "Licence". This job reports "Licence" and fails unless the licence
-  # check passed; it runs under always() so a failed or cancelled check still
-  # reports here.
+  # never as "Licence", so a rule set that requires "Licence" waits forever.
+  # This job reports "Licence" and fails unless the licence check passed; it
+  # runs under always() so a failed, cancelled or skipped check still reports
+  # here.
   result:
     name: Licence
     needs: licence
@@ -124,11 +135,19 @@ jobs:
     timeout-minutes: 5
     permissions: {{}}
     steps:
+      # yamllint disable rule:line-length
+      - name: Report the draft
+        if: needs.licence.result == 'skipped'
+        shell: bash
+        run: |
+          {DRAFT_ERROR}
+          exit 1
+      # yamllint enable rule:line-length
       - name: Fail unless the licence check passed
         if: needs.licence.result != 'success'
         shell: bash
         run: |
-          echo "The licence check did not pass."
+          echo "The licence check did not pass or was skipped on a draft."
           exit 1
 """
 
@@ -147,6 +166,7 @@ on:
     branches: [main]
   schedule:
     - cron: "23 4 * * 2"
+  workflow_dispatch:
 
 permissions: {{}}
 
@@ -271,6 +291,7 @@ def test_scorecard_template_renders_into_the_recorded_caller():
     ids=["licence", "scorecard", "merge-train", "workflow-check"],
 )
 def test_rendered_caller_passes_both_linters(tree, template, name):
+    """A rendered caller passes actionlint and zizmor checks."""
     tree.write({name: rendered_real_template(template)})
     # The runner label a consumer's adoption declares to actionlint, as here.
     config = ["-config-file", str(ROOT / ".github/actionlint.yaml")]
@@ -279,6 +300,7 @@ def test_rendered_caller_passes_both_linters(tree, template, name):
         capture_output=True,
         text=True,
         check=False,
+        timeout=30,
     )
     assert done.returncode == 0, done.stdout + done.stderr
     command = [*external("ZIZMOR", "zizmor"), "--offline", "--strict-collection"]
@@ -287,6 +309,7 @@ def test_rendered_caller_passes_both_linters(tree, template, name):
         capture_output=True,
         text=True,
         check=False,
+        timeout=30,
     )
     assert done.returncode == 0, done.stdout + done.stderr
 
@@ -441,6 +464,11 @@ PLANTED = [
         "the rendered caller does not start with the two SPDX header lines",
         id="spdx-missing-identifier",
     ),
+    pytest.param(
+        GOOD.replace("    permissions:\n", "    if: always()\n    permissions:\n"),
+        f"the call job has `if: always()`, not `{render.DRAFT_IF}`",
+        id="call-job-with-other-if",
+    ),
 ]
 
 
@@ -455,6 +483,26 @@ def test_planted_template_fails(tree, template, message):
 RESULT_JOB = GOOD[GOOD.index("\n  result:\n") :]
 STEP_IF = "if: needs.licence.result != 'success'"
 ECHO = 'echo "The licence check did not pass."'
+DRAFT_STEP = f"""\
+      - name: Report the draft
+        if: needs.licence.result == 'skipped'
+        shell: bash
+        run: |
+          {DRAFT_ERROR}
+          exit 1
+"""
+DRAFT_CALL_IF = """\
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.draft == false
+"""
+DRAFT_TYPES = "    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]\n"
+DRAFT_GOOD = (
+    GOOD.replace("  pull_request:\n", f"  pull_request:\n{DRAFT_TYPES}")
+    .replace("    permissions:\n", f"{DRAFT_CALL_IF}    permissions:\n")
+    .replace("    steps:\n", f"    steps:\n{DRAFT_STEP}")
+)
+TWO_STEPS_GOOD = DRAFT_GOOD
 PLANTED_RESULT = [
     pytest.param(
         GOOD.replace(RESULT_JOB, "\n"),
@@ -507,8 +555,28 @@ PLANTED_RESULT = [
     ),
     pytest.param(
         GOOD + "      - name: Second\n        run: exit 0\n",
-        "job `result` has not exactly one step",
+        "the draft report step of job `result` does not run on `needs.licence.result == 'skipped'`",
         id="result-second-step",
+    ),
+    pytest.param(
+        TWO_STEPS_GOOD.replace(
+            "if: needs.licence.result == 'skipped'", "if: needs.licence.result == 'failure'"
+        ),
+        "the draft report step of job `result` does not run on `needs.licence.result == 'skipped'`",
+        id="draft-report-passes-a-cancelled-call",
+    ),
+    pytest.param(
+        TWO_STEPS_GOOD.replace(
+            DRAFT_ERROR,
+            "curl -fsS https://example.org",
+        ),
+        "the draft report step of job `result` does more than print a line and `exit 1`",
+        id="draft-report-step-runs-a-command",
+    ),
+    pytest.param(
+        TWO_STEPS_GOOD + "      - name: Third\n        run: exit 0\n",
+        "a caller holds one step, or two when the first reports a draft",
+        id="result-three-steps",
     ),
     pytest.param(
         GOOD.replace(STEP_IF, "if: needs.licence.result == 'failure'"),
@@ -548,6 +616,59 @@ def test_planted_result_job_fails(tree, template, message):
     done = check(tree, template)
     assert done.returncode == 1, done.stdout
     assert message in done.stderr
+
+
+def test_draft_handling_caller_passes(tree):
+    """A draft-handling caller with call if, draft step and types passes."""
+    assert check(tree, DRAFT_GOOD).returncode == 0
+
+
+def test_draft_step_without_call_if_fails(tree):
+    """A draft-handling caller whose call job lacks the draft condition fails."""
+    without_call_if = DRAFT_GOOD.replace(DRAFT_CALL_IF, "")
+    done = check(tree, without_call_if)
+    assert done.returncode == 1, done.stdout
+    assert f"the call job has no `if: {render.DRAFT_IF}`" in done.stderr
+
+
+def test_call_if_without_draft_step_fails(tree):
+    """A draft-handling caller whose result job lacks the draft report step fails."""
+    without_draft_step = DRAFT_GOOD.replace(DRAFT_STEP, "")
+    done = check(tree, without_draft_step)
+    assert done.returncode == 1, done.stdout
+    assert "job `result` has no draft report step" in done.stderr
+
+
+def test_draft_handling_without_converted_to_draft_fails(tree):
+    """A draft-handling caller whose pull_request trigger misses converted_to_draft fails."""
+    without_converted = DRAFT_GOOD.replace(", converted_to_draft", "")
+    done = check(tree, without_converted)
+    assert done.returncode == 1, done.stdout
+    assert "on.pull_request.types does not contain `converted_to_draft`" in done.stderr
+
+
+def test_draft_handling_without_ready_for_review_fails(tree):
+    """A draft-handling caller whose pull_request trigger misses ready_for_review fails."""
+    without_ready = DRAFT_GOOD.replace(", ready_for_review", "")
+    done = check(tree, without_ready)
+    assert done.returncode == 1, done.stdout
+    assert "on.pull_request.types does not contain `ready_for_review`" in done.stderr
+
+
+def test_draft_report_step_with_only_exit_fails(tree):
+    """A draft report step with only exit 1 fails for lack of an error annotation."""
+    only_exit = DRAFT_GOOD.replace(f"          {DRAFT_ERROR}\n", "")
+    done = check(tree, only_exit)
+    assert done.returncode == 1, done.stdout
+    assert "the draft report step of job `result` prints no `::error` annotation" in done.stderr
+
+
+def test_draft_report_step_without_error_annotation_fails(tree):
+    """A draft report step whose echo prints no error annotation fails."""
+    plain_echo = DRAFT_GOOD.replace(DRAFT_ERROR, 'echo "The pull request is a draft."')
+    done = check(tree, plain_echo)
+    assert done.returncode == 1, done.stdout
+    assert "the draft report step of job `result` prints no `::error` annotation" in done.stderr
 
 
 def test_caller_that_gates_no_pull_request_needs_no_result_job(tree):
