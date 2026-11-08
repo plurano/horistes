@@ -302,8 +302,12 @@ def call(url, token=None, method="POST", body=None, raw=False, redirect=True):
     except urllib.error.HTTPError as err:
         if not redirect and err.code in (301, 302, 303, 307, 308):
             loc = err.headers.get("Location")
+            err.close()
             return {"location": urllib.parse.urljoin(url, loc) if loc else ""}
-        raise RefusedError(f"{method} {url}: HTTP {err.code} {err.read().decode()[:500]}") from err
+        code = err.code
+        body = err.read().decode()[:500]
+        err.close()
+        raise RefusedError(f"{method} {url}: HTTP {code} {body}") from err
     except (urllib.error.URLError, TimeoutError) as err:
         raise RefusedError(f"{method} {url}: {err}") from err
     return json.loads(text) if text else {}

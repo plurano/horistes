@@ -84,7 +84,10 @@ class Stranger:
             ):
                 return _copy(answer, out, limit, url)
         except urllib.error.HTTPError as err:
-            raise FetchError(f"GET {url}: HTTP {err.code}{_limit(err)}", err.code) from err
+            code = err.code
+            limit_str = _limit(err)
+            err.close()
+            raise FetchError(f"GET {url}: HTTP {code}{limit_str}", code) from err
         except (OSError, ValueError) as err:
             raise FetchError(f"GET {url}: {err}") from err
 

@@ -14,6 +14,7 @@ UNKNOWN merge state and between read retries are shortened.
 from __future__ import annotations
 
 import base64
+import email.message
 import errno
 import functools
 import hashlib
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import zipfile
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -960,6 +962,52 @@ def checkout_problems(doc: dict) -> list[str]:
     return [
         f"{key}: {given.get(key)!r}" for key, want in CHECKOUT.items() if given.get(key) != want
     ]
+
+
+def test_call_http_error_message_closed(tmp_path, monkeypatch):
+    """call closes HTTPError on the error message path."""
+    merge_train = load_train(tmp_path, monkeypatch)
+
+    err = urllib.error.HTTPError(
+        "https://api.github.test/call", 403, "Forbidden", {}, io.BytesIO(b"refused message")
+    )
+
+    class StubOpener:
+        """Stand-in opener raising an HTTPError."""
+
+        def open(self, request, timeout=None):
+            """Raise the designated HTTPError."""
+            raise err
+
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: StubOpener())
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.call("https://api.github.test/call")
+    assert caught.value.__cause__ is err
+    assert "refused message" in str(caught.value)
+    assert err.closed
+
+
+def test_call_http_error_redirect_closed(tmp_path, monkeypatch):
+    """call closes HTTPError on the redirect path when redirect is False."""
+    merge_train = load_train(tmp_path, monkeypatch)
+
+    message = email.message.Message()
+    message["Location"] = "https://api.github.test/redirected"
+    err = urllib.error.HTTPError(
+        "https://api.github.test/call", 302, "Found", message, io.BytesIO(b"")
+    )
+
+    class StubOpener:
+        """Stand-in opener raising an HTTPError."""
+
+        def open(self, request, timeout=None):
+            """Raise the designated HTTPError."""
+            raise err
+
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: StubOpener())
+    res = merge_train.call("https://api.github.test/call", redirect=False)
+    assert res == {"location": "https://api.github.test/redirected"}
+    assert err.closed
 
 
 def test_train_script_comes_from_the_workflow_commit():
