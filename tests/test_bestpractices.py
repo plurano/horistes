@@ -90,7 +90,7 @@ EVIDENCE: dict[str, tuple[str, str]] = {
         "def key_bits(",
         'f"the app key has {bits} bits; at least {MIN_KEY_BITS} are required"',
     ),
-    "tests/test_merge_train.py#L1751-L1936": (
+    "tests/test_merge_train.py#L1793-L1978": (
         "@pytest.mark.parametrize(",
         'assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]',
     ),
