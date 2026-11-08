@@ -51,7 +51,9 @@ a consumer keeps exists as a template for both.
 Consumers call this repository directly; no copy per owner is built. Its name
 is chosen. It turns public now that its history is shown to hold no private
 content; the first release, 0.1.0, is proposed by release-please through the
-merge train and cut when milestone 0.1.0 closes. Until then only private
+merge train; a person merges that release pull request once
+[milestone 0.1.0](https://github.com/plurano/horistes/milestone/1) closes,
+and the train then creates the release. Until then only private
 repositories of the same owner can call it
 ([ADR-0022](docs/adr/0022-public-consumers-call-this-repository-directly.md),
 [ADR-0024](docs/adr/0024-public-before-the-first-release.md),

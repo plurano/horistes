@@ -33,7 +33,7 @@ EXPECTED_PACKAGE: dict[str, Any] = {
     "include-component-in-tag": False,
 }
 
-VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 
 REQUIRED_REUSE_PATHS = frozenset(
     {
@@ -43,9 +43,14 @@ REQUIRED_REUSE_PATHS = frozenset(
     }
 )
 
+# Maximum number of key-value pairs allowed in any JSON object.
+MAX_PAIRS = 32
+
 
 def _pairs_refusing_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """Build a dictionary from key-value pairs, refusing duplicate keys."""
+    """Build a dictionary from key-value pairs, refusing duplicate keys and bounding pair count."""
+    if len(pairs) > MAX_PAIRS:
+        raise ValueError(f"JSON object pair count {len(pairs)} exceeds bound {MAX_PAIRS}")
     seen: set[str] = set()
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -76,7 +81,12 @@ def validate_release_config(config: Any) -> None:
     assert set(packages.keys()) == {"."}, (
         f"packages keys must be exactly {{'.'}}, got {set(packages.keys())}"
     )
-    assert packages["."] == EXPECTED_PACKAGE, (
+    assert isinstance(packages["."], dict), (
+        f"package '.' must be a dict, got {type(packages['.']).__name__}"
+    )
+    actual_package = {key: (type(value), value) for key, value in packages["."].items()}
+    expected_package = {key: (type(value), value) for key, value in EXPECTED_PACKAGE.items()}
+    assert actual_package == expected_package, (
         f"package '.' must equal {EXPECTED_PACKAGE}, got {packages['.']}"
     )
 
@@ -92,7 +102,8 @@ def validate_release_manifest(manifest: Any) -> None:
             f"version for {key!r} must be str, got {type(value).__name__}"
         )
         assert VERSION_RE.fullmatch(value), (
-            f"version {value!r} for {key!r} must be three ASCII digit groups, as 0.1.0"
+            f"version {value!r} for {key!r} must be three ASCII digit groups "
+            "with no leading zeros, as 0.1.0"
         )
 
 
@@ -244,3 +255,79 @@ def test_planted_valid_config_passes(tmp_path: Path) -> None:
     p.write_text(content, encoding="utf-8")
     config = load_unique_json(p)
     validate_release_config(config)
+
+
+def test_planted_manifest_leading_zero_major_fails(tmp_path: Path) -> None:
+    """Manifest version with leading zero in major component fails validation."""
+    p = tmp_path / "manifest_lz_major.json"
+    p.write_text(json.dumps({".": "01.1.0"}), encoding="utf-8")
+    manifest = load_unique_json(p)
+    with pytest.raises(AssertionError):
+        validate_release_manifest(manifest)
+
+
+def test_planted_manifest_leading_zero_minor_fails(tmp_path: Path) -> None:
+    """Manifest version with leading zero in minor component fails validation."""
+    p = tmp_path / "manifest_lz_minor.json"
+    p.write_text(json.dumps({".": "0.01.0"}), encoding="utf-8")
+    manifest = load_unique_json(p)
+    with pytest.raises(AssertionError):
+        validate_release_manifest(manifest)
+
+
+def test_planted_manifest_leading_zero_patch_fails(tmp_path: Path) -> None:
+    """Manifest version with leading zero in patch component fails validation."""
+    p = tmp_path / "manifest_lz_patch.json"
+    p.write_text(json.dumps({".": "0.1.00"}), encoding="utf-8")
+    manifest = load_unique_json(p)
+    with pytest.raises(AssertionError):
+        validate_release_manifest(manifest)
+
+
+def test_planted_manifest_valid_versions_pass(tmp_path: Path) -> None:
+    """Valid semver strings without leading zeros (0.1.0 and 10.20.30) pass validation."""
+    for version in ("0.1.0", "10.20.30"):
+        p = tmp_path / f"manifest_{version.replace('.', '_')}.json"
+        p.write_text(json.dumps({".": version}), encoding="utf-8")
+        manifest = load_unique_json(p)
+        validate_release_manifest(manifest)
+
+
+def test_planted_package_integer_one_bump_minor_fails(tmp_path: Path) -> None:
+    """Integer 1 in place of boolean True for bump-minor-pre-major fails type check."""
+    pkg = {**EXPECTED_PACKAGE, "bump-minor-pre-major": 1}
+    data = {"$schema": EXPECTED_SCHEMA, "packages": {".": pkg}}
+    p = tmp_path / "pkg_int_one.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    config = load_unique_json(p)
+    with pytest.raises(AssertionError):
+        validate_release_config(config)
+
+
+def test_planted_package_integer_zero_include_component_fails(tmp_path: Path) -> None:
+    """Integer 0 in place of boolean False for include-component-in-tag fails type check."""
+    pkg = {**EXPECTED_PACKAGE, "include-component-in-tag": 0}
+    data = {"$schema": EXPECTED_SCHEMA, "packages": {".": pkg}}
+    p = tmp_path / "pkg_int_zero.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    config = load_unique_json(p)
+    with pytest.raises(AssertionError):
+        validate_release_config(config)
+
+
+def test_planted_max_pairs_loads(tmp_path: Path) -> None:
+    """JSON object containing exactly MAX_PAIRS pairs loads successfully."""
+    data = {f"k{i}": i for i in range(MAX_PAIRS)}
+    p = tmp_path / "max_pairs.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    loaded = load_unique_json(p)
+    assert len(loaded) == MAX_PAIRS
+
+
+def test_planted_exceeds_max_pairs_fails(tmp_path: Path) -> None:
+    """JSON object containing MAX_PAIRS + 1 pairs raises ValueError."""
+    data = {f"k{i}": i for i in range(MAX_PAIRS + 1)}
+    p = tmp_path / "too_many_pairs.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="exceeds bound"):
+        load_unique_json(p)

@@ -37,13 +37,15 @@ release pull requests for a repository that holds both `release-please-config.js
     [ADR-0002](0002-versioning-and-pinning.md).
 - Set `.release-please-manifest.json` holding `{}` so release-please discovers package
   `"."` as new and proposes `0.1.0`.
-- The train opens the release pull request, which is labelled `hold` once it is open
-  and stays unmerged until milestone "0.1.0 — Public path" closes.
+- The train opens the release pull request, and a person adds `hold` once it is open;
+  the train never merges a release pull request (`verdict` in
+  `.github/workflows/merge-train.yml`).
 - While held the train does not update it
   ([ADR-0049](0049-the-merge-train-leaves-a-frozen-release-pull-request-alone.md)).
-- When the milestone closes a person removes `hold`, the train refreshes the pull
-  request, and a person merges it, which is the release act, after which the train
-  creates the release ([ADR-0031](0031-the-merge-train-app-runs-release-please.md),
+- When milestone ["0.1.0 — Public path"](https://github.com/plurano/horistes/milestone/1)
+  closes a person removes `hold`, the train refreshes the pull request, and a
+  person merges it, which is the release act, after which the train creates the
+  release ([ADR-0031](0031-the-merge-train-app-runs-release-please.md),
   [ADR-0040](0040-the-merge-train-leaves-a-release-to-its-writer.md)).
 - No tag is made by hand, because a second release path next to
   [ADR-0031](0031-the-merge-train-app-runs-release-please.md) would not move the release
@@ -55,7 +57,7 @@ release pull requests for a repository that holds both `release-please-config.js
 - **Positive**:
   - The release pull request carries `CHANGELOG.md` and the manifest update.
   - The release pull request and the release both come from the train's release job;
-    the one step a person takes is the merge.
+    the three steps a person takes are to add `hold`, remove `hold`, and merge.
   - `tests/test_release_config.py` holds both files to the values above.
 - **Negative**:
   - Four badge criteria (`version_unique`, `version_semver`, `version_tags`,
