@@ -263,10 +263,9 @@ def _tracked_file(root: Path, name: str) -> bool:
     path = Path(name)
     if path.is_absolute() or ".." in path.parts or not (root / path).is_file():
         return False
-    command = ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", f":(literal){name}"]
     try:
         proc = subprocess.run(
-            command,
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", f":(literal){name}"],
             capture_output=True,
             text=True,
             check=False,
