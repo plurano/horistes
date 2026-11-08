@@ -7,7 +7,8 @@ line-length = 100
 target-version = "py312"
 
 [lint]
-select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "T20", "SIM"]
+# Codacy's ruff reports ISC; the repository's ruff must agree.
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "T20", "SIM", "ISC"]
 ignore = []
 
 [lint.isort]

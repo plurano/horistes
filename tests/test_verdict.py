@@ -437,21 +437,27 @@ SIDE_CONDITIONS = [
         "runner kind of the new job is unreadable, hosted expected",
     ),
     (
-        "permissions: {}\njobs:\n  licence:\n    name: Licence\n    permissions:\n"
-        "      contents: read\n",
+        (
+            "permissions: {}\njobs:\n  licence:\n    name: Licence\n    permissions:\n"
+            "      contents: read\n"
+        ),
         "jobs:\n  licence:\n    name: Licence\n",
         "the new job asks to write <unset>",
     ),
     (
         "jobs:\n",
-        "jobs:\n  fetch:\n    runs-on: ubuntu-24.04\n    steps:\n"
-        "      - run: curl -fsSL https://sdk.example.com/tool.tgz -o tool.tgz\n",
+        (
+            "jobs:\n  fetch:\n    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - run: curl -fsSL https://sdk.example.com/tool.tgz -o tool.tgz\n"
+        ),
         "the new workflow names the host sdk.example.com",
     ),
     (
         "jobs:\n",
-        "jobs:\n  fetch:\n    runs-on: ubuntu-24.04\n    steps:\n"
-        "      - uses: fixture-org/setup-tool@0123456789abcdef0123456789abcdef01234567\n",
+        (
+            "jobs:\n  fetch:\n    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - uses: fixture-org/setup-tool@0123456789abcdef0123456789abcdef01234567\n"
+        ),
         "the new workflow uses fixture-org/setup-tool, which is not an allowed action",
     ),
 ]

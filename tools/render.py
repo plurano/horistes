@@ -84,8 +84,8 @@ SAMPLE = {
 }
 HEADER = (
     f"# SPDX-FileCopyrightText: {SAMPLE['Licence']['CopyrightText']}\n"
-    + "# SPDX-"
-    + f"License-Identifier: {SAMPLE['Licence']['Identifier']}\n"
+    "# SPDX-"
+    f"License-Identifier: {SAMPLE['Licence']['Identifier']}\n"
 )
 
 
@@ -308,8 +308,10 @@ def _result_problems(jobs: dict, key: str, doc: dict) -> list[str]:
         if not GATING & set(ciwf.triggers(doc)):
             return []
         return [
-            f"the caller runs on pull requests and no job `{RESULT}` reports `{name}`; the "
-            f"forge reports the calling job only as `{name} / <called job>`"
+            (
+                f"the caller runs on pull requests and no job `{RESULT}` reports `{name}`; the "
+                f"forge reports the calling job only as `{name} / <called job>`"
+            )
         ]
     if not isinstance(result, dict) or sorted(result) != sorted(RESULT_KEYS):
         return [f"job `{RESULT}` has keys other than {', '.join(RESULT_KEYS)}"]

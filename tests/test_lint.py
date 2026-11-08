@@ -29,6 +29,20 @@ YAML_BROKEN_SYNTAX = "---\nkey: [unclosed\n"
 YAML_RULE_VIOLATION = "---\nkey: " + '"' + "a" * 130 + '"\n'
 PY_GOOD = "VALUE: int = 1\n"
 PY_LINT_FINDING = "import sys\n"
+PY_ISC_GOOD = """\
+ITEMS = [
+    (
+        "a"
+        "b"
+    ),
+]
+"""
+PY_ISC_FINDING = """\
+ITEMS = [
+    "a"
+    "b",
+]
+"""
 PY_ISORT_BLOCK = """\
 from __future__ import annotations
 
@@ -115,9 +129,11 @@ def ruff(tree, *args):
 
 
 def test_planted_fixtures_differ_from_the_good_one():
+    """Planted defect fixtures differ from the baseline passing fixtures."""
     assert len({REUSABLE, UNPINNED, INJECTION, CREDENTIALS, NO_JOB, BY_DIGEST, BY_TAG}) == 7
     assert len({YAML_GOOD, YAML_BROKEN_SYNTAX, YAML_RULE_VIOLATION}) == 3
     assert len({PY_GOOD, PY_LINT_FINDING}) == 2
+    assert len({PY_ISC_GOOD, PY_ISC_FINDING}) == 2
 
 
 def test_good_workflow_and_action_pass_both_linters(tree):
@@ -244,3 +260,27 @@ def test_ruff_isort_force_sort_within_sections_both_directions(tree):
     fails = ruff(tree, "check", "--select", "I001", ".")
     assert fails.returncode != 0
     assert "I001" in fails.stdout
+
+
+def test_ruff_isc_select_both_directions(tree):
+    """PY_ISC_GOOD passes and PY_ISC_FINDING fails under ISC; passes without ISC."""
+    base = (ROOT / "ruff.toml").read_text(encoding="utf-8")
+    select_line = ""
+    for line in base.splitlines():
+        if line.startswith("select ="):
+            select_line = line
+            break
+    assert '"ISC"' in select_line
+
+    tree.write({"ruff.toml": base, "sample.py": PY_ISC_GOOD})
+    good = ruff(tree)
+    assert good.returncode == 0, good.stdout + good.stderr
+
+    bad = ruff(tree.write({"sample.py": PY_ISC_FINDING}))
+    assert bad.returncode != 0
+    assert "ISC004" in bad.stdout
+
+    without_isc = base.replace(select_line, select_line.replace(', "ISC"', ""))
+    tree.write({"ruff.toml": without_isc})
+    passed = ruff(tree)
+    assert passed.returncode == 0, passed.stdout + passed.stderr

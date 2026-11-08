@@ -306,8 +306,10 @@ def test_result_of_a_passing_job_is_read_from_its_artifact(tree, client):
         "tools": ["Scorecard v5.5.0"],
         "checks": list(SCORE_RULES),
         "findings": [
-            "TokenPermissionsID | .github/workflows/ci.yml:1 | score is 9: one workflow writes | "
-            "e3b0c44298fc"
+            (
+                "TokenPermissionsID | .github/workflows/ci.yml:1 | "
+                "score is 9: one workflow writes | e3b0c44298fc"
+            )
         ],
     }
     assert tree.forge_calls()[-2:] == [ARTIFACTS, archive_of(901)]
@@ -416,8 +418,10 @@ def test_artifact_without_a_time_is_an_error_not_a_guess(tree, client, missing):
         job[missing] = "soon"
     data = uploaded(client, score_run([held], [job]))
     assert data["errors"] == [
-        f"GET {ARTIFACTS.removesuffix('&' + PAGE)}: "
-        f"no time to tell the attempts of {SCORE_ARTIFACT!r} apart"
+        (
+            f"GET {ARTIFACTS.removesuffix('&' + PAGE)}: "
+            f"no time to tell the attempts of {SCORE_ARTIFACT!r} apart"
+        )
     ]
     assert data["subjects"] == []
     assert archive_of(901) not in tree.forge_calls()

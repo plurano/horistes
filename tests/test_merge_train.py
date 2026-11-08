@@ -2046,8 +2046,10 @@ def test_release_job_mutants_are_found():
     job["if"] = job["if"].replace("inputs.switch == 'on'", "true")
     assert release_job_findings(doc) == [
         "token not limited to the repository",
-        "token rights {'permission-contents': 'write', 'permission-pull-requests': 'write', "
-        "'permission-workflows': 'write', 'permission-issues': 'write'}",
+        (
+            "token rights {'permission-contents': 'write', 'permission-pull-requests': 'write', "
+            "'permission-workflows': 'write', 'permission-issues': 'write'}"
+        ),
         "runs while the train is switched off",
     ]
 
@@ -2828,16 +2830,20 @@ def test_regenerate_excludes_person_branch(tmp_path):
 PLANTED_COMMITS = [
     ("feat: first step\n\nFirst body.\n\nSigned-off-by: Dev <dev@example.org>", 1),
     (
-        "Merge branch 'main' into feat/change-1\n\n"
-        "Signed-off-by: plurano-merge-train[bot] "
-        "<1+plurano-merge-train[bot]@users.noreply.github.com>",
+        (
+            "Merge branch 'main' into feat/change-1\n\n"
+            "Signed-off-by: plurano-merge-train[bot] "
+            "<1+plurano-merge-train[bot]@users.noreply.github.com>"
+        ),
         2,
     ),
     (
-        "fix: follow up\n\nSecond body.\n\n"
-        "Co-authored-by: plurano-merge-train[bot] "
-        "<1+plurano-merge-train[bot]@users.noreply.github.com>\n"
-        "Signed-off-by: Dev <dev@example.org>",
+        (
+            "fix: follow up\n\nSecond body.\n\n"
+            "Co-authored-by: plurano-merge-train[bot] "
+            "<1+plurano-merge-train[bot]@users.noreply.github.com>\n"
+            "Signed-off-by: Dev <dev@example.org>"
+        ),
         1,
     ),
 ]
@@ -2875,9 +2881,11 @@ def test_multiple_distinct_sign_offs_kept_in_first_seen_order(tmp_path):
     forge.commits[1] = [
         ("feat: a\n\nSigned-off-by: First <first@example.org>", 1),
         (
-            "feat: b\n\n"
-            "Signed-off-by: Second <second@example.org>\n"
-            "Signed-off-by: First <first@example.org>",
+            (
+                "feat: b\n\n"
+                "Signed-off-by: Second <second@example.org>\n"
+                "Signed-off-by: First <first@example.org>"
+            ),
             1,
         ),
     ]
@@ -2888,9 +2896,11 @@ def test_multiple_distinct_sign_offs_kept_in_first_seen_order(tmp_path):
             "merge",
             "PR_1",
             "change 1 (#1)",
-            "* feat: a\n\n* feat: b\n\n"
-            "Signed-off-by: First <first@example.org>\n"
-            "Signed-off-by: Second <second@example.org>",
+            (
+                "* feat: a\n\n* feat: b\n\n"
+                "Signed-off-by: First <first@example.org>\n"
+                "Signed-off-by: Second <second@example.org>"
+            ),
         )
     ]
 
