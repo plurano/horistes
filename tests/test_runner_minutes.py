@@ -261,6 +261,7 @@ def test_untimed_workflow_warns_not_fails(tree: Tree, workflow_yaml: str, workfl
 
     assert done.returncode == 0, done.stderr
     assert f"WARN: {workflow_file}: no timeout-minutes declared" in done.stdout
+    assert "FAIL:" not in done.stdout
     assert "FAIL:" not in done.stderr
 
     done_strict = run_tool(
