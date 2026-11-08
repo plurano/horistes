@@ -124,6 +124,7 @@ check-examples: tools
 # into its own temporary directory so concurrent runs cannot collide or erase
 # each other's data. Each coverage step reads pyproject.toml only, so an
 # inherited COVERAGE_RCFILE or a stray .coveragerc cannot set the floor.
+# The last step compares the unrounded total with the floor.
 test: tools
 	data=$$(mktemp -d) && \
 	trap 'rm -rf "$$data"' EXIT && \
@@ -131,7 +132,8 @@ test: tools
 		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" \
 		$(BIN)/python -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest && \
 	$(BIN)/python -B -m coverage combine --rcfile=pyproject.toml --data-file="$$data/.coverage" && \
-	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage"
+	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage" && \
+	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage" --precision=10 --format=total
 
 # Every file carries its licence header or is named in REUSE.toml.
 verify-reuse: tools

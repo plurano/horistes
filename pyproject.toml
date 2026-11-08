@@ -24,7 +24,9 @@ data_file = ".coverage"
 [tool.coverage.report]
 # Missing line and branch numbers are shown in terminal reports.
 show_missing = true
-# Totals are compared at two decimals, so a total below the floor cannot round up to it.
+# Terminal reports show two decimals; the Makefile's last coverage step
+# compares the total at ten decimals, so a total below the floor that
+# rounds up to it at two decimals still fails.
 precision = 2
 # The gate fails below this total; raise it as coverage grows, never lower it.
 fail_under = 94

@@ -19,13 +19,16 @@ FLOOR = 94
 RCFILE = "--rcfile=pyproject.toml"
 DATA_FILE = '--data-file="$$data/.coverage"'
 COVERAGE = ["$(BIN)/python", "-B", "-m", "coverage"]
+STRICT = ["--precision=10", "--format=total"]
 # The Makefile test recipe runs these coverage commands in this order, each
-# reading pyproject.toml only and writing data files to $$data.
+# reading pyproject.toml only and writing data files to $$data. The last step
+# compares the unrounded total with the floor at ten decimals.
 # Environment assignments may come first.
 GATE_COVERAGE = [
     [*COVERAGE, "run", RCFILE, DATA_FILE, "-m", "pytest"],
     [*COVERAGE, "combine", RCFILE, DATA_FILE],
     [*COVERAGE, "report", RCFILE, DATA_FILE],
+    [*COVERAGE, "report", RCFILE, DATA_FILE, *STRICT],
 ]
 ASSIGNMENT = re.compile(r"[A-Z][A-Z0-9_]*=")
 
@@ -143,7 +146,11 @@ def test_report_passes_above_the_floor(
 def test_caller_coverage_env_does_not_reach_the_planted_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A caller's COVERAGE_RCFILE with fail_under = 0 leaves the 75% run failing."""
+    """The _report helper removes a caller's COVERAGE_* variables before the planted run.
+
+    test_rcfile_flag_keeps_a_caller_rcfile_from_lowering_the_floor holds the
+    gate's --rcfile against a variable set after that removal.
+    """
     outer = tmp_path / "outer"
     outer.mkdir()
     rcfile = outer / "coveragerc"
@@ -202,6 +209,55 @@ def test_precision_prevents_rounding_up_to_floor(
     status_prec, out_prec = _coverage(["report"], capsys)
     assert status_prec == 2
     assert "75.76%" in out_prec
+
+
+def _plant_statements(
+    project: Path, statements: int, run: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plant mod.py with the given statements, the first run of them measured.
+
+    The planted pyproject.toml holds fail_under = FLOOR and precision = 2,
+    as the repository's does; the working directory moves to project and
+    every COVERAGE_* variable is removed.
+    """
+    code = "".join(f"x{i} = {i}\n" for i in range(1, statements + 1))
+    (project / "mod.py").write_text(code, encoding="utf-8")
+    pyproject = (
+        '[tool.coverage.run]\nsource = ["."]\n\n'
+        f"[tool.coverage.report]\nfail_under = {FLOOR}\nprecision = 2\n"
+    )
+    (project / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    monkeypatch.chdir(project)
+    _drop_coverage_env(monkeypatch)
+    data = coverage.CoverageData(basename=str(project / ".coverage"))
+    data.add_lines({str(project / "mod.py"): set(range(1, run + 1))})
+    data.write()
+
+
+def test_strict_step_fails_a_total_that_rounds_up_to_the_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """407 of 433 (93.995%) passes the two-decimal report as 94.00% and fails the strict step."""
+    _plant_statements(tmp_path, 433, 407, monkeypatch)
+
+    status_prec, out_prec = _coverage(["report", RCFILE], capsys)
+    assert status_prec == 0
+    assert "94.00%" in out_prec
+
+    status_strict, out_strict = _coverage(["report", RCFILE, *STRICT], capsys)
+    assert status_strict == 2
+    assert "93.99538" in out_strict
+
+
+def test_strict_step_passes_a_total_at_the_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """47 of 50 is exactly 94%, so the strict step passes: equality is not below."""
+    _plant_statements(tmp_path, 50, 47, monkeypatch)
+
+    status, out = _coverage(["report", RCFILE, *STRICT], capsys)
+    assert status == 0
+    assert out.strip() == "94.0000000000", out
 
 
 def _combined(
@@ -266,7 +322,7 @@ def _recipe_commands(makefile: str, target: str) -> list[list[str]]:
 
 
 def test_gate_runs_each_coverage_step_from_pyproject() -> None:
-    """The test recipe runs run, combine and report in $$data, nothing else.
+    """The test recipe runs run, combine, report and strict report in $$data, nothing else.
 
     Each step starts the pinned coverage with --rcfile=pyproject.toml and
     the same --data-file="$$data/.coverage", so runs cannot collide or use
@@ -289,3 +345,29 @@ def test_gate_runs_each_coverage_step_from_pyproject() -> None:
             steps.append(tokens[start:])
     assert steps == GATE_COVERAGE
     assert all("--fail-under" not in line for line in makefile.splitlines())
+
+
+def test_coverage_install_is_hash_pinned() -> None:
+    """Read requirements/tools.txt and Makefile to assert coverage is hash-pinned."""
+    tools_txt = (ROOT / "requirements/tools.txt").read_text(encoding="utf-8").splitlines()
+    cov_idx = next(
+        (i for i, line in enumerate(tools_txt) if line.startswith("coverage==")),
+        None,
+    )
+    assert cov_idx is not None, "coverage== requirement not found in requirements/tools.txt"
+
+    hashes = []
+    for line in tools_txt[cov_idx + 1 :]:
+        stripped = line.strip()
+        if stripped.startswith("--hash=sha256:"):
+            hashes.append(stripped)
+        elif stripped and not stripped.startswith("#") and not stripped.startswith("\\"):
+            break
+
+    assert len(hashes) >= 2, f"expected at least two --hash=sha256: lines, got {len(hashes)}"
+
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    tools_recipe = _recipe_lines(makefile, "tools")
+    assert any(
+        "--require-hashes" in line and "-r requirements/tools.txt" in line for line in tools_recipe
+    ), tools_recipe
