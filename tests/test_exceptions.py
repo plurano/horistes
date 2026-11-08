@@ -297,3 +297,127 @@ def test_actionlint_settings_without_paths_pass(tree):
     done = linted(tree, "---\nself-hosted-runner:\n  labels:\n    - ubuntu-26.04\n")
     assert done.returncode == 0, done.stderr
     assert "0 accepted" in done.stdout
+
+
+RUFF = "ruff.toml"
+HOOK = ".config/agent/hooks/block_evasion.py"
+RUFF_IGNORE = (
+    "[lint.per-file-ignores]\n"
+    f'"{HOOK}" = ["ISC001", "ISC004"] # expires 2026-12-31: praetor-managed hook\n'
+)
+
+
+def ruffed(tree, text, today=TODAY):
+    """Write ruff.toml and the tracked hook file, then run exceptions.py check."""
+    tree.write({HOOK: "# hook\n", RUFF: text})
+    return tree.tool("exceptions.py", "check", "--today", today)
+
+
+def test_ruff_entry_with_comment_and_a_day_ahead_passes(tree):
+    """An entry with comment and a day ahead passes."""
+    done = ruffed(tree, RUFF_IGNORE)
+    assert done.returncode == 0, done.stderr
+    assert "1 accepted" in done.stdout
+
+
+def test_ruff_entry_passes_on_its_last_day_and_fails_the_day_after(tree):
+    """An entry passes on its last day and fails the day after."""
+    assert ruffed(tree, RUFF_IGNORE, "2026-12-31").returncode == 0
+    done = ruffed(tree, RUFF_IGNORE, "2027-01-01")
+    assert done.returncode == 1
+    assert "expired on 2026-12-31" in done.stderr
+
+
+def test_ruff_entry_missing_comment_fails(tree):
+    """An entry without an expiration comment fails."""
+    done = ruffed(tree, f'[lint.per-file-ignores]\n"{HOOK}" = ["ISC001", "ISC004"]\n')
+    assert done.returncode == 1
+    assert "has no `# expires" in done.stderr
+
+
+def test_ruff_key_naming_pattern_or_no_file_fails(tree):
+    """A key that names a pattern or no file fails."""
+    pattern = RUFF_IGNORE.replace(HOOK, ".config/agent/hooks/*.py")
+    done_pat = ruffed(tree, pattern)
+    assert done_pat.returncode == 1
+    assert "is no one file" in done_pat.stderr
+
+    missing = RUFF_IGNORE.replace(HOOK, "no_such_file.py")
+    done_missing = ruffed(tree, missing)
+    assert done_missing.returncode == 1
+    assert "is no one file" in done_missing.stderr
+
+
+def test_ruff_non_empty_lint_ignore_fails(tree):
+    """A non-empty [lint] ignore list fails."""
+    done = ruffed(tree, '[lint]\nignore = ["E501"]\n')
+    assert done.returncode == 1
+    assert "[lint] ignore is not empty" in done.stderr
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        pytest.param(
+            '[lint]\nextend-ignore = ["E501"]\n', "[lint] key `extend-ignore`", id="extend-ignore"
+        ),
+        pytest.param(
+            "[lint]\nextend-per-file-ignores = {}\n",
+            "[lint] key `extend-per-file-ignores`",
+            id="extend-per-file",
+        ),
+        pytest.param(
+            'per-file-ignores = {"a.py" = ["E501"]}\n',
+            "key `per-file-ignores`",
+            id="top-level-per-file",
+        ),
+        pytest.param('extend-ignore = ["E501"]\n', "key `extend-ignore`", id="top-level-extend"),
+        pytest.param("lint = 1\n", "`lint` is not a table", id="lint-not-a-table"),
+        pytest.param(
+            "[lint]\nper-file-ignores = 1\n",
+            "[lint] per-file-ignores is not a table",
+            id="per-file-not-a-table",
+        ),
+    ],
+)
+def test_ruff_key_outside_the_allow_list_fails(tree, text, message):
+    """A key the tool does not read fails, at the top level and in [lint]."""
+    done = ruffed(tree, text)
+    assert done.returncode == 1
+    assert f"ruff.toml: {message}" in done.stderr
+
+
+def test_ruff_known_keys_pass(tree):
+    """Every key of the allow-lists, with an empty ignore list, passes."""
+    text = (
+        'line-length = 100\ntarget-version = "py312"\n[lint]\nselect = ["E"]\nignore = []\n'
+        "[lint.isort]\nforce-sort-within-sections = false\n" + RUFF_IGNORE
+    )
+    done = ruffed(tree, text)
+    assert done.returncode == 0, done.stderr
+    assert "1 accepted" in done.stdout
+
+
+def test_ruff_unreadable_toml_exits_3(tree):
+    """Unreadable TOML configuration causes check to exit with code 3."""
+    done = ruffed(tree, "[lint\nunclosed = [\n")
+    assert done.returncode == 3
+
+
+def real_check(day: str) -> subprocess.CompletedProcess:
+    """Run exceptions.py check on the repository itself as if today were this day."""
+    command = [sys.executable, "-B", str(ROOT / "tools" / "exceptions.py"), "check"]
+    command += ["--root", str(ROOT), "--today", day]
+    return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
+
+
+def test_real_repository_ruff_toml_passes_today_and_fails_after_expiry():
+    """The real repository ruff.toml passes on 2026-11-08 and fails on 2026-11-19."""
+    done_pass = real_check("2026-11-08")
+    assert done_pass.returncode == 0, done_pass.stderr
+    assert "accepted finding(s)" in done_pass.stdout
+    done_fail = real_check("2026-11-19")
+    assert done_fail.returncode == 1
+    assert (
+        "ruff.toml: .config/agent/hooks/block_evasion.py expired on 2026-11-18" in done_fail.stderr
+    )

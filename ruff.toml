@@ -11,5 +11,10 @@ target-version = "py312"
 select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "T20", "SIM", "ISC"]
 ignore = []
 
+# Every entry names one file and ends in `# expires YYYY-MM-DD: reason`;
+# tools/exceptions.py fails an entry without it or past its day.
+[lint.per-file-ignores]
+".config/agent/hooks/block_evasion.py" = ["ISC001", "ISC004"] # expires 2026-11-18: written by praetorctl adopt, not edited by hand; ends when the engine render is ISC clean (engine-hook-render-isc-clean-20261108); category C, entered 2026-11-08
+
 [lint.isort]
 force-sort-within-sections = false
