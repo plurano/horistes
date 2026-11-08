@@ -29,6 +29,20 @@ YAML_BROKEN_SYNTAX = "---\nkey: [unclosed\n"
 YAML_RULE_VIOLATION = "---\nkey: " + '"' + "a" * 130 + '"\n'
 PY_GOOD = "VALUE: int = 1\n"
 PY_LINT_FINDING = "import sys\n"
+PY_ISC_GOOD = """\
+ITEMS = [
+    (
+        "a"
+        "b"
+    ),
+]
+"""
+PY_ISC_FINDING = """\
+ITEMS = [
+    "a"
+    "b",
+]
+"""
 PY_ISORT_BLOCK = """\
 from __future__ import annotations
 
@@ -58,15 +72,18 @@ def actionlint_sha_line() -> str:
 
 
 def actionlint(tree):
+    """Run actionlint against the workflow file in the tree."""
     return subprocess.run(
         [*external("ACTIONLINT", "actionlint"), str(tree.root / WORKFLOW)],
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
 
 def zizmor(tree):
+    """Run zizmor offline in pedantic mode against the planted tree root."""
     command = [
         *external("ZIZMOR", "zizmor"),
         "--offline",
@@ -75,7 +92,7 @@ def zizmor(tree):
         "pedantic",
         str(tree.root),
     ]
-    return subprocess.run(command, capture_output=True, text=True, check=False)
+    return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
 
 
 def rooted(cmd):
@@ -91,6 +108,7 @@ def rooted(cmd):
 
 
 def yamllint(tree, *args):
+    """Run yamllint in strict mode against the given targets in the tree."""
     cmd = rooted(external("YAMLLINT", "yamllint"))
     target = list(args) if args else ["."]
     return subprocess.run(
@@ -99,10 +117,12 @@ def yamllint(tree, *args):
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
 
 def ruff(tree, *args):
+    """Run ruff against the planted tree."""
     cmd = rooted(external("RUFF", "ruff"))
     subcommand = list(args) if args else ["check", "."]
     return subprocess.run(
@@ -111,13 +131,16 @@ def ruff(tree, *args):
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
 
 def test_planted_fixtures_differ_from_the_good_one():
+    """Planted defect fixtures differ from the baseline passing fixtures."""
     assert len({REUSABLE, UNPINNED, INJECTION, CREDENTIALS, NO_JOB, BY_DIGEST, BY_TAG}) == 7
     assert len({YAML_GOOD, YAML_BROKEN_SYNTAX, YAML_RULE_VIOLATION}) == 3
     assert len({PY_GOOD, PY_LINT_FINDING}) == 2
+    assert len({PY_ISC_GOOD, PY_ISC_FINDING}) == 2
 
 
 def test_good_workflow_and_action_pass_both_linters(tree):
@@ -182,6 +205,7 @@ def test_actionlint_sha256_verification_refuses_planted_wrong_digest(tmp_path):
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     assert passed.returncode == 0, passed.stdout + passed.stderr
 
@@ -195,6 +219,7 @@ def test_actionlint_sha256_verification_refuses_planted_wrong_digest(tmp_path):
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     assert failed.returncode != 0
 
@@ -244,3 +269,94 @@ def test_ruff_isort_force_sort_within_sections_both_directions(tree):
     fails = ruff(tree, "check", "--select", "I001", ".")
     assert fails.returncode != 0
     assert "I001" in fails.stdout
+
+
+def test_ruff_isc_select_both_directions(tree):
+    """PY_ISC_GOOD passes and PY_ISC_FINDING fails under ISC; passes without ISC."""
+    base = (ROOT / "ruff.toml").read_text(encoding="utf-8")
+    select_line = ""
+    for line in base.splitlines():
+        if line.startswith("select ="):
+            select_line = line
+            break
+    assert '"ISC"' in select_line
+
+    tree.write({"ruff.toml": base, "sample.py": PY_ISC_GOOD})
+    good = ruff(tree)
+    assert good.returncode == 0, good.stdout + good.stderr
+
+    bad = ruff(tree.write({"sample.py": PY_ISC_FINDING}))
+    assert bad.returncode != 0
+    assert "ISC004" in bad.stdout
+
+    without_isc = base.replace(select_line, select_line.replace(', "ISC"', ""))
+    tree.write({"ruff.toml": without_isc})
+    passed = ruff(tree)
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+
+
+def test_ruff_config_flag_overrides_nested_and_dot_configs(tree):
+    """The --config flag forces ruff.toml over nested pyproject.toml and root .ruff.toml."""
+    base = (ROOT / "ruff.toml").read_text(encoding="utf-8")
+    tree.write(
+        {
+            "ruff.toml": base,
+            "sub/pyproject.toml": (
+                '[tool.ruff]\nline-length = 100\n[tool.ruff.lint]\nselect = ["E"]\n'
+            ),
+            "sub/sample.py": PY_ISC_FINDING,
+        }
+    )
+    passes_nested = ruff(tree, "check", ".")
+    assert passes_nested.returncode == 0, passes_nested.stdout + passes_nested.stderr
+    fails_nested = ruff(tree, "check", "--config", "ruff.toml", ".")
+    assert fails_nested.returncode != 0
+    assert "ISC004" in fails_nested.stdout
+
+    (tree.root / "sub" / "pyproject.toml").unlink()
+    tree.write({".ruff.toml": '[lint]\nselect = ["E"]\n'})
+    passes_dot = ruff(tree, "check", ".")
+    assert passes_dot.returncode == 0, passes_dot.stdout + passes_dot.stderr
+    fails_dot = ruff(tree, "check", "--config", "ruff.toml", ".")
+    assert fails_dot.returncode != 0
+    assert "ISC004" in fails_dot.stdout
+
+
+def _recipe(makefile: str, target: str) -> list[str]:
+    """The recipe lines of target (lines starting with a tab after the line starting <target>:)."""
+    recipe: list[str] = []
+    found = False
+    for line in makefile.splitlines():
+        if not found:
+            if line.startswith(f"{target}:"):
+                found = True
+        else:
+            if line.startswith("\t"):
+                recipe.append(line.removeprefix("\t"))
+            else:
+                break
+    return recipe
+
+
+def test_makefile_lint_python_recipe_passes_config_flag():
+    """Makefile lint-python recipe passes --config ruff.toml to ruff check and format."""
+    content = (ROOT / "Makefile").read_text(encoding="utf-8")
+    recipe = _recipe(content, "lint-python")
+    assert "$(BIN)/ruff check --config ruff.toml tools tests fuzz" in recipe
+    assert "$(BIN)/ruff format --check --config ruff.toml tools tests fuzz" in recipe
+    verify_prereqs: list[str] = []
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("verify:"):
+            curr = line
+            idx = i
+            verify_prereqs.extend(curr.split(":", 1)[1].removesuffix("\\").split())
+            while curr.endswith("\\") and idx + 1 < len(lines):
+                idx += 1
+                curr = lines[idx]
+                verify_prereqs.extend(curr.removesuffix("\\").split())
+            break
+    assert "lint-python" in verify_prereqs
+    for line in content.splitlines():
+        if "$(BIN)/ruff check" in line or "$(BIN)/ruff format" in line:
+            assert "--config ruff.toml" in line

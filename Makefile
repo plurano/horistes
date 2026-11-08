@@ -60,8 +60,8 @@ lint-yaml: tools
 	$(BIN)/yamllint --strict .
 
 lint-python: tools
-	$(BIN)/ruff check tools tests fuzz
-	$(BIN)/ruff format --check tools tests fuzz
+	$(BIN)/ruff check --config ruff.toml tools tests fuzz
+	$(BIN)/ruff format --check --config ruff.toml tools tests fuzz
 
 # actionlint reads .github/workflows by itself; zizmor is given the workflow
 # and the action directories and must find at least the workflows.
@@ -80,8 +80,8 @@ check-interface:
 check-hosts:
 	$(PYTHON) -B tools/hosts.py check
 
-# An accepted linter finding and an entry of exceptions.yaml name one file, a
-# reason and a day it ends, at most 90 days ahead.
+# An accepted linter finding (zizmor, actionlint, ruff.toml) and an entry of
+# exceptions.yaml name one file, a reason and a day it ends, at most 90 days ahead.
 check-exceptions:
 	$(PYTHON) -B tools/exceptions.py check
 

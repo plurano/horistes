@@ -5,7 +5,7 @@
 
     exceptions.py check [--root DIR] [--today YYYY-MM-DD]
 
-Three places are read, and this tool is the only reader of them.
+Four places are read, and this tool is the only reader of them.
 
 .github/zizmor.yml holds accepted linter findings. Every entry of a rule's
 `ignore` list names one file and must end in `# expires YYYY-MM-DD: reason` on
@@ -16,6 +16,15 @@ a whole fail.
 key names one file of the repository, not a pattern, and every entry of its
 `ignore` list is a quoted message pattern that ends in the same
 `# expires YYYY-MM-DD: reason` comment on its own line.
+
+ruff.toml holds accepted ruff findings under `lint.per-file-ignores`. Only
+`[lint.per-file-ignores]` is read. Every key names one file of the repository,
+not a pattern, and the key may be double-quoted, single-quoted or bare. The
+comment sits on the line that opens the entry, ending in the same
+`# expires YYYY-MM-DD: reason`. An array may continue on later lines. A missing
+ruff.toml exits 3. A non-empty `lint.ignore` list fails, and so does any key
+outside RUFF_TOP and RUFF_LINT: an unknown key could carry an ignore this tool
+never reads.
 
 exceptions.yaml holds exceptions to rules no linter configuration can carry.
 An entry has the shape of the engine's own list, plus the issue that tracks
@@ -43,7 +52,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import re
+import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -52,6 +63,10 @@ import ciwf
 CONFIG = ".github/zizmor.yml"
 ACTIONLINT = ".github/actionlint.yaml"
 OWN = "exceptions.yaml"
+RUFF = "ruff.toml"
+# The keys this reader knows; any other key could carry an ignore it never sees.
+RUFF_TOP = frozenset({"line-length", "target-version", "lint"})
+RUFF_LINT = frozenset({"select", "ignore", "per-file-ignores", "isort"})
 FIELDS = ("rule", "path", "issue", "reason", "expires")
 ALLOWED = set(FIELDS) | {"category", "entered"}
 LONGEST = datetime.timedelta(days=90)
@@ -61,6 +76,10 @@ ENTRY = re.compile(
 )
 PATTERN = re.compile(
     r"^\s+- '(?P<pattern>[^']+)'\s+# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
+)
+RUFF_ENTRY = re.compile(
+    r'^(?P<key>"[^"\\]+"|\'[^\']+\'|[A-Za-z0-9_-]+)\s*=\s*\[[^#]*'
+    r"# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
 )
 ISSUE = re.compile(r"^[\w.-]+/[\w.-]+#[1-9]\d*$")
 
@@ -135,6 +154,67 @@ def _actionlint(root: Path, today: datetime.date) -> tuple[list[str], int]:
     return found, count
 
 
+def _ruff_layout(data: dict) -> tuple[list[str], object]:
+    """What is wrong with the keys of ruff.toml, and its per-file-ignores value."""
+    lint = data.get("lint", {})
+    if not isinstance(lint, dict):
+        return [f"{RUFF}: `lint` is not a table"], None
+    found = [
+        f"{RUFF}: key `{key}` is not one this tool reads" for key in sorted(data.keys() - RUFF_TOP)
+    ]
+    found += [
+        f"{RUFF}: [lint] key `{key}` is not one this tool reads"
+        for key in sorted(lint.keys() - RUFF_LINT)
+    ]
+    if lint.get("ignore"):
+        found.append(f"{RUFF}: [lint] ignore is not empty")
+    per_file = lint.get("per-file-ignores", {})
+    if not isinstance(per_file, dict):
+        found.append(f"{RUFF}: [lint] per-file-ignores is not a table")
+        return found, None
+    return found, per_file
+
+
+def _ruff_stated(text: str) -> dict[str, datetime.date]:
+    """Map accepted per-file-ignores keys to their stated expiration day."""
+    stated: dict[str, datetime.date] = {}
+    current_table = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            current_table = stripped.split("#", 1)[0].strip()
+            continue
+        if current_table != "[lint.per-file-ignores]":
+            continue
+        match = RUFF_ENTRY.match(line)
+        if match:
+            key = next(iter(tomllib.loads(f"{match['key']} = 0")))
+            stated[key] = datetime.date.fromisoformat(match["day"])
+    return stated
+
+
+def _ruff(root: Path, today: datetime.date) -> tuple[list[str], int]:
+    """What is wrong with accepted ruff findings, and how many entries were read."""
+    path = root / RUFF
+    try:
+        text = path.read_text(encoding="utf-8")
+        found, per_file = _ruff_layout(tomllib.loads(text))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as err:
+        raise ciwf.ReadError(f"{path}: {err}") from err
+    if per_file is None:
+        return found, 0
+    stated = _ruff_stated(text)
+    for key in sorted(per_file.keys()):
+        where = f"{RUFF}: {key}"
+        if not _tracked_file(root, key):
+            found.append(f"{where} is no one file of the repository")
+        if key not in stated:
+            found.append(f"{where} has no `# expires YYYY-MM-DD: reason`")
+        elif problem := day_problem(stated[key], today):
+            found.append(f"{where} {problem}")
+    return found, len(per_file)
+
+
 def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str]:
     """What is wrong with one entry of the repository's own list."""
     if not isinstance(entry, dict):
@@ -178,9 +258,27 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
 
 
 def _tracked_file(root: Path, name: str) -> bool:
-    """Whether a name is a plain relative path to a file below the root."""
+    """Whether a name is a plain relative path to a file below root and tracked by git."""
     path = Path(name)
-    return not path.is_absolute() and ".." not in path.parts and (root / path).is_file()
+    if path.is_absolute() or ".." in path.parts or not (root / path).is_file():
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", f":(literal){name}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=ciwf.git_env(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as err:
+        raise ciwf.ReadError(f"{root}: {err}") from err
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1 and "did not match" in proc.stderr:
+        return False
+    message = proc.stderr.strip() or f"git exited with {proc.returncode}"
+    raise ciwf.ReadError(f"{root}: {message}")
 
 
 def _own(root: Path, today: datetime.date) -> tuple[list[str], int]:
@@ -219,14 +317,16 @@ def issues(root: Path, rule: str) -> list[str]:
 
 
 def problems(root: Path, today: datetime.date) -> tuple[list[str], int, int]:
-    """What is wrong in the three places, and how many entries they hold."""
+    """What is wrong in the four places, and how many entries they hold."""
     findings, accepted = _findings(root, today)
     linted, ignored = _actionlint(root, today)
+    ruffed, ruff_count = _ruff(root, today)
     own, excepted = _own(root, today)
-    return findings + linted + own, accepted + ignored, excepted
+    return findings + linted + ruffed + own, accepted + ignored + ruff_count, excepted
 
 
 def main() -> int:
+    """Check accepted linter findings and exceptions, exiting non-zero on failure."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("command", choices=("check",))
     parser.add_argument("--root", type=Path, default=Path("."))

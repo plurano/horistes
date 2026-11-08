@@ -9,7 +9,9 @@ true and false as booleans, so the `on` key of a workflow stays the string
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -48,6 +50,32 @@ StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _ma
 
 class ReadError(Exception):
     """A workflow or action file that cannot be read as a mapping."""
+
+
+def git_env() -> dict[str, str]:
+    """Copy os.environ without local git variables per githooks(5), plus LC_ALL=C.
+
+    githooks(5) explains hooks export variables such as GIT_DIR and GIT_WORK_TREE
+    that interfere with git commands aimed at a foreign repository. Clearing every
+    name printed by `git rev-parse --local-env-vars` isolates foreign repository calls.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--local-env-vars"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as err:
+        raise ReadError(f"git rev-parse --local-env-vars: {err}") from err
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or f"git exited with {proc.returncode}"
+        raise ReadError(message)
+    stripped = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    clean = {k: v for k, v in os.environ.items() if k not in stripped}
+    clean["LC_ALL"] = "C"
+    return clean
 
 
 def say(line: str) -> None:
