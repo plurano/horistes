@@ -4837,3 +4837,118 @@ def test_the_query_reads_author_and_reviews(tmp_path):
     rules = load_rules(tmp_path)
     assert "author { login }" in rules.QUERY
     assert "reviews(last: 20)" in rules.QUERY
+
+
+def test_planted_code_scanning_failure_holds_clean_pull(tmp_path):
+    """A pull request with a failed code-scanning results check does not land."""
+    p = pull(
+        1,
+        "CLEAN",
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-code-scanning"),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "code-scanning check failed" in summary
+    assert "| #1 | CLEAN | code-scanning check failed |" in summary
+
+
+def test_code_scanning_success_allows_landing(tmp_path):
+    """A pull request with a successful code-scanning check lands normally."""
+    p = pull(
+        1,
+        "CLEAN",
+        suites=[
+            "SUCCESS",
+            suite(1001, "SUCCESS", 10, None, "github-code-scanning"),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_pull_without_code_scanning_lands_unchanged(tmp_path):
+    """A pull request without a code-scanning check lands unchanged."""
+    p = pull(1, "CLEAN")
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_planted_github_app_code_scanning_failure_holds_clean_pull(tmp_path):
+    """A pull request with a failed suite from the github app does not land."""
+    p = pull(
+        1,
+        "CLEAN",
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github"),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "code-scanning check failed" in summary
+    assert "| #1 | CLEAN | code-scanning check failed |" in summary
+
+
+def test_superseded_code_scanning_failure_allows_landing(tmp_path):
+    """A newer successful code-scanning suite supersedes an older failed one."""
+    p = pull(
+        1,
+        "CLEAN",
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-code-scanning"),
+            suite(1002, "SUCCESS", 15, None, "github-code-scanning"),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_verdict_direct_code_scanning_hold(tmp_path):
+    """Direct test of verdict and has_red_code_scanning for code scanning hold."""
+    rules = load_rules(tmp_path)
+    p_fail = pull(
+        1,
+        "CLEAN",
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-code-scanning"),
+        ],
+    )
+    assert rules.has_red_code_scanning(p_fail) == "code-scanning check failed"
+    conf = {
+        "hold": frozenset(),
+        "person": "",
+        "accept": frozenset({"CLEAN"}),
+        "dependency": "renovate/",
+    }
+    repo = {"defaultBranchRef": {"name": "main"}}
+    assert rules.verdict(p_fail, repo, conf, NOW) == "code-scanning check failed"
+
+    p_pass = pull(
+        2,
+        "CLEAN",
+        suites=[
+            "SUCCESS",
+            suite(1001, "SUCCESS", 10, None, "github-code-scanning"),
+        ],
+    )
+    assert rules.has_red_code_scanning(p_pass) is False
+    assert rules.verdict(p_pass, repo, conf, NOW) == "land"
+

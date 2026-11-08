@@ -75,3 +75,4 @@ record that supersedes it.
 | [0065](0065-the-train-yields-to-a-lander-lease.md) | 2026-10-30 | The train yields to a lander lease | Accepted |
 | [0066](0066-a-train-write-holds-the-landing-order.md) | 2026-11-01 | A train write holds the landing order | Accepted |
 | [0067](0067-the-train-settles-reviews-before-landing.md) | 2026-11-08 | The train settles reviews before landing | Accepted |
+| [0068](0068-the-train-holds-on-failed-code-scanning.md) | 2026-11-08 | The train holds on failed code scanning | Accepted |
