@@ -8,7 +8,7 @@ name: Licence check
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
   merge_group:
@@ -20,8 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # A draft skips this job, and the result job below fails for it, so the
-  # required check stays red on a draft until the ready_for_review run.
+  # On a draft the licence call is skipped and spends no runner; the result job
+  # still takes one runner briefly to report the draft; the check turns red
+  # again when a ready pull request is converted to a draft.
   licence:
     name: Licence
     if: >-
@@ -30,6 +31,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/licence.yml
+    with:
+      runner: ubuntu-26.04
 
   # The forge reports the calling job above only as "Licence / REUSE lint",
   # never as "Licence", so a rule set that requires "Licence" waits forever.

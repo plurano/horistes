@@ -46,7 +46,8 @@ checks every workflow added here must pass. The first reusable workflow is the
 licence check; this repository is its first caller and no longer keeps a
 licence job of its own. The second is the scorecard run; it has no caller
 yet, because a repository can call it only once this one is public. The caller
-a consumer keeps exists as a template for both.
+a consumer keeps exists as a template for both. The scorecard caller can be
+started by hand.
 
 Consumers call this repository directly; no copy per owner is built. Its name
 is chosen. It turns public now that its history is shown to hold no private
@@ -117,11 +118,15 @@ The merge train runs from one caller in the fleet's operations repository
 and sweeps every repository the merge-train app is installed on; the
 repositories it serves keep no caller and no secret. The app's key is the
 secret `MERGE_TRAIN_APP_KEY` of the environment `merge-train` there, which
-only the branch main may use. For each repository the job mints a token
-limited to that repository, with `contents: write`, `pull_requests: write`,
-`workflows: write` and `checks: read`, and revokes it when the repository is
-done; only when an issue is to be closed, a second token for that repository
-carries `issues: write` alone. GITHUB_TOKEN gets no scope. A run lands at most one pull request per
+only the branch main may use. The key must be RSA with at least 2048 bits,
+and the train refuses a shorter one before any call. `check_app_key` in
+tools/merge_train.py enforces this and refuses a non-RSA key too, verified by
+the key tests in tests/test_merge_train.py. For each repository the
+job mints a token limited to that repository, with `contents: write`,
+`pull_requests: write`, `workflows: write` and `checks: read`, and revokes
+it when the repository is done; only when an issue is to be closed, a
+second token for that repository carries `issues: write` alone.
+GITHUB_TOKEN gets no scope. A run lands at most one pull request per
 repository: the oldest the forge reports CLEAN, through the merge call with
 the head commit it read, so a red or blocked pull request is refused by the
 forge itself and the app has no bypass. With none CLEAN and no armed one in
@@ -182,7 +187,15 @@ hashes.
   accepted findings and exceptions, the caller templates, the Scorecard
   service's rules, the runner labels, the relative Markdown links and their
   heading anchors (`tools/links.py`, no host asked), the tests and the licence
-  headers.
+  headers. The test run measures coverage and fails below the floor
+  `fail_under` in `pyproject.toml` (94%), which only goes up;
+  `tests/test_coverage_floor.py` holds the floor and the coverage steps of
+  the `test` recipe. Each coverage step reads `pyproject.toml` only, so a
+  `COVERAGE_RCFILE` in the environment cannot lower the floor. Each run keeps
+  its data files in its own temporary directory, so data an earlier or a
+  concurrent run left behind cannot change the total. The report shows two
+  decimals and a last step compares the total at ten decimals, so a total
+  that only rounds up to the floor still fails.
 - The tests read the message of every commit between the base of the change
   and `HEAD` (`tests/test_commit_messages.py`), on every run of the gate. A
   message fails without a `Signed-off-by` trailer, and when it credits
@@ -215,6 +228,8 @@ A consumer's caller is rendered from `templates/callers/<name>.yml.tmpl`:
 python3 tools/render.py render --template templates/callers/licence.yml.tmpl --context context.toml \
   > .github/workflows/licence-check.yml
 ```
+
+The rendered licence caller skips its job on a draft and reports the draft.
 
 `context.toml` holds the values of the template's fields:
 

@@ -14,11 +14,13 @@ UNKNOWN merge state and between read retries are shortened.
 from __future__ import annotations
 
 import base64
+import errno
 import functools
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -32,10 +34,22 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
-from conftest import ROOT
+from conftest import ROOT, measured
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; the pipe-capacity tests skip there.
+    fcntl = None
+# Setting a pipe's capacity is Linux only (F_SETPIPE_SZ); macOS and Windows skip those tests.
+PIPE_SIZE = getattr(fcntl, "F_SETPIPE_SZ", None)
+NO_PIPE_SIZE = "setting a pipe's capacity needs F_SETPIPE_SZ, which only Linux has"
+# Open descriptors are listed in /proc/self/fd on Linux and /dev/fd on macOS; Windows has
+# neither, so the descriptor-leak tests skip there.
+FD_DIR = next((d for d in ("/proc/self/fd", "/dev/fd") if os.path.isdir(d)), None)
+NO_FD_DIR = "counting open descriptors needs /proc/self/fd or /dev/fd"
 
 TRAIN = ROOT / ".github/workflows/merge-train.yml"
 STEP = "Land or update one pull request in every repository of the app"
@@ -67,6 +81,20 @@ BOT = "merge-train-app"
 
 SCRIPT = ROOT / "tools/merge_train.py"
 RUN = 'python3 "$GITHUB_WORKSPACE/merge-train-source/tools/merge_train.py"'
+# Starts the genuine tools/merge_train.py, so coverage counts that file, with both waits at 0.
+LAUNCH = """\
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("merge_train", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules["merge_train"] = module
+spec.loader.exec_module(module)
+module.SETTLE_SECONDS = 0
+module.READ_BACKOFF_SECONDS = 0
+sys.exit(module.main(os.environ))
+"""
 
 
 def script() -> str:
@@ -98,11 +126,32 @@ def openssl(*args: str, data: bytes = b"") -> bytes:
 
 
 @functools.cache
-def app_key(which: str = "app") -> tuple[str, bytes]:
+def app_key(bits: int = 2048, which: str = "app") -> tuple[str, bytes]:
     """A key made for this test run: the private PEM text and the public PEM."""
     del which
-    private = openssl("genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048")
+    private = openssl("genpkey", "-algorithm", "RSA", "-pkeyopt", f"rsa_keygen_bits:{bits}")
     return private.decode(), openssl("pkey", "-pubout", data=private)
+
+
+@functools.cache
+def non_rsa_app_key(kind: str) -> str:
+    """A non-RSA private key PEM text generated for test refusal."""
+    if kind == "DSA":
+        params = openssl(
+            "genpkey", "-genparam", "-algorithm", "DSA", "-pkeyopt", "dsa_paramgen_bits:2048"
+        )
+        return openssl("genpkey", "-paramfile", "/dev/stdin", data=params).decode()
+    if kind == "EC":
+        return openssl(
+            "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"
+        ).decode()
+    if kind == "Ed25519":
+        return openssl("genpkey", "-algorithm", "ED25519").decode()
+    if kind == "RSA-PSS":
+        return openssl(
+            "genpkey", "-algorithm", "RSA-PSS", "-pkeyopt", "rsa_keygen_bits:2048"
+        ).decode()
+    raise ValueError(f"unsupported key kind: {kind}")
 
 
 _ABSENT = object()
@@ -805,39 +854,46 @@ def train(
 ):
     """Run the step's script against the stand-in forge; the result and the summary written."""
     (tmp_path / "train_rules.py").write_text(helper or module(), encoding="utf-8")
-    source = (text or script()).replace("SETTLE_SECONDS = 5", "SETTLE_SECONDS = 0")
-    source = source.replace("READ_BACKOFF_SECONDS = 5", "READ_BACKOFF_SECONDS = 0")
-    path = tmp_path / "train.py"
-    path.write_text(source, encoding="utf-8")
+    if text is None:
+        # The genuine script runs from tools/, so coverage counts it; LAUNCH zeroes the waits.
+        command = [sys.executable, "-I", "-B", "-c", LAUNCH, str(SCRIPT)]
+    else:
+        source = text.replace("SETTLE_SECONDS = 5", "SETTLE_SECONDS = 0")
+        source = source.replace("READ_BACKOFF_SECONDS = 5", "READ_BACKOFF_SECONDS = 0")
+        path = tmp_path / "train.py"
+        path.write_text(source, encoding="utf-8")
+        command = [sys.executable, "-I", "-B", str(path)]
     summary = tmp_path / "summary.md"
     output = tmp_path / "output"
     forge.workdir = tmp_path
     server = serve(forge)
     url = f"http://127.0.0.1:{server.server_address[1]}"
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "GITHUB_API_URL": url,
-        "GITHUB_GRAPHQL_URL": f"{url}/graphql",
-        "GITHUB_STEP_SUMMARY": str(summary),
-        "GITHUB_OUTPUT": str(output),
-        "RUNNER_TEMP": str(tmp_path),
-        "TRAIN_APP_CLIENT_ID": CLIENT_ID,
-        "TRAIN_APP_KEY": app_key()[0],
-        "TRAIN_SWITCH": "on",
-        "TRAIN_MERGE_METHOD": "SQUASH",
-        "TRAIN_ACCEPT_STATES": "",
-        "TRAIN_MIN_AGE_DAYS": "3",
-        "TRAIN_HOLD_LABELS": "hold,do-not-merge,planted",
-        "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
-        "TRAIN_PERSON_BRANCHES": "release-please--",
-        "TRAIN_RELEASE_OFF": "",
-        "TRAIN_RELEASE_MAX_PARALLEL": "3",
-        "TRAIN_SECURITY_LABELS": "security",
-        **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
-    }
+    env = measured(
+        {
+            "PATH": "/usr/bin:/bin",
+            "GITHUB_API_URL": url,
+            "GITHUB_GRAPHQL_URL": f"{url}/graphql",
+            "GITHUB_STEP_SUMMARY": str(summary),
+            "GITHUB_OUTPUT": str(output),
+            "RUNNER_TEMP": str(tmp_path),
+            "TRAIN_APP_CLIENT_ID": CLIENT_ID,
+            "TRAIN_APP_KEY": app_key()[0],
+            "TRAIN_SWITCH": "on",
+            "TRAIN_MERGE_METHOD": "SQUASH",
+            "TRAIN_ACCEPT_STATES": "",
+            "TRAIN_MIN_AGE_DAYS": "3",
+            "TRAIN_HOLD_LABELS": "hold,do-not-merge,planted",
+            "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
+            "TRAIN_PERSON_BRANCHES": "release-please--",
+            "TRAIN_RELEASE_OFF": "",
+            "TRAIN_RELEASE_MAX_PARALLEL": "3",
+            "TRAIN_SECURITY_LABELS": "security",
+            **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
+        }
+    )
     try:
         done = subprocess.run(
-            [sys.executable, "-I", "-B", str(path)],
+            command,
             capture_output=True,
             text=True,
             check=False,
@@ -1456,6 +1512,28 @@ def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
     assert (forge.minted, forge.writes) == ([], [])
 
 
+@pytest.mark.parametrize(
+    ("status", "settings"),
+    [
+        pytest.param(3, {"merge_method": "REBASE"}, id="invalid_setting"),
+        pytest.param(0, {}, id="clean_pull_lands"),
+    ],
+)
+def test_entrypoint_exit_status(tmp_path, status, settings):
+    """The script run as a program exits with the status main() returns.
+
+    LAUNCH calls main() directly, so only this test holds the exit status of the entrypoint.
+    """
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, text=script(), **settings)
+    assert done.returncode == status, done.stdout + done.stderr
+    if status == 3:
+        assert done.stdout.startswith("::error title=Merge train setting::")
+        assert (forge.minted, forge.writes) == ([], [])
+    else:
+        assert forge.writes == [landed(1)]
+
+
 @pytest.mark.parametrize("parallel", ["1", "3"])
 def test_release_max_parallel_boundaries_accepted(tmp_path, parallel):
     forge = Forge(repository(pull(1, "CLEAN")))
@@ -1483,7 +1561,6 @@ def test_token_and_key_are_never_printed(tmp_path):
         "jwt.sig",
         "output",
         "summary.md",
-        "train.py",
         "train_rules.py",
     ]
 
@@ -1700,6 +1777,443 @@ def test_missing_app_credential_stops_before_any_call(tmp_path, key, value):
     assert done.returncode == 3, done.stdout + done.stderr
     assert done.stdout.startswith("::error title=Merge train setting::")
     assert (forge.minted, forge.where) == ([], [])
+
+
+def load_train(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The merge train script, imported with its rules module written to RUNNER_TEMP."""
+    (tmp_path / "train_rules.py").write_text(module(), encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    spec = importlib.util.spec_from_file_location("merge_train", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize(
+    "bits",
+    [
+        pytest.param(1024, id="1024-bits"),
+        pytest.param(2047, id="2047-bits"),
+    ],
+)
+def test_short_app_key_is_refused(tmp_path, bits):
+    """An RSA app key shorter than 2048 bits is refused before any forge call."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, app_key=app_key(bits)[0])
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert str(bits) in done.stdout
+    assert "2048" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
+
+
+@pytest.mark.parametrize(
+    "bits",
+    [
+        pytest.param(2048, id="2048-bits"),
+        pytest.param(4096, id="4096-bits"),
+    ],
+)
+def test_sufficient_app_key_is_accepted(tmp_path, bits):
+    """An RSA app key of at least 2048 bits is accepted and proceeds to the forge."""
+    priv, pub = app_key(bits)
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.public = pub
+    done, _ = train(tmp_path, forge, app_key=priv)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]
+
+
+@pytest.mark.parametrize(
+    ("bits", "expected"),
+    [
+        pytest.param(2048, 2048, id="2048-bits"),
+        pytest.param(1024, 1024, id="1024-bits"),
+    ],
+)
+def test_key_bits_reads_length_directly(tmp_path, monkeypatch, bits, expected):
+    """The key_bits helper measures the key's bit length through a pipe."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    assert train_mod.key_bits(app_key(bits)[0]) == expected
+
+
+def test_key_bits_timeout_raises_invalid_setting_error(tmp_path, monkeypatch):
+    """A subprocess timeout in key_bits raises InvalidSettingError."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    key = app_key(2048)[0]
+
+    def mock_run(*args, **kwargs):
+        """Stand in for subprocess.run: every openssl call times out."""
+        raise subprocess.TimeoutExpired(cmd=["openssl"], timeout=train_mod.TIMEOUT)
+
+    monkeypatch.setattr(train_mod.subprocess, "run", mock_run)
+    with pytest.raises(train_mod.InvalidSettingError) as exc_info:
+        train_mod.key_bits(key)
+    assert f"timed out after {train_mod.TIMEOUT}" in str(exc_info.value)
+    assert str(train_mod.MIN_KEY_BITS) in str(exc_info.value)
+
+
+def test_app_jwt_timeout_raises_refused_error(tmp_path, monkeypatch):
+    """A subprocess timeout in app_jwt raises RefusedError."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+
+    def mock_run(*args, **kwargs):
+        """Stand in for subprocess.run: every openssl call times out."""
+        raise subprocess.TimeoutExpired(cmd=["openssl"], timeout=train_mod.TIMEOUT)
+
+    monkeypatch.setattr(train_mod.subprocess, "run", mock_run)
+    conf = {"client_id": "test-client-id"}
+    with pytest.raises(train_mod.RefusedError) as exc_info:
+        train_mod.app_jwt(env, conf)
+    assert f"timed out after {train_mod.TIMEOUT}" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        pytest.param("DSA", id="dsa-2048"),
+        pytest.param("EC", id="ec-p256"),
+        pytest.param("Ed25519", id="ed25519"),
+        pytest.param("RSA-PSS", id="rsa-pss-2048"),
+    ],
+)
+def test_non_rsa_app_key_is_refused(tmp_path, kind):
+    """A non-RSA app key is refused before any forge call."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, app_key=non_rsa_app_key(kind))
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert "RSA" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
+
+
+def leaked(body: str, out: str) -> list[str]:
+    """Return every 12-character window of body found in out."""
+    if len(body) < 12:
+        return []
+    return [body[i : i + 12] for i in range(len(body) - 12 + 1) if body[i : i + 12] in out]
+
+
+def test_leaked_finds_sixteen_character_fragment():
+    """A 16-character fragment of the key body embedded in other text is detected."""
+    body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out = f"prefix_{body[4:20]}_suffix"
+    found = leaked(body, out)
+    assert len(found) == 5
+    assert found[0] == body[4:16]
+
+
+def test_leaked_finds_twelve_character_fragment():
+    """A 12-character fragment of the key body embedded in other text is detected."""
+    body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out = f"prefix_{body[10:22]}_suffix"
+    assert leaked(body, out) == [body[10:22]]
+
+
+def test_leaked_returns_empty_when_no_fragment_present():
+    """Text containing no fragment of the key body yields an empty list."""
+    body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out = "completely_different_text_without_matching_chunks"
+    assert leaked(body, out) == []
+
+
+def test_leaked_returns_empty_for_eleven_character_boundary_fragment():
+    """An 11-character fragment is below the 12-character window threshold and returns empty."""
+    body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out = f"prefix_{body[4:15]}_suffix"
+    assert leaked(body, out) == []
+
+
+def test_refused_app_key_is_never_printed(tmp_path):
+    """The private key material never appears in the output of a refused run."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    key_pem = app_key(1024)[0]
+    done, summary = train(tmp_path, forge, app_key=key_pem)
+    assert done.returncode == 3, done.stdout + done.stderr
+    out = (done.stdout + done.stderr + summary).replace("\n", "")
+    body = "".join(key_pem.splitlines()[1:-1])
+    assert leaked(body, out) == []
+    assert "PRIVATE KEY" not in out
+
+
+def test_unreadable_app_key_is_refused(tmp_path):
+    """An unreadable app key is refused before any forge call."""
+    lines = app_key(2048)[0].splitlines()
+    corrupted = f"{lines[0]}\ncorrupted\n{lines[-1]}\n"
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, app_key=corrupted)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert "2048" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
+
+
+def test_oversized_app_key_is_refused(tmp_path):
+    """An app key longer than MAX_KEY_CHARS is refused before any forge call."""
+    lines = app_key(2048)[0].splitlines()
+    header = f"{lines[0]}\n"
+    footer = f"\n{lines[-1]}\n"
+    filler = "A" * (16384 + 1 - len(header) - len(footer))
+    oversized = header + filler + footer
+    assert len(oversized) == 16384 + 1
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, app_key=oversized)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert "16384" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
+
+
+def test_app_key_at_maximum_length_boundary_is_accepted(tmp_path):
+    """An RSA app key padded to exactly MAX_KEY_CHARS is accepted and proceeds."""
+    priv, pub = app_key(2048)
+    padded = priv + "\n" * (16384 - len(priv))
+    assert len(padded) == 16384
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.public = pub
+    done, _ = train(tmp_path, forge, app_key=padded)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]
+
+
+def shrink_pipes(train_mod, monkeypatch):
+    """Set the capacity of both ends of train_mod.os.pipe to 4096 bytes."""
+    real_pipe = train_mod.os.pipe
+
+    def small_pipe():
+        """Create a pipe with 4096-byte capacity on each end."""
+        r, w = real_pipe()
+        fcntl.fcntl(r, PIPE_SIZE, 4096)
+        fcntl.fcntl(w, PIPE_SIZE, 4096)
+        return r, w
+
+    monkeypatch.setattr(train_mod.os, "pipe", small_pipe)
+
+
+@pytest.mark.skipif(PIPE_SIZE is None, reason=NO_PIPE_SIZE)
+def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
+    """key_bits reads an RSA key longer than the 4096-byte pipe buffer without hanging."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    shrink_pipes(train_mod, monkeypatch)
+    key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
+    result = {}
+
+    def worker():
+        """Read key_bits in a background thread."""
+        try:
+            result["bits"] = train_mod.key_bits(key)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(20)
+    assert not thread.is_alive()
+    assert result == {"bits": 2048}
+
+
+@pytest.mark.skipif(PIPE_SIZE is None, reason=NO_PIPE_SIZE)
+def test_key_longer_than_pipe_capacity_app_jwt(tmp_path, monkeypatch):
+    """app_jwt signs a JWT using a key longer than the 4096-byte pipe buffer without hanging."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    shrink_pipes(train_mod, monkeypatch)
+    key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
+    env = {"TRAIN_APP_KEY": key}
+    conf = {"client_id": "test-client-id"}
+    result = {}
+
+    def worker():
+        """Sign app_jwt in a background thread."""
+        try:
+            result["jwt"] = train_mod.app_jwt(env, conf)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(20)
+    assert not thread.is_alive()
+    assert "error" not in result, result
+    token = result.get("jwt")
+    assert isinstance(token, str)
+    assert len(token.split(".")) == 3
+
+
+def test_key_bits_pipe_oserror_raises_invalid_setting_error(tmp_path, monkeypatch):
+    """An OSError from os.pipe in key_bits raises InvalidSettingError."""
+    train_mod = load_train(tmp_path, monkeypatch)
+
+    def mock_pipe():
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
+    with pytest.raises(train_mod.InvalidSettingError) as exc_info:
+        train_mod.key_bits(app_key(2048)[0])
+    msg = str(exc_info.value)
+    assert "Too many open files" in msg or "EMFILE" in msg
+    assert f"at least {train_mod.MIN_KEY_BITS} bits are required" in msg
+
+
+def test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch):
+    """An OSError from os.pipe in app_jwt raises RefusedError."""
+    train_mod = load_train(tmp_path, monkeypatch)
+
+    def mock_pipe():
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    conf = {"client_id": "test-client-id"}
+    with pytest.raises(train_mod.RefusedError) as exc_info:
+        train_mod.app_jwt(env, conf)
+    msg = str(exc_info.value)
+    assert "Too many open files" in msg or "EMFILE" in msg
+
+
+def test_os_failure_names_the_type_and_description_only(tmp_path, monkeypatch):
+    """os_failure gives the type and strerror without errno or file name, else the plain text."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    missing = FileNotFoundError(errno.ENOENT, "No such file or directory", "key.pem")
+    assert train_mod.os_failure(missing) == "FileNotFoundError: No such file or directory"
+    assert train_mod.os_failure(OSError("plain text")) == "OSError: plain text"
+
+
+@pytest.mark.skipif(FD_DIR is None, reason=NO_FD_DIR)
+def test_key_bits_thread_runtime_error_raises_invalid_setting_error_and_leaks_no_fds(
+    tmp_path, monkeypatch
+):
+    """A RuntimeError in thread start in key_bits raises InvalidSettingError and leaks no fds."""
+    train_mod = load_train(tmp_path, monkeypatch)
+
+    class FailingThread(train_mod.threading.Thread):
+        def start(self):
+            raise RuntimeError("thread creation failed")
+
+    monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
+    fds_before = len(os.listdir(FD_DIR))
+    with pytest.raises(train_mod.InvalidSettingError) as exc_info:
+        train_mod.key_bits(app_key(2048)[0])
+    fds_after = len(os.listdir(FD_DIR))
+    assert fds_after == fds_before
+    msg = str(exc_info.value)
+    assert "thread creation failed" in msg or "RuntimeError" in msg
+    assert f"at least {train_mod.MIN_KEY_BITS} bits are required" in msg
+
+
+@pytest.mark.skipif(FD_DIR is None, reason=NO_FD_DIR)
+def test_app_jwt_thread_runtime_error_raises_refused_error_and_leaks_no_fds(tmp_path, monkeypatch):
+    """A RuntimeError in thread start in app_jwt raises RefusedError and leaks no fds."""
+    train_mod = load_train(tmp_path, monkeypatch)
+
+    class FailingThread(train_mod.threading.Thread):
+        def start(self):
+            raise RuntimeError("thread creation failed")
+
+    monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    conf = {"client_id": "test-client-id"}
+    fds_before = len(os.listdir(FD_DIR))
+    with pytest.raises(train_mod.RefusedError) as exc_info:
+        train_mod.app_jwt(env, conf)
+    fds_after = len(os.listdir(FD_DIR))
+    assert fds_after == fds_before
+    msg = str(exc_info.value)
+    assert "thread creation failed" in msg or "RuntimeError" in msg
+
+
+def patch_openssl_which(tmp_path, monkeypatch, train_mod, marker):
+    """Point shutil.which at a wrapper that touches marker and runs openssl; record each run.
+
+    Returns the wrapper path and the list of (argument list, executable) pairs.
+    """
+    wrapper = tmp_path / "openssl_wrapper.sh"
+    wrapper.write_text(f'#!/bin/sh\ntouch "{marker}"\nexec openssl "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(
+        train_mod.shutil,
+        "which",
+        lambda cmd: str(wrapper) if cmd == "openssl" else None,
+    )
+    calls = []
+    real_run = train_mod.subprocess.run
+
+    def recording_run(cmd, *args, **kwargs):
+        """Record the argument list and the executable, then make the real call."""
+        calls.append((cmd, kwargs.get("executable")))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(train_mod.subprocess, "run", recording_run)
+    return str(wrapper), calls
+
+
+def run_app_jwt(train_mod):
+    """Sign a token with a fresh 2048-bit key and return it."""
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    conf = {"client_id": "test-client-id"}
+    return train_mod.app_jwt(env, conf)
+
+
+def test_key_bits_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
+    """key_bits runs the openssl that shutil.which found."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    marker = tmp_path / "marker_key_bits"
+    patch_openssl_which(tmp_path, monkeypatch, train_mod, marker)
+    assert train_mod.key_bits(app_key(2048)[0]) == 2048
+    assert marker.is_file()
+
+
+def test_app_jwt_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
+    """app_jwt runs the openssl that shutil.which found."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    marker = tmp_path / "marker_app_jwt"
+    patch_openssl_which(tmp_path, monkeypatch, train_mod, marker)
+    assert len(run_app_jwt(train_mod).split(".")) == 3
+    assert marker.is_file()
+
+
+def test_key_bits_passes_literal_openssl_and_executable_path(tmp_path, monkeypatch):
+    """key_bits passes the literal "openssl" first and the which path as executable."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
+    assert train_mod.key_bits(app_key(2048)[0]) == 2048
+    assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
+
+
+def test_app_jwt_passes_literal_openssl_and_executable_path(tmp_path, monkeypatch):
+    """app_jwt passes the literal "openssl" first and the which path as executable."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
+    assert len(run_app_jwt(train_mod).split(".")) == 3
+    assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
+
+
+def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):
+    """key_pipe waits for the background writer thread to terminate before returning."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    script = tmp_path / "failing_openssl.sh"
+    script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    monkeypatch.setattr(
+        train_mod.shutil,
+        "which",
+        lambda cmd: str(script) if cmd == "openssl" else None,
+    )
+
+    real_write_key = train_mod.write_key
+    event = threading.Event()
+
+    def wrapped_write_key(write_end, key):
+        """Sleep two seconds before calling real write_key and signaling completion."""
+        time.sleep(2)
+        real_write_key(write_end, key)
+        event.set()
+
+    monkeypatch.setattr(train_mod, "write_key", wrapped_write_key)
+    assert train_mod.key_bits(app_key(2048)[0]) is None
+    assert event.is_set()
 
 
 def key_on_disk(text: str) -> list[str]:
