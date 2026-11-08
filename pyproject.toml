@@ -17,7 +17,8 @@ branch = true
 source = ["tools"]
 # Many tests invoke tools and hooks as subprocesses; patch measures them.
 patch = ["subprocess"]
-# The test recipe writes its data files into its own temporary directory.
+# Default data file for a bare coverage command. The Makefile test recipe
+# overrides it with --data-file in a temporary directory of its own.
 data_file = ".coverage"
 
 [tool.coverage.report]
