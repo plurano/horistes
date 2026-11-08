@@ -28,8 +28,12 @@ engines:
     # expires 2026-11-11
     # tests/test_merge_guard.py:21 dangerous-subprocess-use-audit — test mock,
     # CompletedProcess constructor with static args
+    # tests/test_dev_mode.py:68 dangerous-subprocess-use-audit — test helper, runs
+    # the planted suite with sys.executable, static flags and the test's own
+    # temporary tree; entered 2026-11-08, category B, expires 2026-11-11
     # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
     exclude_paths:
+      - "tests/test_dev_mode.py"
       - "tests/test_examples.py"
       - "tests/test_exceptions.py"
       - "tests/test_lint.py"
