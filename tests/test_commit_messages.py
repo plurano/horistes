@@ -11,10 +11,13 @@ engine release.
 The sign-off is read here too, so it is checked on every run of the gate:
 pull request, merge queue and push alike. A message without a `Signed-off-by`
 trailer is refused. The sign-off must name the author's email; names may
-differ because the forge writes the account name on squash commits. A bot
-author needs a sign-off of the person who lands it. A merge commit the forge
-writes for a bot (the merge train's update-branch) is exempt: it carries no
-trailer and brings in only commits of the base.
+differ because the forge writes the account name on squash commits. A merge
+commit without a sign-off passes only when its tree is the clean merge of its
+two parents (it adds no content of its own: the forge's test merge of a pull
+request, an update-branch merge); a merge that carries a sign-off is checked
+like any commit. A bot author passes with its own sign-off, as the update
+bot's `:gitSignOff` preset writes it, or with a person's; every sign-off value
+must read `Name <email>`.
 
 Two credit rules, on one message each:
 
@@ -43,9 +46,11 @@ from conftest import ROOT
 
 DEADLINE = 20  # seconds for one git call
 MAX_COMMITS = 500
+MAX_MESSAGE = 65536
 TRAILERS = {"signed-off-by", "migration"}
 FOOTER = re.compile(r"^\W*(generated with\b|co-authored-by\s*:)", re.IGNORECASE)
 FORGE_BOT = re.compile(r"\d+\+[a-z0-9-]+\[bot\]@users\.noreply\.github\.com")
+SIGN_OFF_VALUE = re.compile(r"[^<>\n]*[^<>\s] <([^<>\s@]+@[^<>\s@]+)>")
 SIGN_OFF = "Signed-off-by: A Person <person@example.org>"
 GOOD = f"feat(x): add a thing\n\nThe header is generated with its own command.\n\n{SIGN_OFF}\n"
 # Outside this repository git reads no configuration of the machine it runs on.
@@ -64,8 +69,11 @@ BOT = {
 }
 
 
-def git(repo: Path, *arguments: str, text: str | None = None, env: dict | None = None) -> str:
-    done = subprocess.run(
+def run_git(
+    repo: Path, *arguments: str, text: str | None = None, env: dict | None = None
+) -> subprocess.CompletedProcess[str]:
+    """One git call in repo; the caller judges its exit status."""
+    return subprocess.run(
         ["git", "-C", str(repo), *arguments],
         input=text,
         capture_output=True,
@@ -74,8 +82,20 @@ def git(repo: Path, *arguments: str, text: str | None = None, env: dict | None =
         check=False,
         env=None if env is None else {**os.environ, **env},
     )
+
+
+def git(repo: Path, *arguments: str, text: str | None = None, env: dict | None = None) -> str:
+    done = run_git(repo, *arguments, text=text, env=env)
     assert done.returncode == 0, f"git {' '.join(arguments)}: {done.stderr.strip()}"
     return done.stdout
+
+
+def merged_tree(repo: Path, ours: str, theirs: str) -> str | None:
+    """Tree of the clean merge of ours and theirs, or None when they conflict."""
+    done = run_git(repo, "merge-tree", "--write-tree", ours, theirs, env=ALONE)
+    if done.returncode == 0 and done.stdout:
+        return done.stdout.splitlines()[0].strip()
+    return None
 
 
 def trailers(message: str) -> list[tuple[str, str]]:
@@ -93,26 +113,27 @@ def trailer_keys(message: str) -> list[str]:
     return [key for key, _ in trailers(message)]
 
 
-def sign_off_email(value: str) -> str:
-    """Email between the last '<' and '>' of a trailer value."""
-    start = value.rfind("<")
-    end = value.rfind(">")
-    if start != -1 and end != -1 and start < end:
-        return value[start + 1 : end]
-    return value
-
-
 def foreign_sign_off(author: str, message: str) -> list[str]:
-    """Findings when Signed-off-by trailers do not match the author email."""
-    if FORGE_BOT.fullmatch(author):
-        return []
+    """Findings on malformed sign-offs, and when none names the author (a bot's: or a person)."""
     values = [v for k, v in trailers(message) if k.lower() == "signed-off-by"]
-    emails = [sign_off_email(v) for v in values]
+    if not values:
+        return []
+    findings: list[str] = []
+    emails: list[str] = []
+    for value in values:
+        match = SIGN_OFF_VALUE.fullmatch(value)
+        if match:
+            emails.append(match.group(1))
+        else:
+            findings.append(f"malformed sign-off {value!r}")
     if not emails:
-        return []
+        return findings
     if any(email.lower() == author.lower() for email in emails):
-        return []
-    return [f"sign-off {', '.join(emails)} is not the author {author}"]
+        return findings
+    if FORGE_BOT.fullmatch(author) and any(not FORGE_BOT.fullmatch(e) for e in emails):
+        return findings
+    findings.append(f"sign-off {', '.join(emails)} is not the author {author}")
+    return findings
 
 
 def credited(message: str) -> list[str]:
@@ -131,10 +152,22 @@ def unsigned(message: str) -> list[str]:
     return [] if "signed-off-by" in keys else ["no trailer Signed-off-by"]
 
 
-def signed_off(author: str, parents: str, message: str) -> list[str]:
-    """Sign-off findings of one commit; a merge the forge writes for a bot is exempt."""
-    if len(parents.split()) > 1 and FORGE_BOT.fullmatch(author):
-        return []
+def oversize(message: str) -> list[str]:
+    """Finding when a message is longer than MAX_MESSAGE characters."""
+    if len(message) > MAX_MESSAGE:
+        return [f"message of {len(message)} characters, over {MAX_MESSAGE}"]
+    return []
+
+
+def signed_off(repo: Path, sha: str, author: str, parents: str, message: str) -> list[str]:
+    """Sign-off findings of one commit; a clean 2-parent merge without a trailer is exempt."""
+    parent_list = parents.split()
+    if len(parent_list) == 2 and unsigned(message):
+        p1, p2 = parent_list
+        tree = merged_tree(repo, p1, p2)
+        target = git(repo, "rev-parse", f"{sha}^{{tree}}", env=ALONE).strip()
+        if tree is not None and tree == target:
+            return []
     return unsigned(message) + foreign_sign_off(author, message)
 
 
@@ -148,7 +181,11 @@ def refused(repo: Path, base: str) -> dict[str, list[str]]:
     for sha in commits:
         read = git(repo, "log", "-1", "--format=%ae%x00%P%x00%B", sha)
         author, parents, message = read.split("\x00", 2)
-        lines = signed_off(author, parents, message) + credited(message)
+        too_long = oversize(message)
+        if too_long:
+            found[sha] = too_long
+            continue
+        lines = signed_off(repo, sha, author, parents, message) + credited(message)
         if lines:
             found[sha] = lines
     return found
@@ -225,22 +262,38 @@ def commit(repo: Path, message: str, env: dict | None = None) -> str:
     return git(repo, "rev-parse", "HEAD").strip()
 
 
+def commit_file(repo: Path, name: str, content: str, message: str, env: dict | None = None) -> str:
+    """Write one file, stage it and commit it with this message; returns the commit."""
+    (repo / name).write_text(content, encoding="utf-8")
+    git(repo, "add", name, env=ALONE)
+    return commit(repo, message, env)
+
+
 def branches(repo: Path) -> str:
-    """Planted repository: main and feature one commit apart each; returns the base."""
+    """Planted repository: main and feature one commit apart, each adding a file; the base."""
     git(repo, "init", "--quiet", "--initial-branch=main", env=ALONE)
-    base = commit(repo, GOOD)
+    base = commit_file(repo, "base.txt", "base\n", GOOD)
     git(repo, "checkout", "--quiet", "-b", "feature", env=ALONE)
-    commit(repo, GOOD.replace("add a thing", "feature work"))
+    commit_file(repo, "feature.txt", "feature work\n", GOOD.replace("add a thing", "feature work"))
     git(repo, "checkout", "--quiet", "main", env=ALONE)
-    commit(repo, GOOD.replace("add a thing", "main work"))
+    commit_file(repo, "main.txt", "main work\n", GOOD.replace("add a thing", "main work"))
     return base
 
 
-def merge(repo: Path, message: str, env: dict | None = None) -> str:
-    """Merge feature into main with this message; returns the merge commit."""
+def merge(repo: Path, message: str, branch: str = "feature", env: dict | None = None) -> str:
+    """Merge a branch with this message; returns the merge commit."""
     options = ["--no-ff", "--no-edit", "--no-gpg-sign", "--quiet", "-m", message]
-    git(repo, "merge", *options, "feature", env=env or ALONE)
+    git(repo, "merge", *options, branch, env=env or ALONE)
     return git(repo, "rev-parse", "HEAD").strip()
+
+
+def merge_with_own_content(
+    repo: Path, message: str, branch: str = "feature", env: dict | None = None
+) -> str:
+    """Merge a branch and add a file of the merge's own; returns the merge commit."""
+    options = ["--no-ff", "--no-commit", "--no-gpg-sign", "--quiet"]
+    git(repo, "merge", *options, branch, env=env or ALONE)
+    return commit_file(repo, "own.txt", "own content\n", message, env)
 
 
 def test_planted_commit_is_refused_and_the_commits_around_it_pass(tmp_path):
@@ -335,17 +388,150 @@ def test_planted_merge_commit_with_foreign_sign_off_is_refused(tmp_path):
     assert refused(tmp_path, base) == {}
 
 
-def test_planted_merge_commit_without_sign_off_is_refused(tmp_path):
-    """A merge commit without a sign-off trailer is refused by unsigned."""
+def test_planted_forge_test_merge_passes(tmp_path):
+    """A clean merge representing a forge test merge without a trailer passes."""
     base = branches(tmp_path)
-    merged = merge(tmp_path, "Merge branch 'feature' without sign-off\n")
+    feature_sha = git(tmp_path, "rev-parse", "feature", env=ALONE).strip()
+    main_sha = git(tmp_path, "rev-parse", "main", env=ALONE).strip()
+    merge(tmp_path, f"Merge {feature_sha} into {main_sha}\n", env=ALONE)
+    assert refused(tmp_path, base) == {}
+
+
+def test_planted_update_branch_merge_for_a_bot_passes(tmp_path):
+    """A bot update-branch merge (clean merge of main into feature) without a trailer passes."""
+    base = branches(tmp_path)
+    git(tmp_path, "checkout", "--quiet", "feature", env=ALONE)
+    merge(tmp_path, "Merge branch 'main' into feature\n", branch="main", env=BOT)
+    assert refused(tmp_path, base) == {}
+
+
+def test_planted_merge_commit_with_own_content_is_refused(tmp_path):
+    """A merge commit adding content without a sign-off trailer is refused."""
+    base = branches(tmp_path)
+    merged = merge_with_own_content(
+        tmp_path, "Merge branch 'feature' with own content\n", env=ALONE
+    )
     assert refused(tmp_path, base) == {merged: ["no trailer Signed-off-by"]}
 
 
-def test_planted_forge_merge_for_a_bot_passes_and_its_plain_commit_does_not(tmp_path):
-    """Boundary: a bot's merge without a sign-off is exempt; a bot's plain commit is not."""
+def test_planted_spoofed_bot_merge_with_own_content_is_refused(tmp_path):
+    """A merge commit adding content under a bot author without a sign-off is refused."""
     base = branches(tmp_path)
-    merge(tmp_path, "Merge branch 'main' into feature\n", env=BOT)
+    merged = merge_with_own_content(tmp_path, "Merge branch 'feature' with own content\n", env=BOT)
+    assert refused(tmp_path, base) == {merged: ["no trailer Signed-off-by"]}
+
+
+def test_conflict_merge_resolved_without_sign_off_is_refused(tmp_path):
+    """A merge whose conflict is resolved by hand, without a sign-off, is refused."""
+    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
+    base = commit_file(tmp_path, "file.txt", "base line\n", GOOD)
+    git(tmp_path, "checkout", "--quiet", "-b", "feature", env=ALONE)
+    commit_file(tmp_path, "file.txt", "feature edit\n", GOOD.replace("add a thing", "feature work"))
+    git(tmp_path, "checkout", "--quiet", "main", env=ALONE)
+    commit_file(tmp_path, "file.txt", "main edit\n", GOOD.replace("add a thing", "main work"))
+    conflict = run_git(
+        tmp_path, "merge", "--no-ff", "--no-gpg-sign", "--quiet", "feature", env=ALONE
+    )
+    assert conflict.returncode == 1, conflict.stdout + conflict.stderr
+    merged = commit_file(tmp_path, "file.txt", "resolved line\n", "Merge branch 'feature'\n")
+    assert len(git(tmp_path, "log", "-1", "--format=%P", merged).split()) == 2
+    assert refused(tmp_path, base) == {merged: ["no trailer Signed-off-by"]}
+
+
+def test_bot_plain_commit_sign_off_requirements(tmp_path):
+    """A bot commit passes with its own or a person's sign-off; none or another bot's fails."""
+    bot = BOT["GIT_AUTHOR_EMAIL"]
+    other = "49699333+dependabot[bot]@users.noreply.github.com"
+    no_trailer_msg = "chore(deps): update\n"
+    assert unsigned(no_trailer_msg) + foreign_sign_off(bot, no_trailer_msg) == [
+        "no trailer Signed-off-by"
+    ]
+    own_msg = f"chore(deps): update\n\nSigned-off-by: renovate[bot] <{bot}>\n"
+    assert unsigned(own_msg) + foreign_sign_off(bot, own_msg) == []
+    other_msg = f"chore(deps): update\n\nSigned-off-by: dependabot[bot] <{other}>\n"
+    assert foreign_sign_off(bot, other_msg) == [f"sign-off {other} is not the author {bot}"]
+    person_signed_msg = f"chore(deps): update\n\n{SIGN_OFF}\n"
+    assert unsigned(person_signed_msg) + foreign_sign_off(bot, person_signed_msg) == []
+
+    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
+    base = commit(tmp_path, GOOD)
+    bad_plain = commit(tmp_path, no_trailer_msg, env=BOT)
+    assert refused(tmp_path, base) == {bad_plain: ["no trailer Signed-off-by"]}
+    bad_other = commit(tmp_path, other_msg, env=BOT)
+    not_author = f"sign-off {other} is not the author {bot}"
+    assert refused(tmp_path, bad_plain) == {bad_other: [not_author]}
+    commit(tmp_path, own_msg, env=BOT)
+    commit(tmp_path, person_signed_msg, env=BOT)
+    assert refused(tmp_path, bad_other) == {}
+
+
+@pytest.mark.parametrize(
+    ("trailer", "finding"),
+    [
+        (
+            "Signed-off-by: A Person <person@example.org> junk",
+            "malformed sign-off 'A Person <person@example.org> junk'",
+        ),
+        (
+            "Signed-off-by: <person@example.org>",
+            "malformed sign-off '<person@example.org>'",
+        ),
+        (
+            "Signed-off-by: A Person person@example.org",
+            "malformed sign-off 'A Person person@example.org'",
+        ),
+    ],
+    ids=["trailing junk", "missing name", "missing angle brackets"],
+)
+def test_malformed_sign_off_is_refused(trailer, finding):
+    """Negative: a sign-off that is not `Name <email>` is refused, even with the author's email."""
+    message = f"feat(x): add\n\n{trailer}\n"
+    assert foreign_sign_off("person@example.org", message) == [finding]
+
+
+def test_message_length_boundary():
+    """Boundary: MAX_MESSAGE characters pass; one more is refused before any parsing."""
+    exact = "a" * MAX_MESSAGE
+    assert oversize(exact) == []
+    over = "a" * (MAX_MESSAGE + 1)
+    assert oversize(over) == [f"message of {MAX_MESSAGE + 1} characters, over {MAX_MESSAGE}"]
+
+
+def test_planted_oversize_message_is_refused(tmp_path):
+    """Boundary: a commit whose message git reports at MAX_MESSAGE passes; one over is refused."""
+    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
+    base = commit(tmp_path, GOOD)
+    header = "feat(x): add\n\n"
+    trailer = f"\n{SIGN_OFF}\n"
+    body_len = MAX_MESSAGE - len(header) - len(trailer) - 1
+    exact_msg = header + ("x" * body_len) + trailer
+    commit(tmp_path, exact_msg)
     assert refused(tmp_path, base) == {}
-    plain = commit(tmp_path, "chore(deps): update a pin\n", env=BOT)
-    assert refused(tmp_path, base) == {plain: ["no trailer Signed-off-by"]}
+
+    over_msg = header + ("x" * (body_len + 1)) + trailer
+    bad = commit(tmp_path, over_msg)
+    assert refused(tmp_path, "HEAD~1") == {
+        bad: [f"message of {MAX_MESSAGE + 1} characters, over {MAX_MESSAGE}"]
+    }
+
+
+def test_boundary_octopus_merge_without_trailer_is_refused(tmp_path):
+    """Boundary: a clean three-parent merge without a trailer is refused; exemption needs two."""
+    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
+    base = commit_file(tmp_path, "base.txt", "base\n", GOOD)
+    for name in ("branch1", "branch2"):
+        git(tmp_path, "checkout", "--quiet", "-b", name, "main", env=ALONE)
+        commit_file(tmp_path, f"{name}.txt", f"{name}\n", GOOD.replace("add a thing", name))
+    git(tmp_path, "checkout", "--quiet", "main", env=ALONE)
+    commit_file(tmp_path, "main.txt", "main\n", GOOD.replace("add a thing", "main work"))
+    options = [
+        "--no-ff",
+        "--no-gpg-sign",
+        "--quiet",
+        "-m",
+        "Merge branches 'branch1' and 'branch2'\n",
+    ]
+    git(tmp_path, "merge", *options, "branch1", "branch2", env=ALONE)
+    merged = git(tmp_path, "rev-parse", "HEAD").strip()
+    assert len(git(tmp_path, "log", "-1", "--format=%P", merged).split()) == 3
+    assert refused(tmp_path, base) == {merged: ["no trailer Signed-off-by"]}
