@@ -713,6 +713,14 @@ def re_arm_drifted(env, conf, served, held, notes):
     return None
 
 
+def disarm_red_scanning(env, rows, notes):
+    """Disarm auto-merge on any pull request held by a red code-scanning check."""
+    for pull, reason in rows:
+        if reason == "code-scanning check failed" and pull.get("autoMergeRequest"):
+            graphql(env, DISARM, {"id": pull["id"]})
+            notes[pull["number"]] = "disarmed: code-scanning check failed"
+
+
 def land_clean(env, conf, repo, served, notes):
     """Land or enqueue the oldest clean pull request, or None."""
     for pull, reason in served:
@@ -743,6 +751,7 @@ def run(env, conf, repo, now):
     notes = {pull["number"]: reason for pull, reason in rows}
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
+    disarm_red_scanning(env, rows, notes)
     lease = lander_lease(repo, now)
     served = serving_order(rows, conf)
     held = hold_for_security(env, repo, served, notes, conf)

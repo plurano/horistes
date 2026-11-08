@@ -41,6 +41,9 @@ permitting the train to merge a commit with open security alerts.
 - The sweep's `advance()` refuses to arm auto-merge on a `BEHIND` pull request
   whose code-scanning results are red, and `re_arm_drifted()` refuses to re-arm
   a retitled pull request in the same state.
+- `disarm_red_scanning()` in `tools/merge_train.py` disarms any pull request whose
+  verdict is a code-scanning hold and whose `autoMergeRequest` is set, preventing
+  the forge's native auto-merge from merging it while the scan is red.
 
 ## Consequences
 
@@ -51,9 +54,13 @@ commit resolves the alerts. A newer successful run from the code-scanning app su
 an older failed run. Pull requests without code-scanning suites or with successful
 checks continue landing normally.
 
+Implementation: `has_red_code_scanning()` in `.github/workflows/merge-train.yml`
+(the `train_rules.py` heredoc), integrated in `verdict()`; arming guards and
+`disarm_red_scanning()` in `tools/merge_train.py`.
+
 Tests in `tests/test_merge_train.py` verify that a failed code-scanning suite holds a
 `CLEAN` pull request, a successful code-scanning check allows landing, pull requests
 without code-scanning suites land unchanged, a newer successful code-scanning suite
 supersedes an older failed run, an armed pull request with a red code-scanning check is
-not merged, a `BEHIND` pull request is not armed when code scanning is red, and a
-retitled armed pull request is not re-armed when code scanning is red.
+not merged and disarmed, a `BEHIND` pull request is not armed when code scanning is red,
+and a retitled armed pull request is not re-armed when code scanning is red.

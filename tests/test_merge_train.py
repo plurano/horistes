@@ -4967,9 +4967,8 @@ def test_planted_armed_pr_with_red_code_scanning_is_not_merged(tmp_path):
     forge = Forge(repository(armed_clean))
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert forge.writes == []
-    assert "code-scanning check failed" in summary
-    assert "| #1 | CLEAN | code-scanning check failed |" in summary
+    assert forge.writes == [disarmed(1)]
+    assert "disarmed: code-scanning check failed" in summary
 
 
 def test_behind_pr_not_armed_when_code_scanning_is_red(tmp_path):
@@ -5005,6 +5004,6 @@ def test_retitled_armed_pr_not_re_armed_when_code_scanning_is_red(tmp_path):
     forge = Forge(repository(retitled))
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert disarmed(1) not in forge.writes
+    assert disarmed(1) in forge.writes
     assert armed(1) not in forge.writes
     assert "not re-armed: code-scanning check failed" in summary
