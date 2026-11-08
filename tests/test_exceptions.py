@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 import pytest
-from conftest import ROOT
+from conftest import ROOT, Tree
 
 CONFIG = ".github/zizmor.yml"
 RUFF = "ruff.toml"
@@ -125,9 +125,10 @@ ENTRY = (
 LIST = "---\nexceptions:\n" + ENTRY
 
 
-def own(tree, text, today=TODAY, subject=SUBJECT):
+def own(tree, text, today=TODAY, subject=SUBJECT, env=None):
+    """Write exception files into tree and run exceptions.py check."""
     files = {OWN: text} | ({subject: "{}\n"} if subject else {})
-    return tree.write(files).tool("exceptions.py", "check", "--today", today)
+    return tree.write(files).tool("exceptions.py", "check", "--today", today, env=env)
 
 
 def test_own_entry_with_every_field_passes(tree):
@@ -208,6 +209,90 @@ def test_own_entry_path_naming_untracked_file_fails(tree):
         "exceptions.yaml: entry 1 names `untracked.json`, which is no file of the repository"
         in done.stderr
     )
+
+
+def foreign_index(tmp_path):
+    """Make a repository outside the tree whose index holds docs/a.md."""
+    foreign = Tree(tmp_path / "foreign")
+    foreign.git("init", "-b", "main")
+    foreign.write({"docs/a.md": "# foreign doc\n"})
+    foreign.git("add", "docs/a.md")
+    return foreign
+
+
+def untracked_doc(tree, tmp_path):
+    """Point tree at a fresh repository holding docs/a.md untracked."""
+    tree.root = tmp_path / "own"
+    tree.git("init", "-b", "main")
+    tree.write({RUFF: '[lint]\nselect = ["E"]\n'})
+    (tree.root / "docs").mkdir(parents=True, exist_ok=True)
+    (tree.root / "docs/a.md").write_text("# own untracked doc\n")
+
+
+def test_own_entry_untracked_file_with_foreign_git_dir_fails(tree, tmp_path):
+    """An untracked file listed in exceptions fails even if tracked in foreign GIT_DIR."""
+    foreign = foreign_index(tmp_path)
+
+    untracked_doc(tree, tmp_path)
+
+    entry = LIST.replace(SUBJECT, "docs/a.md")
+    done = own(tree, entry, subject=None, env={"GIT_DIR": str(foreign.root / ".git")})
+    assert done.returncode == 1
+    assert (
+        "exceptions.yaml: entry 1 names `docs/a.md`, which is no file of the repository"
+        in done.stderr
+    )
+
+
+def test_own_entry_untracked_file_with_foreign_git_index_fails(tree, tmp_path):
+    """An untracked file listed in exceptions fails even if tracked in foreign GIT_INDEX_FILE."""
+    foreign = foreign_index(tmp_path)
+
+    untracked_doc(tree, tmp_path)
+
+    entry = LIST.replace(SUBJECT, "docs/a.md")
+    done = own(
+        tree,
+        entry,
+        subject=None,
+        env={"GIT_INDEX_FILE": str(foreign.root / ".git" / "index")},
+    )
+    assert done.returncode == 1
+    assert (
+        "exceptions.yaml: entry 1 names `docs/a.md`, which is no file of the repository"
+        in done.stderr
+    )
+
+
+def test_own_entry_tracked_file_with_foreign_git_dir_passes(tree, tmp_path):
+    """A tracked file in own tree passes even if foreign GIT_DIR does not track it."""
+    foreign = Tree(tmp_path / "foreign")
+    foreign.git("init", "-b", "main")
+
+    tree.root = tmp_path / "own"
+    tree.git("init", "-b", "main")
+    tree.write({RUFF: '[lint]\nselect = ["E"]\n', "docs/a.md": "# own tracked doc\n"})
+
+    entry = LIST.replace(SUBJECT, "docs/a.md")
+    done = own(tree, entry, subject=None, env={"GIT_DIR": str(foreign.root / ".git")})
+    assert done.returncode == 0, done.stderr
+    assert "0 accepted finding(s) and 1 exception(s)" in done.stdout
+
+
+def test_tree_git_init_ignores_inherited_git_dir(tmp_path, monkeypatch):
+    """Tree.git init creates fresh repo and preserves foreign HEAD and index when GIT_DIR is set."""
+    foreign = foreign_index(tmp_path)
+
+    head_bytes = (foreign.root / ".git" / "HEAD").read_bytes()
+    index_bytes = (foreign.root / ".git" / "index").read_bytes()
+
+    monkeypatch.setenv("GIT_DIR", str(foreign.root / ".git"))
+    fresh = Tree(tmp_path / "fresh")
+    fresh.git("init", "-b", "main")
+
+    assert (fresh.root / ".git").is_dir()
+    assert (foreign.root / ".git" / "HEAD").read_bytes() == head_bytes
+    assert (foreign.root / ".git" / "index").read_bytes() == index_bytes
 
 
 def test_own_entry_named_twice_fails_and_another_path_does_not(tree):

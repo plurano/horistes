@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import os
 import re
 import subprocess
 import sys
@@ -270,7 +269,7 @@ def _tracked_file(root: Path, name: str) -> bool:
             text=True,
             check=False,
             timeout=30,
-            env={**os.environ, "LC_ALL": "C"},
+            env=ciwf.git_env(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as err:
         raise ciwf.ReadError(f"{root}: {err}") from err

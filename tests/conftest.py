@@ -22,7 +22,11 @@ from urllib.parse import quote
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import ciwf
+
 ROOT = Path(__file__).resolve().parent.parent
+
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
 
 REUSABLE = f"""\
@@ -312,6 +316,8 @@ class Tree:
         return [call[5] for call in calls]
 
     def git(self, *args: str) -> str:
+        """Run git with fixture identity, isolated environment and a timeout."""
+        self.root.mkdir(parents=True, exist_ok=True)
         identity = [
             "-c",
             "user.name=fixture",
@@ -325,6 +331,8 @@ class Tree:
             capture_output=True,
             text=True,
             check=True,
+            timeout=30,
+            env=ciwf.git_env(),
         )
         return done.stdout.strip()
 
