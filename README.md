@@ -182,8 +182,10 @@ hashes.
   accepted findings and exceptions, the caller templates, the Scorecard
   service's rules, the runner labels, the relative Markdown links and their
   heading anchors (`tools/links.py`, no host asked), the tests and the licence
-  headers. The test run measures coverage and fails below a floor that only
-  goes up. Each coverage step reads `pyproject.toml` only, so a
+  headers. The test run measures coverage and fails below the floor
+  `fail_under` in `pyproject.toml` (94%), which only goes up;
+  `tests/test_coverage_floor.py` holds the floor and the coverage steps of
+  the `test` recipe. Each coverage step reads `pyproject.toml` only, so a
   `COVERAGE_RCFILE` in the environment cannot lower the floor, and the run
   first erases data an earlier run left behind.
 - The tests read the message of every commit between the base of the change
