@@ -26,12 +26,5 @@ engines:
       - "tests/test_examples.py"
       - "tests/test_exceptions.py"
       - "tests/test_merge_guard.py"
-  ruff:
-    # tools/examples.py:18 I001 import ordering — local ruff 0.16.10 passes,
-    # Codacy Ruff disagrees on try/except import block ordering despite
-    # usesConfigurationFile: true; version skew, not a rule gap
-    # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
-    exclude_paths:
-      - "tools/examples.py"
 exclude_paths:
   - ".workingdir/**"
