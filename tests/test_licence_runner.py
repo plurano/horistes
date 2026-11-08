@@ -25,10 +25,12 @@ README_RUNNER_SUBSTRING = "`runner` (Linux label"
 LICENCE_WORKFLOW = ".github/workflows/licence.yml"
 
 RUNNER_OS_PATTERN = re.compile(r"^runner\.os != '([A-Za-z]+)'$")
-ASSIGNMENT_PATTERN = re.compile(r'^\$[A-Za-z_]\w*\s*=\s*"[^"]*"$')
+ASSIGNMENT_PATTERN = re.compile(r'^\$([A-Za-z_]\w*)\s*=\s*"([^"]*)"$')
 # GitHub's form is `::error <parameters>::<message>`; the parameters are optional and the
 # message is not empty.
-ANNOTATION_PATTERN = re.compile(r'^Write-Output\s+"::error(?: [^"]*?)?::[^"]+"$')
+ANNOTATION_PATTERN = re.compile(r'^Write-Output\s+"::error(?: [^"]*?)?::([^"]+)"$')
+VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)\b(?!:)")
+RUNTIME_REF_PATTERN = re.compile(r"\$\{[^}]*\}|\$[A-Za-z0-9_:]+|\$[\$?]")
 
 
 def _check_job(job: dict) -> list[str]:
@@ -53,6 +55,42 @@ def _check_step(step: dict, idx: int) -> list[str]:
     if step.get("shell") != "pwsh":
         problems.append(f"step {STEP_NAME!r} shell is not 'pwsh' (got {step.get('shell')!r})")
     return problems
+
+
+def _expand(text: str, assigned: dict[str, str]) -> str:
+    """Replace each `$name` and `${name}` in text by its assigned value.
+
+    PowerShell names ignore case, so assigned is keyed by lower case; a name the script
+    never assigns expands to nothing. Runtime references such as `$env:RUNNER_OS` stay.
+    """
+    return VAR_REF_PATTERN.sub(
+        lambda m: assigned.get((m.group(1) or m.group(2)).lower(), ""),
+        text,
+    )
+
+
+def _literal_messages(lines: list[str]) -> list[str]:
+    """The message of each annotation, holding only the text the script writes itself.
+
+    Statements are read in order: an assignment records its value, expanded from earlier
+    assignments; an annotation message is expanded the same way, then every runtime
+    reference left in it is removed and the rest stripped.
+    """
+    assigned: dict[str, str] = {}
+    messages: list[str] = []
+    for line in lines:
+        assign_match = ASSIGNMENT_PATTERN.fullmatch(line)
+        if assign_match:
+            assigned[assign_match.group(1).lower()] = _expand(assign_match.group(2), assigned)
+            continue
+
+        annot_match = ANNOTATION_PATTERN.fullmatch(line)
+        if annot_match:
+            raw_msg = _expand(annot_match.group(1), assigned)
+            cleaned = RUNTIME_REF_PATTERN.sub("", raw_msg).strip()
+            messages.append(cleaned)
+
+    return messages
 
 
 def _check_script(step: dict) -> list[str]:
@@ -82,8 +120,14 @@ def _check_script(step: dict) -> list[str]:
         ):
             return [f"statement outside the allow-list: {line}"]
 
-    if not any(ANNOTATION_PATTERN.fullmatch(line) for line in effective_lines[:-1]):
+    messages = _literal_messages(effective_lines[:-1])
+    if not messages:
         return [f"step {STEP_NAME!r} run script writes no {REQUIRED_ANNOTATION!r} annotation"]
+
+    if any(not msg for msg in messages):
+        return [
+            f"step {STEP_NAME!r} annotation writes an empty message once its variables are expanded"
+        ]
 
     return []
 
@@ -233,6 +277,36 @@ def _mutate_annotation_malformed(doc: dict) -> None:
     )
 
 
+def _mutate_message_empty(doc: dict) -> None:
+    """Planted defect: the msg assignment value is an empty string."""
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = step["run"].replace(
+        (
+            '$msg   = "The licence step is a container action and needs a Linux runner.'
+            ' Got $env:RUNNER_OS."'
+        ),
+        '$msg   = ""',
+    )
+
+
+def _mutate_message_runtime_only(doc: dict) -> None:
+    """Planted defect: the msg assignment holds only a runtime reference."""
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = step["run"].replace(
+        (
+            '$msg   = "The licence step is a container action and needs a Linux runner.'
+            ' Got $env:RUNNER_OS."'
+        ),
+        '$msg   = "$env:RUNNER_OS"',
+    )
+
+
+def _mutate_annotation_unassigned_variable(doc: dict) -> None:
+    """Planted defect: the annotation reads an unassigned variable name."""
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = step["run"].replace("${msg}", "${MSG2}")
+
+
 def evaluate_runner_os_condition(condition: str, runner_os: str) -> bool:
     """Evaluate condition of the single form `runner.os != '<OS>'`."""
     expr = condition.strip().removeprefix("${{").removesuffix("}}").strip()
@@ -295,7 +369,52 @@ PLANTED_DEFECTS = [
     pytest.param(
         _mutate_annotation_malformed, "statement outside the allow-list", id="annotation-malformed"
     ),
+    pytest.param(_mutate_message_empty, "empty message", id="message-empty-assignment"),
+    pytest.param(
+        _mutate_message_runtime_only, "empty message", id="message-runtime-reference-only"
+    ),
+    pytest.param(
+        _mutate_annotation_unassigned_variable, "empty message", id="annotation-unassigned-variable"
+    ),
 ]
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        pytest.param(
+            [
+                '$title = "Wrong runner OS"',
+                (
+                    '$msg   = "The licence step is a container action and needs a Linux runner.'
+                    ' Got $env:RUNNER_OS."'
+                ),
+                'Write-Output "::error title=${title}::${msg}"',
+                "exit 1",
+            ],
+            ["The licence step is a container action and needs a Linux runner. Got ."],
+            id="workflow-form",
+        ),
+        pytest.param(
+            [
+                '$Msg = "Wrong runner OS"',
+                'Write-Output "::error::${msg}"',
+            ],
+            ["Wrong runner OS"],
+            id="case-difference",
+        ),
+        pytest.param(
+            [
+                'Write-Output "::error::m"',
+            ],
+            ["m"],
+            id="one-char-literal",
+        ),
+    ],
+)
+def test_literal_messages_boundaries(lines: list[str], expected: list[str]) -> None:
+    """Boundary test: _literal_messages extracts non-empty messages and expands variables."""
+    assert _literal_messages(lines) == expected
 
 
 @pytest.mark.parametrize(
