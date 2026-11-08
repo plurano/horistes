@@ -408,6 +408,20 @@ jobs:
               return None
 
 
+          def has_red_code_scanning(pull):
+              """Whether a code-scanning results check on the head is red."""
+              nodes = pull["latest"]["nodes"]
+              if not nodes:
+                  return False
+              suites = nodes[-1]["commit"]["checkSuites"]["nodes"]
+              for suite in newest_suites(suites).values():
+                  slug = (suite.get("app") or {}).get("slug") or ""
+                  scanning_app = "code-scanning" in slug or slug in ("github", "github-advanced-security")
+                  if scanning_app and suite.get("conclusion") in RED:
+                      return "code-scanning check failed"
+              return False
+
+
           def verdict(pull, repo, conf, now, replaced=frozenset()):
               """land, behind, or the reason the train leaves the pull request alone."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
@@ -435,6 +449,9 @@ jobs:
               settled = review_settle(pull, conf, now)
               if settled:
                   return settled
+              scanning = has_red_code_scanning(pull)
+              if scanning:
+                  return scanning
               if state in conf["accept"]:
                   return "land"
               if state == "BEHIND":

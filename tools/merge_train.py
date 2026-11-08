@@ -43,6 +43,7 @@ from train_rules import (
     check_release_off,
     check_release_parallel,
     drifted,
+    has_red_code_scanning,
     head_since,
     in_flight,
     is_red,
@@ -333,6 +334,10 @@ def advance(env, conf, repo, rows, notes):
     """Update the first pull request `updatable` names, arming it first where it says."""
     for pull, arming in updatable(repo, rows, notes, conf):
         if arming:
+            scanning = has_red_code_scanning(pull)
+            if scanning:
+                notes[pull["number"]] = "not armed: code-scanning check failed"
+                continue
             try:
                 arm(env, conf, pull)
             except UnsignedBotError:
@@ -698,11 +703,22 @@ def re_arm_drifted(env, conf, served, held, notes):
     """Re-arm an armed squash pull request whose headline drifted from its title."""
     for pull, _ in served:
         if pull["number"] not in held and drifted(pull, conf):
+            if has_red_code_scanning(pull):
+                notes[pull["number"]] = "not re-armed: code-scanning check failed"
+                continue
             graphql(env, DISARM, {"id": pull["id"]})
             arm(env, conf, pull)
             notes[pull["number"]] = "re-armed: title changed after arming"
             return f"re-armed #{pull['number']}"
     return None
+
+
+def disarm_red_scanning(env, rows, notes):
+    """Disarm auto-merge on any pull request with a red code-scanning check."""
+    for pull, _reason in rows:
+        if pull.get("autoMergeRequest") and has_red_code_scanning(pull):
+            graphql(env, DISARM, {"id": pull["id"]})
+            notes[pull["number"]] = "disarmed: code-scanning check failed"
 
 
 def land_clean(env, conf, repo, served, notes):
@@ -735,6 +751,7 @@ def run(env, conf, repo, now):
     notes = {pull["number"]: reason for pull, reason in rows}
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
+    disarm_red_scanning(env, rows, notes)
     lease = lander_lease(repo, now)
     served = serving_order(rows, conf)
     held = hold_for_security(env, repo, served, notes, conf)
