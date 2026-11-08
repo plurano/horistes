@@ -181,7 +181,8 @@ def key_bits(key):
     try:
         with key_pipe(key) as read_end:
             done = subprocess.run(
-                [openssl, "pkey", "-in", f"/dev/fd/{read_end}", "-noout", "-text_pub"],
+                ["openssl", "pkey", "-in", f"/dev/fd/{read_end}", "-noout", "-text_pub"],
+                executable=openssl,
                 capture_output=True,
                 pass_fds=(read_end,),
                 timeout=TIMEOUT,
@@ -942,7 +943,8 @@ def app_jwt(env, conf):
     try:
         with key_pipe(env["TRAIN_APP_KEY"]) as read_end:
             done = subprocess.run(
-                [openssl, "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
+                ["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
+                executable=openssl,
                 input=signing_input.encode(),
                 capture_output=True,
                 pass_fds=(read_end,),

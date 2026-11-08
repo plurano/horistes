@@ -2081,41 +2081,70 @@ def test_app_jwt_thread_runtime_error_raises_refused_error_and_leaks_no_fds(tmp_
     assert "thread creation failed" in msg or "RuntimeError" in msg
 
 
-def test_key_bits_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
-    """key_bits passes the path found by shutil.which to subprocess.run."""
-    train_mod = load_train(tmp_path, monkeypatch)
-    marker = tmp_path / "marker_key_bits"
+def patch_openssl_which(tmp_path, monkeypatch, train_mod, marker):
+    """Point shutil.which at a wrapper that touches marker and runs openssl; record each run.
+
+    Returns the wrapper path and the list of (argument list, executable) pairs.
+    """
     wrapper = tmp_path / "openssl_wrapper.sh"
     wrapper.write_text(f'#!/bin/sh\ntouch "{marker}"\nexec openssl "$@"\n', encoding="utf-8")
     wrapper.chmod(0o755)
-
     monkeypatch.setattr(
         train_mod.shutil,
         "which",
         lambda cmd: str(wrapper) if cmd == "openssl" else None,
     )
+    calls = []
+    real_run = train_mod.subprocess.run
+
+    def recording_run(cmd, *args, **kwargs):
+        """Record the argument list and the executable, then make the real call."""
+        calls.append((cmd, kwargs.get("executable")))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(train_mod.subprocess, "run", recording_run)
+    return str(wrapper), calls
+
+
+def run_app_jwt(train_mod):
+    """Sign a token with a fresh 2048-bit key and return it."""
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    conf = {"client_id": "test-client-id"}
+    return train_mod.app_jwt(env, conf)
+
+
+def test_key_bits_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
+    """key_bits runs the openssl that shutil.which found."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    marker = tmp_path / "marker_key_bits"
+    patch_openssl_which(tmp_path, monkeypatch, train_mod, marker)
     assert train_mod.key_bits(app_key(2048)[0]) == 2048
     assert marker.is_file()
 
 
 def test_app_jwt_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
-    """app_jwt passes the path found by shutil.which to subprocess.run."""
+    """app_jwt runs the openssl that shutil.which found."""
     train_mod = load_train(tmp_path, monkeypatch)
     marker = tmp_path / "marker_app_jwt"
-    wrapper = tmp_path / "openssl_wrapper.sh"
-    wrapper.write_text(f'#!/bin/sh\ntouch "{marker}"\nexec openssl "$@"\n', encoding="utf-8")
-    wrapper.chmod(0o755)
-
-    monkeypatch.setattr(
-        train_mod.shutil,
-        "which",
-        lambda cmd: str(wrapper) if cmd == "openssl" else None,
-    )
-    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
-    conf = {"client_id": "test-client-id"}
-    token = train_mod.app_jwt(env, conf)
-    assert len(token.split(".")) == 3
+    patch_openssl_which(tmp_path, monkeypatch, train_mod, marker)
+    assert len(run_app_jwt(train_mod).split(".")) == 3
     assert marker.is_file()
+
+
+def test_key_bits_passes_literal_openssl_and_executable_path(tmp_path, monkeypatch):
+    """key_bits passes the literal "openssl" first and the which path as executable."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
+    assert train_mod.key_bits(app_key(2048)[0]) == 2048
+    assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
+
+
+def test_app_jwt_passes_literal_openssl_and_executable_path(tmp_path, monkeypatch):
+    """app_jwt passes the literal "openssl" first and the which path as executable."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
+    assert len(run_app_jwt(train_mod).split(".")) == 3
+    assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
 
 
 def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):
