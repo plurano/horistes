@@ -352,8 +352,10 @@ def _result_problems(jobs: dict, key: str, doc: dict) -> list[str]:
         count = len(steps) if isinstance(steps, list) else "not a list of"
         return [
             *problems,
-            f"job `{RESULT}` has {count} steps; "
-            "a caller holds one step, or two when the first reports a draft",
+            (
+                f"job `{RESULT}` has {count} steps; "
+                "a caller holds one step, or two when the first reports a draft"
+            ),
         ]
     if len(steps) == 2:
         return problems + _draft_step_problems(steps[0], key) + _step_problems(steps[1], key)
