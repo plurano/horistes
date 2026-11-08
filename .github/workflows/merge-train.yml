@@ -416,7 +416,7 @@ jobs:
               suites = nodes[-1]["commit"]["checkSuites"]["nodes"]
               for suite in newest_suites(suites).values():
                   slug = (suite.get("app") or {}).get("slug") or ""
-                  if ("code-scanning" in slug or slug == "github") and suite.get("conclusion") in RED:
+                  if ("code-scanning" in slug or slug in ("github", "github-advanced-security")) and suite.get("conclusion") in RED:
                       return "code-scanning check failed"
               return False
 

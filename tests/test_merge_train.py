@@ -5028,3 +5028,50 @@ def test_without_code_scanning_hold_the_red_scan_pr_would_land(tmp_path):
     done, _ = train(tmp_path, forge, helper=mutant)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(1)]
+
+
+def test_github_advanced_security_app_holds_clean_pull(tmp_path):
+    """A failed suite from the github-advanced-security app holds a CLEAN pull."""
+    p = pull(
+        1,
+        "CLEAN",
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-advanced-security"),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "code-scanning check failed" in summary
+
+
+def test_armed_pr_disarmed_when_review_settle_hides_red_scan(tmp_path):
+    """An armed PR held by review settle is still disarmed when scanning is red."""
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    review_time = (NOW - timedelta(minutes=3)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        committedDate=head_time,
+        autoMergeRequest={"enabledAt": OLD},
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "COMMENTED",
+                "author": {"login": "coderabbit[bot]"},
+                "commit": {"oid": f"{1:040x}"},
+            }
+        ],
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-code-scanning"),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert disarmed(1) in forge.writes
+    assert "disarmed: code-scanning check failed" in summary

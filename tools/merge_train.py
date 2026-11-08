@@ -714,9 +714,9 @@ def re_arm_drifted(env, conf, served, held, notes):
 
 
 def disarm_red_scanning(env, rows, notes):
-    """Disarm auto-merge on any pull request held by a red code-scanning check."""
-    for pull, reason in rows:
-        if reason == "code-scanning check failed" and pull.get("autoMergeRequest"):
+    """Disarm auto-merge on any pull request with a red code-scanning check."""
+    for pull, _reason in rows:
+        if pull.get("autoMergeRequest") and has_red_code_scanning(pull):
             graphql(env, DISARM, {"id": pull["id"]})
             notes[pull["number"]] = "disarmed: code-scanning check failed"
 

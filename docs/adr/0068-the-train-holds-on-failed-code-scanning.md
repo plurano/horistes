@@ -29,8 +29,9 @@ permitting the train to merge a commit with open security alerts.
 
 - Add a dedicated code-scanning check in `train_rules.py`: `has_red_code_scanning(pull)`.
 - Inspect the head commit's `checkSuites` nodes from the GraphQL query data.
-- Check suites from the code-scanning app (slug containing `"code-scanning"` or slug
-  equal to `"github"`) are evaluated using `newest_suites()` deduplication.
+- Check suites from the code-scanning app (slug containing `"code-scanning"`, or slug
+  equal to `"github"` or `"github-advanced-security"`) are evaluated using
+  `newest_suites()` deduplication.
 - If any newest suite from a code-scanning app carries a conclusion in `RED`
   (`FAILURE`, `TIMED_OUT`, `CANCELLED`, `ACTION_REQUIRED`, `STARTUP_FAILURE`),
   `has_red_code_scanning()` returns a hold reason (`"code-scanning check failed"`).
@@ -42,8 +43,9 @@ permitting the train to merge a commit with open security alerts.
   whose code-scanning results are red, and `re_arm_drifted()` refuses to re-arm
   a retitled pull request in the same state.
 - `disarm_red_scanning()` in `tools/merge_train.py` disarms any pull request whose
-  verdict is a code-scanning hold and whose `autoMergeRequest` is set, preventing
-  the forge's native auto-merge from merging it while the scan is red.
+  `autoMergeRequest` is set and whose head carries a red code-scanning check,
+  checked independently of the verdict so that a pull request held by another
+  reason (such as review settle) is still disarmed.
 
 ## Consequences
 
