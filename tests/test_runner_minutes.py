@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import sys
 
+import pytest
 from conftest import ROOT, Tree
 
 sys.path.insert(0, str(ROOT / "tools"))
@@ -37,6 +38,27 @@ jobs:
     timeout-minutes: 15
     steps:
       - run: echo fast
+"""
+NO_TIMEOUT_YAML = """\
+name: Untimed
+on: push
+jobs:
+  untimed:
+    name: Untimed
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo untimed
+"""
+ZERO_TIMEOUT_YAML = """\
+name: Zero
+on: push
+jobs:
+  zero:
+    name: Zero
+    runs-on: ubuntu-24.04
+    timeout-minutes: 0
+    steps:
+      - run: echo zero
 """
 
 
@@ -141,6 +163,19 @@ def test_calculate_percentile_95():
     assert 407.0 <= p95_skewed <= 408.5
 
 
+# --- Unit Tests: Workflow Evaluation ---
+
+
+def test_evaluate_workflow_zero_timeout_warns():
+    """Planted defect: timeout 0 is read as a 0 s budget and fails."""
+    ev = runners.evaluate_workflow(
+        {"name": "X", "path": ".github/workflows/x.yml", "timeout_minutes": 0},
+        [540.0],
+    )
+    assert ev.severity == "warn"
+    assert ev.finding == "no timeout-minutes declared"
+
+
 # --- Integration Tests with Mocked Forge Responses ---
 
 
@@ -194,6 +229,47 @@ def test_generous_timeout_warns(tree: Tree):
         answers=answers,
         workflow_yaml=GENEROUS_YAML,
         workflow_file=".github/workflows/fast.yml",
+    )
+    assert done_strict.returncode == 1, done_strict.stdout
+
+
+@pytest.mark.parametrize(
+    ("workflow_yaml", "workflow_file"),
+    [
+        pytest.param(NO_TIMEOUT_YAML, "untimed.yml", id="key-absent"),
+        pytest.param(ZERO_TIMEOUT_YAML, "zero.yml", id="key-zero"),
+    ],
+)
+def test_untimed_workflow_warns_not_fails(tree: Tree, workflow_yaml: str, workflow_file: str):
+    """Planted defect: a job with no usable timeout-minutes gives a false FAIL.
+
+    Regression for the CodeRabbit item on PR 127: with no timeout the
+    budget is 0 s, so any measured run would exceed it. The check must
+    warn "no timeout-minutes declared" instead, and --strict turns that
+    warning into exit 1.
+    """
+    runs = [_forge_run(1, "2026-11-08T01:00:00Z", "2026-11-08T01:09:00Z")]
+    answers = make_answers(workflow_file, runs)
+    path = f".github/workflows/{workflow_file}"
+    done = run_tool(
+        tree,
+        "check",
+        answers=answers,
+        workflow_yaml=workflow_yaml,
+        workflow_file=path,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert f"WARN: {workflow_file}: no timeout-minutes declared" in done.stdout
+    assert "FAIL:" not in done.stderr
+
+    done_strict = run_tool(
+        tree,
+        "check",
+        "--strict",
+        answers=answers,
+        workflow_yaml=workflow_yaml,
+        workflow_file=path,
     )
     assert done_strict.returncode == 1, done_strict.stdout
 
