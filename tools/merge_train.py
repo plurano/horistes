@@ -9,13 +9,16 @@ RUNNER_TEMP. The header of the workflow describes what a run does.
 """
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -73,6 +76,11 @@ MAX_PAGES = 20
 JWT_SECONDS = 540
 MAX_RELEASES = 256
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+# NIST SP 800-57 Part 1: 112-bit security is 2048-bit RSA; OpenSSF Best Practices crypto_keylength.
+MIN_KEY_BITS = 2048
+# The cap bounds the input; the writer thread fills the pipe while openssl reads,
+# so the pipe's capacity does not matter.
+MAX_KEY_CHARS = 16384
 WRITE_RIGHTS = {
     "actions": "read",
     "contents": "write",
@@ -113,6 +121,122 @@ class InvalidSettingError(Exception):
     """A setting outside its allowed values."""
 
 
+def write_key(write_end, key):
+    """Write an app key to the write end of an os.pipe and close it."""
+    try:
+        pipe = os.fdopen(write_end, "w")
+    except OSError:
+        os.close(write_end)
+        return
+    try:
+        pipe.write(key)
+    except OSError:
+        # BrokenPipeError when openssl exits without reading all of it ends the write.
+        # Handled in caller: openssl's exit status reports the short key.
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
+@contextlib.contextmanager
+def key_pipe(key):
+    """Stream a key into an os.pipe and yield the read end file descriptor.
+
+    Exactly one writer thread per call runs daemonized while openssl reads.
+    The writer thread fills the pipe while openssl reads, so the pipe's capacity
+    does not matter.
+    """
+    read_end, write_end = os.pipe()
+    writer = threading.Thread(
+        target=write_key,
+        args=(write_end, key),
+        daemon=True,
+    )
+    try:
+        writer.start()
+    except RuntimeError as err:
+        os.close(read_end)
+        os.close(write_end)
+        raise OSError(0, f"failed to start key writer thread: {err}") from err
+    try:
+        yield read_end
+    finally:
+        os.close(read_end)
+        writer.join(TIMEOUT)
+
+
+def os_failure(err):
+    """Format an OSError as its exception type and description."""
+    return (
+        f"{type(err).__name__}: {err.strerror}" if err.strerror else f"{type(err).__name__}: {err}"
+    )
+
+
+def key_bits(key):
+    """The bit length of an RSA private key, read through a pipe via openssl pkey."""
+    openssl = shutil.which("openssl")
+    if not openssl:
+        raise InvalidSettingError("openssl is not on the runner: the app key cannot be verified")
+    try:
+        with key_pipe(key) as read_end:
+            done = subprocess.run(
+                ["openssl", "pkey", "-in", f"/dev/fd/{read_end}", "-noout", "-text_pub"],
+                executable=openssl,
+                capture_output=True,
+                pass_fds=(read_end,),
+                timeout=TIMEOUT,
+                check=False,
+                text=True,
+            )
+    except subprocess.TimeoutExpired as err:
+        raise InvalidSettingError(
+            f"openssl timed out after {TIMEOUT} seconds reading the app key; "
+            f"at least {MIN_KEY_BITS} bits are required"
+        ) from err
+    except OSError as err:
+        failure = os_failure(err)
+        raise InvalidSettingError(
+            f"openssl failed reading the app key ({failure}); "
+            f"at least {MIN_KEY_BITS} bits are required"
+        ) from err
+    if done.returncode != 0 or not done.stdout:
+        return None
+    lines = done.stdout.splitlines()
+    if not any(line.startswith("Modulus:") for line in lines) or any(
+        "PSS parameter" in line for line in lines
+    ):
+        raise InvalidSettingError(
+            f"the app key must be an RSA key (PKCS#1 v1.5, RS256); "
+            f"at least {MIN_KEY_BITS} bits are required"
+        )
+    match = re.search(r"Public-Key:\s*\((\d+)\s*bit\)", done.stdout)
+    return int(match.group(1)) if match else None
+
+
+def check_app_key(key):
+    """Refuse an app key that is empty, too long, unreadable, not RSA or under MIN_KEY_BITS."""
+    if "PRIVATE KEY-----" not in key:
+        raise InvalidSettingError(
+            "the app key is empty or no PEM key: the caller passes no secret, "
+            "or the job runs outside the environment that holds it"
+        )
+    if len(key) > MAX_KEY_CHARS:
+        raise InvalidSettingError(
+            f"the app key is longer than {MAX_KEY_CHARS} characters: "
+            f"at most {MAX_KEY_CHARS} are allowed"
+        )
+    bits = key_bits(key)
+    if bits is None:
+        raise InvalidSettingError(
+            f"the app key could not be read by openssl; at least {MIN_KEY_BITS} bits are required"
+        )
+    if bits < MIN_KEY_BITS:
+        raise InvalidSettingError(
+            f"the app key has {bits} bits; at least {MIN_KEY_BITS} are required"
+        )
+
+
 def settings(env):
     """The inputs of the workflow, each checked against an allow-list."""
     switch = env["TRAIN_SWITCH"]
@@ -129,11 +253,7 @@ def settings(env):
         raise InvalidSettingError(f"min_age_days is {age!r}, not a whole number from 0 to 30")
     if not env.get("TRAIN_APP_CLIENT_ID", "").strip():
         raise InvalidSettingError("app_client_id is empty")
-    if "PRIVATE KEY-----" not in env.get("TRAIN_APP_KEY", ""):
-        raise InvalidSettingError(
-            "the app key is empty or no PEM key: the caller passes no secret, "
-            "or the job runs outside the environment that holds it"
-        )
+    check_app_key(env.get("TRAIN_APP_KEY", ""))
     release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
     parallel = check_release_parallel(env["TRAIN_RELEASE_MAX_PARALLEL"], InvalidSettingError)
     return {
@@ -820,20 +940,24 @@ def app_jwt(env, conf):
     claims = {"iat": now - 60, "exp": now + JWT_SECONDS, "iss": conf["client_id"]}
     head = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
     signing_input = f"{head}.{b64url(json.dumps(claims).encode())}"
-    read_end, write_end = os.pipe()
-    with os.fdopen(write_end, "w") as pipe:
-        pipe.write(env["TRAIN_APP_KEY"])
     try:
-        done = subprocess.run(
-            [openssl, "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
-            input=signing_input.encode(),
-            capture_output=True,
-            pass_fds=(read_end,),
-            timeout=TIMEOUT,
-            check=False,
-        )
-    finally:
-        os.close(read_end)
+        with key_pipe(env["TRAIN_APP_KEY"]) as read_end:
+            done = subprocess.run(
+                ["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
+                executable=openssl,
+                input=signing_input.encode(),
+                capture_output=True,
+                pass_fds=(read_end,),
+                timeout=TIMEOUT,
+                check=False,
+            )
+    except subprocess.TimeoutExpired as err:
+        raise RefusedError(
+            f"openssl timed out after {TIMEOUT} seconds signing the app's JWT"
+        ) from err
+    except OSError as err:
+        failure = os_failure(err)
+        raise RefusedError(f"openssl failed signing the app's JWT ({failure})") from err
     if done.returncode != 0 or not done.stdout:
         raise RefusedError(f"openssl could not sign the app's JWT (exit {done.returncode})")
     return f"{signing_input}.{b64url(done.stdout)}"
