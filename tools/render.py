@@ -68,8 +68,10 @@ RESULT = "result"
 RESULT_KEYS = ("if", "name", "needs", "permissions", "runs-on", "steps", "timeout-minutes")
 STEP_KEYS = ("if", "name", "run", "shell")
 ECHO = re.compile(r'echo "[^"$`\\]*"')
+DRAFT_ECHO = re.compile(r'echo "::error title=[^"$`\\]+?::[^"$`\\]+"')
 GATING = {"pull_request", "pull_request_target", "merge_group"}
 LONGEST_MINUTES = 10
+DRAFT_IF = "github.event_name != 'pull_request' || github.event.pull_request.draft == false"
 SAMPLE = {
     "RunnerTag": "ubuntu-26.04",
     "Shared": {
@@ -263,6 +265,29 @@ def _secret_problems(job: dict, called: dict, path: str) -> list[str]:
     return problems
 
 
+def _is_draft_handling(job: dict, doc: dict) -> bool:
+    """Whether the caller handles drafts: call job has `if` or job `result` has two steps."""
+    result = doc.get("jobs", {}).get(RESULT) if isinstance(doc, dict) else None
+    steps = result.get("steps") if isinstance(result, dict) else None
+    return "if" in job or (isinstance(steps, list) and len(steps) == 2)
+
+
+def _trigger_problems(doc: dict) -> list[str]:
+    """What is missing from the triggers of a draft-handling caller."""
+    triggers = ciwf.triggers(doc)
+    if "pull_request" not in triggers:
+        return []
+    settings = triggers["pull_request"]
+    types = settings.get("types") if isinstance(settings, dict) else None
+    types_list = types if isinstance(types, list) else []
+    problems = []
+    if "ready_for_review" not in types_list:
+        problems.append("on.pull_request.types does not contain `ready_for_review`")
+    if "converted_to_draft" not in types_list:
+        problems.append("on.pull_request.types does not contain `converted_to_draft`")
+    return problems
+
+
 def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
     """What is wrong with the one job of a rendered caller."""
     call = CALL.fullmatch(str(job.get("uses", "")))
@@ -273,6 +298,11 @@ def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
         problems.append(f"the job calls {call['repository']}, not the shared repository's field")
     if call["ref"] != SAMPLE["Shared"]["Commit"]:
         problems.append("the called workflow is not named by the commit field alone")
+    if _is_draft_handling(job, doc):
+        if "if" not in job:
+            problems.append(f"the call job has no `if: {DRAFT_IF}`")
+        elif job["if"] != DRAFT_IF:
+            problems.append(f"the call job has `if: {job['if']}`, not `{DRAFT_IF}`")
     path = call["path"]
     called = _called(root, path)
     if called is None:
@@ -280,6 +310,31 @@ def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
     problems += _with_problems(job, called, path, _public_inputs(root, path))
     problems += _grant_problems(job, doc, called, path)
     problems += _secret_problems(job, called, path)
+    return problems
+
+
+def _draft_step_problems(step: object, key: str) -> list[str]:
+    """What keeps the draft report step of job `result` from reporting a skipped draft."""
+    if not isinstance(step, dict) or sorted(step) != sorted(STEP_KEYS):
+        return [
+            f"the draft report step of job `{RESULT}` has keys other than {', '.join(STEP_KEYS)}"
+        ]
+    problems = []
+    if step["if"] != f"needs.{key}.result == 'skipped'":
+        problems.append(
+            f"the draft report step of job `{RESULT}` does not run on "
+            f"`needs.{key}.result == 'skipped'`"
+        )
+    if step["shell"] != "bash":
+        problems.append(f"the draft report step of job `{RESULT}` does not run in bash")
+    lines = str(step["run"]).strip().split("\n")
+    run_lines = lines[:-1]
+    if not run_lines or not DRAFT_ECHO.fullmatch(run_lines[0]):
+        problems.append(f"the draft report step of job `{RESULT}` prints no `::error` annotation")
+    if lines[-1] != "exit 1" or not all(ECHO.fullmatch(line) for line in run_lines):
+        problems.append(
+            f"the draft report step of job `{RESULT}` does more than print a line and `exit 1`"
+        )
     return problems
 
 
@@ -323,8 +378,22 @@ def _result_problems(jobs: dict, key: str, doc: dict) -> list[str]:
     if type(minutes) is not int or not 1 <= minutes <= LONGEST_MINUTES:
         problems.append(f"job `{RESULT}` has no timeout of 1 to {LONGEST_MINUTES} minutes")
     steps = result["steps"]
-    if not isinstance(steps, list) or len(steps) != 1:
-        return [*problems, f"job `{RESULT}` has not exactly one step"]
+    if not isinstance(steps, list) or len(steps) not in (1, 2):
+        count = len(steps) if isinstance(steps, list) else "not a list of"
+        return [
+            *problems,
+            (
+                f"job `{RESULT}` has {count} steps; "
+                "a caller holds one step, or two when the first reports a draft"
+            ),
+        ]
+    draft_handling = _is_draft_handling(jobs[key], doc)
+    if draft_handling:
+        problems += _trigger_problems(doc)
+    if len(steps) == 2:
+        return problems + _draft_step_problems(steps[0], key) + _step_problems(steps[1], key)
+    if draft_handling:
+        problems.append(f"job `{RESULT}` has no draft report step")
     return problems + _step_problems(steps[0], key)
 
 
@@ -359,6 +428,7 @@ def _unnamed(source: str, root: Path) -> list[str]:
 
 
 def check(root: Path) -> int:
+    """Check that each caller template renders into a valid caller of a workflow kept here."""
     folder = root / TEMPLATES
     names = sorted(path for path in folder.glob(f"*{SUFFIX}")) if folder.is_dir() else []
     if not names:
@@ -389,6 +459,7 @@ def check(root: Path) -> int:
 
 
 def _render(template: Path, context: Path) -> int:
+    """Render a caller template using values from a context file."""
     try:
         values = tomllib.loads(context.read_text(encoding="utf-8"))
         text = render(template.read_text(encoding="utf-8"), values, str(template))
@@ -400,6 +471,7 @@ def _render(template: Path, context: Path) -> int:
 
 
 def main() -> int:
+    """Parse arguments and execute render or check commands."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("command", choices=("render", "check"))
     parser.add_argument("--root", type=Path, default=Path("."))
