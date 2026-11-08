@@ -124,11 +124,14 @@ check-examples: tools
 # into its own temporary directory so concurrent runs cannot collide or erase
 # each other's data. Each coverage step reads pyproject.toml only, so an
 # inherited COVERAGE_RCFILE or a stray .coveragerc cannot set the floor.
+# The run clears PYTHONOPTIMIZE, which would strip the asserts of tools/, and
+# PYTEST_ADDOPTS, whose options can override the warning filters of
+# pyproject.toml.
 # The last step compares the unrounded total with the floor.
 test: tools
 	data=$$(mktemp -d) && \
 	trap 'rm -rf "$$data"' EXIT && \
-	ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
+	PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
 		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" \
 		$(BIN)/python -X dev -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest && \
 	$(BIN)/python -B -m coverage combine --rcfile=pyproject.toml --data-file="$$data/.coverage" && \

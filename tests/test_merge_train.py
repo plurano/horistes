@@ -18,6 +18,7 @@ import email.message
 import errno
 import functools
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -964,13 +965,8 @@ def checkout_problems(doc: dict) -> list[str]:
     ]
 
 
-def test_call_http_error_message_closed(tmp_path, monkeypatch):
-    """call closes HTTPError on the error message path."""
-    merge_train = load_train(tmp_path, monkeypatch)
-
-    err = urllib.error.HTTPError(
-        "https://api.github.test/call", 403, "Forbidden", {}, io.BytesIO(b"refused message")
-    )
+def _raising_opener(err: urllib.error.HTTPError):
+    """Stand-in opener raising an HTTPError."""
 
     class StubOpener:
         """Stand-in opener raising an HTTPError."""
@@ -979,11 +975,114 @@ def test_call_http_error_message_closed(tmp_path, monkeypatch):
             """Raise the designated HTTPError."""
             raise err
 
-    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: StubOpener())
+    return StubOpener()
+
+
+def test_call_http_error_message_closed(tmp_path, monkeypatch):
+    """call closes HTTPError on the error message path."""
+    merge_train = load_train(tmp_path, monkeypatch)
+
+    err = urllib.error.HTTPError(
+        "https://api.github.test/call", 403, "Forbidden", {}, io.BytesIO(b"refused message")
+    )
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(err))
     with pytest.raises(merge_train.RefusedError) as caught:
         merge_train.call("https://api.github.test/call")
     assert caught.value.__cause__ is err
     assert "refused message" in str(caught.value)
+    assert err.closed
+
+
+class _UnreadableBody(io.BytesIO):
+    """A response body whose read raises the error it is given."""
+
+    def __init__(self, failure: Exception):
+        super().__init__(b"")
+        self.failure = failure
+
+    def read(self, *args, **kwargs):
+        """Raise the given error instead of reading."""
+        raise self.failure
+
+
+class _RecordingBody(io.BytesIO):
+    """A response body that records how many bytes each read asked for."""
+
+    def __init__(self, initial: bytes):
+        super().__init__(initial)
+        self.asked: list[int | None] = []
+
+    def read(self, amt=None):
+        """Record the size asked for, then read."""
+        self.asked.append(amt)
+        return super().read(amt)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("disk read error"), http.client.IncompleteRead(b"")],
+    ids=["oserror", "incomplete-read"],
+)
+def test_call_http_error_unreadable_body(tmp_path, monkeypatch, failure):
+    """Negative: a body that cannot be read still gives a RefusedError with the status.
+
+    The message says the body was unreadable, the HTTPError is its cause, and it is closed.
+    """
+    merge_train = load_train(tmp_path, monkeypatch)
+
+    err = urllib.error.HTTPError(
+        "https://api.github.test/call", 502, "Bad Gateway", {}, _UnreadableBody(failure)
+    )
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(err))
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.call("https://api.github.test/call")
+    assert caught.value.__cause__ is err
+    assert "HTTP 502" in str(caught.value)
+    assert "body unreadable" in str(caught.value)
+    assert err.closed
+
+
+def test_call_http_error_invalid_utf8_body(tmp_path, monkeypatch):
+    """Negative: a body that is not UTF-8 is decoded with replacement characters, then closed."""
+    merge_train = load_train(tmp_path, monkeypatch)
+
+    err = urllib.error.HTTPError(
+        "https://api.github.test/call", 500, "Internal Error", {}, io.BytesIO(b"\xffbad")
+    )
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(err))
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.call("https://api.github.test/call")
+    assert caught.value.__cause__ is err
+    assert str(caught.value).endswith("HTTP 500 �bad")
+    assert err.closed
+
+
+@pytest.mark.parametrize("size", [499, 500, 501])
+def test_call_http_error_body_boundary_truncation(tmp_path, monkeypatch, size):
+    """Boundary: the message keeps at most ERROR_TEXT characters of the body."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    assert merge_train.ERROR_TEXT == 500
+
+    err = urllib.error.HTTPError(
+        "https://api.github.test/call", 500, "Error", {}, io.BytesIO(b"a" * size)
+    )
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(err))
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.call("https://api.github.test/call")
+    assert str(caught.value).endswith("HTTP 500 " + "a" * min(size, merge_train.ERROR_TEXT))
+    assert err.closed
+
+
+def test_call_http_error_read_bounded(tmp_path, monkeypatch):
+    """Boundary: the body is read once, at most 4 * ERROR_TEXT bytes, never to its end."""
+    merge_train = load_train(tmp_path, monkeypatch)
+
+    body = _RecordingBody(b"short response")
+    err = urllib.error.HTTPError("https://api.github.test/call", 500, "Error", {}, body)
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(err))
+    with pytest.raises(merge_train.RefusedError):
+        merge_train.call("https://api.github.test/call")
+    assert body.asked == [4 * merge_train.ERROR_TEXT]
     assert err.closed
 
 
@@ -996,15 +1095,7 @@ def test_call_http_error_redirect_closed(tmp_path, monkeypatch):
     err = urllib.error.HTTPError(
         "https://api.github.test/call", 302, "Found", message, io.BytesIO(b"")
     )
-
-    class StubOpener:
-        """Stand-in opener raising an HTTPError."""
-
-        def open(self, request, timeout=None):
-            """Raise the designated HTTPError."""
-            raise err
-
-    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: StubOpener())
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(err))
     res = merge_train.call("https://api.github.test/call", redirect=False)
     assert res == {"location": "https://api.github.test/redirected"}
     assert err.closed
