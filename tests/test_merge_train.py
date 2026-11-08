@@ -14,11 +14,14 @@ UNKNOWN merge state and between read retries are shortened.
 from __future__ import annotations
 
 import base64
+import errno
+import fcntl
 import functools
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1833,6 +1836,43 @@ def test_non_rsa_app_key_is_refused(tmp_path, kind):
     assert (forge.minted, forge.where) == ([], [])
 
 
+def leaked(body: str, out: str) -> list[str]:
+    """Return every 12-character window of body found in out."""
+    if len(body) < 12:
+        return []
+    return [body[i : i + 12] for i in range(len(body) - 12 + 1) if body[i : i + 12] in out]
+
+
+def test_leaked_finds_sixteen_character_fragment():
+    """A 16-character fragment of the key body embedded in other text is detected."""
+    body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out = f"prefix_{body[4:20]}_suffix"
+    found = leaked(body, out)
+    assert len(found) == 5
+    assert found[0] == body[4:16]
+
+
+def test_leaked_finds_twelve_character_fragment():
+    """A 12-character fragment of the key body embedded in other text is detected."""
+    body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out = f"prefix_{body[10:22]}_suffix"
+    assert leaked(body, out) == [body[10:22]]
+
+
+def test_leaked_returns_empty_when_no_fragment_present():
+    """Text containing no fragment of the key body yields an empty list."""
+    body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out = "completely_different_text_without_matching_chunks"
+    assert leaked(body, out) == []
+
+
+def test_leaked_returns_empty_for_eleven_character_boundary_fragment():
+    """An 11-character fragment is below the 12-character window threshold and returns empty."""
+    body = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    out = f"prefix_{body[4:15]}_suffix"
+    assert leaked(body, out) == []
+
+
 def test_refused_app_key_is_never_printed(tmp_path):
     """The private key material never appears in the output of a refused run."""
     forge = Forge(repository(pull(1, "CLEAN")))
@@ -1841,8 +1881,7 @@ def test_refused_app_key_is_never_printed(tmp_path):
     assert done.returncode == 3, done.stdout + done.stderr
     out = (done.stdout + done.stderr + summary).replace("\n", "")
     body = "".join(key_pem.splitlines()[1:-1])
-    for start in range(0, len(body) - 24 + 1, 12):
-        assert body[start : start + 24] not in out
+    assert leaked(body, out) == []
     assert "PRIVATE KEY" not in out
 
 
@@ -1884,6 +1923,175 @@ def test_app_key_at_maximum_length_boundary_is_accepted(tmp_path):
     done, _ = train(tmp_path, forge, app_key=padded)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]
+
+
+def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
+    """key_bits reads an RSA key longer than the 4096-byte pipe buffer without hanging."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    real_pipe = train_mod.os.pipe
+
+    def small_pipe():
+        r, w = real_pipe()
+        fcntl.fcntl(r, fcntl.F_SETPIPE_SZ, 4096)
+        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)
+        return r, w
+
+    monkeypatch.setattr(train_mod.os, "pipe", small_pipe)
+    key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
+    result = {}
+
+    def worker():
+        try:
+            result["bits"] = train_mod.key_bits(key)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(20)
+    assert not thread.is_alive()
+    assert result.get("bits") == 2048
+
+
+def test_key_longer_than_pipe_capacity_app_jwt(tmp_path, monkeypatch):
+    """app_jwt signs a JWT using a key longer than the 4096-byte pipe buffer without hanging."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    real_pipe = train_mod.os.pipe
+
+    def small_pipe():
+        r, w = real_pipe()
+        fcntl.fcntl(r, fcntl.F_SETPIPE_SZ, 4096)
+        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)
+        return r, w
+
+    monkeypatch.setattr(train_mod.os, "pipe", small_pipe)
+    key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
+    env = {"TRAIN_APP_KEY": key}
+    conf = {"client_id": "test-client-id"}
+    result = {}
+
+    def worker():
+        try:
+            result["jwt"] = train_mod.app_jwt(env, conf)
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(20)
+    assert not thread.is_alive()
+    token = result.get("jwt")
+    assert isinstance(token, str)
+    assert len(token.split(".")) == 3
+
+
+def test_key_bits_pipe_oserror_raises_invalid_setting_error(tmp_path, monkeypatch):
+    """An OSError from os.pipe in key_bits raises InvalidSettingError."""
+    train_mod = load_train(tmp_path, monkeypatch)
+
+    def mock_pipe():
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
+    with pytest.raises(train_mod.InvalidSettingError) as exc_info:
+        train_mod.key_bits(app_key(2048)[0])
+    msg = str(exc_info.value)
+    assert "Too many open files" in msg or "EMFILE" in msg
+    assert f"at least {train_mod.MIN_KEY_BITS} bits are required" in msg
+
+
+def test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch):
+    """An OSError from os.pipe in app_jwt raises RefusedError."""
+    train_mod = load_train(tmp_path, monkeypatch)
+
+    def mock_pipe():
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    conf = {"client_id": "test-client-id"}
+    with pytest.raises(train_mod.RefusedError) as exc_info:
+        train_mod.app_jwt(env, conf)
+    msg = str(exc_info.value)
+    assert "Too many open files" in msg or "EMFILE" in msg
+
+
+def test_key_bits_thread_runtime_error_raises_invalid_setting_error_and_leaks_no_fds(
+    tmp_path, monkeypatch
+):
+    """A RuntimeError in thread start in key_bits raises InvalidSettingError and leaks no fds."""
+    train_mod = load_train(tmp_path, monkeypatch)
+
+    class FailingThread(train_mod.threading.Thread):
+        def start(self):
+            raise RuntimeError("thread creation failed")
+
+    monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
+    fds_before = len(os.listdir("/proc/self/fd"))
+    with pytest.raises(train_mod.InvalidSettingError) as exc_info:
+        train_mod.key_bits(app_key(2048)[0])
+    fds_after = len(os.listdir("/proc/self/fd"))
+    assert fds_after == fds_before
+    msg = str(exc_info.value)
+    assert "thread creation failed" in msg or "RuntimeError" in msg
+    assert f"at least {train_mod.MIN_KEY_BITS} bits are required" in msg
+
+
+def test_app_jwt_thread_runtime_error_raises_refused_error_and_leaks_no_fds(tmp_path, monkeypatch):
+    """A RuntimeError in thread start in app_jwt raises RefusedError and leaks no fds."""
+    train_mod = load_train(tmp_path, monkeypatch)
+
+    class FailingThread(train_mod.threading.Thread):
+        def start(self):
+            raise RuntimeError("thread creation failed")
+
+    monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    conf = {"client_id": "test-client-id"}
+    fds_before = len(os.listdir("/proc/self/fd"))
+    with pytest.raises(train_mod.RefusedError) as exc_info:
+        train_mod.app_jwt(env, conf)
+    fds_after = len(os.listdir("/proc/self/fd"))
+    assert fds_after == fds_before
+    msg = str(exc_info.value)
+    assert "thread creation failed" in msg or "RuntimeError" in msg
+
+
+def test_key_bits_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
+    """key_bits passes the path found by shutil.which to subprocess.run."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    marker = tmp_path / "marker_key_bits"
+    wrapper = tmp_path / "openssl_wrapper.sh"
+    wrapper.write_text(f'#!/bin/sh\ntouch "{marker}"\nexec openssl "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    monkeypatch.setattr(
+        train_mod.shutil,
+        "which",
+        lambda cmd: str(wrapper) if cmd == "openssl" else None,
+    )
+    assert train_mod.key_bits(app_key(2048)[0]) == 2048
+    assert marker.is_file()
+
+
+def test_app_jwt_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
+    """app_jwt passes the path found by shutil.which to subprocess.run."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    marker = tmp_path / "marker_app_jwt"
+    wrapper = tmp_path / "openssl_wrapper.sh"
+    wrapper.write_text(f'#!/bin/sh\ntouch "{marker}"\nexec openssl "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    monkeypatch.setattr(
+        train_mod.shutil,
+        "which",
+        lambda cmd: str(wrapper) if cmd == "openssl" else None,
+    )
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    conf = {"client_id": "test-client-id"}
+    token = train_mod.app_jwt(env, conf)
+    assert len(token.split(".")) == 3
+    assert marker.is_file()
 
 
 def key_on_disk(text: str) -> list[str]:

@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -77,7 +78,8 @@ MAX_RELEASES = 256
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 # NIST SP 800-57 Part 1: 112-bit security is 2048-bit RSA; OpenSSF Best Practices crypto_keylength.
 MIN_KEY_BITS = 2048
-# A 16384-bit RSA PEM is about 12.7 KB; the cap keeps the pipe write under the 64 KiB buffer.
+# The cap bounds the input; the writer thread fills the pipe while openssl reads,
+# so the pipe's capacity does not matter.
 MAX_KEY_CHARS = 16384
 WRITE_RIGHTS = {
     "actions": "read",
@@ -119,23 +121,49 @@ class InvalidSettingError(Exception):
     """A setting outside its allowed values."""
 
 
+def write_key(write_end, key):
+    """Write an app key to the write end of an os.pipe and close it."""
+    try:
+        pipe = os.fdopen(write_end, "w")
+    except OSError:
+        os.close(write_end)
+        return
+    try:
+        pipe.write(key)
+    except OSError:
+        # BrokenPipeError when openssl exits without reading all of it ends the write.
+        # Handled in caller: openssl's exit status reports the short key.
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
 @contextlib.contextmanager
 def key_pipe(key):
-    """Stream a key into an os.pipe and yield the read end file descriptor."""
+    """Stream a key into an os.pipe and yield the read end file descriptor.
+
+    Exactly one writer thread per call runs daemonized while openssl reads.
+    The writer thread fills the pipe while openssl reads, so the pipe's capacity
+    does not matter.
+    """
     read_end, write_end = os.pipe()
+    writer = threading.Thread(
+        target=write_key,
+        args=(write_end, key),
+        daemon=True,
+    )
     try:
-        pipe = None
-        try:
-            pipe = os.fdopen(write_end, "w")
-            pipe.write(key)
-        finally:
-            if pipe is not None:
-                pipe.close()
-            else:
-                os.close(write_end)
+        writer.start()
+    except RuntimeError as err:
+        os.close(read_end)
+        os.close(write_end)
+        raise OSError(0, f"failed to start key writer thread: {err}") from err
+    try:
         yield read_end
     finally:
         os.close(read_end)
+        writer.join(TIMEOUT)
 
 
 def key_bits(key):
@@ -146,7 +174,7 @@ def key_bits(key):
     try:
         with key_pipe(key) as read_end:
             done = subprocess.run(
-                ["openssl", "pkey", "-in", f"/dev/fd/{read_end}", "-noout", "-text_pub"],
+                [openssl, "pkey", "-in", f"/dev/fd/{read_end}", "-noout", "-text_pub"],
                 capture_output=True,
                 pass_fds=(read_end,),
                 timeout=TIMEOUT,
@@ -156,6 +184,16 @@ def key_bits(key):
     except subprocess.TimeoutExpired as err:
         raise InvalidSettingError(
             f"openssl timed out after {TIMEOUT} seconds reading the app key; "
+            f"at least {MIN_KEY_BITS} bits are required"
+        ) from err
+    except OSError as err:
+        failure = (
+            f"{type(err).__name__}: {err.strerror}"
+            if err.strerror
+            else f"{type(err).__name__}: {err}"
+        )
+        raise InvalidSettingError(
+            f"openssl failed reading the app key ({failure}); "
             f"at least {MIN_KEY_BITS} bits are required"
         ) from err
     if done.returncode != 0 or not done.stdout:
@@ -901,7 +939,7 @@ def app_jwt(env, conf):
     try:
         with key_pipe(env["TRAIN_APP_KEY"]) as read_end:
             done = subprocess.run(
-                ["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
+                [openssl, "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
                 input=signing_input.encode(),
                 capture_output=True,
                 pass_fds=(read_end,),
@@ -912,6 +950,13 @@ def app_jwt(env, conf):
         raise RefusedError(
             f"openssl timed out after {TIMEOUT} seconds signing the app's JWT"
         ) from err
+    except OSError as err:
+        failure = (
+            f"{type(err).__name__}: {err.strerror}"
+            if err.strerror
+            else f"{type(err).__name__}: {err}"
+        )
+        raise RefusedError(f"openssl failed signing the app's JWT ({failure})") from err
     if done.returncode != 0 or not done.stdout:
         raise RefusedError(f"openssl could not sign the app's JWT (exit {done.returncode})")
     return f"{signing_input}.{b64url(done.stdout)}"
