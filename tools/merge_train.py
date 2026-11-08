@@ -43,6 +43,7 @@ from train_rules import (
     check_release_off,
     check_release_parallel,
     drifted,
+    has_red_code_scanning,
     head_since,
     in_flight,
     is_red,
@@ -333,6 +334,10 @@ def advance(env, conf, repo, rows, notes):
     """Update the first pull request `updatable` names, arming it first where it says."""
     for pull, arming in updatable(repo, rows, notes, conf):
         if arming:
+            scanning = has_red_code_scanning(pull)
+            if scanning:
+                notes[pull["number"]] = "not armed: code-scanning check failed"
+                continue
             try:
                 arm(env, conf, pull)
             except UnsignedBotError:
@@ -698,6 +703,9 @@ def re_arm_drifted(env, conf, served, held, notes):
     """Re-arm an armed squash pull request whose headline drifted from its title."""
     for pull, _ in served:
         if pull["number"] not in held and drifted(pull, conf):
+            if has_red_code_scanning(pull):
+                notes[pull["number"]] = "not re-armed: code-scanning check failed"
+                continue
             graphql(env, DISARM, {"id": pull["id"]})
             arm(env, conf, pull)
             notes[pull["number"]] = "re-armed: title changed after arming"

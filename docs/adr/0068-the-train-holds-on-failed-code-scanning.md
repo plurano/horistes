@@ -38,6 +38,9 @@ permitting the train to merge a commit with open security alerts.
   and before the accept/behind state checks.
 - The hold applies to both `CLEAN` and `BEHIND` pull requests, preventing landing
   when code-scanning results are failing.
+- The sweep's `advance()` refuses to arm auto-merge on a `BEHIND` pull request
+  whose code-scanning results are red, and `re_arm_drifted()` refuses to re-arm
+  a retitled pull request in the same state.
 
 ## Consequences
 
@@ -50,5 +53,7 @@ checks continue landing normally.
 
 Tests in `tests/test_merge_train.py` verify that a failed code-scanning suite holds a
 `CLEAN` pull request, a successful code-scanning check allows landing, pull requests
-without code-scanning suites land unchanged, and a newer successful code-scanning suite
-supersedes an older failed run.
+without code-scanning suites land unchanged, a newer successful code-scanning suite
+supersedes an older failed run, an armed pull request with a red code-scanning check is
+not merged, a `BEHIND` pull request is not armed when code scanning is red, and a
+retitled armed pull request is not re-armed when code scanning is red.

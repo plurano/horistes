@@ -4952,3 +4952,59 @@ def test_verdict_direct_code_scanning_hold(tmp_path):
     assert rules.has_red_code_scanning(p_pass) is False
     assert rules.verdict(p_pass, repo, conf, NOW) == "land"
 
+
+def test_planted_armed_pr_with_red_code_scanning_is_not_merged(tmp_path):
+    """An armed PR whose CodeQL results check turns red is not merged (sveltesentio#512)."""
+    armed_clean = pull(
+        1,
+        "CLEAN",
+        autoMergeRequest={"enabledAt": OLD},
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-code-scanning"),
+        ],
+    )
+    forge = Forge(repository(armed_clean))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "code-scanning check failed" in summary
+    assert "| #1 | CLEAN | code-scanning check failed |" in summary
+
+
+def test_behind_pr_not_armed_when_code_scanning_is_red(tmp_path):
+    """A BEHIND PR with a failed code-scanning check is not armed or updated."""
+    p = pull(
+        1,
+        "BEHIND",
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-code-scanning"),
+        ],
+    )
+    forge = Forge(repository(p, pull(2, "BEHIND")))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert armed(1) not in forge.writes
+    assert "| #1 | BEHIND | code-scanning check failed |" in summary
+    assert armed(2) in forge.writes
+
+
+def test_retitled_armed_pr_not_re_armed_when_code_scanning_is_red(tmp_path):
+    """A retitled armed PR with a failed code-scanning check is not re-armed."""
+    retitled = pull(
+        1,
+        "BLOCKED",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-code-scanning"),
+        ],
+    )
+    forge = Forge(repository(retitled))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert disarmed(1) not in forge.writes
+    assert armed(1) not in forge.writes
+    assert "not re-armed: code-scanning check failed" in summary
