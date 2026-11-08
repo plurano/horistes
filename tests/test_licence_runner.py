@@ -61,8 +61,10 @@ def _check_script(step: dict) -> list[str]:
 
     if not effective_lines or effective_lines[-1] != REQUIRED_EXIT:
         return [
-            f"step {STEP_NAME!r} run script does not end the step with a nonzero exit"
-            f" (the last statement must be {REQUIRED_EXIT!r})"
+            (
+                f"step {STEP_NAME!r} run script does not end the step with a nonzero exit"
+                f" (the last statement must be {REQUIRED_EXIT!r})"
+            )
         ]
 
     for line in effective_lines[:-1]:
