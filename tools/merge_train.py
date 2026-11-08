@@ -166,6 +166,13 @@ def key_pipe(key):
         writer.join(TIMEOUT)
 
 
+def os_failure(err):
+    """Format an OSError as its exception type and description."""
+    return (
+        f"{type(err).__name__}: {err.strerror}" if err.strerror else f"{type(err).__name__}: {err}"
+    )
+
+
 def key_bits(key):
     """The bit length of an RSA private key, read through a pipe via openssl pkey."""
     openssl = shutil.which("openssl")
@@ -187,11 +194,7 @@ def key_bits(key):
             f"at least {MIN_KEY_BITS} bits are required"
         ) from err
     except OSError as err:
-        failure = (
-            f"{type(err).__name__}: {err.strerror}"
-            if err.strerror
-            else f"{type(err).__name__}: {err}"
-        )
+        failure = os_failure(err)
         raise InvalidSettingError(
             f"openssl failed reading the app key ({failure}); "
             f"at least {MIN_KEY_BITS} bits are required"
@@ -951,11 +954,7 @@ def app_jwt(env, conf):
             f"openssl timed out after {TIMEOUT} seconds signing the app's JWT"
         ) from err
     except OSError as err:
-        failure = (
-            f"{type(err).__name__}: {err.strerror}"
-            if err.strerror
-            else f"{type(err).__name__}: {err}"
-        )
+        failure = os_failure(err)
         raise RefusedError(f"openssl failed signing the app's JWT ({failure})") from err
     if done.returncode != 0 or not done.stdout:
         raise RefusedError(f"openssl could not sign the app's JWT (exit {done.returncode})")

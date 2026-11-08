@@ -1925,22 +1925,29 @@ def test_app_key_at_maximum_length_boundary_is_accepted(tmp_path):
     assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]
 
 
-def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
-    """key_bits reads an RSA key longer than the 4096-byte pipe buffer without hanging."""
-    train_mod = load_train(tmp_path, monkeypatch)
+def shrink_pipes(train_mod, monkeypatch):
+    """Set the capacity of both ends of train_mod.os.pipe to 4096 bytes."""
     real_pipe = train_mod.os.pipe
 
     def small_pipe():
+        """Create a pipe with 4096-byte capacity on each end."""
         r, w = real_pipe()
         fcntl.fcntl(r, fcntl.F_SETPIPE_SZ, 4096)
         fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)
         return r, w
 
     monkeypatch.setattr(train_mod.os, "pipe", small_pipe)
+
+
+def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
+    """key_bits reads an RSA key longer than the 4096-byte pipe buffer without hanging."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    shrink_pipes(train_mod, monkeypatch)
     key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
     result = {}
 
     def worker():
+        """Read key_bits in a background thread."""
         try:
             result["bits"] = train_mod.key_bits(key)
         except Exception as exc:
@@ -1950,27 +1957,20 @@ def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
     thread.start()
     thread.join(20)
     assert not thread.is_alive()
-    assert result.get("bits") == 2048
+    assert result == {"bits": 2048}
 
 
 def test_key_longer_than_pipe_capacity_app_jwt(tmp_path, monkeypatch):
     """app_jwt signs a JWT using a key longer than the 4096-byte pipe buffer without hanging."""
     train_mod = load_train(tmp_path, monkeypatch)
-    real_pipe = train_mod.os.pipe
-
-    def small_pipe():
-        r, w = real_pipe()
-        fcntl.fcntl(r, fcntl.F_SETPIPE_SZ, 4096)
-        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)
-        return r, w
-
-    monkeypatch.setattr(train_mod.os, "pipe", small_pipe)
+    shrink_pipes(train_mod, monkeypatch)
     key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
     env = {"TRAIN_APP_KEY": key}
     conf = {"client_id": "test-client-id"}
     result = {}
 
     def worker():
+        """Sign app_jwt in a background thread."""
         try:
             result["jwt"] = train_mod.app_jwt(env, conf)
         except Exception as exc:
@@ -1980,6 +1980,7 @@ def test_key_longer_than_pipe_capacity_app_jwt(tmp_path, monkeypatch):
     thread.start()
     thread.join(20)
     assert not thread.is_alive()
+    assert "error" not in result, result
     token = result.get("jwt")
     assert isinstance(token, str)
     assert len(token.split(".")) == 3
@@ -2014,6 +2015,14 @@ def test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch):
         train_mod.app_jwt(env, conf)
     msg = str(exc_info.value)
     assert "Too many open files" in msg or "EMFILE" in msg
+
+
+def test_os_failure_names_the_type_and_description_only(tmp_path, monkeypatch):
+    """os_failure gives the type and strerror without errno or file name, else the plain text."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    missing = FileNotFoundError(errno.ENOENT, "No such file or directory", "key.pem")
+    assert train_mod.os_failure(missing) == "FileNotFoundError: No such file or directory"
+    assert train_mod.os_failure(OSError("plain text")) == "OSError: plain text"
 
 
 def test_key_bits_thread_runtime_error_raises_invalid_setting_error_and_leaks_no_fds(
@@ -2092,6 +2101,33 @@ def test_app_jwt_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
     token = train_mod.app_jwt(env, conf)
     assert len(token.split(".")) == 3
     assert marker.is_file()
+
+
+def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):
+    """key_pipe waits for the background writer thread to terminate before returning."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    script = tmp_path / "failing_openssl.sh"
+    script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    monkeypatch.setattr(
+        train_mod.shutil,
+        "which",
+        lambda cmd: str(script) if cmd == "openssl" else None,
+    )
+
+    real_write_key = train_mod.write_key
+    event = threading.Event()
+
+    def wrapped_write_key(write_end, key):
+        """Sleep two seconds before calling real write_key and signaling completion."""
+        time.sleep(2)
+        real_write_key(write_end, key)
+        event.set()
+
+    monkeypatch.setattr(train_mod, "write_key", wrapped_write_key)
+    assert train_mod.key_bits(app_key(2048)[0]) is None
+    assert event.is_set()
 
 
 def key_on_disk(text: str) -> list[str]:
