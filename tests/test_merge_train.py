@@ -4680,13 +4680,14 @@ def test_planted_review_settle_allows_after_reply(tmp_path):
 
 
 def test_planted_review_settle_skips_bot_pr(tmp_path):
-    """A bot PR (dependency prefix) lands despite unaddressed reviews."""
+    """A bot PR (dependency prefix + bot author) lands despite unaddressed reviews."""
     head_time = (NOW - timedelta(minutes=10)).isoformat()
     review_time = (NOW - timedelta(minutes=3)).isoformat()
     p = pull(
         1,
         "CLEAN",
         headRefName="renovate/something",
+        author={"login": "renovate[bot]"},
         createdAt=OLD,
         committedDate=head_time,
         reviews=[
@@ -4744,6 +4745,82 @@ def test_push_after_review_allows_landing(tmp_path):
                 "submittedAt": review_time,
                 "state": "COMMENTED",
                 "author": {"login": "coderabbit[bot]"},
+                "commit": {"oid": f"{1:040x}"},
+            }
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_person_on_dependency_branch_is_held(tmp_path):
+    """A person-authored PR on a dependency-prefix branch is not exempt."""
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    review_time = (NOW - timedelta(minutes=3)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/something",
+        author={"login": "person"},
+        createdAt=OLD,
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "COMMENTED",
+                "author": {"login": "coderabbit[bot]"},
+                "commit": {"oid": f"{1:040x}"},
+            }
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review settle" in summary
+
+
+def test_approved_review_does_not_hold(tmp_path):
+    """An APPROVED review on the current head does not hold landing."""
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    review_time = (NOW - timedelta(minutes=3)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "APPROVED",
+                "author": {"login": "reviewer"},
+                "commit": {"oid": f"{1:040x}"},
+            }
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_pending_review_does_not_crash(tmp_path):
+    """A review without submittedAt (PENDING state) does not crash or hold."""
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": None,
+                "state": "PENDING",
+                "author": {"login": "reviewer"},
                 "commit": {"oid": f"{1:040x}"},
             }
         ],

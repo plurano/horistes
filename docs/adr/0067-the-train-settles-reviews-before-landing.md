@@ -29,30 +29,14 @@ external session dependencies or requiring extra status checks.
 
 - Add a settle rule in `train_rules.py`: `review_settle(pull, conf, now)`.
 - The GraphQL pull request query fetches `author { login }` and `reviews(last: 20)` on
-  the pull request node:
-  ```graphql
-  reviews(last: 20) {
-    nodes {
-      submittedAt
-      state
-      author { login }
-      commit { oid }
-    }
-  }
-  ```
-- `review_settle()` inspects submitted reviews on the pull request's current head commit
-  (`commit.oid == headRefOid`):
-  1. Bot pull requests whose branch matches `conf["dependency"]` are exempt and continue
-     using their existing minimum-age check ([ADR-0046](0046-the-merge-train-counts-the-minimum-age-from-the-pull-request.md)).
-  2. Reviews authored by the pull request author (`author.login == pr_author`) count as
-     author replies.
-  3. Reviews authored by external accounts (`author.login != pr_author`) are considered.
-     If no external reviews exist on the current head, the pull request does not wait.
-  4. When an external review on the head is newer than the author's last response
-     (`settle_at = max(push_at, reply_at)` where `push_at` is the head commit's
-     `committedDate` and `reply_at` is the latest review by the PR author on the same head),
-     `review_settle()` returns a hold reason:
-     `f"review settle: review at {newest_ext:%H:%M:%SZ} on head, last response at {settle_at:%H:%M:%SZ}"`.
+  the pull request node.
+- `review_settle()` inspects submitted reviews on the pull request's current head commit.
+  Bot pull requests (dependency prefix branch AND `[bot]` author suffix) are exempt and
+  continue using their existing minimum-age check
+  ([ADR-0046](0046-the-merge-train-counts-the-minimum-age-from-the-pull-request.md)).
+  Only `CHANGES_REQUESTED` and `COMMENTED` review states hold; approved, dismissed, and
+  pending reviews are ignored.  When a blocking external review on the head is newer than
+  the author's last push or review reply, `review_settle()` returns a hold reason.
 - `verdict()` integrates `review_settle()` immediately after `too_young()` and before
   the accept/behind state checks.
 - The mechanism is self-contained within the verdict calculation rather than implemented as
@@ -62,10 +46,12 @@ external session dependencies or requiring extra status checks.
 ## Consequences
 
 Person-authored pull requests at `CLEAN` or `UNSTABLE` wait for the author to respond to
-every review event on the current head (by pushing a new commit or posting a review comment)
-before landing. Once the author replies or pushes a fix, the train resumes landing them normally.
-Bot-authored dependency updates remain unaffected.
+every blocking review on the current head (by pushing a new commit or posting a review)
+before landing. Approved and dismissed reviews do not hold. A person-authored pull request
+on a dependency-prefix branch is not exempt. Once the author responds, the train resumes
+landing normally. Bot-authored dependency updates remain unaffected.
 
 Tests in `tests/test_merge_train.py` verify that an unaddressed review holds a person-authored
 pull request, an author reply on the same head unblocks landing, bot pull requests bypass review
-settle, and the GraphQL query fetches the required author and review fields.
+settle, approved reviews do not hold, pending reviews do not crash the sweep, a person on a
+dependency-prefix branch is held, and the GraphQL query fetches the required fields.
