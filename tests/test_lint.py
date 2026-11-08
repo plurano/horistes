@@ -72,11 +72,13 @@ def actionlint_sha_line() -> str:
 
 
 def actionlint(tree):
+    """Run actionlint against the workflow file in the tree."""
     return subprocess.run(
         [*external("ACTIONLINT", "actionlint"), str(tree.root / WORKFLOW)],
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
 
@@ -90,7 +92,7 @@ def zizmor(tree):
         "pedantic",
         str(tree.root),
     ]
-    return subprocess.run(command, capture_output=True, text=True, check=False)
+    return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
 
 
 def rooted(cmd):
@@ -106,6 +108,7 @@ def rooted(cmd):
 
 
 def yamllint(tree, *args):
+    """Run yamllint in strict mode against the given targets in the tree."""
     cmd = rooted(external("YAMLLINT", "yamllint"))
     target = list(args) if args else ["."]
     return subprocess.run(
@@ -114,10 +117,12 @@ def yamllint(tree, *args):
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
 
 def ruff(tree, *args):
+    """Run ruff against the planted tree."""
     cmd = rooted(external("RUFF", "ruff"))
     subcommand = list(args) if args else ["check", "."]
     return subprocess.run(
@@ -126,6 +131,7 @@ def ruff(tree, *args):
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
 
@@ -199,6 +205,7 @@ def test_actionlint_sha256_verification_refuses_planted_wrong_digest(tmp_path):
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     assert passed.returncode == 0, passed.stdout + passed.stderr
 
@@ -212,6 +219,7 @@ def test_actionlint_sha256_verification_refuses_planted_wrong_digest(tmp_path):
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     assert failed.returncode != 0
 
@@ -314,11 +322,41 @@ def test_ruff_config_flag_overrides_nested_and_dot_configs(tree):
     assert "ISC004" in fails_dot.stdout
 
 
+def _recipe(makefile: str, target: str) -> list[str]:
+    """The recipe lines of target (lines starting with a tab after the line starting <target>:)."""
+    recipe: list[str] = []
+    found = False
+    for line in makefile.splitlines():
+        if not found:
+            if line.startswith(f"{target}:"):
+                found = True
+        else:
+            if line.startswith("\t"):
+                recipe.append(line.removeprefix("\t"))
+            else:
+                break
+    return recipe
+
+
 def test_makefile_lint_python_recipe_passes_config_flag():
     """Makefile lint-python recipe passes --config ruff.toml to ruff check and format."""
     content = (ROOT / "Makefile").read_text(encoding="utf-8")
-    assert "\t$(BIN)/ruff check --config ruff.toml tools tests fuzz\n" in content
-    assert "\t$(BIN)/ruff format --check --config ruff.toml tools tests fuzz\n" in content
+    recipe = _recipe(content, "lint-python")
+    assert "$(BIN)/ruff check --config ruff.toml tools tests fuzz" in recipe
+    assert "$(BIN)/ruff format --check --config ruff.toml tools tests fuzz" in recipe
+    verify_prereqs: list[str] = []
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("verify:"):
+            curr = line
+            idx = i
+            verify_prereqs.extend(curr.split(":", 1)[1].removesuffix("\\").split())
+            while curr.endswith("\\") and idx + 1 < len(lines):
+                idx += 1
+                curr = lines[idx]
+                verify_prereqs.extend(curr.removesuffix("\\").split())
+            break
+    assert "lint-python" in verify_prereqs
     for line in content.splitlines():
         if "$(BIN)/ruff check" in line or "$(BIN)/ruff format" in line:
             assert "--config ruff.toml" in line

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 
@@ -21,7 +22,17 @@ TODAY = "2026-10-11"
 
 @pytest.fixture(autouse=True)
 def _default_ruff_toml(tree):
-    """Write minimal ruff.toml so tests without explicit ruff config pass."""
+    """Write minimal ruff.toml and track written files in a fixture git repository."""
+    tree.git("init", "-b", "main")
+    orig_write = tree.write
+
+    def write_and_track(files: dict[str, str]):
+        orig_write(files)
+        if files and (tree.root / ".git").exists():
+            tree.git("add", "--", *files.keys())
+        return tree
+
+    tree.write = write_and_track
     tree.write({RUFF: '[lint]\nselect = ["E"]\n'})
 
 
@@ -42,6 +53,18 @@ def test_missing_ruff_toml_exits_3(tree):
     done = tree.tool("exceptions.py", "check", "--today", TODAY)
     assert done.returncode == 3
     assert str(tree.root / RUFF) in done.stderr
+
+
+def test_root_that_is_no_git_repository_exits_3(tree):
+    """A root that is not a git repository causes check to exit with code 3."""
+    shutil.rmtree(tree.root / ".git")
+    (tree.root / "hook.py").write_text("# hook\n")
+    (tree.root / RUFF).write_text(
+        '[lint.per-file-ignores]\n"hook.py" = ["ISC001"] # expires 2026-12-31: test\n'
+    )
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 3
+    assert "not a git repository" in done.stderr
 
 
 def test_entry_with_reason_and_a_day_ahead_passes(tree):
@@ -166,6 +189,25 @@ def test_own_entry_for_a_file_that_is_gone_fails(tree):
     done = own(tree, LIST, subject=None)
     assert done.returncode == 1
     assert "is no file of the repository" in done.stderr
+
+
+def test_own_entry_path_naming_untracked_file_fails(tree):
+    """An own-list path naming an untracked file fails."""
+    (tree.root / "untracked.json").write_text("{}\n")
+    entry = (
+        "---\nexceptions:\n"
+        "  - rule: required-check-is-reported\n"
+        "    path: untracked.json\n"
+        "    issue: owner/engine#1212\n"
+        "    reason: untracked file test\n"
+        '    expires: "2026-12-31"\n'
+    )
+    done = own(tree, entry, subject=None)
+    assert done.returncode == 1
+    assert (
+        "exceptions.yaml: entry 1 names `untracked.json`, which is no file of the repository"
+        in done.stderr
+    )
 
 
 def test_own_entry_named_twice_fails_and_another_path_does_not(tree):
@@ -315,6 +357,18 @@ def test_actionlint_settings_without_paths_pass(tree):
     assert "0 accepted" in done.stdout
 
 
+def test_actionlint_config_path_naming_untracked_file_fails(tree):
+    """An actionlint config path naming an untracked file fails."""
+    (tree.root / "untracked.yml").write_text("# untracked\n")
+    text = (
+        "---\npaths:\n  untracked.yml:\n    ignore:\n"
+        "      - 'property \"x\" is not defined' # expires 2026-12-31: test\n"
+    )
+    done = linted(tree, text)
+    assert done.returncode == 1
+    assert ".github/actionlint.yaml: untracked.yml is no one file of the repository" in done.stderr
+
+
 RUFF = "ruff.toml"
 HOOK = ".config/agent/hooks/block_evasion.py"
 RUFF_IGNORE = (
@@ -362,6 +416,34 @@ def test_ruff_key_naming_pattern_or_no_file_fails(tree):
     done_missing = ruffed(tree, missing)
     assert done_missing.returncode == 1
     assert "is no one file" in done_missing.stderr
+
+
+def test_ruff_key_naming_untracked_file_fails(tree):
+    """A per-file-ignores key naming a file that is not tracked by git fails."""
+    (tree.root / "untracked.py").write_text("# untracked\n")
+    text = (
+        "[lint.per-file-ignores]\n"
+        '"untracked.py" = ["ISC001"] # expires 2026-12-31: untracked file\n'
+    )
+    done = ruffed(tree, text)
+    assert done.returncode == 1
+    assert "ruff.toml: untracked.py is no one file of the repository" in done.stderr
+
+
+def test_ruff_key_naming_untracked_file_passes_after_git_add(tree):
+    """A per-file-ignores key naming a file passes once tracked by git."""
+    (tree.root / "untracked.py").write_text("# untracked\n")
+    text = (
+        "[lint.per-file-ignores]\n"
+        '"untracked.py" = ["ISC001"] # expires 2026-12-31: untracked file\n'
+    )
+    done_fail = ruffed(tree, text)
+    assert done_fail.returncode == 1
+    assert "is no one file of the repository" in done_fail.stderr
+    tree.git("add", "untracked.py")
+    done_pass = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done_pass.returncode == 0, done_pass.stderr
+    assert "1 accepted" in done_pass.stdout
 
 
 def test_ruff_non_empty_lint_ignore_fails(tree):

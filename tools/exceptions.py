@@ -51,7 +51,9 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -257,9 +259,28 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
 
 
 def _tracked_file(root: Path, name: str) -> bool:
-    """Whether a name is a plain relative path to a file below the root."""
+    """Whether a name is a plain relative path to a file below root and tracked by git."""
     path = Path(name)
-    return not path.is_absolute() and ".." not in path.parts and (root / path).is_file()
+    if path.is_absolute() or ".." in path.parts or not (root / path).is_file():
+        return False
+    command = ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", f":(literal){name}"]
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as err:
+        raise ciwf.ReadError(f"{root}: {err}") from err
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1 and "did not match" in proc.stderr:
+        return False
+    message = proc.stderr.strip() or f"git exited with {proc.returncode}"
+    raise ciwf.ReadError(f"{root}: {message}")
 
 
 def _own(root: Path, today: datetime.date) -> tuple[list[str], int]:
