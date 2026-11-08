@@ -7,9 +7,9 @@ engines:
     # tools/examples.py:97 B603/B607 subprocess.run — static argument lists only
     # tests/test_examples.py:7 B404 import subprocess — test helper, static args
     # tests/test_examples.py:23 B603 subprocess.run — test helper, static args
-    # tests/test_exceptions.py:7 B404 import subprocess — test helper, static args
-    # tests/test_exceptions.py:302 B603 subprocess.run — test helper, static args
-    # tests/test_exceptions.py:594 B603 subprocess.run — test helper, static args
+    # tests/test_exceptions.py:8 B404 import subprocess — test helper, static args
+    # tests/test_exceptions.py:387 B603 subprocess.run — test helper, static args
+    # tests/test_exceptions.py:679 B603 subprocess.run — test helper, static args
     # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
     exclude_paths:
       - "tools/examples.py"
@@ -18,12 +18,12 @@ engines:
   opengrep:
     # tests/test_examples.py:23 dangerous-subprocess-use-audit — test helper,
     # subprocess.run with static argument list, not user input
-    # tests/test_exceptions.py:302 dangerous-subprocess-use-audit — test helper,
+    # tests/test_exceptions.py:387 dangerous-subprocess-use-audit — test helper,
     # subprocess.run with static argument list, not user input
-    # tests/test_exceptions.py:594 dangerous-subprocess-use-audit — test helper,
+    # tests/test_exceptions.py:679 dangerous-subprocess-use-audit — test helper,
     # subprocess.run with static argument list, not user input
     # tests/test_lint.py:95 dangerous-subprocess-use-audit — test helper, runs the
-    # zizmor command the Makefile sets (tests/conftest.py:337 external) with static
+    # zizmor command the Makefile sets (tests/conftest.py:345 external) with static
     # flags and the test's own temporary tree; entered 2026-11-08, category B,
     # expires 2026-11-11
     # tests/test_merge_guard.py:21 dangerous-subprocess-use-audit — test mock,
