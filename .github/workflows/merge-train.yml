@@ -358,6 +358,44 @@ jobs:
               return frozenset(found)
 
 
+          def review_settle(pull, conf, now):
+              """Why a person-authored PR waits for its reviews to settle, or None.
+
+              A submitted review on the current head that is newer than the author's
+              last push (head commit date) or reply (author review on the same head)
+              holds the PR from landing. Bot PRs (dependency prefix) skip this check.
+              """
+              if pull["headRefName"].startswith(conf["dependency"]):
+                  return None
+              head_oid = pull["headRefOid"]
+              nodes = pull["latest"]["nodes"]
+              if not nodes:
+                  return None
+              push_at = datetime.fromisoformat(nodes[-1]["commit"]["committedDate"])
+              pr_author = (pull.get("author") or {}).get("login") or ""
+              reviews = pull.get("reviews", {}).get("nodes") or []
+              # Reviews on the current head only
+              on_head = [r for r in reviews if (r.get("commit") or {}).get("oid") == head_oid]
+              # External reviews (not by PR author)
+              external = [r for r in on_head if (r.get("author") or {}).get("login") != pr_author]
+              if not external:
+                  return None
+              newest_ext = max(datetime.fromisoformat(r["submittedAt"]) for r in external)
+              # Author's replies (reviews by the PR author on same head)
+              author_reviews = [r for r in on_head if (r.get("author") or {}).get("login") == pr_author]
+              reply_at = max(
+                  (datetime.fromisoformat(r["submittedAt"]) for r in author_reviews),
+                  default=datetime.min.replace(tzinfo=push_at.tzinfo) if push_at.tzinfo else datetime.min,
+              )
+              settle_at = max(push_at, reply_at)
+              if newest_ext > settle_at:
+                  return (
+                      f"review settle: review at {newest_ext:%H:%M:%SZ} on head, "
+                      f"last response at {settle_at:%H:%M:%SZ}"
+                  )
+              return None
+
+
           def verdict(pull, repo, conf, now, replaced=frozenset()):
               """land, behind, or the reason the train leaves the pull request alone."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
@@ -382,6 +420,9 @@ jobs:
               young = too_young(pull, labels, conf, now)
               if young:
                   return young
+              settled = review_settle(pull, conf, now)
+              if settled:
+                  return settled
               if state in conf["accept"]:
                   return "land"
               if state == "BEHIND":
@@ -676,8 +717,17 @@ jobs:
                 nodes {
                   number id title body createdAt isDraft isCrossRepository baseRefName headRefName headRefOid
                   mergeStateStatus isInMergeQueue
+                  author { login }
                   autoMergeRequest { enabledAt commitHeadline mergeMethod }
                   labels(first: 50) { nodes { name } }
+                  reviews(last: 20) {
+                    nodes {
+                      submittedAt
+                      state
+                      author { login }
+                      commit { oid }
+                    }
+                  }
                   refreshes: timelineItems(itemTypes: [UNLABELED_EVENT], last: 5) {
                     nodes { ... on UnlabeledEvent { createdAt label { name } } }
                   }

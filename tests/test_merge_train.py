@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -160,6 +161,16 @@ def pull(number: int, state: str, **fields) -> dict:
     suites = fields.pop("suites", ["SUCCESS"])
     labels = fields.pop("labels", ())
     created_at = fields.get("createdAt", OLD)
+    raw_author = fields.pop("author", _ABSENT)
+    if raw_author is _ABSENT:
+        pr_author = {"login": f"author-{number}"}
+    elif isinstance(raw_author, dict) and "login" in raw_author and "email" not in raw_author:
+        pr_author = raw_author
+    else:
+        fields["author"] = raw_author
+        pr_author = {"login": f"author-{number}"}
+    reviews = fields.pop("reviews", [])
+    review_nodes = reviews if isinstance(reviews, dict) else {"nodes": reviews}
     commit_node = build_commit_node(number, suites, **fields)
     node = {
         "number": number,
@@ -167,6 +178,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "title": fields.pop("title", f"change {number}"),
         "body": fields.pop("body", ""),
         "createdAt": created_at,
+        "author": pr_author,
         "isDraft": False,
         "isCrossRepository": False,
         "baseRefName": "main",
@@ -175,6 +187,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "mergeStateStatus": state,
         "autoMergeRequest": None,
         "labels": {"nodes": [{"name": name} for name in labels]},
+        "reviews": review_nodes,
         "refreshes": {"nodes": []},
         "latest": {"nodes": [{"commit": commit_node}]},
     }
@@ -1480,7 +1493,13 @@ def test_script_passes_the_python_linter(tmp_path, name):
     path = tmp_path / f"{name}.py"
     path.write_text(script() if name == "train" else module(), encoding="utf-8")
     ruff = ROOT / ".venv/bin/ruff"
-    command = [str(ruff)] if ruff.exists() else [sys.executable, "-m", "ruff"]
+    which_ruff = shutil.which("ruff")
+    if ruff.exists():
+        command = [str(ruff)]
+    elif which_ruff:
+        command = [which_ruff]
+    else:
+        command = [sys.executable, "-m", "ruff"]
     done = subprocess.run(
         [*command, "check", "--config", str(ROOT / "ruff.toml"), str(path)],
         capture_output=True,
@@ -4599,3 +4618,145 @@ def test_without_the_write_hold_other_pull_request_lands(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(2)]
     assert "### fleet/app: landed #2" in summary
+
+
+def test_planted_review_settle_holds_unaddressed_review(tmp_path):
+    """A person-authored PR with an unaddressed review does not land."""
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    review_time = (NOW - timedelta(minutes=3)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "COMMENTED",
+                "author": {"login": "coderabbit[bot]"},
+                "commit": {"oid": f"{1:040x}"},
+            }
+        ],
+    )
+    repo = repository(p)
+    forge = Forge(repo)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review settle: review at" in summary
+    assert "| #1 | CLEAN | review settle:" in summary
+
+
+def test_planted_review_settle_allows_after_reply(tmp_path):
+    """A person-authored PR lands after the author replies to the review."""
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    review_time = (NOW - timedelta(minutes=5)).isoformat()
+    reply_time = (NOW - timedelta(minutes=2)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "COMMENTED",
+                "author": {"login": "coderabbit[bot]"},
+                "commit": {"oid": f"{1:040x}"},
+            },
+            {
+                "submittedAt": reply_time,
+                "state": "COMMENTED",
+                "author": {"login": "person"},
+                "commit": {"oid": f"{1:040x}"},
+            },
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_planted_review_settle_skips_bot_pr(tmp_path):
+    """A bot PR (dependency prefix) lands despite unaddressed reviews."""
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    review_time = (NOW - timedelta(minutes=3)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/something",
+        createdAt=OLD,
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "COMMENTED",
+                "author": {"login": "coderabbit[bot]"},
+                "commit": {"oid": f"{1:040x}"},
+            }
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_review_on_previous_head_does_not_hold(tmp_path):
+    """A review on an older commit does not hold the current head."""
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    review_time = (NOW - timedelta(minutes=3)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "COMMENTED",
+                "author": {"login": "coderabbit[bot]"},
+                "commit": {"oid": "0" * 39 + "2"},
+            }
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_push_after_review_allows_landing(tmp_path):
+    """A commit pushed after the review unblocks landing."""
+    review_time = (NOW - timedelta(minutes=10)).isoformat()
+    head_time = (NOW - timedelta(minutes=3)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "COMMENTED",
+                "author": {"login": "coderabbit[bot]"},
+                "commit": {"oid": f"{1:040x}"},
+            }
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_the_query_reads_author_and_reviews(tmp_path):
+    """The GraphQL pull query requests the PR author and recent reviews."""
+    rules = load_rules(tmp_path)
+    assert "author { login }" in rules.QUERY
+    assert "reviews(last: 20)" in rules.QUERY
