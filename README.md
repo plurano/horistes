@@ -118,7 +118,9 @@ and sweeps every repository the merge-train app is installed on; the
 repositories it serves keep no caller and no secret. The app's key is the
 secret `MERGE_TRAIN_APP_KEY` of the environment `merge-train` there, which
 only the branch main may use. The key must be RSA with at least 2048 bits,
-and the train refuses a shorter one before any call. For each repository the
+and the train refuses a shorter one before any call. `check_app_key` in
+tools/merge_train.py enforces this and refuses a non-RSA key too, verified by
+the key tests in tests/test_merge_train.py. For each repository the
 job mints a token limited to that repository, with `contents: write`,
 `pull_requests: write`, `workflows: write` and `checks: read`, and revokes
 it when the repository is done; only when an issue is to be closed, a

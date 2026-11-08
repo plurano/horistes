@@ -105,6 +105,27 @@ def app_key(bits: int = 2048, which: str = "app") -> tuple[str, bytes]:
     return private.decode(), openssl("pkey", "-pubout", data=private)
 
 
+@functools.cache
+def non_rsa_app_key(kind: str) -> str:
+    """A non-RSA private key PEM text generated for test refusal."""
+    if kind == "DSA":
+        params = openssl(
+            "genpkey", "-genparam", "-algorithm", "DSA", "-pkeyopt", "dsa_paramgen_bits:2048"
+        )
+        return openssl("genpkey", "-paramfile", "/dev/stdin", data=params).decode()
+    if kind == "EC":
+        return openssl(
+            "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"
+        ).decode()
+    if kind == "Ed25519":
+        return openssl("genpkey", "-algorithm", "ED25519").decode()
+    if kind == "RSA-PSS":
+        return openssl(
+            "genpkey", "-algorithm", "RSA-PSS", "-pkeyopt", "rsa_keygen_bits:2048"
+        ).decode()
+    raise ValueError(f"unsupported key kind: {kind}")
+
+
 _ABSENT = object()
 
 
@@ -1761,21 +1782,74 @@ def test_key_bits_reads_length_directly(tmp_path, monkeypatch, bits, expected):
     assert train_mod.key_bits(app_key(bits)[0]) == expected
 
 
+def test_key_bits_timeout_raises_invalid_setting_error(tmp_path, monkeypatch):
+    """A subprocess timeout in key_bits raises InvalidSettingError."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    key = app_key(2048)[0]
+
+    def mock_run(*args, **kwargs):
+        """Stand in for subprocess.run: every openssl call times out."""
+        raise subprocess.TimeoutExpired(cmd=["openssl"], timeout=train_mod.TIMEOUT)
+
+    monkeypatch.setattr(train_mod.subprocess, "run", mock_run)
+    with pytest.raises(train_mod.InvalidSettingError) as exc_info:
+        train_mod.key_bits(key)
+    assert f"timed out after {train_mod.TIMEOUT}" in str(exc_info.value)
+    assert str(train_mod.MIN_KEY_BITS) in str(exc_info.value)
+
+
+def test_app_jwt_timeout_raises_refused_error(tmp_path, monkeypatch):
+    """A subprocess timeout in app_jwt raises RefusedError."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+
+    def mock_run(*args, **kwargs):
+        """Stand in for subprocess.run: every openssl call times out."""
+        raise subprocess.TimeoutExpired(cmd=["openssl"], timeout=train_mod.TIMEOUT)
+
+    monkeypatch.setattr(train_mod.subprocess, "run", mock_run)
+    conf = {"client_id": "test-client-id"}
+    with pytest.raises(train_mod.RefusedError) as exc_info:
+        train_mod.app_jwt(env, conf)
+    assert f"timed out after {train_mod.TIMEOUT}" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        pytest.param("DSA", id="dsa-2048"),
+        pytest.param("EC", id="ec-p256"),
+        pytest.param("Ed25519", id="ed25519"),
+        pytest.param("RSA-PSS", id="rsa-pss-2048"),
+    ],
+)
+def test_non_rsa_app_key_is_refused(tmp_path, kind):
+    """A non-RSA app key is refused before any forge call."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, app_key=non_rsa_app_key(kind))
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert "RSA" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
+
+
 def test_refused_app_key_is_never_printed(tmp_path):
     """The private key material never appears in the output of a refused run."""
     forge = Forge(repository(pull(1, "CLEAN")))
     key_pem = app_key(1024)[0]
     done, summary = train(tmp_path, forge, app_key=key_pem)
     assert done.returncode == 3, done.stdout + done.stderr
-    out = done.stdout + done.stderr + summary
+    out = (done.stdout + done.stderr + summary).replace("\n", "")
     body = "".join(key_pem.splitlines()[1:-1])
-    assert body[:40] not in out.replace("\n", "")
+    for start in range(0, len(body) - 24 + 1, 12):
+        assert body[start : start + 24] not in out
     assert "PRIVATE KEY" not in out
 
 
 def test_unreadable_app_key_is_refused(tmp_path):
     """An unreadable app key is refused before any forge call."""
-    corrupted = "-----BEGIN RSA PRIVATE KEY-----\ncorrupted\n-----END RSA PRIVATE KEY-----\n"
+    lines = app_key(2048)[0].splitlines()
+    corrupted = f"{lines[0]}\ncorrupted\n{lines[-1]}\n"
     forge = Forge(repository(pull(1, "CLEAN")))
     done, _ = train(tmp_path, forge, app_key=corrupted)
     assert done.returncode == 3, done.stdout + done.stderr
@@ -1786,8 +1860,9 @@ def test_unreadable_app_key_is_refused(tmp_path):
 
 def test_oversized_app_key_is_refused(tmp_path):
     """An app key longer than MAX_KEY_CHARS is refused before any forge call."""
-    header = "-----BEGIN RSA PRIVATE KEY-----\n"
-    footer = "\n-----END RSA PRIVATE KEY-----\n"
+    lines = app_key(2048)[0].splitlines()
+    header = f"{lines[0]}\n"
+    footer = f"\n{lines[-1]}\n"
     filler = "A" * (16384 + 1 - len(header) - len(footer))
     oversized = header + filler + footer
     assert len(oversized) == 16384 + 1

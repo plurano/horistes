@@ -9,6 +9,7 @@ RUNNER_TEMP. The header of the workflow describes what a run does.
 """
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -118,29 +119,21 @@ class InvalidSettingError(Exception):
     """A setting outside its allowed values."""
 
 
-def openssl_with_key(openssl, key, args, data=None, text=False):
-    """Run an openssl command with a key streamed through an os.pipe file descriptor.
-
-    Builds '/dev/fd/<read_end>' for the read end of an os.pipe and substitutes
-    '{key_path}' in each element of args. Streams key into the write end of the
-    pipe, runs openssl with pass_fds=(read_end,), input=data, capture_output=True,
-    check=False, timeout=TIMEOUT and text=text, and closes the read end in finally.
-    """
+@contextlib.contextmanager
+def key_pipe(key):
+    """Stream a key into an os.pipe and yield the read end file descriptor."""
     read_end, write_end = os.pipe()
-    with os.fdopen(write_end, "w") as pipe:
-        pipe.write(key)
     try:
-        key_path = f"/dev/fd/{read_end}"
-        cmd = [openssl] + [arg.replace("{key_path}", key_path) for arg in args]
-        return subprocess.run(
-            cmd,
-            input=data,
-            capture_output=True,
-            pass_fds=(read_end,),
-            timeout=TIMEOUT,
-            check=False,
-            text=text,
-        )
+        pipe = None
+        try:
+            pipe = os.fdopen(write_end, "w")
+            pipe.write(key)
+        finally:
+            if pipe is not None:
+                pipe.close()
+            else:
+                os.close(write_end)
+        yield read_end
     finally:
         os.close(read_end)
 
@@ -150,20 +143,37 @@ def key_bits(key):
     openssl = shutil.which("openssl")
     if not openssl:
         raise InvalidSettingError("openssl is not on the runner: the app key cannot be verified")
-    done = openssl_with_key(
-        openssl,
-        key,
-        ["pkey", "-in", "{key_path}", "-noout", "-text_pub"],
-        text=True,
-    )
+    try:
+        with key_pipe(key) as read_end:
+            done = subprocess.run(
+                ["openssl", "pkey", "-in", f"/dev/fd/{read_end}", "-noout", "-text_pub"],
+                capture_output=True,
+                pass_fds=(read_end,),
+                timeout=TIMEOUT,
+                check=False,
+                text=True,
+            )
+    except subprocess.TimeoutExpired as err:
+        raise InvalidSettingError(
+            f"openssl timed out after {TIMEOUT} seconds reading the app key; "
+            f"at least {MIN_KEY_BITS} bits are required"
+        ) from err
     if done.returncode != 0 or not done.stdout:
         return None
+    lines = done.stdout.splitlines()
+    if not any(line.startswith("Modulus:") for line in lines) or any(
+        "PSS parameter" in line for line in lines
+    ):
+        raise InvalidSettingError(
+            f"the app key must be an RSA key (PKCS#1 v1.5, RS256); "
+            f"at least {MIN_KEY_BITS} bits are required"
+        )
     match = re.search(r"Public-Key:\s*\((\d+)\s*bit\)", done.stdout)
     return int(match.group(1)) if match else None
 
 
 def check_app_key(key):
-    """Refuse an app key that is empty, unreadable or shorter than MIN_KEY_BITS."""
+    """Refuse an app key that is empty, too long, unreadable, not RSA or under MIN_KEY_BITS."""
     if "PRIVATE KEY-----" not in key:
         raise InvalidSettingError(
             "the app key is empty or no PEM key: the caller passes no secret, "
@@ -888,12 +898,20 @@ def app_jwt(env, conf):
     claims = {"iat": now - 60, "exp": now + JWT_SECONDS, "iss": conf["client_id"]}
     head = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
     signing_input = f"{head}.{b64url(json.dumps(claims).encode())}"
-    done = openssl_with_key(
-        openssl,
-        env["TRAIN_APP_KEY"],
-        ["dgst", "-sha256", "-sign", "{key_path}"],
-        data=signing_input.encode(),
-    )
+    try:
+        with key_pipe(env["TRAIN_APP_KEY"]) as read_end:
+            done = subprocess.run(
+                ["openssl", "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
+                input=signing_input.encode(),
+                capture_output=True,
+                pass_fds=(read_end,),
+                timeout=TIMEOUT,
+                check=False,
+            )
+    except subprocess.TimeoutExpired as err:
+        raise RefusedError(
+            f"openssl timed out after {TIMEOUT} seconds signing the app's JWT"
+        ) from err
     if done.returncode != 0 or not done.stdout:
         raise RefusedError(f"openssl could not sign the app's JWT (exit {done.returncode})")
     return f"{signing_input}.{b64url(done.stdout)}"
