@@ -183,7 +183,9 @@ hashes.
   service's rules, the runner labels, the relative Markdown links and their
   heading anchors (`tools/links.py`, no host asked), the tests and the licence
   headers. The test run measures coverage and fails below a floor that only
-  goes up.
+  goes up. Each coverage step reads `pyproject.toml` only, so a
+  `COVERAGE_RCFILE` in the environment cannot lower the floor, and the run
+  first erases data an earlier run left behind.
 - The tests read the message of every commit between the base of the change
   and `HEAD` (`tests/test_commit_messages.py`), on every run of the gate. A
   message fails without a `Signed-off-by` trailer, and when it credits
