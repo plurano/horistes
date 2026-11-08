@@ -5,23 +5,35 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 from pathlib import Path
 
 import ciwf
+import pytest
 from conftest import ROOT
 
-PIPELINE = "sha256sum requirements/tools.txt | cut -d ' ' -f 1"
+HASH_COMMAND = (
+    "$$($(PYTHON) -c 'import hashlib, pathlib, sys; "
+    "print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "
+    "requirements/tools.txt)"
+)
 
 
-def _run_make_check(tmp_dir: Path) -> subprocess.CompletedProcess[str]:
+def _run_make_check(
+    tmp_dir: Path,
+    *,
+    env: dict[str, str] | None = None,
+    make_bin: str = "make",
+) -> subprocess.CompletedProcess[str]:
     """Run `make -s -C <tmp_dir> -f <ROOT>/Makefile check-tools-stamp`."""
     return subprocess.run(
-        ["make", "-s", "-C", str(tmp_dir), "-f", str(ROOT / "Makefile"), "check-tools-stamp"],
+        [make_bin, "-s", "-C", str(tmp_dir), "-f", str(ROOT / "Makefile"), "check-tools-stamp"],
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
+        env=env,
     )
 
 
@@ -172,8 +184,42 @@ def test_lefthook_pre_push_tools_stamp() -> None:
         assert stamp_prio < effective_prio
 
 
-def test_makefile_shares_sha256sum_pipeline() -> None:
-    """Assert Makefile text holds the sha256sum pipeline exactly once."""
+def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
+    """Plant without sha256sum on PATH: passes with valid stamp, fails when stale."""
+    py_path = shutil.which("python3")
+    cat_path = shutil.which("cat")
+    if py_path is None or cat_path is None:
+        pytest.skip("python3 or cat not found on PATH")
+    make_bin = shutil.which("make")
+    if make_bin is None:
+        pytest.skip("make not found on PATH")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "python3").symlink_to(py_path)
+    (bin_dir / "cat").symlink_to(cat_path)
+    restricted_env = {"PATH": str(bin_dir)}
+
+    tools_txt, stamp = _setup_tree(tmp_path)
+    h = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
+    stamp.write_text(f"{h}\n", encoding="utf-8")
+
+    proc = _run_make_check(tmp_path, env=restricted_env, make_bin=make_bin)
+    assert proc.returncode == 0
+    assert proc.stderr == ""
+
+    stale_hash = hashlib.sha256(b"stale-tools-content\n").hexdigest()
+    stamp.write_text(f"{stale_hash}\n", encoding="utf-8")
+
+    proc_stale = _run_make_check(tmp_path, env=restricted_env, make_bin=make_bin)
+    assert proc_stale.returncode != 0
+    assert "make tools" in proc_stale.stderr
+
+
+def test_makefile_shares_hashlib_command() -> None:
+    """Assert Makefile text holds the hashlib hash command exactly once."""
     makefile_text = (ROOT / "Makefile").read_text(encoding="utf-8")
-    assert makefile_text.count(PIPELINE) == 1
+    assert makefile_text.count(HASH_COMMAND) == 1
+    assert "sha256sum" not in makefile_text
+    assert "shasum" not in makefile_text
     assert "check-tools-stamp" in makefile_text

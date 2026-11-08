@@ -36,7 +36,8 @@ verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-e
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.
 # Linked worktrees share .venv by symlink: compare content, not mtime.
-TOOLS_HASH = $$(sha256sum requirements/tools.txt | cut -d ' ' -f 1)
+# Hashed with Python's hashlib: macOS ships no coreutils hash command.
+TOOLS_HASH = $$($(PYTHON) -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' requirements/tools.txt)
 TOOLS_STAMP = $$(cat $(VENV)/.stamp 2>/dev/null)
 
 tools:
