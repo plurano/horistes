@@ -18,7 +18,8 @@ fails, so "Scorecard / Analysis" is red with the reason in its text
 
 Not passed: `publish`. The Scorecard service reads the called workflow file
 from the shared repository before it takes a result, which it can do only
-once that repository is public.
+once that repository is public. A person can start the check by hand; it passes
+no `publish`.
 
 Scopes: the job grants what the called job asks for and nothing else.
 security-events write puts the findings into the forge's code scanning,
@@ -63,6 +64,7 @@ on:
     branches: [main]
   schedule:
     - cron: "23 4 * * 2"
+  workflow_dispatch:
 
 permissions: {}
 
