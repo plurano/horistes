@@ -26,7 +26,9 @@ LICENCE_WORKFLOW = ".github/workflows/licence.yml"
 
 RUNNER_OS_PATTERN = re.compile(r"^runner\.os != '([A-Za-z]+)'$")
 ASSIGNMENT_PATTERN = re.compile(r'^\$[A-Za-z_]\w*\s*=\s*"[^"]*"$')
-ANNOTATION_PATTERN = re.compile(r'^Write-Output\s+"::error[^"]*"$')
+# GitHub's form is `::error <parameters>::<message>`; the parameters are optional and the
+# message is not empty.
+ANNOTATION_PATTERN = re.compile(r'^Write-Output\s+"::error(?: [^"]*?)?::[^"]+"$')
 
 
 def _check_job(job: dict) -> list[str]:
@@ -54,10 +56,14 @@ def _check_step(step: dict, idx: int) -> list[str]:
 
 
 def _check_script(step: dict) -> list[str]:
-    """Check run script statements against an allow-list, returning at most one problem."""
+    """Check run script statements against an allow-list, returning at most one problem.
+
+    The allow-list holds assignments, the annotation and the final exit. Comment lines
+    are not on it: PowerShell applies a `#Requires` line before the script runs.
+    """
     run_script = str(step.get("run", ""))
     raw_lines = [line.strip() for line in run_script.splitlines()]
-    effective_lines = [line for line in raw_lines if line and not line.startswith("#")]
+    effective_lines = [line for line in raw_lines if line]
 
     if not effective_lines or effective_lines[-1] != REQUIRED_EXIT:
         return [
@@ -207,6 +213,26 @@ def _mutate_subexpression(doc: dict) -> None:
     step["run"] = step["run"].replace('$title = "Wrong runner OS"', '$title = "$(exit 0)"')
 
 
+def _mutate_requires_directive(doc: dict) -> None:
+    """Planted defect: a `#Requires` line stops the script before the annotation."""
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = "#Requires -Modules MissingModule\n" + step["run"]
+
+
+def _mutate_requires_lowercase(doc: dict) -> None:
+    """Planted defect: the same directive written in lower case."""
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = "#requires -Version 99\n" + step["run"]
+
+
+def _mutate_annotation_malformed(doc: dict) -> None:
+    """Planted defect: the annotation loses its `::` separator and message."""
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = step["run"].replace(
+        'Write-Output "::error title=${title}::${msg}"', 'Write-Output "::errorx"'
+    )
+
+
 def evaluate_runner_os_condition(condition: str, runner_os: str) -> bool:
     """Evaluate condition of the single form `runner.os != '<OS>'`."""
     expr = condition.strip().removeprefix("${{").removesuffix("}}").strip()
@@ -250,13 +276,44 @@ PLANTED_DEFECTS = [
     pytest.param(_mutate_job_continue_on_error, "continue-on-error", id="job-continue-on-error"),
     pytest.param(_mutate_step_continue_on_error, "continue-on-error", id="step-continue-on-error"),
     pytest.param(_mutate_early_exit_zero, "statement outside the allow-list", id="early-exit-zero"),
-    pytest.param(_mutate_annotation_in_comment, "::error", id="annotation-in-comment"),
+    pytest.param(
+        _mutate_annotation_in_comment,
+        "statement outside the allow-list",
+        id="annotation-in-comment",
+    ),
     pytest.param(
         _mutate_annotation_in_branch, "statement outside the allow-list", id="annotation-in-branch"
     ),
     pytest.param(_mutate_annotation_after_exit, "nonzero exit", id="annotation-after-exit"),
     pytest.param(_mutate_subexpression, "statement outside the allow-list", id="subexpression"),
+    pytest.param(
+        _mutate_requires_directive, "statement outside the allow-list", id="requires-directive"
+    ),
+    pytest.param(
+        _mutate_requires_lowercase, "statement outside the allow-list", id="requires-lowercase"
+    ),
+    pytest.param(
+        _mutate_annotation_malformed, "statement outside the allow-list", id="annotation-malformed"
+    ),
 ]
+
+
+@pytest.mark.parametrize(
+    ("line", "accepted"),
+    [
+        pytest.param('Write-Output "::error title=${title}::${msg}"', True, id="workflow-form"),
+        pytest.param('Write-Output "::error::m"', True, id="no-parameters-one-char-message"),
+        pytest.param('Write-Output "::error title=t::m"', True, id="parameters-one-char-message"),
+        pytest.param('Write-Output "::errorx"', False, id="other-command"),
+        pytest.param('Write-Output "::error"', False, id="no-separator"),
+        pytest.param('Write-Output "::error::"', False, id="empty-message"),
+        pytest.param('Write-Output "::error title=t::"', False, id="parameters-empty-message"),
+        pytest.param('Write-Output "::errortitle=t::m"', False, id="no-space-before-parameters"),
+    ],
+)
+def test_annotation_pattern_boundaries(line: str, accepted: bool) -> None:
+    """Boundary test: only `::error[ <parameters>]::<message>` with a message counts."""
+    assert bool(ANNOTATION_PATTERN.fullmatch(line)) is accepted
 
 
 @pytest.mark.parametrize(("mutate", "expected_fragment"), PLANTED_DEFECTS)
