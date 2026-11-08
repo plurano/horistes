@@ -23,3 +23,5 @@ data_file = ".coverage"
 [tool.coverage.report]
 # Missing line and branch numbers are shown in terminal reports.
 show_missing = true
+# The gate fails below this total; raise it as coverage grows, never lower it.
+fail_under = 94
