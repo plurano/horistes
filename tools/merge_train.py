@@ -11,6 +11,7 @@ RUNNER_TEMP. The header of the workflow describes what a run does.
 import base64
 import contextlib
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -66,6 +67,8 @@ from train_rules import (
 )
 
 TIMEOUT = 30
+# Characters of a refused request's body that its error keeps.
+ERROR_TEXT = 500
 SETTLE_ROUNDS = 3
 SETTLE_SECONDS = 5
 PULL_PAGES = 4
@@ -278,6 +281,16 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def error_text(err):
+    """At most ERROR_TEXT characters of a refused request's body, or why it could not be read."""
+    try:
+        content = err.read(4 * ERROR_TEXT)
+    except (OSError, http.client.HTTPException) as failure:
+        return f"(body unreadable: {failure!r})"
+    else:
+        return content.decode(errors="replace")[:ERROR_TEXT]
+
+
 def call(url, token=None, method="POST", body=None, raw=False, redirect=True):
     """One request to the forge; the parsed answer, or RefusedError with what it said."""
     data = None if body is None else json.dumps(body).encode()
@@ -300,10 +313,13 @@ def call(url, token=None, method="POST", body=None, raw=False, redirect=True):
                 return content
             text = content.decode()
     except urllib.error.HTTPError as err:
-        if not redirect and err.code in (301, 302, 303, 307, 308):
-            loc = err.headers.get("Location")
-            return {"location": urllib.parse.urljoin(url, loc) if loc else ""}
-        raise RefusedError(f"{method} {url}: HTTP {err.code} {err.read().decode()[:500]}") from err
+        try:
+            if not redirect and err.code in (301, 302, 303, 307, 308):
+                loc = err.headers.get("Location")
+                return {"location": urllib.parse.urljoin(url, loc) if loc else ""}
+            raise RefusedError(f"{method} {url}: HTTP {err.code} {error_text(err)}") from err
+        finally:
+            err.close()
     except (urllib.error.URLError, TimeoutError) as err:
         raise RefusedError(f"{method} {url}: {err}") from err
     return json.loads(text) if text else {}
