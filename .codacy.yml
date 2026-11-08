@@ -9,6 +9,7 @@ engines:
     # tests/test_examples.py:23 B603 subprocess.run — test helper, static args
     # tests/test_exceptions.py:7 B404 import subprocess — test helper, static args
     # tests/test_exceptions.py:244 B603 subprocess.run — test helper, static args
+    # tests/test_exceptions.py:411 B603 subprocess.run — test helper, static args
     # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
     exclude_paths:
       - "tools/examples.py"
@@ -18,6 +19,8 @@ engines:
     # tests/test_examples.py:23 dangerous-subprocess-use-audit — test helper,
     # subprocess.run with static argument list, not user input
     # tests/test_exceptions.py:244 dangerous-subprocess-use-audit — test helper,
+    # subprocess.run with static argument list, not user input
+    # tests/test_exceptions.py:411 dangerous-subprocess-use-audit — test helper,
     # subprocess.run with static argument list, not user input
     # tests/test_merge_guard.py:21 dangerous-subprocess-use-audit — test mock,
     # CompletedProcess constructor with static args
