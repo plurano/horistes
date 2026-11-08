@@ -120,10 +120,13 @@ check-examples: tools
 # The tests plant one defect per rule; the outside linters are run on a
 # planted workflow or repository as well, so a linter that stopped refusing
 # fails here.
+# The coverage floor only goes up.
 test: tools
 	ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
 		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" \
-		$(BIN)/python -B -m pytest
+		$(BIN)/python -B -m coverage run -m pytest
+	$(BIN)/python -B -m coverage combine
+	$(BIN)/python -B -m coverage report
 
 # Every file carries its licence header or is named in REUSE.toml.
 verify-reuse: tools

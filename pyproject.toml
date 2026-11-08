@@ -9,3 +9,17 @@ skips = ["B404", "B603", "B607"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
+
+[tool.coverage.run]
+# Branch coverage counts both outcomes of every condition, not only the lines.
+branch = true
+# The directories under test; tests/ and fuzz/ are left out.
+source = ["tools"]
+# Many tests invoke tools and hooks as subprocesses; patch measures them.
+patch = ["subprocess"]
+# The data files go to .coverage* at the root, which .gitignore leaves out.
+data_file = ".coverage"
+
+[tool.coverage.report]
+# Missing line and branch numbers are shown in terminal reports.
+show_missing = true

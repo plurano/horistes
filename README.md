@@ -182,7 +182,8 @@ hashes.
   accepted findings and exceptions, the caller templates, the Scorecard
   service's rules, the runner labels, the relative Markdown links and their
   heading anchors (`tools/links.py`, no host asked), the tests and the licence
-  headers.
+  headers. The test run measures coverage and fails below a floor that only
+  goes up.
 - The tests read the message of every commit between the base of the change
   and `HEAD` (`tests/test_commit_messages.py`), on every run of the gate. A
   message fails without a `Signed-off-by` trailer, and when it credits
