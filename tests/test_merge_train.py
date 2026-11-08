@@ -46,6 +46,10 @@ except ImportError:  # Windows has no fcntl; the pipe-capacity tests skip there.
 # Setting a pipe's capacity is Linux only (F_SETPIPE_SZ); macOS and Windows skip those tests.
 PIPE_SIZE = getattr(fcntl, "F_SETPIPE_SZ", None)
 NO_PIPE_SIZE = "setting a pipe's capacity needs F_SETPIPE_SZ, which only Linux has"
+# Open descriptors are listed in /proc/self/fd on Linux and /dev/fd on macOS; Windows has
+# neither, so the descriptor-leak tests skip there.
+FD_DIR = next((d for d in ("/proc/self/fd", "/dev/fd") if os.path.isdir(d)), None)
+NO_FD_DIR = "counting open descriptors needs /proc/self/fd or /dev/fd"
 
 TRAIN = ROOT / ".github/workflows/merge-train.yml"
 STEP = "Land or update one pull request in every repository of the app"
@@ -2034,6 +2038,7 @@ def test_os_failure_names_the_type_and_description_only(tmp_path, monkeypatch):
     assert train_mod.os_failure(OSError("plain text")) == "OSError: plain text"
 
 
+@pytest.mark.skipif(FD_DIR is None, reason=NO_FD_DIR)
 def test_key_bits_thread_runtime_error_raises_invalid_setting_error_and_leaks_no_fds(
     tmp_path, monkeypatch
 ):
@@ -2045,16 +2050,17 @@ def test_key_bits_thread_runtime_error_raises_invalid_setting_error_and_leaks_no
             raise RuntimeError("thread creation failed")
 
     monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
-    fds_before = len(os.listdir("/proc/self/fd"))
+    fds_before = len(os.listdir(FD_DIR))
     with pytest.raises(train_mod.InvalidSettingError) as exc_info:
         train_mod.key_bits(app_key(2048)[0])
-    fds_after = len(os.listdir("/proc/self/fd"))
+    fds_after = len(os.listdir(FD_DIR))
     assert fds_after == fds_before
     msg = str(exc_info.value)
     assert "thread creation failed" in msg or "RuntimeError" in msg
     assert f"at least {train_mod.MIN_KEY_BITS} bits are required" in msg
 
 
+@pytest.mark.skipif(FD_DIR is None, reason=NO_FD_DIR)
 def test_app_jwt_thread_runtime_error_raises_refused_error_and_leaks_no_fds(tmp_path, monkeypatch):
     """A RuntimeError in thread start in app_jwt raises RefusedError and leaks no fds."""
     train_mod = load_train(tmp_path, monkeypatch)
@@ -2066,10 +2072,10 @@ def test_app_jwt_thread_runtime_error_raises_refused_error_and_leaks_no_fds(tmp_
     monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
     env = {"TRAIN_APP_KEY": app_key(2048)[0]}
     conf = {"client_id": "test-client-id"}
-    fds_before = len(os.listdir("/proc/self/fd"))
+    fds_before = len(os.listdir(FD_DIR))
     with pytest.raises(train_mod.RefusedError) as exc_info:
         train_mod.app_jwt(env, conf)
-    fds_after = len(os.listdir("/proc/self/fd"))
+    fds_after = len(os.listdir(FD_DIR))
     assert fds_after == fds_before
     msg = str(exc_info.value)
     assert "thread creation failed" in msg or "RuntimeError" in msg
