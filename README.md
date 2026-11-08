@@ -53,8 +53,9 @@ is chosen. It turns public now that its history is shown to hold no private
 content; the first release, 0.1.0, is proposed by release-please through the
 merge train; a person merges that release pull request once
 [milestone 0.1.0](https://github.com/plurano/horistes/milestone/1) closes,
-and the train then creates the release. Until then only private
-repositories of the same owner can call it
+and the train then creates the release. As the repository is public,
+public repositories can call it before that release; until then a caller
+pins a full commit of the default branch
 ([ADR-0022](docs/adr/0022-public-consumers-call-this-repository-directly.md),
 [ADR-0024](docs/adr/0024-public-before-the-first-release.md),
 [ADR-0069](docs/adr/0069-the-first-release-is-0-1-0-from-release-please.md)).
