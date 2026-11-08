@@ -19,7 +19,6 @@ import hashlib
 import importlib.util
 import io
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -99,10 +98,10 @@ def openssl(*args: str, data: bytes = b"") -> bytes:
 
 
 @functools.cache
-def app_key(which: str = "app") -> tuple[str, bytes]:
+def app_key(bits: int = 2048, which: str = "app") -> tuple[str, bytes]:
     """A key made for this test run: the private PEM text and the public PEM."""
     del which
-    private = openssl("genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048")
+    private = openssl("genpkey", "-algorithm", "RSA", "-pkeyopt", f"rsa_keygen_bits:{bits}")
     return private.decode(), openssl("pkey", "-pubout", data=private)
 
 
@@ -1703,19 +1702,11 @@ def test_missing_app_credential_stops_before_any_call(tmp_path, key, value):
     assert (forge.minted, forge.where) == ([], [])
 
 
-@functools.cache
-def rsa_key(bits: int) -> tuple[str, bytes]:
-    """An RSA key pair made for test runs: the private PEM text and the public PEM."""
-    private = openssl("genpkey", "-algorithm", "RSA", "-pkeyopt", f"rsa_keygen_bits:{bits}")
-    return private.decode(), openssl("pkey", "-pubout", data=private)
-
-
-def load_train(tmp_path: Path):
+def load_train(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """The merge train script, imported with its rules module written to RUNNER_TEMP."""
     (tmp_path / "train_rules.py").write_text(module(), encoding="utf-8")
-    if str(tmp_path) not in sys.path:
-        sys.path.insert(0, str(tmp_path))
-    os.environ["RUNNER_TEMP"] = str(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
     spec = importlib.util.spec_from_file_location("merge_train", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -1732,7 +1723,7 @@ def load_train(tmp_path: Path):
 def test_short_app_key_is_refused(tmp_path, bits):
     """An RSA app key shorter than 2048 bits is refused before any forge call."""
     forge = Forge(repository(pull(1, "CLEAN")))
-    done, _ = train(tmp_path, forge, app_key=rsa_key(bits)[0])
+    done, _ = train(tmp_path, forge, app_key=app_key(bits)[0])
     assert done.returncode == 3, done.stdout + done.stderr
     assert done.stdout.startswith("::error title=Merge train setting::")
     assert str(bits) in done.stdout
@@ -1749,7 +1740,7 @@ def test_short_app_key_is_refused(tmp_path, bits):
 )
 def test_sufficient_app_key_is_accepted(tmp_path, bits):
     """An RSA app key of at least 2048 bits is accepted and proceeds to the forge."""
-    priv, pub = rsa_key(bits)
+    priv, pub = app_key(bits)
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.public = pub
     done, _ = train(tmp_path, forge, app_key=priv)
@@ -1764,16 +1755,16 @@ def test_sufficient_app_key_is_accepted(tmp_path, bits):
         pytest.param(1024, 1024, id="1024-bits"),
     ],
 )
-def test_key_bits_reads_length_directly(tmp_path, bits, expected):
+def test_key_bits_reads_length_directly(tmp_path, monkeypatch, bits, expected):
     """The key_bits helper measures the key's bit length through a pipe."""
-    train_mod = load_train(tmp_path)
-    assert train_mod.key_bits(rsa_key(bits)[0]) == expected
+    train_mod = load_train(tmp_path, monkeypatch)
+    assert train_mod.key_bits(app_key(bits)[0]) == expected
 
 
 def test_refused_app_key_is_never_printed(tmp_path):
     """The private key material never appears in the output of a refused run."""
     forge = Forge(repository(pull(1, "CLEAN")))
-    key_pem = rsa_key(1024)[0]
+    key_pem = app_key(1024)[0]
     done, summary = train(tmp_path, forge, app_key=key_pem)
     assert done.returncode == 3, done.stdout + done.stderr
     out = done.stdout + done.stderr + summary
@@ -1791,6 +1782,33 @@ def test_unreadable_app_key_is_refused(tmp_path):
     assert done.stdout.startswith("::error title=Merge train setting::")
     assert "2048" in done.stdout
     assert (forge.minted, forge.where) == ([], [])
+
+
+def test_oversized_app_key_is_refused(tmp_path):
+    """An app key longer than MAX_KEY_CHARS is refused before any forge call."""
+    header = "-----BEGIN RSA PRIVATE KEY-----\n"
+    footer = "\n-----END RSA PRIVATE KEY-----\n"
+    filler = "A" * (16384 + 1 - len(header) - len(footer))
+    oversized = header + filler + footer
+    assert len(oversized) == 16384 + 1
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, app_key=oversized)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert "16384" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
+
+
+def test_app_key_at_maximum_length_boundary_is_accepted(tmp_path):
+    """An RSA app key padded to exactly MAX_KEY_CHARS is accepted and proceeds."""
+    priv, pub = app_key(2048)
+    padded = priv + "\n" * (16384 - len(priv))
+    assert len(padded) == 16384
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.public = pub
+    done, _ = train(tmp_path, forge, app_key=padded)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]
 
 
 def key_on_disk(text: str) -> list[str]:

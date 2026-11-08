@@ -67,11 +67,11 @@ The k8s warden measured how the forge behaves:
     restart the wait. A security label or "[SECURITY]" in the title skips it.
 - **Settings.** Every input is checked against an allow-list before any call.
   A bad value, an empty client id or a key that is no private key stops the
-  run with exit code 3. The key must be RSA with at least 2048 bits. A forge
-  refusal in one repository is reported with the forge's message and the sweep
-  goes on; the run ends with exit code 1 when any repository refused. The input
-  `switch: off` turns a run into a report and its tokens carry read rights only.
-  Repositories not reached within 25 minutes are named in the summary.
+  run with exit code 3. A forge refusal in one repository is reported with the
+  forge's message and the sweep goes on; the run ends with exit code 1 when
+  any repository refused. The input `switch: off` turns a run into a report
+  and its tokens carry read rights only. Repositories not reached within 25
+  minutes are named in the summary.
 - **The app.**
   - The rights are in `apps/merge-train.json`, and a test holds them equal to
     what the train asks the forge for: `contents: write` (merge),

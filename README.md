@@ -117,9 +117,11 @@ The merge train runs from one caller in the fleet's operations repository
 and sweeps every repository the merge-train app is installed on; the
 repositories it serves keep no caller and no secret. The app's key is the
 secret `MERGE_TRAIN_APP_KEY` of the environment `merge-train` there, which
-only the branch main may use. For each repository the job mints a token
-limited to that repository, with `contents: write`, `pull_requests: write`,
-`workflows: write` and `checks: read`, and revokes it when the repository is
+only the branch main may use. The key must be RSA with at least 2048 bits,
+and the train refuses a shorter one before any call. For each repository the
+job mints a token limited to that repository, with `contents: write`,
+`pull_requests: write`, `workflows: write` and `checks: read`, and revokes it
+when the repository is
 done; only when an issue is to be closed, a second token for that repository
 carries `issues: write` alone. GITHUB_TOKEN gets no scope. A run lands at most one pull request per
 repository: the oldest the forge reports CLEAN, through the merge call with

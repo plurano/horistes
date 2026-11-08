@@ -76,6 +76,8 @@ MAX_RELEASES = 256
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 # NIST SP 800-57 Part 1: 112-bit security is 2048-bit RSA; OpenSSF Best Practices crypto_keylength.
 MIN_KEY_BITS = 2048
+# A 16384-bit RSA PEM is about 12.7 KB; the cap keeps the pipe write under the 64 KiB buffer.
+MAX_KEY_CHARS = 16384
 WRITE_RIGHTS = {
     "actions": "read",
     "contents": "write",
@@ -116,25 +118,44 @@ class InvalidSettingError(Exception):
     """A setting outside its allowed values."""
 
 
+def openssl_with_key(openssl, key, args, data=None, text=False):
+    """Run an openssl command with a key streamed through an os.pipe file descriptor.
+
+    Builds '/dev/fd/<read_end>' for the read end of an os.pipe and substitutes
+    '{key_path}' in each element of args. Streams key into the write end of the
+    pipe, runs openssl with pass_fds=(read_end,), input=data, capture_output=True,
+    check=False, timeout=TIMEOUT and text=text, and closes the read end in finally.
+    """
+    read_end, write_end = os.pipe()
+    with os.fdopen(write_end, "w") as pipe:
+        pipe.write(key)
+    try:
+        key_path = f"/dev/fd/{read_end}"
+        cmd = [openssl] + [arg.replace("{key_path}", key_path) for arg in args]
+        return subprocess.run(
+            cmd,
+            input=data,
+            capture_output=True,
+            pass_fds=(read_end,),
+            timeout=TIMEOUT,
+            check=False,
+            text=text,
+        )
+    finally:
+        os.close(read_end)
+
+
 def key_bits(key):
     """The bit length of an RSA private key, read through a pipe via openssl pkey."""
     openssl = shutil.which("openssl")
     if not openssl:
         raise InvalidSettingError("openssl is not on the runner: the app key cannot be verified")
-    read_end, write_end = os.pipe()
-    with os.fdopen(write_end, "w") as pipe:
-        pipe.write(key)
-    try:
-        done = subprocess.run(
-            [openssl, "pkey", "-in", f"/dev/fd/{read_end}", "-noout", "-text_pub"],
-            capture_output=True,
-            pass_fds=(read_end,),
-            timeout=TIMEOUT,
-            check=False,
-            text=True,
-        )
-    finally:
-        os.close(read_end)
+    done = openssl_with_key(
+        openssl,
+        key,
+        ["pkey", "-in", "{key_path}", "-noout", "-text_pub"],
+        text=True,
+    )
     if done.returncode != 0 or not done.stdout:
         return None
     match = re.search(r"Public-Key:\s*\((\d+)\s*bit\)", done.stdout)
@@ -147,6 +168,11 @@ def check_app_key(key):
         raise InvalidSettingError(
             "the app key is empty or no PEM key: the caller passes no secret, "
             "or the job runs outside the environment that holds it"
+        )
+    if len(key) > MAX_KEY_CHARS:
+        raise InvalidSettingError(
+            f"the app key is longer than {MAX_KEY_CHARS} characters: "
+            f"at most {MAX_KEY_CHARS} are allowed"
         )
     bits = key_bits(key)
     if bits is None:
@@ -862,20 +888,12 @@ def app_jwt(env, conf):
     claims = {"iat": now - 60, "exp": now + JWT_SECONDS, "iss": conf["client_id"]}
     head = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
     signing_input = f"{head}.{b64url(json.dumps(claims).encode())}"
-    read_end, write_end = os.pipe()
-    with os.fdopen(write_end, "w") as pipe:
-        pipe.write(env["TRAIN_APP_KEY"])
-    try:
-        done = subprocess.run(
-            [openssl, "dgst", "-sha256", "-sign", f"/dev/fd/{read_end}"],
-            input=signing_input.encode(),
-            capture_output=True,
-            pass_fds=(read_end,),
-            timeout=TIMEOUT,
-            check=False,
-        )
-    finally:
-        os.close(read_end)
+    done = openssl_with_key(
+        openssl,
+        env["TRAIN_APP_KEY"],
+        ["dgst", "-sha256", "-sign", "{key_path}"],
+        data=signing_input.encode(),
+    )
     if done.returncode != 0 or not done.stdout:
         raise RefusedError(f"openssl could not sign the app's JWT (exit {done.returncode})")
     return f"{signing_input}.{b64url(done.stdout)}"
