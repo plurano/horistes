@@ -70,6 +70,7 @@ STEP_KEYS = ("if", "name", "run", "shell")
 ECHO = re.compile(r'echo "[^"$`\\]*"')
 GATING = {"pull_request", "pull_request_target", "merge_group"}
 LONGEST_MINUTES = 10
+DRAFT_IF = "github.event_name != 'pull_request' || github.event.pull_request.draft == false"
 SAMPLE = {
     "RunnerTag": "ubuntu-26.04",
     "Shared": {
@@ -273,6 +274,8 @@ def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
         problems.append(f"the job calls {call['repository']}, not the shared repository's field")
     if call["ref"] != SAMPLE["Shared"]["Commit"]:
         problems.append("the called workflow is not named by the commit field alone")
+    if "if" in job and job["if"] != DRAFT_IF:
+        problems.append(f"the call job has `if: {job['if']}`, not `{DRAFT_IF}`")
     path = call["path"]
     called = _called(root, path)
     if called is None:
@@ -280,6 +283,28 @@ def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
     problems += _with_problems(job, called, path, _public_inputs(root, path))
     problems += _grant_problems(job, doc, called, path)
     problems += _secret_problems(job, called, path)
+    return problems
+
+
+def _draft_step_problems(step: object, key: str) -> list[str]:
+    """What keeps the draft report step of job `result` from reporting a skipped draft."""
+    if not isinstance(step, dict) or sorted(step) != sorted(STEP_KEYS):
+        return [
+            f"the draft report step of job `{RESULT}` has keys other than {', '.join(STEP_KEYS)}"
+        ]
+    problems = []
+    if step["if"] != f"needs.{key}.result == 'skipped'":
+        problems.append(
+            f"the draft report step of job `{RESULT}` does not run on "
+            f"`needs.{key}.result == 'skipped'`"
+        )
+    if step["shell"] != "bash":
+        problems.append(f"the draft report step of job `{RESULT}` does not run in bash")
+    lines = str(step["run"]).strip().split("\n")
+    if lines[-1] != "exit 1" or not all(ECHO.fullmatch(line) for line in lines[:-1]):
+        problems.append(
+            f"the draft report step of job `{RESULT}` does more than print a line and `exit 1`"
+        )
     return problems
 
 
@@ -323,8 +348,15 @@ def _result_problems(jobs: dict, key: str, doc: dict) -> list[str]:
     if type(minutes) is not int or not 1 <= minutes <= LONGEST_MINUTES:
         problems.append(f"job `{RESULT}` has no timeout of 1 to {LONGEST_MINUTES} minutes")
     steps = result["steps"]
-    if not isinstance(steps, list) or len(steps) != 1:
-        return [*problems, f"job `{RESULT}` has not exactly one step"]
+    if not isinstance(steps, list) or len(steps) not in (1, 2):
+        count = len(steps) if isinstance(steps, list) else "not a list of"
+        return [
+            *problems,
+            f"job `{RESULT}` has {count} steps; "
+            "a caller holds one step, or two when the first reports a draft",
+        ]
+    if len(steps) == 2:
+        return problems + _draft_step_problems(steps[0], key) + _step_problems(steps[1], key)
     return problems + _step_problems(steps[0], key)
 
 

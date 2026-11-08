@@ -30,6 +30,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/licence.yml
+    with:
+      runner: ubuntu-26.04
 
   # The forge reports the calling job above only as "Licence / REUSE lint",
   # never as "Licence", so a rule set that requires "Licence" waits forever.

@@ -46,7 +46,8 @@ checks every workflow added here must pass. The first reusable workflow is the
 licence check; this repository is its first caller and no longer keeps a
 licence job of its own. The second is the scorecard run; it has no caller
 yet, because a repository can call it only once this one is public. The caller
-a consumer keeps exists as a template for both.
+a consumer keeps exists as a template for both. The scorecard caller can be
+started by hand.
 
 Consumers call this repository directly; no copy per owner is built. Its name
 is chosen. It turns public now that its history is shown to hold no private
@@ -215,6 +216,8 @@ A consumer's caller is rendered from `templates/callers/<name>.yml.tmpl`:
 python3 tools/render.py render --template templates/callers/licence.yml.tmpl --context context.toml \
   > .github/workflows/licence-check.yml
 ```
+
+The rendered licence caller skips its job on a draft and reports the draft.
 
 `context.toml` holds the values of the template's fields:
 

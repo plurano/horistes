@@ -82,6 +82,10 @@ exceptions:
     reason: the engine declares a name no run reports
     expires: "2026-12-31"
 """
+DRAFT_ERROR = (
+    'echo "::error title=Gate not run on a draft::The gate did not run because '
+    'the pull request is a draft. It runs when the pull request is marked ready for review."'
+)
 RENDERED = f"""\
 # SPDX-FileCopyrightText: 2026 Owner <owner@example.org>
 # SPDX-License-Identifier: EUPL-1.2
@@ -104,8 +108,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A draft skips this job, and the result job below fails for it, so the
+  # required check stays red on a draft until the ready_for_review run.
   licence:
     name: Licence
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.draft == false
     permissions:
       contents: read
     uses: owner/shared/{CALLED}@{COMMIT} # v1.2.3
@@ -113,9 +122,10 @@ jobs:
       runner: ubuntu-26.04
 
   # The forge reports the calling job above only as "Licence / REUSE lint",
-  # never as "Licence". This job reports "Licence" and fails unless the licence
-  # check passed; it runs under always() so a failed or cancelled check still
-  # reports here.
+  # never as "Licence", so a rule set that requires "Licence" waits forever.
+  # This job reports "Licence" and fails unless the licence check passed; it
+  # runs under always() so a failed, cancelled or skipped check still reports
+  # here.
   result:
     name: Licence
     needs: licence
@@ -124,11 +134,19 @@ jobs:
     timeout-minutes: 5
     permissions: {{}}
     steps:
+      # yamllint disable rule:line-length
+      - name: Report the draft
+        if: needs.licence.result == 'skipped'
+        shell: bash
+        run: |
+          {DRAFT_ERROR}
+          exit 1
+      # yamllint enable rule:line-length
       - name: Fail unless the licence check passed
         if: needs.licence.result != 'success'
         shell: bash
         run: |
-          echo "The licence check did not pass."
+          echo "The licence check did not pass or was skipped on a draft."
           exit 1
 """
 
@@ -147,6 +165,7 @@ on:
     branches: [main]
   schedule:
     - cron: "23 4 * * 2"
+  workflow_dispatch:
 
 permissions: {{}}
 
@@ -441,6 +460,11 @@ PLANTED = [
         "the rendered caller does not start with the two SPDX header lines",
         id="spdx-missing-identifier",
     ),
+    pytest.param(
+        GOOD.replace("    permissions:\n", "    if: always()\n    permissions:\n"),
+        f"the call job has `if: always()`, not `{render.DRAFT_IF}`",
+        id="call-job-with-other-if",
+    ),
 ]
 
 
@@ -455,6 +479,20 @@ def test_planted_template_fails(tree, template, message):
 RESULT_JOB = GOOD[GOOD.index("\n  result:\n") :]
 STEP_IF = "if: needs.licence.result != 'success'"
 ECHO = 'echo "The licence check did not pass."'
+DRAFT_STEP = """\
+      - name: Report the draft
+        if: needs.licence.result == 'skipped'
+        shell: bash
+        run: |
+          echo "::error title=Gate not run on a draft::The gate did not run."
+          exit 1
+"""
+TWO_STEPS_GOOD = GOOD.replace("    steps:\n", f"    steps:\n{DRAFT_STEP}")
+DRAFT_CALL_IF = """\
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.draft == false
+"""
 PLANTED_RESULT = [
     pytest.param(
         GOOD.replace(RESULT_JOB, "\n"),
@@ -507,8 +545,28 @@ PLANTED_RESULT = [
     ),
     pytest.param(
         GOOD + "      - name: Second\n        run: exit 0\n",
-        "job `result` has not exactly one step",
+        "the draft report step of job `result` does not run on `needs.licence.result == 'skipped'`",
         id="result-second-step",
+    ),
+    pytest.param(
+        TWO_STEPS_GOOD.replace(
+            "if: needs.licence.result == 'skipped'", "if: needs.licence.result == 'failure'"
+        ),
+        "the draft report step of job `result` does not run on `needs.licence.result == 'skipped'`",
+        id="draft-report-passes-a-cancelled-call",
+    ),
+    pytest.param(
+        TWO_STEPS_GOOD.replace(
+            'echo "::error title=Gate not run on a draft::The gate did not run."',
+            "curl -fsS https://example.org",
+        ),
+        "the draft report step of job `result` does more than print a line and `exit 1`",
+        id="draft-report-step-runs-a-command",
+    ),
+    pytest.param(
+        TWO_STEPS_GOOD + "      - name: Third\n        run: exit 0\n",
+        "a caller holds one step, or two when the first reports a draft",
+        id="result-three-steps",
     ),
     pytest.param(
         GOOD.replace(STEP_IF, "if: needs.licence.result == 'failure'"),
@@ -548,6 +606,17 @@ def test_planted_result_job_fails(tree, template, message):
     done = check(tree, template)
     assert done.returncode == 1, done.stdout
     assert message in done.stderr
+
+
+def test_two_steps_with_draft_report_first_passes(tree):
+    """A caller with the draft report step followed by the failure step passes."""
+    assert check(tree, TWO_STEPS_GOOD).returncode == 0
+
+
+def test_call_job_with_draft_if_passes(tree):
+    """A call job carrying the draft handling condition passes."""
+    with_draft_if = GOOD.replace("    permissions:\n", f"{DRAFT_CALL_IF}    permissions:\n")
+    assert check(tree, with_draft_if).returncode == 0
 
 
 def test_caller_that_gates_no_pull_request_needs_no_result_job(tree):
