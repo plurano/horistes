@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import base64
 import errno
-import fcntl
 import functools
 import hashlib
 import importlib.util
@@ -39,6 +38,14 @@ from conftest import ROOT
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; the pipe-capacity tests skip there.
+    fcntl = None
+# Setting a pipe's capacity is Linux only (F_SETPIPE_SZ); macOS and Windows skip those tests.
+PIPE_SIZE = getattr(fcntl, "F_SETPIPE_SZ", None)
+NO_PIPE_SIZE = "setting a pipe's capacity needs F_SETPIPE_SZ, which only Linux has"
 
 TRAIN = ROOT / ".github/workflows/merge-train.yml"
 STEP = "Land or update one pull request in every repository of the app"
@@ -1932,13 +1939,14 @@ def shrink_pipes(train_mod, monkeypatch):
     def small_pipe():
         """Create a pipe with 4096-byte capacity on each end."""
         r, w = real_pipe()
-        fcntl.fcntl(r, fcntl.F_SETPIPE_SZ, 4096)
-        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)
+        fcntl.fcntl(r, PIPE_SIZE, 4096)
+        fcntl.fcntl(w, PIPE_SIZE, 4096)
         return r, w
 
     monkeypatch.setattr(train_mod.os, "pipe", small_pipe)
 
 
+@pytest.mark.skipif(PIPE_SIZE is None, reason=NO_PIPE_SIZE)
 def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
     """key_bits reads an RSA key longer than the 4096-byte pipe buffer without hanging."""
     train_mod = load_train(tmp_path, monkeypatch)
@@ -1960,6 +1968,7 @@ def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
     assert result == {"bits": 2048}
 
 
+@pytest.mark.skipif(PIPE_SIZE is None, reason=NO_PIPE_SIZE)
 def test_key_longer_than_pipe_capacity_app_jwt(tmp_path, monkeypatch):
     """app_jwt signs a JWT using a key longer than the 4096-byte pipe buffer without hanging."""
     train_mod = load_train(tmp_path, monkeypatch)
