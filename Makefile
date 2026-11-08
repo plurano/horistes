@@ -16,7 +16,7 @@ ACTIONLINT_VERSION := 1.7.12
 GITLEAKS ?= gitleaks
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
-.PHONY: verify verify-all tools requirements requirements-fuzz lint-yaml lint-python lint-workflows \
+.PHONY: verify verify-all tools check-tools-stamp requirements requirements-fuzz lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
 	interface-snapshot list-pins check-pins pin check-runners check-links check-examples
 
@@ -36,12 +36,25 @@ verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-e
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.
 # Linked worktrees share .venv by symlink: compare content, not mtime.
+TOOLS_HASH = $$(sha256sum requirements/tools.txt | cut -d ' ' -f 1)
+TOOLS_STAMP = $$(cat $(VENV)/.stamp 2>/dev/null)
+
 tools:
-	@hash=$$(sha256sum requirements/tools.txt | cut -d ' ' -f 1); \
-	if [ "$$(cat $(VENV)/.stamp 2>/dev/null)" != "$$hash" ]; then \
+	@hash=$(TOOLS_HASH); \
+	if [ "$(TOOLS_STAMP)" != "$$hash" ]; then \
 		if [ ! -x $(BIN)/python ]; then $(PYTHON) -m venv $(VENV); fi && \
 		$(BIN)/python -m pip install --quiet --disable-pip-version-check --require-hashes -r requirements/tools.txt && \
 		printf '%s\n' "$$hash" > $(VENV)/.stamp; \
+	fi
+
+# The pre-push gate refuses a run that installs into .venv during
+# verification, so pre-push runs this first: it fails when the stamp does
+# not match requirements/tools.txt, or when that file cannot be read.
+check-tools-stamp:
+	@hash=$(TOOLS_HASH); \
+	if [ -z "$$hash" ] || [ "$(TOOLS_STAMP)" != "$$hash" ]; then \
+		printf '%s\n' '$(VENV)/.stamp does not match requirements/tools.txt; run make tools' >&2; \
+		exit 1; \
 	fi
 
 # Recompile the pins; a release younger than three days is left out. The
