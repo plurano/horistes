@@ -131,13 +131,17 @@ def evaluate_age(
     if age_days > BOUND_DAYS:
         return (
             1,
-            f"FAIL: newest release {newest_version} is {age_days} days old "
-            f"(> {BOUND_DAYS} days), but pinned release is {pinned_version}.",
+            (
+                f"FAIL: newest release {newest_version} is {age_days} days old "
+                f"(> {BOUND_DAYS} days), but pinned release is {pinned_version}."
+            ),
         )
     return (
         0,
-        f"PASS: newer release {newest_version} is {age_days} day(s) old "
-        f"(Renovate proposes it after 3 days).",
+        (
+            f"PASS: newer release {newest_version} is {age_days} day(s) old "
+            f"(Renovate proposes it after 3 days)."
+        ),
     )
 
 
