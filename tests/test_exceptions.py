@@ -295,6 +295,21 @@ def test_tree_git_init_ignores_inherited_git_dir(tmp_path, monkeypatch):
     assert (foreign.root / ".git" / "index").read_bytes() == index_bytes
 
 
+def test_tree_git_add_ignores_inherited_git_index_file(tmp_path, monkeypatch):
+    """Tree.git add stages into the tree's own index when GIT_INDEX_FILE names a foreign one."""
+    foreign = foreign_index(tmp_path)
+    index_bytes = (foreign.root / ".git" / "index").read_bytes()
+
+    monkeypatch.setenv("GIT_INDEX_FILE", str(foreign.root / ".git" / "index"))
+    fresh = Tree(tmp_path / "fresh")
+    fresh.git("init", "-b", "main")
+    fresh.write({RUFF: '[lint]\nselect = ["E"]\n'})
+    fresh.git("add", "--", RUFF)
+
+    assert (foreign.root / ".git" / "index").read_bytes() == index_bytes
+    assert fresh.git("ls-files") == RUFF
+
+
 def test_own_entry_named_twice_fails_and_another_path_does_not(tree):
     done = own(tree, LIST + ENTRY)
     assert done.returncode == 1
