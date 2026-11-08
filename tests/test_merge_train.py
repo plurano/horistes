@@ -19,6 +19,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1699,6 +1700,96 @@ def test_missing_app_credential_stops_before_any_call(tmp_path, key, value):
     done, _ = train(tmp_path, forge, **{key: value})
     assert done.returncode == 3, done.stdout + done.stderr
     assert done.stdout.startswith("::error title=Merge train setting::")
+    assert (forge.minted, forge.where) == ([], [])
+
+
+@functools.cache
+def rsa_key(bits: int) -> tuple[str, bytes]:
+    """An RSA key pair made for test runs: the private PEM text and the public PEM."""
+    private = openssl("genpkey", "-algorithm", "RSA", "-pkeyopt", f"rsa_keygen_bits:{bits}")
+    return private.decode(), openssl("pkey", "-pubout", data=private)
+
+
+def load_train(tmp_path: Path):
+    """The merge train script, imported with its rules module written to RUNNER_TEMP."""
+    (tmp_path / "train_rules.py").write_text(module(), encoding="utf-8")
+    if str(tmp_path) not in sys.path:
+        sys.path.insert(0, str(tmp_path))
+    os.environ["RUNNER_TEMP"] = str(tmp_path)
+    spec = importlib.util.spec_from_file_location("merge_train", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize(
+    "bits",
+    [
+        pytest.param(1024, id="1024-bits"),
+        pytest.param(2047, id="2047-bits"),
+    ],
+)
+def test_short_app_key_is_refused(tmp_path, bits):
+    """An RSA app key shorter than 2048 bits is refused before any forge call."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, app_key=rsa_key(bits)[0])
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert str(bits) in done.stdout
+    assert "2048" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
+
+
+@pytest.mark.parametrize(
+    "bits",
+    [
+        pytest.param(2048, id="2048-bits"),
+        pytest.param(4096, id="4096-bits"),
+    ],
+)
+def test_sufficient_app_key_is_accepted(tmp_path, bits):
+    """An RSA app key of at least 2048 bits is accepted and proceeds to the forge."""
+    priv, pub = rsa_key(bits)
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.public = pub
+    done, _ = train(tmp_path, forge, app_key=priv)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]
+
+
+@pytest.mark.parametrize(
+    ("bits", "expected"),
+    [
+        pytest.param(2048, 2048, id="2048-bits"),
+        pytest.param(1024, 1024, id="1024-bits"),
+    ],
+)
+def test_key_bits_reads_length_directly(tmp_path, bits, expected):
+    """The key_bits helper measures the key's bit length through a pipe."""
+    train_mod = load_train(tmp_path)
+    assert train_mod.key_bits(rsa_key(bits)[0]) == expected
+
+
+def test_refused_app_key_is_never_printed(tmp_path):
+    """The private key material never appears in the output of a refused run."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    key_pem = rsa_key(1024)[0]
+    done, summary = train(tmp_path, forge, app_key=key_pem)
+    assert done.returncode == 3, done.stdout + done.stderr
+    out = done.stdout + done.stderr + summary
+    body = "".join(key_pem.splitlines()[1:-1])
+    assert body[:40] not in out.replace("\n", "")
+    assert "PRIVATE KEY" not in out
+
+
+def test_unreadable_app_key_is_refused(tmp_path):
+    """An unreadable app key is refused before any forge call."""
+    corrupted = "-----BEGIN RSA PRIVATE KEY-----\ncorrupted\n-----END RSA PRIVATE KEY-----\n"
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, app_key=corrupted)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert "2048" in done.stdout
     assert (forge.minted, forge.where) == ([], [])
 
 

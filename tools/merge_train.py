@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -73,6 +74,8 @@ MAX_PAGES = 20
 JWT_SECONDS = 540
 MAX_RELEASES = 256
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+# NIST SP 800-57 Part 1: 112-bit security is 2048-bit RSA; OpenSSF Best Practices crypto_keylength.
+MIN_KEY_BITS = 2048
 WRITE_RIGHTS = {
     "actions": "read",
     "contents": "write",
@@ -113,6 +116,49 @@ class InvalidSettingError(Exception):
     """A setting outside its allowed values."""
 
 
+def key_bits(key):
+    """The bit length of an RSA private key, read through a pipe via openssl pkey."""
+    openssl = shutil.which("openssl")
+    if not openssl:
+        raise InvalidSettingError("openssl is not on the runner: the app key cannot be verified")
+    read_end, write_end = os.pipe()
+    with os.fdopen(write_end, "w") as pipe:
+        pipe.write(key)
+    try:
+        done = subprocess.run(
+            [openssl, "pkey", "-in", f"/dev/fd/{read_end}", "-noout", "-text_pub"],
+            capture_output=True,
+            pass_fds=(read_end,),
+            timeout=TIMEOUT,
+            check=False,
+            text=True,
+        )
+    finally:
+        os.close(read_end)
+    if done.returncode != 0 or not done.stdout:
+        return None
+    match = re.search(r"Public-Key:\s*\((\d+)\s*bit\)", done.stdout)
+    return int(match.group(1)) if match else None
+
+
+def check_app_key(key):
+    """Refuse an app key that is empty, unreadable or shorter than MIN_KEY_BITS."""
+    if "PRIVATE KEY-----" not in key:
+        raise InvalidSettingError(
+            "the app key is empty or no PEM key: the caller passes no secret, "
+            "or the job runs outside the environment that holds it"
+        )
+    bits = key_bits(key)
+    if bits is None:
+        raise InvalidSettingError(
+            f"the app key could not be read by openssl; at least {MIN_KEY_BITS} bits are required"
+        )
+    if bits < MIN_KEY_BITS:
+        raise InvalidSettingError(
+            f"the app key has {bits} bits; at least {MIN_KEY_BITS} are required"
+        )
+
+
 def settings(env):
     """The inputs of the workflow, each checked against an allow-list."""
     switch = env["TRAIN_SWITCH"]
@@ -129,11 +175,7 @@ def settings(env):
         raise InvalidSettingError(f"min_age_days is {age!r}, not a whole number from 0 to 30")
     if not env.get("TRAIN_APP_CLIENT_ID", "").strip():
         raise InvalidSettingError("app_client_id is empty")
-    if "PRIVATE KEY-----" not in env.get("TRAIN_APP_KEY", ""):
-        raise InvalidSettingError(
-            "the app key is empty or no PEM key: the caller passes no secret, "
-            "or the job runs outside the environment that holds it"
-        )
+    check_app_key(env.get("TRAIN_APP_KEY", ""))
     release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
     parallel = check_release_parallel(env["TRAIN_RELEASE_MAX_PARALLEL"], InvalidSettingError)
     return {
