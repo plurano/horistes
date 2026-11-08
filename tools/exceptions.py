@@ -17,11 +17,14 @@ key names one file of the repository, not a pattern, and every entry of its
 `ignore` list is a quoted message pattern that ends in the same
 `# expires YYYY-MM-DD: reason` comment on its own line.
 
-ruff.toml holds accepted ruff findings under `lint.per-file-ignores`. Every key
-names one file of the repository, not a pattern, and its line must end in the
-same `# expires YYYY-MM-DD: reason` comment. A non-empty `lint.ignore` list
-fails, and so does any key outside RUFF_TOP and RUFF_LINT: an unknown key could
-carry an ignore this tool never reads.
+ruff.toml holds accepted ruff findings under `lint.per-file-ignores`. Only
+`[lint.per-file-ignores]` is read. Every key names one file of the repository,
+not a pattern, and the key may be double-quoted, single-quoted or bare. The
+comment sits on the line that opens the entry, ending in the same
+`# expires YYYY-MM-DD: reason`. An array may continue on later lines. A missing
+ruff.toml exits 3. A non-empty `lint.ignore` list fails, and so does any key
+outside RUFF_TOP and RUFF_LINT: an unknown key could carry an ignore this tool
+never reads.
 
 exceptions.yaml holds exceptions to rules no linter configuration can carry.
 An entry has the shape of the engine's own list, plus the issue that tracks
@@ -74,7 +77,8 @@ PATTERN = re.compile(
     r"^\s+- '(?P<pattern>[^']+)'\s+# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
 )
 RUFF_ENTRY = re.compile(
-    r'^"(?P<file>[^"]+)"\s*=\s*\[[^\]]*\]\s*# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$'
+    r'^(?P<key>"[^"\\]+"|\'[^\']+\'|[A-Za-z0-9_-]+)\s*=\s*\[[^#]*'
+    r"# expires (?P<day>\d{4}-\d{2}-\d{2}): (?P<why>\S.*)$"
 )
 ISSUE = re.compile(r"^[\w.-]+/[\w.-]+#[1-9]\d*$")
 
@@ -170,11 +174,27 @@ def _ruff_layout(data: dict) -> tuple[list[str], object]:
     return found, per_file
 
 
+def _ruff_stated(text: str) -> dict[str, datetime.date]:
+    """Map accepted per-file-ignores keys to their stated expiration day."""
+    stated: dict[str, datetime.date] = {}
+    current_table = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            current_table = stripped.split("#", 1)[0].strip()
+            continue
+        if current_table != "[lint.per-file-ignores]":
+            continue
+        match = RUFF_ENTRY.match(line)
+        if match:
+            key = next(iter(tomllib.loads(f"{match['key']} = 0")))
+            stated[key] = datetime.date.fromisoformat(match["day"])
+    return stated
+
+
 def _ruff(root: Path, today: datetime.date) -> tuple[list[str], int]:
     """What is wrong with accepted ruff findings, and how many entries were read."""
     path = root / RUFF
-    if not path.exists():
-        return [], 0
     try:
         text = path.read_text(encoding="utf-8")
         found, per_file = _ruff_layout(tomllib.loads(text))
@@ -182,11 +202,7 @@ def _ruff(root: Path, today: datetime.date) -> tuple[list[str], int]:
         raise ciwf.ReadError(f"{path}: {err}") from err
     if per_file is None:
         return found, 0
-    stated = {}
-    for line in text.splitlines():
-        match = RUFF_ENTRY.match(line)
-        if match:
-            stated[match["file"]] = datetime.date.fromisoformat(match["day"])
+    stated = _ruff_stated(text)
     for key in sorted(per_file.keys()):
         where = f"{RUFF}: {key}"
         if not _tracked_file(root, key):
@@ -291,6 +307,7 @@ def problems(root: Path, today: datetime.date) -> tuple[list[str], int, int]:
 
 
 def main() -> int:
+    """Check accepted linter findings and exceptions, exiting non-zero on failure."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("command", choices=("check",))
     parser.add_argument("--root", type=Path, default=Path("."))

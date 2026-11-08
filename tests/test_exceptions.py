@@ -11,6 +11,7 @@ import pytest
 from conftest import ROOT
 
 CONFIG = ".github/zizmor.yml"
+RUFF = "ruff.toml"
 GOOD = (
     "---\nrules:\n  concurrency-limits:\n    ignore:\n"
     "      - old.yml # expires 2026-12-31: written by another tool\n"
@@ -18,14 +19,29 @@ GOOD = (
 TODAY = "2026-10-11"
 
 
+@pytest.fixture(autouse=True)
+def _default_ruff_toml(tree):
+    """Write minimal ruff.toml so tests without explicit ruff config pass."""
+    tree.write({RUFF: '[lint]\nselect = ["E"]\n'})
+
+
 def check(tree, text, today=TODAY):
     return tree.write({CONFIG: text}).tool("exceptions.py", "check", "--today", today)
 
 
-def test_no_configuration_passes(tree):
+def test_tree_holding_only_default_ruff_toml_passes(tree):
+    """A tree holding only the minimal ruff.toml configuration passes."""
     done = tree.tool("exceptions.py", "check", "--today", TODAY)
     assert done.returncode == 0
     assert "0 accepted" in done.stdout
+
+
+def test_missing_ruff_toml_exits_3(tree):
+    """Missing ruff.toml causes check to exit with code 3 naming the path."""
+    (tree.root / RUFF).unlink()
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 3
+    assert str(tree.root / RUFF) in done.stderr
 
 
 def test_entry_with_reason_and_a_day_ahead_passes(tree):
@@ -396,6 +412,91 @@ def test_ruff_known_keys_pass(tree):
     done = ruffed(tree, text)
     assert done.returncode == 0, done.stderr
     assert "1 accepted" in done.stdout
+
+
+def test_ruff_single_quoted_key_passes(tree):
+    """A single-quoted key in per-file-ignores passes."""
+    text = (
+        "[lint.per-file-ignores]\n"
+        f'\'{HOOK}\' = ["ISC001", "ISC004"] # expires 2026-12-31: single-quoted key\n'
+    )
+    done = ruffed(tree, text)
+    assert done.returncode == 0, done.stderr
+    assert "1 accepted" in done.stdout
+
+
+def test_ruff_bare_key_passes(tree):
+    """A bare key naming a tracked file in per-file-ignores passes."""
+    tree.write({"hook_file": "# tracked\n"})
+    text = '[lint.per-file-ignores]\nhook_file = ["ISC001"] # expires 2026-12-31: bare key\n'
+    done = ruffed(tree, text)
+    assert done.returncode == 0, done.stderr
+    assert "1 accepted" in done.stdout
+
+
+def test_ruff_comment_counts_for_the_key_toml_decodes(tree):
+    """A comment on the literal key '"<hook>"' does not count for the bare hook key."""
+    text = (
+        "[lint.per-file-ignores]\n"
+        f'\'"{HOOK}"\' = ["ISC001"] # expires 2026-12-31: key holds quote marks\n'
+        f'"{HOOK}" = ["ISC001"]\n'
+    )
+    done = ruffed(tree, text)
+    assert done.returncode == 1
+    assert f"ruff.toml: {HOOK} has no `# expires" in done.stderr
+    assert f'ruff.toml: "{HOOK}" is no one file of the repository' in done.stderr
+
+
+def test_ruff_multiline_array_comment_on_opening_line_passes(tree):
+    """A multiline array with the comment on the opening line passes."""
+    text = (
+        "[lint.per-file-ignores]\n"
+        f'"{HOOK}" = [ # expires 2026-12-31: multiline array\n'
+        '    "ISC001",\n'
+        '    "ISC004",\n'
+        "]\n"
+    )
+    done = ruffed(tree, text)
+    assert done.returncode == 0, done.stderr
+    assert "1 accepted" in done.stdout
+
+
+def test_ruff_multiline_array_comment_on_closing_line_fails(tree):
+    """A multiline array with the comment only on the closing line fails."""
+    text = (
+        "[lint.per-file-ignores]\n"
+        f'"{HOOK}" = [\n'
+        '    "ISC001",\n'
+        '    "ISC004",\n'
+        "] # expires 2026-12-31: closing line comment\n"
+    )
+    done = ruffed(tree, text)
+    assert done.returncode == 1
+    assert "has no `# expires" in done.stderr
+
+
+def test_ruff_entry_under_isort_instead_of_per_file_ignores_fails(tree):
+    """An entry with comment placed under [lint.isort] instead of per-file-ignores fails."""
+    text = (
+        "[lint.per-file-ignores]\n"
+        f'"{HOOK}" = ["ISC001"]\n'
+        "[lint.isort]\n"
+        f'"{HOOK}" = ["ISC001"] # expires 2026-12-31: under isort\n'
+    )
+    done = ruffed(tree, text)
+    assert done.returncode == 1
+    assert "has no `# expires" in done.stderr
+
+
+def test_ruff_header_with_spaces_fails(tree):
+    """A header spelled `[ lint.per-file-ignores ]` fails to collect stated entries."""
+    text = (
+        "[ lint.per-file-ignores ]\n"
+        f'"{HOOK}" = ["ISC001", "ISC004"] # expires 2026-12-31: praetor-managed hook\n'
+    )
+    done = ruffed(tree, text)
+    assert done.returncode == 1
+    assert "has no `# expires" in done.stderr
 
 
 def test_ruff_unreadable_toml_exits_3(tree):

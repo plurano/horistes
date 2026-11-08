@@ -36,6 +36,7 @@ def rest(*lines: str) -> str:
 
 
 def test_checks_are_the_rules_and_findings_name_rule_place_score_and_details():
+    """Checks list SARIF rules and findings format rule, location, score, and detail hash."""
     assert results.from_sarif(GOOD) == {
         "tools": ["Scorecard v5.5.0"],
         "checks": list(RULES),

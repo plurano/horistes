@@ -2038,6 +2038,7 @@ def test_release_job_without_the_judge_is_found():
 
 
 def test_release_job_mutants_are_found():
+    """Release job findings flag unconstrained tokens, excess rights, and bypassed switches."""
     doc = ciwf.load(TRAIN)
     job = doc["jobs"]["release"]
     mint = [s for s in job["steps"] if s.get("uses", "").startswith(APP_TOKEN)][0]["with"]
@@ -2877,6 +2878,7 @@ def test_single_commit_squash_message_uses_body_and_distinct_sign_offs(tmp_path)
 
 
 def test_multiple_distinct_sign_offs_kept_in_first_seen_order(tmp_path):
+    """Multiple distinct Signed-off-by trailers are preserved in first-seen order."""
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.commits[1] = [
         ("feat: a\n\nSigned-off-by: First <first@example.org>", 1),

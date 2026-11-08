@@ -60,8 +60,8 @@ lint-yaml: tools
 	$(BIN)/yamllint --strict .
 
 lint-python: tools
-	$(BIN)/ruff check tools tests fuzz
-	$(BIN)/ruff format --check tools tests fuzz
+	$(BIN)/ruff check --config ruff.toml tools tests fuzz
+	$(BIN)/ruff format --check --config ruff.toml tools tests fuzz
 
 # actionlint reads .github/workflows by itself; zizmor is given the workflow
 # and the action directories and must find at least the workflows.

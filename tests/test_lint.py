@@ -81,6 +81,7 @@ def actionlint(tree):
 
 
 def zizmor(tree):
+    """Run zizmor offline in pedantic mode against the planted tree root."""
     command = [
         *external("ZIZMOR", "zizmor"),
         "--offline",
@@ -284,3 +285,40 @@ def test_ruff_isc_select_both_directions(tree):
     tree.write({"ruff.toml": without_isc})
     passed = ruff(tree)
     assert passed.returncode == 0, passed.stdout + passed.stderr
+
+
+def test_ruff_config_flag_overrides_nested_and_dot_configs(tree):
+    """The --config flag forces ruff.toml over nested pyproject.toml and root .ruff.toml."""
+    base = (ROOT / "ruff.toml").read_text(encoding="utf-8")
+    tree.write(
+        {
+            "ruff.toml": base,
+            "sub/pyproject.toml": (
+                '[tool.ruff]\nline-length = 100\n[tool.ruff.lint]\nselect = ["E"]\n'
+            ),
+            "sub/sample.py": PY_ISC_FINDING,
+        }
+    )
+    passes_nested = ruff(tree, "check", ".")
+    assert passes_nested.returncode == 0, passes_nested.stdout + passes_nested.stderr
+    fails_nested = ruff(tree, "check", "--config", "ruff.toml", ".")
+    assert fails_nested.returncode != 0
+    assert "ISC004" in fails_nested.stdout
+
+    (tree.root / "sub" / "pyproject.toml").unlink()
+    tree.write({".ruff.toml": '[lint]\nselect = ["E"]\n'})
+    passes_dot = ruff(tree, "check", ".")
+    assert passes_dot.returncode == 0, passes_dot.stdout + passes_dot.stderr
+    fails_dot = ruff(tree, "check", "--config", "ruff.toml", ".")
+    assert fails_dot.returncode != 0
+    assert "ISC004" in fails_dot.stdout
+
+
+def test_makefile_lint_python_recipe_passes_config_flag():
+    """Makefile lint-python recipe passes --config ruff.toml to ruff check and format."""
+    content = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "\t$(BIN)/ruff check --config ruff.toml tools tests fuzz\n" in content
+    assert "\t$(BIN)/ruff format --check --config ruff.toml tools tests fuzz\n" in content
+    for line in content.splitlines():
+        if "$(BIN)/ruff check" in line or "$(BIN)/ruff format" in line:
+            assert "--config ruff.toml" in line

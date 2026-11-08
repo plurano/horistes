@@ -297,6 +297,7 @@ def result_of(data: dict) -> dict:
 
 
 def test_result_of_a_passing_job_is_read_from_its_artifact(tree, client):
+    """A passing job's SARIF result is read directly from its uploaded artifact."""
     held = forge_artifact(901, SCORE_ARTIFACT, SARIF)
     data = uploaded(client, score_run([held]))
     assert result_of(data) == {
@@ -410,6 +411,7 @@ def test_archive_over_the_limit_is_unreadable_and_not_fetched(tree, client, monk
 
 @pytest.mark.parametrize("missing", ["created_at", "started_at"])
 def test_artifact_without_a_time_is_an_error_not_a_guess(tree, client, missing):
+    """An artifact or job lacking valid timestamps produces an error instead of guessing."""
     held = forge_artifact(901, SCORE_ARTIFACT, SARIF)
     job = forge_job(601, SCORE_JOB, "success")
     if missing == "created_at":
