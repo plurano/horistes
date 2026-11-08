@@ -76,3 +76,4 @@ record that supersedes it.
 | [0066](0066-a-train-write-holds-the-landing-order.md) | 2026-11-01 | A train write holds the landing order | Accepted |
 | [0067](0067-the-train-settles-reviews-before-landing.md) | 2026-11-08 | The train settles reviews before landing | Accepted |
 | [0068](0068-the-train-holds-on-failed-code-scanning.md) | 2026-11-08 | The train holds on failed code scanning | Accepted |
+| [0069](0069-the-first-release-is-0-1-0-from-release-please.md) | 2026-11-08 | The first release is 0.1.0 from release-please | Accepted |

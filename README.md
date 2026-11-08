@@ -50,10 +50,12 @@ a consumer keeps exists as a template for both.
 
 Consumers call this repository directly; no copy per owner is built. Its name
 is chosen. It turns public now that its history is shown to hold no private
-content; the first release follows later. Until then only private repositories
-of the same owner can call it
+content; the first release, 0.1.0, is proposed by release-please through the
+merge train and cut when milestone 0.1.0 closes. Until then only private
+repositories of the same owner can call it
 ([ADR-0022](docs/adr/0022-public-consumers-call-this-repository-directly.md),
-[ADR-0024](docs/adr/0024-public-before-the-first-release.md)).
+[ADR-0024](docs/adr/0024-public-before-the-first-release.md),
+[ADR-0069](docs/adr/0069-the-first-release-is-0-1-0-from-release-please.md)).
 
 ## Workflows
 
