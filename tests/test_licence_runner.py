@@ -110,11 +110,13 @@ def linux_gate_problems(doc: dict) -> list[str]:
 
 
 def _mutate_step_removed(doc: dict) -> None:
+    """Planted defect: the gate step is removed from the job."""
     steps = doc["jobs"]["reuse"]["steps"]
     doc["jobs"]["reuse"]["steps"] = [s for s in steps if s.get("name") != STEP_NAME]
 
 
 def _mutate_step_moved(doc: dict) -> None:
+    """Planted defect: the gate step runs after the draft check instead of first."""
     steps = doc["jobs"]["reuse"]["steps"]
     idx = next(i for i, s in enumerate(steps) if s.get("name") == STEP_NAME)
     step = steps.pop(idx)
@@ -125,50 +127,60 @@ def _mutate_step_moved(doc: dict) -> None:
 
 
 def _mutate_condition(doc: dict) -> None:
+    """Planted defect: the step condition is inverted to `==`."""
     step = doc["jobs"]["reuse"]["steps"][0]
     step["if"] = "runner.os == 'Linux'"
 
 
 def _mutate_exit(doc: dict) -> None:
+    """Planted defect: the refusal ends with `exit 0`."""
     step = doc["jobs"]["reuse"]["steps"][0]
     step["run"] = step["run"].replace("exit 1", "exit 0")
 
 
 def _mutate_annotation(doc: dict) -> None:
+    """Planted defect: the `::error` annotation line is removed."""
     step = doc["jobs"]["reuse"]["steps"][0]
     lines = [line for line in step["run"].splitlines() if REQUIRED_ANNOTATION not in line]
     step["run"] = "\n".join(lines)
 
 
 def _mutate_shell_bash(doc: dict) -> None:
+    """Planted defect: the gate step runs in bash instead of pwsh."""
     step = doc["jobs"]["reuse"]["steps"][0]
     step["shell"] = "bash"
 
 
 def _mutate_job_condition(doc: dict) -> None:
+    """Planted defect: the job carries `if: false`."""
     doc["jobs"]["reuse"]["if"] = False
 
 
 def _mutate_job_continue_on_error(doc: dict) -> None:
+    """Planted defect: the job carries `continue-on-error: true`."""
     doc["jobs"]["reuse"]["continue-on-error"] = True
 
 
 def _mutate_step_continue_on_error(doc: dict) -> None:
+    """Planted defect: the gate step carries `continue-on-error: true`."""
     step = doc["jobs"]["reuse"]["steps"][0]
     step["continue-on-error"] = True
 
 
 def _mutate_early_exit_zero(doc: dict) -> None:
+    """Planted defect: an `exit 0` runs before the refusal."""
     step = doc["jobs"]["reuse"]["steps"][0]
     step["run"] = "exit 0\n" + step["run"]
 
 
 def _mutate_annotation_in_comment(doc: dict) -> None:
+    """Planted defect: the annotation survives only as a comment."""
     step = doc["jobs"]["reuse"]["steps"][0]
     step["run"] = step["run"].replace('Write-Output "::error', '# Write-Output "::error')
 
 
 def _mutate_annotation_in_branch(doc: dict) -> None:
+    """Planted defect: the annotation sits inside a branch that never runs."""
     step = doc["jobs"]["reuse"]["steps"][0]
     lines = []
     for line in step["run"].splitlines():
@@ -180,6 +192,7 @@ def _mutate_annotation_in_branch(doc: dict) -> None:
 
 
 def _mutate_annotation_after_exit(doc: dict) -> None:
+    """Planted defect: the annotation comes after the final exit."""
     step = doc["jobs"]["reuse"]["steps"][0]
     lines = [line for line in step["run"].splitlines() if line.strip()]
     exit_idx = next(i for i, line in enumerate(lines) if line.strip() == "exit 1")
@@ -189,6 +202,7 @@ def _mutate_annotation_after_exit(doc: dict) -> None:
 
 
 def _mutate_subexpression(doc: dict) -> None:
+    """Planted defect: an assignment value runs a `$(exit 0)` subexpression."""
     step = doc["jobs"]["reuse"]["steps"][0]
     step["run"] = step["run"].replace('$title = "Wrong runner OS"', '$title = "$(exit 0)"')
 
