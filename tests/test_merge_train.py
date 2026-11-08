@@ -5007,3 +5007,24 @@ def test_retitled_armed_pr_not_re_armed_when_code_scanning_is_red(tmp_path):
     assert disarmed(1) in forge.writes
     assert armed(1) not in forge.writes
     assert "not re-armed: code-scanning check failed" in summary
+
+
+def test_without_code_scanning_hold_the_red_scan_pr_would_land(tmp_path):
+    """A mutant that disables has_red_code_scanning lets the planted case land."""
+    mutant = module().replace(
+        "    scanning = has_red_code_scanning(pull)\n    if scanning:\n        return scanning",
+        "    pass",
+    )
+    assert mutant != module()
+    p = pull(
+        1,
+        "CLEAN",
+        suites=[
+            "SUCCESS",
+            suite(1001, "FAILURE", 10, None, "github-code-scanning"),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, _ = train(tmp_path, forge, helper=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
