@@ -1477,6 +1477,28 @@ def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
     assert (forge.minted, forge.writes) == ([], [])
 
 
+@pytest.mark.parametrize(
+    ("status", "settings"),
+    [
+        pytest.param(3, {"merge_method": "REBASE"}, id="invalid_setting"),
+        pytest.param(0, {}, id="clean_pull_lands"),
+    ],
+)
+def test_entrypoint_exit_status(tmp_path, status, settings):
+    """The script run as a program exits with the status main() returns.
+
+    LAUNCH calls main() directly, so only this test holds the exit status of the entrypoint.
+    """
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, text=script(), **settings)
+    assert done.returncode == status, done.stdout + done.stderr
+    if status == 3:
+        assert done.stdout.startswith("::error title=Merge train setting::")
+        assert (forge.minted, forge.writes) == ([], [])
+    else:
+        assert forge.writes == [landed(1)]
+
+
 @pytest.mark.parametrize("parallel", ["1", "3"])
 def test_release_max_parallel_boundaries_accepted(tmp_path, parallel):
     forge = Forge(repository(pull(1, "CLEAN")))
