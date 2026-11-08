@@ -29,6 +29,22 @@ YAML_BROKEN_SYNTAX = "---\nkey: [unclosed\n"
 YAML_RULE_VIOLATION = "---\nkey: " + '"' + "a" * 130 + '"\n'
 PY_GOOD = "VALUE: int = 1\n"
 PY_LINT_FINDING = "import sys\n"
+PY_ISORT_BLOCK = """\
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+try:
+    from yaml import YAMLError, safe_load_all
+except ImportError:
+    safe_load_all = None
+    YAMLError = Exception
+"""
 
 
 def actionlint_sha_line() -> str:
@@ -209,3 +225,22 @@ def test_ruff_refuses_a_planted_lint_finding(tree):
     bad = ruff(tree.write({"sample.py": PY_LINT_FINDING}))
     assert bad.returncode != 0
     assert "F401" in bad.stdout
+
+
+def test_ruff_isort_force_sort_within_sections_both_directions(tree):
+    """The try/except import block passes with false and fails with true."""
+    base = (ROOT / "ruff.toml").read_text(encoding="utf-8")
+    assert "force-sort-within-sections = false" in base
+
+    tree.write({"ruff.toml": base, "sample.py": PY_ISORT_BLOCK})
+    passes = ruff(tree, "check", "--select", "I001", ".")
+    assert passes.returncode == 0, passes.stdout + passes.stderr
+
+    forced = base.replace(
+        "force-sort-within-sections = false",
+        "force-sort-within-sections = true",
+    )
+    tree.write({"ruff.toml": forced})
+    fails = ruff(tree, "check", "--select", "I001", ".")
+    assert fails.returncode != 0
+    assert "I001" in fails.stdout
