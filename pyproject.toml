@@ -28,3 +28,12 @@ show_missing = true
 precision = 2
 # The gate fails below this total; raise it as coverage grows, never lower it.
 fail_under = 94
+
+# Codacy's Ruff passes ruff `--config` with the first of pyproject.toml,
+# ruff.toml or .ruff.toml it lists at the root (codacy/codacy-ruff,
+# src/codacy_ruff.py, find_ruff_configFile). Without this section a
+# pick of this file runs ruff on its defaults: line length 88, target
+# 3.10, where tomllib sorts as third party. Every root pick resolves to
+# ruff.toml; tests/test_codacy_ruff_config.py holds that.
+[tool.ruff]
+extend = "ruff.toml"
