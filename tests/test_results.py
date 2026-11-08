@@ -36,6 +36,7 @@ def rest(*lines: str) -> str:
 
 
 def test_checks_are_the_rules_and_findings_name_rule_place_score_and_details():
+    """Checks list SARIF rules and findings format rule, location, score, and detail hash."""
     assert results.from_sarif(GOOD) == {
         "tools": ["Scorecard v5.5.0"],
         "checks": list(RULES),
@@ -43,8 +44,10 @@ def test_checks_are_the_rules_and_findings_name_rule_place_score_and_details():
             "PinnedDependenciesID | .github/workflows/planted.yml:7 | "
             "score is 7: dependency not pinned by hash | "
             + rest("Warn: third-party action", "Warn: container image"),
-            "TokenPermissionsID | .github/workflows/ci.yml:1 | "
-            f"score is 9: one workflow writes | {rest()}",
+            (
+                "TokenPermissionsID | .github/workflows/ci.yml:1 | "
+                f"score is 9: one workflow writes | {rest()}"
+            ),
         ],
     }
 
@@ -270,8 +273,10 @@ def test_run_with_falsy_non_list_results_is_refused():
         ),
         (
             (
-                '"physicalLocation": {"artifactLocation":'
-                ' {"uri": ".github/workflows/planted.yml"}, "region": {"startLine": 7}}',
+                (
+                    '"physicalLocation": {"artifactLocation":'
+                    ' {"uri": ".github/workflows/planted.yml"}, "region": {"startLine": 7}}'
+                ),
                 '"physicalLocation": {"artifactLocation": "x", "region": 3}',
             ),
             "PinnedDependenciesID | -: |",

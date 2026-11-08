@@ -263,8 +263,10 @@ def _guard_problems(path: str, doc: dict, public: set[str]) -> list[str]:
     jobs = {str(n): j for n, j in (doc.get("jobs") or {}).items() if isinstance(j, dict)}
     if GUARD not in jobs:
         return [
-            f"{path}: an input is for public repositories only and no job `{GUARD}` "
-            "refuses another repository"
+            (
+                f"{path}: an input is for public repositories only and no job `{GUARD}` "
+                "refuses another repository"
+            )
         ]
     problems = [
         f"{path}: job `{GUARD}` {problem}" for problem in _guard_job_problems(jobs[GUARD], public)
