@@ -340,3 +340,10 @@ def external(variable: str, default: str) -> list[str]:
     A missing tool is an error, never a skip.
     """
     return shlex.split(os.environ.get(variable, default))
+
+
+def measured(env: dict[str, str]) -> dict[str, str]:
+    """Pass COVERAGE_PROCESS_CONFIG to a child process if set in the parent environment."""
+    if "COVERAGE_PROCESS_CONFIG" in os.environ:
+        return {**env, "COVERAGE_PROCESS_CONFIG": os.environ["COVERAGE_PROCESS_CONFIG"]}
+    return dict(env)

@@ -1,6 +1,7 @@
 /.venv/
 __pycache__/
 *.pyc
+/.coverage*
 
 # The pre-push gate's local receipt.
 

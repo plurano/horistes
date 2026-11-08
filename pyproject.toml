@@ -10,6 +10,27 @@ skips = ["B404", "B603", "B607"]
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
+[tool.coverage.run]
+# Branch coverage counts both outcomes of every condition, not only the lines.
+branch = true
+# The directories under test; tests/ and fuzz/ are left out.
+source = ["tools"]
+# Many tests invoke tools and hooks as subprocesses; patch measures them.
+patch = ["subprocess"]
+# Default data file for a bare coverage command. The Makefile test recipe
+# overrides it with --data-file in a temporary directory of its own.
+data_file = ".coverage"
+
+[tool.coverage.report]
+# Missing line and branch numbers are shown in terminal reports.
+show_missing = true
+# Terminal reports show two decimals; the Makefile's last coverage step
+# compares the total at ten decimals, so a total below the floor that
+# rounds up to it at two decimals still fails.
+precision = 2
+# The gate fails below this total; raise it as coverage grows, never lower it.
+fail_under = 94
+
 # Codacy's Ruff passes ruff `--config` with the first of pyproject.toml,
 # ruff.toml or .ruff.toml it lists at the root (codacy/codacy-ruff,
 # src/codacy_ruff.py, find_ruff_configFile). Without this section a

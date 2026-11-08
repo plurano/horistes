@@ -34,7 +34,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
-from conftest import ROOT
+from conftest import ROOT, measured
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
@@ -81,6 +81,20 @@ BOT = "merge-train-app"
 
 SCRIPT = ROOT / "tools/merge_train.py"
 RUN = 'python3 "$GITHUB_WORKSPACE/merge-train-source/tools/merge_train.py"'
+# Starts the genuine tools/merge_train.py, so coverage counts that file, with both waits at 0.
+LAUNCH = """\
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("merge_train", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules["merge_train"] = module
+spec.loader.exec_module(module)
+module.SETTLE_SECONDS = 0
+module.READ_BACKOFF_SECONDS = 0
+sys.exit(module.main(os.environ))
+"""
 
 
 def script() -> str:
@@ -840,39 +854,46 @@ def train(
 ):
     """Run the step's script against the stand-in forge; the result and the summary written."""
     (tmp_path / "train_rules.py").write_text(helper or module(), encoding="utf-8")
-    source = (text or script()).replace("SETTLE_SECONDS = 5", "SETTLE_SECONDS = 0")
-    source = source.replace("READ_BACKOFF_SECONDS = 5", "READ_BACKOFF_SECONDS = 0")
-    path = tmp_path / "train.py"
-    path.write_text(source, encoding="utf-8")
+    if text is None:
+        # The genuine script runs from tools/, so coverage counts it; LAUNCH zeroes the waits.
+        command = [sys.executable, "-I", "-B", "-c", LAUNCH, str(SCRIPT)]
+    else:
+        source = text.replace("SETTLE_SECONDS = 5", "SETTLE_SECONDS = 0")
+        source = source.replace("READ_BACKOFF_SECONDS = 5", "READ_BACKOFF_SECONDS = 0")
+        path = tmp_path / "train.py"
+        path.write_text(source, encoding="utf-8")
+        command = [sys.executable, "-I", "-B", str(path)]
     summary = tmp_path / "summary.md"
     output = tmp_path / "output"
     forge.workdir = tmp_path
     server = serve(forge)
     url = f"http://127.0.0.1:{server.server_address[1]}"
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "GITHUB_API_URL": url,
-        "GITHUB_GRAPHQL_URL": f"{url}/graphql",
-        "GITHUB_STEP_SUMMARY": str(summary),
-        "GITHUB_OUTPUT": str(output),
-        "RUNNER_TEMP": str(tmp_path),
-        "TRAIN_APP_CLIENT_ID": CLIENT_ID,
-        "TRAIN_APP_KEY": app_key()[0],
-        "TRAIN_SWITCH": "on",
-        "TRAIN_MERGE_METHOD": "SQUASH",
-        "TRAIN_ACCEPT_STATES": "",
-        "TRAIN_MIN_AGE_DAYS": "3",
-        "TRAIN_HOLD_LABELS": "hold,do-not-merge,planted",
-        "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
-        "TRAIN_PERSON_BRANCHES": "release-please--",
-        "TRAIN_RELEASE_OFF": "",
-        "TRAIN_RELEASE_MAX_PARALLEL": "3",
-        "TRAIN_SECURITY_LABELS": "security",
-        **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
-    }
+    env = measured(
+        {
+            "PATH": "/usr/bin:/bin",
+            "GITHUB_API_URL": url,
+            "GITHUB_GRAPHQL_URL": f"{url}/graphql",
+            "GITHUB_STEP_SUMMARY": str(summary),
+            "GITHUB_OUTPUT": str(output),
+            "RUNNER_TEMP": str(tmp_path),
+            "TRAIN_APP_CLIENT_ID": CLIENT_ID,
+            "TRAIN_APP_KEY": app_key()[0],
+            "TRAIN_SWITCH": "on",
+            "TRAIN_MERGE_METHOD": "SQUASH",
+            "TRAIN_ACCEPT_STATES": "",
+            "TRAIN_MIN_AGE_DAYS": "3",
+            "TRAIN_HOLD_LABELS": "hold,do-not-merge,planted",
+            "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
+            "TRAIN_PERSON_BRANCHES": "release-please--",
+            "TRAIN_RELEASE_OFF": "",
+            "TRAIN_RELEASE_MAX_PARALLEL": "3",
+            "TRAIN_SECURITY_LABELS": "security",
+            **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
+        }
+    )
     try:
         done = subprocess.run(
-            [sys.executable, "-I", "-B", str(path)],
+            command,
             capture_output=True,
             text=True,
             check=False,
@@ -1491,6 +1512,28 @@ def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
     assert (forge.minted, forge.writes) == ([], [])
 
 
+@pytest.mark.parametrize(
+    ("status", "settings"),
+    [
+        pytest.param(3, {"merge_method": "REBASE"}, id="invalid_setting"),
+        pytest.param(0, {}, id="clean_pull_lands"),
+    ],
+)
+def test_entrypoint_exit_status(tmp_path, status, settings):
+    """The script run as a program exits with the status main() returns.
+
+    LAUNCH calls main() directly, so only this test holds the exit status of the entrypoint.
+    """
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, text=script(), **settings)
+    assert done.returncode == status, done.stdout + done.stderr
+    if status == 3:
+        assert done.stdout.startswith("::error title=Merge train setting::")
+        assert (forge.minted, forge.writes) == ([], [])
+    else:
+        assert forge.writes == [landed(1)]
+
+
 @pytest.mark.parametrize("parallel", ["1", "3"])
 def test_release_max_parallel_boundaries_accepted(tmp_path, parallel):
     forge = Forge(repository(pull(1, "CLEAN")))
@@ -1518,7 +1561,6 @@ def test_token_and_key_are_never_printed(tmp_path):
         "jwt.sig",
         "output",
         "summary.md",
-        "train.py",
         "train_rules.py",
     ]
 
