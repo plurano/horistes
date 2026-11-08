@@ -33,28 +33,33 @@ its own copy.
 Greek *horistes*, the boundary commissioner who fixes limits. Pronounced
 ho-RIS-tees.
 
-The repository is `plurano/horistes`. The name is final with the first
-release: callers and preset references carry it, and the forge does not
-redirect a call after a rename
-([ADR-0023](docs/adr/0023-the-name-is-horistes.md)). Records written before
-2026-10-12 keep the working name `shared-ci`.
+The repository is `plurano/horistes`. The name is final with the change of
+visibility ([ADR-0024](docs/adr/0024-public-before-the-first-release.md)):
+callers and preset references carry it, and the forge does not redirect a
+call after a rename ([ADR-0023](docs/adr/0023-the-name-is-horistes.md)).
+Records written before 2026-10-12 keep the working name `shared-ci`.
 
 ## Status
 
-Private; nothing is released yet. The repository has its own gate and the
+Public; nothing is released yet. The repository has its own gate and the
 checks every workflow added here must pass. The first reusable workflow is the
 licence check; this repository is its first caller and no longer keeps a
-licence job of its own. The second is the scorecard run; it has no caller
-yet, because a repository can call it only once this one is public. The caller
-a consumer keeps exists as a template for both. The scorecard caller can be
-started by hand.
+licence job of its own. The second is the scorecard run; this repository is
+its first caller (`.github/workflows/scorecard-check.yml`), and other public
+repositories can call it. The caller a consumer keeps exists as a template for
+both. The scorecard caller can be started by hand.
 
 Consumers call this repository directly; no copy per owner is built. Its name
-is chosen. It turns public now that its history is shown to hold no private
-content; the first release follows later. Until then only private repositories
-of the same owner can call it
+is chosen. It turned public once its history was shown to hold no private
+content; the first release, 0.1.0, is proposed by release-please through the
+merge train; a person merges that release pull request once
+[milestone 0.1.0](https://github.com/plurano/horistes/milestone/1) closes,
+and the train then creates the release. As the repository is public,
+public repositories can call it before that release; until then a caller
+pins a full commit of the default branch
 ([ADR-0022](docs/adr/0022-public-consumers-call-this-repository-directly.md),
-[ADR-0024](docs/adr/0024-public-before-the-first-release.md)).
+[ADR-0024](docs/adr/0024-public-before-the-first-release.md),
+[ADR-0069](docs/adr/0069-the-first-release-is-0-1-0-from-release-please.md)).
 
 ## Workflows
 
@@ -599,9 +604,8 @@ in this family the reference is `github>plurano/horistes`. This
 repository's own `renovate.json` extends the preset the same way and repeats
 none of its values.
 
-- While this repository is private, only private repositories of the same
-  owner can extend the preset. A public repository waits until this one is
-  public.
+- As the repository is public, any repository can extend the preset
+  ([ADR-0024](docs/adr/0024-public-before-the-first-release.md)).
 - From the first release on, a consumer names the release
   (`github><owner>/<this repository>#<release tag>`) and adds
   `renovate-config` to its `enabledManagers`: Renovate then proposes the
