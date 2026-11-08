@@ -120,16 +120,18 @@ check-examples: tools
 # The tests plant one defect per rule; the outside linters are run on a
 # planted workflow or repository as well, so a linter that stopped refusing
 # fails here.
-# The coverage floor only goes up. Each coverage step reads pyproject.toml
-# only, so an inherited COVERAGE_RCFILE or a stray .coveragerc cannot set the
-# floor, and erase drops data files an earlier run left behind.
+# The coverage floor only goes up. The test recipe writes coverage data files
+# into its own temporary directory so concurrent runs cannot collide or erase
+# each other's data. Each coverage step reads pyproject.toml only, so an
+# inherited COVERAGE_RCFILE or a stray .coveragerc cannot set the floor.
 test: tools
-	$(BIN)/python -B -m coverage erase --rcfile=pyproject.toml
+	data=$$(mktemp -d) && \
+	trap 'rm -rf "$$data"' EXIT && \
 	ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
 		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" \
-		$(BIN)/python -B -m coverage run --rcfile=pyproject.toml -m pytest
-	$(BIN)/python -B -m coverage combine --rcfile=pyproject.toml
-	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml
+		$(BIN)/python -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest && \
+	$(BIN)/python -B -m coverage combine --rcfile=pyproject.toml --data-file="$$data/.coverage" && \
+	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage"
 
 # Every file carries its licence header or is named in REUSE.toml.
 verify-reuse: tools

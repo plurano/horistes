@@ -17,14 +17,15 @@ from conftest import ROOT
 
 FLOOR = 94
 RCFILE = "--rcfile=pyproject.toml"
+DATA_FILE = '--data-file="$$data/.coverage"'
 COVERAGE = ["$(BIN)/python", "-B", "-m", "coverage"]
 # The Makefile test recipe runs these coverage commands in this order, each
-# reading pyproject.toml only. Environment assignments may come first.
+# reading pyproject.toml only and writing data files to $$data.
+# Environment assignments may come first.
 GATE_COVERAGE = [
-    [*COVERAGE, "erase", RCFILE],
-    [*COVERAGE, "run", RCFILE, "-m", "pytest"],
-    [*COVERAGE, "combine", RCFILE],
-    [*COVERAGE, "report", RCFILE],
+    [*COVERAGE, "run", RCFILE, DATA_FILE, "-m", "pytest"],
+    [*COVERAGE, "combine", RCFILE, DATA_FILE],
+    [*COVERAGE, "report", RCFILE, DATA_FILE],
 ]
 ASSIGNMENT = re.compile(r"[A-Z][A-Z0-9_]*=")
 
@@ -36,6 +37,15 @@ def test_floor_is_set_and_never_lowered() -> None:
     report = config.get("tool", {}).get("coverage", {}).get("report", {})
     assert "fail_under" in report
     assert report["fail_under"] >= FLOOR
+
+
+def test_precision_is_set_to_at_least_two_decimals() -> None:
+    """Read pyproject.toml and assert tool.coverage.report.precision is >= 2."""
+    with open(ROOT / "pyproject.toml", "rb") as f:
+        config = tomllib.load(f)
+    report = config.get("tool", {}).get("coverage", {}).get("report", {})
+    assert "precision" in report
+    assert report["precision"] >= 2
 
 
 # mod.py holds four statements; lines 1, 2, and 5 are marked measured,
@@ -53,18 +63,31 @@ def _drop_coverage_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(key)
 
 
-def _plant(project: Path, fail_under: int, run: str = 'source = ["."]') -> None:
+def _plant(
+    project: Path,
+    fail_under: int,
+    run: str = 'source = ["."]',
+    report: str = "",
+) -> None:
     """Write mod.py and a pyproject.toml holding the given floor under project."""
     (project / "mod.py").write_text(MOD, encoding="utf-8")
-    (project / "pyproject.toml").write_text(
-        f"[tool.coverage.run]\n{run}\n\n[tool.coverage.report]\nfail_under = {fail_under}\n",
-        encoding="utf-8",
+    report_extra = f"\n{report}" if report else ""
+    content = (
+        f"[tool.coverage.run]\n{run}\n\n"
+        f"[tool.coverage.report]\nfail_under = {fail_under}{report_extra}\n"
     )
+    (project / "pyproject.toml").write_text(content, encoding="utf-8")
 
 
-def _shard(project: Path, lines: set[int], suffix: str | None = None) -> None:
+def _shard(
+    project: Path,
+    lines: set[int],
+    suffix: str | None = None,
+    data_dir: Path | None = None,
+) -> None:
     """Write a coverage data file marking the given lines of mod.py as run."""
-    data = coverage.CoverageData(basename=str(project / ".coverage"), suffix=suffix)
+    base = (data_dir or project) / ".coverage"
+    data = coverage.CoverageData(basename=str(base), suffix=suffix)
     data.add_lines({str(project / "mod.py"): lines})
     data.write()
 
@@ -150,25 +173,59 @@ def test_rcfile_flag_keeps_a_caller_rcfile_from_lowering_the_floor(
     assert status == 2
 
 
+def test_precision_prevents_rounding_up_to_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 75.76% total rounds up to 76% without precision, but precision = 2 fails under 76."""
+    code = "\n".join(f"x{i} = {i}" for i in range(1, 34)) + "\n"
+    (tmp_path / "mod.py").write_text(code, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _drop_coverage_env(monkeypatch)
+    data = coverage.CoverageData(basename=str(tmp_path / ".coverage"))
+    data.add_lines({str(tmp_path / "mod.py"): set(range(1, 26))})
+    data.write()
+
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[tool.coverage.run]\nsource = ["."]\n\n[tool.coverage.report]\nfail_under = 76\n',
+        encoding="utf-8",
+    )
+    status_no_prec, out_no_prec = _coverage(["report"], capsys)
+    assert status_no_prec == 0
+    assert "76%" in out_no_prec
+
+    pyproject.write_text(
+        '[tool.coverage.run]\nsource = ["."]\n\n'
+        "[tool.coverage.report]\nfail_under = 76\nprecision = 2\n",
+        encoding="utf-8",
+    )
+    status_prec, out_prec = _coverage(["report"], capsys)
+    assert status_prec == 2
+    assert "75.76%" in out_prec
+
+
 def _combined(
     project: Path,
-    erase: bool,
+    data_dir: Path | None,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> tuple[int, str]:
     """Leave a stale 100% shard, run a fresh 75% one, combine and report.
 
     The planted config carries the repository's patch = ["subprocess"],
-    which turns on parallel mode, so erase also deletes .coverage.* shards.
+    which turns on parallel mode.
     """
     project.mkdir()
     _plant(project, TOTAL + 1, 'source = ["."]\npatch = ["subprocess"]')
     monkeypatch.chdir(project)
     _drop_coverage_env(monkeypatch)
     _shard(project, EVERY_LINE, "stale")
-    if erase:
-        assert _coverage(["erase", RCFILE], capsys)[0] == 0
-        assert not list(project.glob(".coverage*"))
+    if data_dir is not None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        data_arg = f"--data-file={data_dir / '.coverage'}"
+        _shard(project, MEASURED, "fresh", data_dir=data_dir)
+        assert _coverage(["combine", RCFILE, data_arg], capsys)[0] == 0
+        return _coverage(["report", RCFILE, data_arg], capsys)
     _shard(project, MEASURED, "fresh")
     assert _coverage(["combine", RCFILE], capsys)[0] == 0
     return _coverage(["report", RCFILE], capsys)
@@ -177,37 +234,52 @@ def _combined(
 def test_stale_shard_lifts_the_total_without_erase(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Without erase, combine takes the stale shard and the 75% run passes at 100%."""
-    status, out = _combined(tmp_path / "kept", False, monkeypatch, capsys)
+    """Without a separate data directory, combine takes the stale shard and passes at 100%."""
+    status, out = _combined(tmp_path / "kept", None, monkeypatch, capsys)
     assert "100%" in out, out
     assert status == 0
 
 
-def test_erase_drops_a_stale_shard_before_the_run(
+def test_data_file_in_new_directory_ignores_stale_root_shard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Erase first, and the same 75% run fails under fail_under = 76."""
-    status, out = _combined(tmp_path / "erased", True, monkeypatch, capsys)
+    """With --data-file in a new directory, a stale root shard is ignored and 75% fails under 76."""
+    project = tmp_path / "isolated"
+    status, out = _combined(project, tmp_path / "data", monkeypatch, capsys)
     assert f"{TOTAL}%" in out, out
     assert status == 2
+    assert (project / ".coverage.stale").exists()
 
 
-def _recipe_commands(makefile: str, target: str) -> list[list[str]]:
-    """Return the target's recipe as one token list per logical shell line."""
+def _recipe_lines(makefile: str, target: str) -> list[str]:
+    """Return the target's recipe as one string per command, split at &&."""
     recipe = re.search(rf"^{target}:[^\n]*\n((?:\t.*\n)+)", makefile, re.M)
     assert recipe is not None, target
     joined = recipe[1].replace("\\\n", " ")
-    return [shlex.split(line) for line in joined.splitlines() if line.strip()]
+    commands = [cmd.strip() for line in joined.splitlines() for cmd in line.split("&&")]
+    return [cmd for cmd in commands if cmd]
+
+
+def _recipe_commands(makefile: str, target: str) -> list[list[str]]:
+    """Return the target's recipe as one token list per command, quotes kept."""
+    return [shlex.split(cmd, posix=False) for cmd in _recipe_lines(makefile, target)]
 
 
 def test_gate_runs_each_coverage_step_from_pyproject() -> None:
-    """The test recipe runs erase, run, combine and report as written, nothing else.
+    """The test recipe runs run, combine and report in $$data, nothing else.
 
-    Each step starts the pinned coverage with --rcfile=pyproject.toml, so an
-    inherited COVERAGE_RCFILE or a stray .coveragerc cannot set the floor;
-    a step behind echo, with || true or with --fail-under fails here.
+    Each step starts the pinned coverage with --rcfile=pyproject.toml and
+    the same --data-file="$$data/.coverage", so runs cannot collide or use
+    stale data; a step behind echo, with || true or with --fail-under fails here.
+    A trap set right after mktemp removes $$data when the recipe exits.
     """
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    commands = _recipe_lines(makefile, "test")
+    first = next((i for i, cmd in enumerate(commands) if "coverage" in cmd), len(commands))
+    setup = commands[:first]
+    made = next((i for i, cmd in enumerate(setup) if re.search(r"\bdata=.*mktemp -d\b", cmd)), None)
+    assert made is not None, setup
+    assert setup[made + 1 : made + 2] == ["trap 'rm -rf \"$$data\"' EXIT"], setup
     steps = []
     for tokens in _recipe_commands(makefile, "test"):
         start = next(

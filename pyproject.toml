@@ -17,11 +17,13 @@ branch = true
 source = ["tools"]
 # Many tests invoke tools and hooks as subprocesses; patch measures them.
 patch = ["subprocess"]
-# The data files go to .coverage* at the root, which .gitignore leaves out.
+# The test recipe writes its data files into its own temporary directory.
 data_file = ".coverage"
 
 [tool.coverage.report]
 # Missing line and branch numbers are shown in terminal reports.
 show_missing = true
+# Totals are compared at two decimals, so a total below the floor cannot round up to it.
+precision = 2
 # The gate fails below this total; raise it as coverage grows, never lower it.
 fail_under = 94
