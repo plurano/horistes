@@ -8,6 +8,7 @@ Pins gap audit row C13-02 for .github/workflows/licence.yml and README.md.
 from __future__ import annotations
 
 import copy
+import re
 import sys
 
 import pytest
@@ -22,6 +23,61 @@ REQUIRED_EXIT = "exit 1"
 REQUIRED_ANNOTATION = "::error"
 README_RUNNER_SUBSTRING = "`runner` (Linux label"
 LICENCE_WORKFLOW = ".github/workflows/licence.yml"
+
+RUNNER_OS_PATTERN = re.compile(r"^runner\.os != '([A-Za-z]+)'$")
+ASSIGNMENT_PATTERN = re.compile(r'^\$[A-Za-z_]\w*\s*=\s*"[^"]*"$')
+ANNOTATION_PATTERN = re.compile(r'^Write-Output\s+"::error[^"]*"$')
+
+
+def _check_job(job: dict) -> list[str]:
+    """Check job-level properties for the reuse job."""
+    problems: list[str] = []
+    if "if" in job:
+        problems.append(f"job `reuse` has a condition ({job['if']!r})")
+    if "continue-on-error" in job:
+        problems.append(f"job `reuse` has continue-on-error ({job['continue-on-error']!r})")
+    return problems
+
+
+def _check_step(step: dict, idx: int) -> list[str]:
+    """Check step-level properties for the Linux runner gate."""
+    problems: list[str] = []
+    if idx != 0:
+        problems.append(f"step {STEP_NAME!r} is not the first step of the job")
+    if step.get("if") != REQUIRED_IF:
+        problems.append(f"step {STEP_NAME!r} `if` is not exactly {REQUIRED_IF!r}")
+    if "continue-on-error" in step:
+        problems.append(f"step {STEP_NAME!r} has continue-on-error ({step['continue-on-error']!r})")
+    if step.get("shell") != "pwsh":
+        problems.append(f"step {STEP_NAME!r} shell is not 'pwsh' (got {step.get('shell')!r})")
+    return problems
+
+
+def _check_script(step: dict) -> list[str]:
+    """Check run script statements against an allow-list, returning at most one problem."""
+    run_script = str(step.get("run", ""))
+    raw_lines = [line.strip() for line in run_script.splitlines()]
+    effective_lines = [line for line in raw_lines if line and not line.startswith("#")]
+
+    if not effective_lines or effective_lines[-1] != REQUIRED_EXIT:
+        return [
+            f"step {STEP_NAME!r} run script does not end the step with a nonzero exit"
+            f" (the last statement must be {REQUIRED_EXIT!r})"
+        ]
+
+    for line in effective_lines[:-1]:
+        if (
+            "$(" in line
+            or "`" in line
+            or ";" in line
+            or not (ASSIGNMENT_PATTERN.fullmatch(line) or ANNOTATION_PATTERN.fullmatch(line))
+        ):
+            return [f"statement outside the allow-list: {line}"]
+
+    if not any(ANNOTATION_PATTERN.fullmatch(line) for line in effective_lines[:-1]):
+        return [f"step {STEP_NAME!r} run script writes no {REQUIRED_ANNOTATION!r} annotation"]
+
+    return []
 
 
 def linux_gate_problems(doc: dict) -> list[str]:
@@ -41,28 +97,13 @@ def linux_gate_problems(doc: dict) -> list[str]:
     if not indices:
         return [f"no step named {STEP_NAME!r}"]
 
-    problems: list[str] = []
     idx = indices[0]
-    if idx != 0:
-        problems.append(f"step {STEP_NAME!r} is not the first step of the job")
-
     step = steps[idx]
-    if step.get("if") != REQUIRED_IF:
-        problems.append(f"step {STEP_NAME!r} `if` is not exactly {REQUIRED_IF!r}")
 
-    run_script = str(step.get("run", ""))
-    lines = [line.strip() for line in run_script.splitlines()]
-    if REQUIRED_EXIT not in lines:
-        problems.append(
-            f"step {STEP_NAME!r} run script does not end the step with a nonzero exit"
-            f" (look for a line {REQUIRED_EXIT!r})"
-        )
-
-    if REQUIRED_ANNOTATION not in run_script:
-        problems.append(
-            f"step {STEP_NAME!r} run script writes no {REQUIRED_ANNOTATION!r} annotation"
-        )
-
+    problems: list[str] = []
+    problems.extend(_check_job(job))
+    problems.extend(_check_step(step, idx))
+    problems.extend(_check_script(step))
     return problems
 
 
@@ -97,13 +138,66 @@ def _mutate_annotation(doc: dict) -> None:
     step["run"] = "\n".join(lines)
 
 
+def _mutate_shell_bash(doc: dict) -> None:
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["shell"] = "bash"
+
+
+def _mutate_job_condition(doc: dict) -> None:
+    doc["jobs"]["reuse"]["if"] = False
+
+
+def _mutate_job_continue_on_error(doc: dict) -> None:
+    doc["jobs"]["reuse"]["continue-on-error"] = True
+
+
+def _mutate_step_continue_on_error(doc: dict) -> None:
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["continue-on-error"] = True
+
+
+def _mutate_early_exit_zero(doc: dict) -> None:
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = "exit 0\n" + step["run"]
+
+
+def _mutate_annotation_in_comment(doc: dict) -> None:
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = step["run"].replace('Write-Output "::error', '# Write-Output "::error')
+
+
+def _mutate_annotation_in_branch(doc: dict) -> None:
+    step = doc["jobs"]["reuse"]["steps"][0]
+    lines = []
+    for line in step["run"].splitlines():
+        if 'Write-Output "::error' in line:
+            lines.append('if ($false) { Write-Output "::error x" }')
+        else:
+            lines.append(line)
+    step["run"] = "\n".join(lines)
+
+
+def _mutate_annotation_after_exit(doc: dict) -> None:
+    step = doc["jobs"]["reuse"]["steps"][0]
+    lines = [line for line in step["run"].splitlines() if line.strip()]
+    exit_idx = next(i for i, line in enumerate(lines) if line.strip() == "exit 1")
+    annotation_idx = next(i for i, line in enumerate(lines) if "Write-Output" in line)
+    lines[exit_idx], lines[annotation_idx] = lines[annotation_idx], lines[exit_idx]
+    step["run"] = "\n".join(lines)
+
+
+def _mutate_subexpression(doc: dict) -> None:
+    step = doc["jobs"]["reuse"]["steps"][0]
+    step["run"] = step["run"].replace('$title = "Wrong runner OS"', '$title = "$(exit 0)"')
+
+
 def evaluate_runner_os_condition(condition: str, runner_os: str) -> bool:
     """Evaluate condition of the single form `runner.os != '<OS>'`."""
     expr = condition.strip().removeprefix("${{").removesuffix("}}").strip()
-    prefix = "runner.os != "
-    if not expr.startswith(prefix):
+    match = RUNNER_OS_PATTERN.fullmatch(expr)
+    if not match:
         raise ValueError(f"unsupported condition: {condition!r}")
-    target_os = expr[len(prefix) :].strip().strip("'\"")
+    target_os = match.group(1)
     return runner_os != target_os
 
 
@@ -135,6 +229,17 @@ PLANTED_DEFECTS = [
     pytest.param(_mutate_condition, "not exactly", id="condition-inverted"),
     pytest.param(_mutate_exit, "nonzero exit", id="exit-zero"),
     pytest.param(_mutate_annotation, "::error", id="annotation-missing"),
+    pytest.param(_mutate_shell_bash, "shell is not 'pwsh'", id="shell-bash"),
+    pytest.param(_mutate_job_condition, "job `reuse` has a condition", id="job-condition"),
+    pytest.param(_mutate_job_continue_on_error, "continue-on-error", id="job-continue-on-error"),
+    pytest.param(_mutate_step_continue_on_error, "continue-on-error", id="step-continue-on-error"),
+    pytest.param(_mutate_early_exit_zero, "statement outside the allow-list", id="early-exit-zero"),
+    pytest.param(_mutate_annotation_in_comment, "::error", id="annotation-in-comment"),
+    pytest.param(
+        _mutate_annotation_in_branch, "statement outside the allow-list", id="annotation-in-branch"
+    ),
+    pytest.param(_mutate_annotation_after_exit, "nonzero exit", id="annotation-after-exit"),
+    pytest.param(_mutate_subexpression, "statement outside the allow-list", id="subexpression"),
 ]
 
 
@@ -165,10 +270,19 @@ def test_runner_os_boundary_conditions(runner_os: str, expected_runs: bool) -> N
     assert runs is expected_runs
 
 
-def test_evaluator_refuses_other_condition_forms() -> None:
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "runner.os == 'Linux'",
+        "runner.os != 'Linux' || true",
+        "runner.os != Linux",
+        "runner.os != ''",
+    ],
+)
+def test_evaluator_refuses_other_condition_forms(condition: str) -> None:
     """Negative test: a condition outside `runner.os != '<OS>'` is refused, not guessed."""
     with pytest.raises(ValueError, match="unsupported condition"):
-        evaluate_runner_os_condition("runner.os == 'Linux'", "Linux")
+        evaluate_runner_os_condition(condition, "Linux")
 
 
 def test_readme_documents_linux_runner_label() -> None:
