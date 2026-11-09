@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
@@ -58,8 +59,14 @@ def coverage_config_problems(config: dict[str, object]) -> list[str]:
         problems.append("missing or invalid [tool.coverage.report] table")
     else:
         fail_under = report.get("fail_under")
-        if not isinstance(fail_under, (int, float)) or fail_under < FLOOR:
-            problems.append(f"fail_under must be >= {FLOOR}, got {fail_under!r}")
+        # `nan < FLOOR` is false, so the comparison alone lets a NaN through;
+        # coverage itself refuses one with a ConfigError.
+        if (
+            not isinstance(fail_under, (int, float))
+            or not math.isfinite(fail_under)
+            or fail_under < FLOOR
+        ):
+            problems.append(f"fail_under must be a finite number >= {FLOOR}, got {fail_under!r}")
     return problems
 
 
@@ -96,18 +103,32 @@ def test_coverage_config_problems_refuses_invalid_run_config(
     assert any(expected_substring in p for p in problems), problems
 
 
-def test_coverage_config_problems_refuses_lowered_floor() -> None:
-    """Planted: coverage_config_problems flags fail_under below FLOOR."""
-    config: dict[str, object] = {
-        "tool": {
-            "coverage": {
-                "run": {"source": ["tools"], "branch": True},
-                "report": {"fail_under": FLOOR - 1},
-            }
-        }
-    }
-    problems = coverage_config_problems(config)
+def _planted_floor(value: str) -> dict[str, object]:
+    """A coverage config read from TOML text, `fail_under` written as `value`."""
+    return tomllib.loads(
+        "[tool.coverage.run]\n"
+        'source = ["tools"]\n'
+        "branch = true\n"
+        "[tool.coverage.report]\n"
+        f"fail_under = {value}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [str(FLOOR - 1), "nan", "inf", "-inf", f'"{FLOOR}"'],
+    ids=["lowered", "nan", "inf", "minus-inf", "string"],
+)
+def test_coverage_config_problems_refuses_lowered_floor(value: str) -> None:
+    """Planted: fail_under below FLOOR, not finite, or not a number is refused."""
+    problems = coverage_config_problems(_planted_floor(value))
     assert any("fail_under" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("value", [str(FLOOR), f"{FLOOR}.0", "100"], ids=["floor", "float", "full"])
+def test_coverage_config_problems_accepts_floor_and_above(value: str) -> None:
+    """Boundary: fail_under at FLOOR, as int or float, and at 100 passes."""
+    assert coverage_config_problems(_planted_floor(value)) == []
 
 
 def test_measured_forwards_coverage_process_config_when_set(

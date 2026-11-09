@@ -359,10 +359,11 @@ def rooted(cmd: list[str]) -> list[str]:
     """The command with a relative tool path read from the checkout, as the Makefile passes it.
 
     The planted tree is the working directory, so `.venv/bin/x` would name a
-    file inside it.
+    file inside it. The Makefile writes `/`; a native separator counts too, so
+    the rule holds where `os.sep` is a backslash.
     """
     head = cmd[0]
-    if os.sep in head and not os.path.isabs(head):
+    if ("/" in head or os.sep in head) and not os.path.isabs(head):
         return [str(ROOT / head), *cmd[1:]]
     return cmd
 

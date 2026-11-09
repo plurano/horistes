@@ -8,6 +8,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import ciwf
@@ -21,6 +22,11 @@ HASH_COMMAND = (
     "requirements/tools.txt)"
 )
 HASH_FAILED = "cannot hash requirements/tools.txt"
+# The planted lefthook commands are `touch`, `true` and `exit`, which need a
+# POSIX shell; the Makefile gate that runs this suite needs one too.
+POSIX_SHELL = pytest.mark.skipif(
+    sys.platform == "win32", reason="planted lefthook commands need a POSIX shell"
+)
 
 
 def _run_make(
@@ -268,6 +274,7 @@ def _run_planted_lefthook(
     )
 
 
+@POSIX_SHELL
 def test_lefthook_pre_push_stop_on_failure_negative(tmp_path: Path) -> None:
     """Planted: tools-stamp exit 1 stops pre-push execution; no other command runs."""
     tree = _init_repo_tree(tmp_path)
@@ -278,6 +285,7 @@ def test_lefthook_pre_push_stop_on_failure_negative(tmp_path: Path) -> None:
     assert ran_files == [], f"expected no *.ran files, got {ran_files}"
 
 
+@POSIX_SHELL
 def test_lefthook_pre_push_stop_on_failure_positive(tmp_path: Path) -> None:
     """When tools-stamp succeeds with run: true, all subsequent commands run and exit 0."""
     tree = _init_repo_tree(tmp_path)
@@ -294,6 +302,7 @@ def test_lefthook_pre_push_stop_on_failure_positive(tmp_path: Path) -> None:
     assert ran_names == expected_others
 
 
+@POSIX_SHELL
 def test_lefthook_pre_push_mutation_proof_without_piped(tmp_path: Path) -> None:
     """Planted: without piped: true, a failing tools-stamp does not prevent subsequent commands."""
     tree = _init_repo_tree(tmp_path)

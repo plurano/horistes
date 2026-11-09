@@ -348,3 +348,25 @@ def test_makefile_lint_python_recipe_passes_config_flag():
     for line in content.splitlines():
         if "$(BIN)/ruff check" in line or "$(BIN)/ruff format" in line:
             assert "--config ruff.toml" in line
+
+
+def test_rooted_reads_a_relative_tool_path_from_the_checkout() -> None:
+    """Positive: a Makefile path such as `.venv/bin/ruff` is read from the checkout."""
+    assert rooted([".venv/bin/ruff", "check"]) == [str(ROOT / ".venv/bin/ruff"), "check"]
+
+
+@pytest.mark.parametrize(
+    "head", ["ruff", os.path.abspath("bin/ruff")], ids=["bare-name", "absolute"]
+)
+def test_rooted_keeps_a_bare_name_or_absolute_path(head: str) -> None:
+    """Negative: a name found on PATH, or an absolute path, is passed through."""
+    assert rooted([head, "check"]) == [head, "check"]
+
+
+def test_rooted_reads_the_makefile_separator_under_a_backslash_sep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary: where `os.sep` is a backslash, the Makefile's `/` path is still rooted."""
+    monkeypatch.setattr(os, "sep", "\\")
+    assert rooted([".venv/bin/ruff"]) == [str(ROOT / ".venv/bin/ruff")]
+    assert rooted(["ruff"]) == ["ruff"]
