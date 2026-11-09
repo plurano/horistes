@@ -1,20 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""The commit-msg hook judges one message by the gate's rules (ADR-0072).
+"""The commit-msg hook judges one message by the gate's rules (ADR-0072, ADR-0074).
 
 Each case plants a repository whose `lefthook.yml` holds this repository's
 commit-msg job and whose Makefile, pyproject.toml, requirements, tests and tools
-are links to this checkout. Its `.venv/bin/python` runs the interpreter of this
-test run, and its stamp matches `requirements/tools.txt`. The hook then runs as
-the squash helper runs it (`lefthook run commit-msg <file>`) and as git runs it
-on a commit.
+are links to this checkout. It has no .venv: the hook runs on host python3 alone
+(ADR-0074). The hook then runs as the squash helper runs it
+(`lefthook run commit-msg <file>`) and as git runs it on a commit.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -25,7 +22,7 @@ import pytest
 import yaml
 from conftest import ROOT, Tree, external, rooted
 
-DEADLINE = 120  # seconds for one hook run: make, then a pytest start
+DEADLINE = 120  # seconds for one hook run: make, then the judge
 JOB = ciwf.load(ROOT / "lefthook.yml")["commit-msg"]
 RUN = JOB["commands"]["message-judge"]["run"]
 PERSON = {
@@ -54,34 +51,38 @@ POSIX_SHELL = pytest.mark.skipif(
 )
 
 
-def planted(tmp_path: Path, run: str = RUN, pyproject: str | None = None) -> Tree:
+def planted(tmp_path: Path, run: str = RUN, env: dict[str, str] | None = None) -> Tree:
     """A repository whose commit-msg job runs `run` against this checkout's rules.
 
-    With `pyproject` given, the tree holds that text instead of a link.
+    With `env` given, the job sets those variables for its command: they reach
+    make and the judge as an inherited setting would, and lefthook itself, a
+    Python wrapper in a virtual environment, never reads them.
     """
     tree = Tree(tmp_path / "repo")
     tree.git("init", "-b", "main")
     for name in LINKED:
-        if name == "pyproject.toml" and pyproject is not None:
-            tree.write({name: pyproject})
-            continue
         (tree.root / name).symlink_to(ROOT / name)
-    python = tree.root / ".venv" / "bin" / "python"
-    python.parent.mkdir(parents=True)
-    python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n', encoding="utf-8")
-    python.chmod(0o755)
-    digest = hashlib.sha256((ROOT / "requirements" / "tools.txt").read_bytes()).hexdigest()
-    job = {"commands": {"message-judge": {"run": run}}}
-    return tree.write(
-        {".venv/.stamp": f"{digest}\n", "lefthook.yml": yaml.safe_dump({"commit-msg": job})}
-    )
+    command: dict[str, object] = {"run": run}
+    if env:
+        command["env"] = env
+    job = {"commands": {"message-judge": command}}
+    return tree.write({"lefthook.yml": yaml.safe_dump({"commit-msg": job})})
 
 
 def environment(tree: Tree) -> dict[str, str]:
-    """PATH with lefthook first, HOME in the tree, and the author git hands the hook."""
+    """PATH with a lefthook link first, HOME in the tree, and the author git hands the hook.
+
+    The link sits in a directory of its own next to the tree, so the directory
+    lefthook came from (a virtual environment's bin, say) stays off PATH and the
+    hook runs the host python3 (ADR-0074).
+    """
     found = shutil.which(rooted(external("LEFTHOOK_BIN", "lefthook"))[0])
     assert found, "lefthook is missing"
-    path = os.pathsep.join([str(Path(found).parent), os.environ.get("PATH", "")])
+    link = tree.root.parent / "bin" / "lefthook"
+    if not link.is_symlink():
+        link.parent.mkdir(exist_ok=True)
+        link.symlink_to(Path(found).absolute())
+    path = os.pathsep.join([str(link.parent), os.environ.get("PATH", "")])
     return {"PATH": path, "HOME": str(tree.root), "LC_ALL": "C", **PERSON}
 
 
@@ -102,6 +103,7 @@ def hook(
 
 
 def test_job_reads_the_message_file_from_a_quoted_here_document():
+    """The hook job sets MESSAGE_FILE from a quoted here-document before running make."""
     assert RUN == (
         "MESSAGE_FILE=$(cat <<'GIT_ARGUMENT'\n{1}\nGIT_ARGUMENT\n"
         ") make --no-print-directory check-message\n"
@@ -110,16 +112,17 @@ def test_job_reads_the_message_file_from_a_quoted_here_document():
 
 @POSIX_SHELL
 def test_message_file_name_with_shell_syntax_is_one_literal_path(tmp_path):
+    """A message file name with shell syntax is read as a literal path without executing code."""
     tree = planted(tmp_path)
     done = hook(tree, CLEAN, name=HOSTILE)
     output = done.stdout + done.stderr
     assert done.returncode == 0, output
-    assert "1 passed" in output, output
     assert not (tree.root / "planted").exists()
 
 
 @POSIX_SHELL
 def test_planted_single_quoted_file_runs_shell_syntax_in_the_name(tmp_path):
+    """A planted single-quoted hook command runs shell syntax in the file name and is refused."""
     tree = planted(tmp_path, QUOTED)
     done = hook(tree, CLEAN, name=HOSTILE)
     assert done.returncode != 0, done.stdout + done.stderr
@@ -128,35 +131,42 @@ def test_planted_single_quoted_file_runs_shell_syntax_in_the_name(tmp_path):
 
 @POSIX_SHELL
 def test_planted_bot_co_author_is_refused(tmp_path):
+    """A message with a planted bot Co-authored-by trailer is refused by the hook."""
     done = hook(planted(tmp_path), PLANTED)
     output = done.stdout + done.stderr
     assert done.returncode != 0, output
     assert "trailer Co-authored-by" in output
 
 
-def plain_asserts() -> str:
-    """This repository's pyproject.toml with pytest's assertion rewriting turned off."""
-    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    line = 'addopts = "-q -p no:cacheprovider"\n'
-    assert text.count(line) == 1
-    return text.replace(line, 'addopts = "-q -p no:cacheprovider --assert=plain"\n')
+def sitecustomize_env(tmp_path: Path) -> dict[str, str]:
+    """A directory on PYTHONPATH holding a sitecustomize.py that calls os._exit(0)."""
+    site = tmp_path / "site"
+    site.mkdir(parents=True, exist_ok=True)
+    (site / "sitecustomize.py").write_text("import os; os._exit(0)\n", encoding="utf-8")
+    return {"PYTHONPATH": str(site)}
+
+
+def python_stub_env(tmp_path: Path) -> dict[str, str]:
+    """A stub executable named by PYTHON that exits 0."""
+    stub = tmp_path / "python_stub"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    return {"PYTHON": str(stub)}
 
 
 @POSIX_SHELL
 @pytest.mark.parametrize(
-    ("inherited", "rewrite"),
-    [({"PYTEST_ADDOPTS": "--collect-only"}, True), ({"PYTHONOPTIMIZE": "2"}, False)],
-    ids=["addopts-collects-only", "optimize-without-rewriting"],
+    "env_builder",
+    [
+        pytest.param(lambda _: {"PYTHONOPTIMIZE": "2"}, id="optimize"),
+        pytest.param(sitecustomize_env, id="pythonpath-sitecustomize"),
+        pytest.param(python_stub_env, id="python-stub"),
+    ],
 )
-def test_inherited_settings_cannot_pass_a_planted_message(tmp_path, inherited, rewrite):
-    """check-message clears each setting that would let pytest pass the planted message.
-
-    pytest rewrites the asserts of test modules, and those run under -O too; the
-    PYTHONOPTIMIZE case therefore turns rewriting off, so the cleared value is
-    the barrier that holds.
-    """
-    tree = planted(tmp_path, pyproject=None if rewrite else plain_asserts())
-    done = hook(tree, PLANTED, env=inherited)
+def test_inherited_settings_cannot_pass_a_planted_message(tmp_path, env_builder):
+    """The -I barrier and literal python3 refuse inherited settings on a planted message."""
+    tree = planted(tmp_path, env=env_builder(tmp_path))
+    done = hook(tree, PLANTED)
     output = done.stdout + done.stderr
     assert done.returncode != 0, output
     assert "trailer Co-authored-by" in output
@@ -164,14 +174,15 @@ def test_inherited_settings_cannot_pass_a_planted_message(tmp_path, inherited, r
 
 @POSIX_SHELL
 def test_clean_message_passes(tmp_path):
+    """A clean commit message signed off by its author passes the commit-msg hook."""
     done = hook(planted(tmp_path), CLEAN)
     output = done.stdout + done.stderr
     assert done.returncode == 0, output
-    assert "1 passed" in output, output
 
 
 @POSIX_SHELL
 def test_sign_off_of_another_author_is_refused(tmp_path):
+    """A commit message signed off by a different author is refused by the hook."""
     done = hook(planted(tmp_path), CLEAN, env={"GIT_AUTHOR_EMAIL": "other@example.net"})
     output = done.stdout + done.stderr
     assert done.returncode != 0, output
@@ -180,12 +191,14 @@ def test_sign_off_of_another_author_is_refused(tmp_path):
 
 @POSIX_SHELL
 def test_planted_unquoted_file_splits_at_the_space(tmp_path):
+    """A planted unquoted hook command splits on spaced file names and is refused."""
     done = hook(planted(tmp_path, UNQUOTED), CLEAN)
     assert done.returncode != 0, done.stdout + done.stderr
 
 
 @POSIX_SHELL
 def test_missing_message_file_is_refused(tmp_path):
+    """Running the commit-msg hook with a missing message file is refused."""
     tree = planted(tmp_path)
     done = subprocess.run(
         ["lefthook", "run", "commit-msg", "absent.txt"],
@@ -204,6 +217,7 @@ def test_missing_message_file_is_refused(tmp_path):
 @POSIX_SHELL
 @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
 def test_check_message_without_message_file_is_refused(tmp_path, value):
+    """make check-message is refused when MESSAGE_FILE is unset or empty."""
     tree = planted(tmp_path)
     env = environment(tree) | ({} if value is None else {"MESSAGE_FILE": value})
     done = subprocess.run(
@@ -221,6 +235,7 @@ def test_check_message_without_message_file_is_refused(tmp_path, value):
 
 @POSIX_SHELL
 def test_check_message_reads_a_make_variable(tmp_path):
+    """make check-message accepts MESSAGE_FILE passed as a Make variable."""
     tree = planted(tmp_path)
     tree.write({"message.txt": PLANTED})
     done = subprocess.run(
@@ -237,12 +252,33 @@ def test_check_message_reads_a_make_variable(tmp_path):
 
 
 @POSIX_SHELL
-def test_check_message_refuses_a_stale_stamp(tmp_path):
-    tree = planted(tmp_path).write({".venv/.stamp": "0" * 64 + "\n"})
-    done = hook(tree, CLEAN)
-    output = done.stdout + done.stderr
-    assert done.returncode != 0, output
-    assert "run make tools" in output
+def test_check_message_judges_a_file_named_like_an_option(tmp_path):
+    """A MESSAGE_FILE named --help is a file to judge, not the help option that exits 0."""
+    tree = planted(tmp_path)
+    done = subprocess.run(
+        ["make", "--no-print-directory", "check-message", "MESSAGE_FILE=--help"],
+        cwd=tree.root,
+        env=environment(tree),
+        capture_output=True,
+        text=True,
+        timeout=DEADLINE,
+        check=False,
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "--help: No such file or directory" in done.stderr
+    assert "usage:" not in done.stdout + done.stderr
+
+
+@POSIX_SHELL
+def test_check_message_runs_in_fresh_tree_without_venv(tmp_path):
+    """A fresh tree without .venv passes CLEAN and refuses PLANTED."""
+    tree = planted(tmp_path)
+    clean_done = hook(tree, CLEAN)
+    assert clean_done.returncode == 0, clean_done.stdout + clean_done.stderr
+    planted_done = hook(tree, PLANTED)
+    output = planted_done.stdout + planted_done.stderr
+    assert planted_done.returncode != 0, output
+    assert "trailer Co-authored-by" in output
 
 
 def install(tree: Tree) -> dict[str, str]:
@@ -290,6 +326,7 @@ def commit(tree: Tree, message: str, *options: str) -> subprocess.CompletedProce
     ("message", "lands"), [(CLEAN, True), (PLANTED, False)], ids=["clean", "planted"]
 )
 def test_git_commit_runs_the_judge(tmp_path, message, lands):
+    """git commit runs the hook judge, landing a clean message and refusing a planted one."""
     tree = planted(tmp_path)
     done = commit(tree, message)
     head = subprocess.run(
@@ -312,6 +349,7 @@ def test_git_commit_runs_the_judge(tmp_path, message, lands):
     ids=["author-signs", "committer-signs"],
 )
 def test_git_commit_judges_the_author_option(tmp_path, message, lands):
+    """git commit --author requires a sign-off matching the specified author."""
     done = commit(planted(tmp_path), message, f"--author={OTHER}")
     output = done.stdout + done.stderr
     assert (done.returncode == 0) is lands, output
@@ -325,6 +363,7 @@ def test_git_commit_judges_the_author_option(tmp_path, message, lands):
     ids=["author-signs", "committer-signs"],
 )
 def test_git_commit_amend_judges_the_author_it_keeps(tmp_path, message, lands):
+    """git commit --amend verifies the sign-off against the preserved original author."""
     tree = planted(tmp_path)
     first = commit(tree, OTHER_CLEAN, f"--author={OTHER}")
     assert first.returncode == 0, first.stdout + first.stderr
@@ -377,6 +416,7 @@ def parent_count(tree: Tree, env: dict[str, str]) -> int:
 
 @POSIX_SHELL
 def test_git_merge_of_a_clean_merge_without_sign_off_passes(tmp_path):
+    """A clean git merge without a sign-off passes the judge and creates a two-parent commit."""
     tree, env = two_branches(tmp_path)
     done = git_in(tree, env, "merge", "--no-ff", "-q", "-m", UNSIGNED, "side")
     assert done.returncode == 0, done.stdout + done.stderr
@@ -388,6 +428,7 @@ def test_git_merge_of_a_clean_merge_without_sign_off_passes(tmp_path):
     ("own", "lands"), [(False, True), (True, False)], ids=["clean", "own-content"]
 )
 def test_git_commit_of_a_merge_without_sign_off_judges_its_tree(tmp_path, own, lands):
+    """A merge without sign-off passes if clean, but is refused when own content is staged."""
     tree, env = two_branches(tmp_path)
     ran(git_in(tree, env, "merge", "--no-ff", "--no-commit", "-q", "side"))
     tree.write({"message.txt": UNSIGNED, "extra.txt": "own content\n"})
