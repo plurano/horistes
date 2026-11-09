@@ -227,30 +227,115 @@ def outside_settings_sync(preset: dict) -> list[str]:
     return unknown + sorted(f"{key} block" for key in HELD & set(preset) if preset[key] != SWITCH)
 
 
-def pattern_matches(pattern: str, package: str) -> bool:
-    """True when a package name matches a Renovate pattern."""
-    if pattern.startswith("/") and pattern.endswith("/i"):
-        return bool(re.search(pattern[1:-2], package, re.IGNORECASE))
-    if pattern.startswith("/") and pattern.endswith("/"):
-        return bool(re.search(pattern[1:-1], package))
-    return pattern.lower() == package.lower()
+MAX_RULES = 50
+MAX_PATTERNS = 50
+
+
+def _glob_to_regex(glob: str) -> str:
+    """Convert a segment-aware Renovate glob pattern to an anchored regex."""
+    if "{" in glob or "[" in glob:
+        raise ValueError(f"unsupported glob pattern `{glob}`")
+    if glob == "*":
+        return r"^.*$"
+    res: list[str] = ["^"]
+    n = len(glob)
+    skip = False
+    for i in range(n):
+        if skip:
+            skip = False
+            continue
+        if glob[i : i + 2] == "**":
+            res.append(r".*")
+            skip = True
+        elif glob[i] == "*":
+            res.append(r"[^/]*")
+        elif glob[i] == "?":
+            res.append(r"[^/]")
+        else:
+            res.append(re.escape(glob[i]))
+    res.append("$")
+    return "".join(res)
+
+
+def _single_pattern_match(pattern: str, package: str) -> tuple[bool, bool]:
+    """Return (is_negative, matches) for one pattern against a package name."""
+    is_neg = pattern.startswith("!")
+    raw = pattern[1:] if is_neg else pattern
+    if raw.startswith("/") and (raw.endswith("/") or raw.endswith("/i")):
+        if raw.endswith("/i"):
+            return is_neg, bool(re.search(raw[1:-2], package, re.IGNORECASE))
+        return is_neg, bool(re.search(raw[1:-1], package))
+    reg = _glob_to_regex(raw)
+    return is_neg, bool(re.fullmatch(reg, package, re.IGNORECASE))
+
+
+def patterns_match(patterns: list[str], package: str) -> bool:
+    """True when a package name matches a list of Renovate string patterns."""
+    if len(patterns) > MAX_PATTERNS:
+        raise ValueError(f"rule has {len(patterns)} patterns, at most {MAX_PATTERNS} supported")
+    if not patterns:
+        return False
+    has_positive = False
+    positive_matched = False
+    for pattern in patterns[:MAX_PATTERNS]:
+        is_neg, matched = _single_pattern_match(pattern, package)
+        if is_neg:
+            if matched:
+                return False
+        else:
+            has_positive = True
+            if matched:
+                positive_matched = True
+    return not (has_positive and not positive_matched)
 
 
 def release_age(preset: dict, datasource: str, package: str) -> str | None:
     """Emulate Renovate packageRules matching for minimumReleaseAge."""
     current_age = preset.get("minimumReleaseAge")
-    for rule in preset.get("packageRules", [])[:50]:
+    rules = preset.get("packageRules", [])
+    if len(rules) > MAX_RULES:
+        raise ValueError(f"preset has {len(rules)} packageRules, at most {MAX_RULES} supported")
+    for rule in rules[:MAX_RULES]:
         if "enabled" in rule:
             continue
         if "matchDatasources" in rule and datasource not in rule["matchDatasources"]:
             continue
-        if "matchPackageNames" in rule and not any(
-            pattern_matches(pattern, package) for pattern in rule["matchPackageNames"][:50]
-        ):
+        if "matchPackageNames" in rule and not patterns_match(rule["matchPackageNames"], package):
             continue
         if "minimumReleaseAge" in rule:
             current_age = rule["minimumReleaseAge"]
     return current_age
+
+
+def disabled_package_rules(
+    preset: dict,
+    manager: str,
+    datasource: str,
+    update_type: str,
+    package: str,
+    dep_type: str,
+) -> list[dict]:
+    """Rules with `enabled: false` whose every match condition holds for this dependency."""
+    rules = preset.get("packageRules", [])
+    if len(rules) > MAX_RULES:
+        raise ValueError(f"preset has {len(rules)} packageRules, at most {MAX_RULES} supported")
+    matching = []
+    for rule in rules[:MAX_RULES]:
+        if rule.get("enabled") is False:
+            if "matchManagers" in rule and manager not in rule["matchManagers"]:
+                continue
+            if "matchDatasources" in rule and datasource not in rule["matchDatasources"]:
+                continue
+            if "matchUpdateTypes" in rule and update_type not in rule["matchUpdateTypes"]:
+                continue
+            if "matchDepTypes" in rule and dep_type not in rule["matchDepTypes"]:
+                continue
+            if "matchPackageNames" in rule and not patterns_match(
+                rule["matchPackageNames"], package
+            ):
+                continue
+            matching.append(rule)
+    return matching
 
 
 def held_forks(preset: dict) -> list[str]:
@@ -1001,3 +1086,166 @@ def test_planted_missing_fork_in_fork_rule_is_refused():
     problems = held_forks(planted)
     assert "github-tags:lusoris/llama-swap" in problems
     assert release_age(planted, "github-tags", "lusoris/llama-swap") is None
+
+
+# Renovate 44.181.7 gives a reusable workflow pin the dependency type `workflow`
+# (measured with --dry-run=lookup) and a step's action pin `action`.
+@pytest.mark.parametrize("dep_type", ["workflow", "action"])
+def test_preset_permits_horistes_digest_updates(dep_type):
+    """default.json lets plurano/horistes digest updates through at once and disables none."""
+    assert release_age(PRESET, "github-digest", "plurano/horistes") is None
+    found = disabled_package_rules(
+        PRESET, "github-actions", "github-digest", "digest", "plurano/horistes", dep_type
+    )
+    assert found == []
+
+
+def test_planted_presets_refuse_disabled_or_aged_horistes_digest():
+    """A preset that disables or delays plurano/horistes digest updates is refused."""
+    planted_disabled = copy.deepcopy(PRESET)
+    planted_disabled["packageRules"].append(
+        {
+            "matchPackageNames": ["plurano/horistes"],
+            "matchUpdateTypes": ["digest"],
+            "enabled": False,
+        }
+    )
+    disabled = disabled_package_rules(
+        planted_disabled,
+        "github-actions",
+        "github-digest",
+        "digest",
+        "plurano/horistes",
+        "workflow",
+    )
+    assert disabled == [planted_disabled["packageRules"][-1]]
+
+    planted_delayed = copy.deepcopy(PRESET)
+    for rule in planted_delayed["packageRules"]:
+        if "github-digest" in rule.get("matchDatasources", []):
+            rule["minimumReleaseAge"] = "3 days"
+    assert release_age(planted_delayed, "github-digest", "plurano/horistes") == "3 days"
+
+
+def test_planted_preset_with_glob_plurano_star_disables_package():
+    """A planted preset disabling plurano/* matches plurano/horistes."""
+    planted = copy.deepcopy(PRESET)
+    planted["packageRules"].append(
+        {
+            "matchPackageNames": ["plurano/*"],
+            "matchUpdateTypes": ["digest"],
+            "enabled": False,
+        }
+    )
+    disabled = disabled_package_rules(
+        planted, "github-actions", "github-digest", "digest", "plurano/horistes", "workflow"
+    )
+    assert disabled == [planted["packageRules"][-1]]
+
+
+def test_planted_preset_with_glob_plurano_double_star_disables_package():
+    """A planted preset disabling plurano/** matches plurano/horistes."""
+    planted = copy.deepcopy(PRESET)
+    planted["packageRules"].append(
+        {
+            "matchPackageNames": ["plurano/**"],
+            "matchUpdateTypes": ["digest"],
+            "enabled": False,
+        }
+    )
+    disabled = disabled_package_rules(
+        planted, "github-actions", "github-digest", "digest", "plurano/horistes", "workflow"
+    )
+    assert disabled == [planted["packageRules"][-1]]
+
+
+def test_planted_preset_with_star_alone_disables_package():
+    """A planted preset disabling * matches any package."""
+    planted = copy.deepcopy(PRESET)
+    planted["packageRules"].append(
+        {
+            "matchPackageNames": ["*"],
+            "matchUpdateTypes": ["digest"],
+            "enabled": False,
+        }
+    )
+    disabled = disabled_package_rules(
+        planted, "github-actions", "github-digest", "digest", "plurano/horistes", "workflow"
+    )
+    assert disabled == [planted["packageRules"][-1]]
+
+
+def test_planted_preset_with_positive_and_negative_patterns_excludes_package():
+    """A negative pattern in matchPackageNames excludes the package from disabling."""
+    planted = copy.deepcopy(PRESET)
+    planted["packageRules"].append(
+        {
+            "matchPackageNames": ["/^plurano/", "!plurano/horistes"],
+            "matchUpdateTypes": ["digest"],
+            "enabled": False,
+        }
+    )
+    disabled = disabled_package_rules(
+        planted, "github-actions", "github-digest", "digest", "plurano/horistes", "workflow"
+    )
+    assert disabled == []
+
+
+def test_preset_with_more_than_50_rules_fails_with_error():
+    """A preset with more than 50 packageRules raises an error instead of silently passing."""
+    planted = copy.deepcopy(PRESET)
+    while len(planted["packageRules"]) < 59:
+        planted["packageRules"].append({"matchPackageNames": ["other/dep"], "enabled": True})
+    planted["packageRules"].append(
+        {
+            "matchPackageNames": ["plurano/horistes"],
+            "matchUpdateTypes": ["digest"],
+            "enabled": False,
+        }
+    )
+    assert len(planted["packageRules"]) == 60
+    with pytest.raises(ValueError, match="at most 50"):
+        disabled_package_rules(
+            planted, "github-actions", "github-digest", "digest", "plurano/horistes", "workflow"
+        )
+
+
+def test_unsupported_brace_glob_pattern_fails_with_error():
+    """A glob pattern containing braces raises an error naming the pattern."""
+    planted = copy.deepcopy(PRESET)
+    planted["packageRules"].append(
+        {
+            "matchPackageNames": ["plurano/{a,b}"],
+            "enabled": False,
+        }
+    )
+    with pytest.raises(ValueError, match=r"unsupported glob pattern `plurano/\{a,b\}`"):
+        disabled_package_rules(
+            planted, "github-actions", "github-digest", "digest", "plurano/a", "workflow"
+        )
+
+
+def test_rule_with_more_than_50_patterns_fails_with_error():
+    """A disabling rule with more than 50 package patterns raises an error naming the count."""
+    planted = copy.deepcopy(PRESET)
+    names = [f"other/dep-{index}" for index in range(50)] + ["plurano/horistes"]
+    planted["packageRules"].append({"matchPackageNames": names, "enabled": False})
+    with pytest.raises(ValueError, match="rule has 51 patterns, at most 50"):
+        disabled_package_rules(
+            planted, "github-actions", "github-digest", "digest", "plurano/horistes", "workflow"
+        )
+
+
+def test_preset_at_both_50_bounds_is_read_to_its_end():
+    """Exactly 50 rules, the last with exactly 50 patterns: its last pattern still disables."""
+    planted = copy.deepcopy(PRESET)
+    while len(planted["packageRules"]) < 49:
+        planted["packageRules"].append({"matchPackageNames": ["other/dep"], "enabled": True})
+    names = [f"other/dep-{index}" for index in range(49)] + ["plurano/horistes"]
+    last = {"matchPackageNames": names, "matchUpdateTypes": ["digest"], "enabled": False}
+    planted["packageRules"].append(last)
+    assert len(planted["packageRules"]) == 50
+    found = disabled_package_rules(
+        planted, "github-actions", "github-digest", "digest", "plurano/horistes", "workflow"
+    )
+    assert found == [last]
