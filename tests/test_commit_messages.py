@@ -17,7 +17,8 @@ two parents (it adds no content of its own: the forge's test merge of a pull
 request, an update-branch merge); a merge that carries a sign-off is checked
 like any commit. A bot author passes with its own sign-off, as the update
 bot's `:gitSignOff` preset writes it, or with a person's; every sign-off value
-must read `Name <email>`.
+must read `Name <email>`. A forge bot address is recognised in any case, local
+part and domain alike, as the author's email is compared.
 
 Two credit rules, on one message each:
 
@@ -49,7 +50,7 @@ MAX_COMMITS = 500
 MAX_MESSAGE = 65536
 TRAILERS = {"signed-off-by", "migration"}
 FOOTER = re.compile(r"^\W*(generated with\b|co-authored-by\s*:)", re.IGNORECASE)
-FORGE_BOT = re.compile(r"\d+\+[a-z0-9-]+\[bot\]@users\.noreply\.github\.com")
+FORGE_BOT = re.compile(r"\d+\+[a-z0-9-]+\[bot\]@users\.noreply\.github\.com", re.IGNORECASE)
 SIGN_OFF_VALUE = re.compile(r"[^<>\n]*[^<>\s] <([^<>\s@]+@[^<>\s@]+)>")
 SIGN_OFF = "Signed-off-by: A Person <person@example.org>"
 GOOD = f"feat(x): add a thing\n\nThe header is generated with its own command.\n\n{SIGN_OFF}\n"
@@ -368,6 +369,46 @@ def test_bot_author_forge_format_distinction():
 )
 def test_bot_author_with_a_longer_address_is_not_the_forge_form(author):
     """Negative: the forge form must span the whole address, neither open nor close it."""
+    message = f"chore(deps): update\n\n{SIGN_OFF}\n"
+    assert foreign_sign_off(author, message) == [
+        f"sign-off person@example.org is not the author {author}"
+    ]
+
+
+@pytest.mark.parametrize(
+    "other_cased",
+    [
+        "49699333+DEPENDABOT[BOT]@USERS.NOREPLY.GITHUB.COM",
+        "49699333+dependabot[bot]@USERS.NOREPLY.GITHUB.COM",
+        "49699333+Dependabot[BOT]@users.noreply.github.com",
+    ],
+    ids=["all-upper", "upper-domain", "mixed-local"],
+)
+def test_foreign_sign_off_refuses_other_forge_bot_in_various_casings(other_cased):
+    """Negative: a bot commit signed off by another forge bot in various casings is refused."""
+    bot = BOT["GIT_AUTHOR_EMAIL"]
+    message = f"chore(deps): update\n\nSigned-off-by: dependabot[bot] <{other_cased}>\n"
+    assert foreign_sign_off(bot, message) == [f"sign-off {other_cased} is not the author {bot}"]
+
+
+@pytest.mark.parametrize(
+    "bot_author",
+    [
+        "29139614+RENOVATE[BOT]@USERS.NOREPLY.GITHUB.COM",
+        "29139614+renovate[bot]@USERS.NOREPLY.GITHUB.COM",
+        "29139614+Renovate[BOT]@users.noreply.github.com",
+    ],
+    ids=["all-upper", "upper-domain", "mixed-local"],
+)
+def test_forge_bot_author_in_various_casings_passes_with_person_sign_off(bot_author):
+    """Positive: a forge bot author in various casings passes with a person's sign-off."""
+    message = f"chore(deps): update\n\n{SIGN_OFF}\n"
+    assert foreign_sign_off(bot_author, message) == []
+
+
+def test_bot_author_with_uppercase_longer_address_is_refused():
+    """Boundary: an upper-case address that runs past the forge form is no bot address."""
+    author = "29139614+RENOVATE[BOT]@USERS.NOREPLY.GITHUB.COM.example.org"
     message = f"chore(deps): update\n\n{SIGN_OFF}\n"
     assert foreign_sign_off(author, message) == [
         f"sign-off person@example.org is not the author {author}"
