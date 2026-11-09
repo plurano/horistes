@@ -532,11 +532,15 @@ def comment_problems(
         rule_pat = r"^#\s*nosec(?::|\s+)\s*(B\d{3}(?:[ ,]+B\d{3})*)"
         probs = _check_directive(comment, NOSEC_FLEET, "nosec", where, now, valid, path, rule_pat)
         problems.extend(probs)
-    if NOQA_DIRECTIVE.search(comment):
+    noqa_match = NOQA_DIRECTIVE.search(comment)
+    if noqa_match:
         if counts is not None:
             counts["noqa"] = counts.get("noqa", 0) + 1
+        noqa_comment = comment[noqa_match.start() :]
         rule_pat = r"^#\s*noqa:\s*([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)"
-        probs = _check_directive(comment, NOQA_FLEET, "noqa", where, now, valid, path, rule_pat)
+        probs = _check_directive(
+            noqa_comment, NOQA_FLEET, "noqa", where, now, valid, path, rule_pat
+        )
         problems.extend(probs)
     if TYPE_IGNORE_DIRECTIVE.search(comment):
         if counts is not None:
@@ -556,6 +560,15 @@ def comment_problems(
         probs = _check_directive(comment, PYLINT_FLEET, "pylint", where, now, valid, path, rule_pat)
         problems.extend(probs)
     return problems
+
+
+def _has_trailing_noqa_e501(comment: str) -> bool:
+    """Whether comment ends with # noqa: ... containing E501."""
+    match = re.search(r"#\s*noqa:\s*([A-Za-z0-9_.,\s]+)$", comment)
+    if not match:
+        return False
+    codes = {c.strip() for c in re.split(r"[,\s]+", match.group(1)) if c.strip()}
+    return "E501" in codes
 
 
 def suppression_problems(
@@ -589,7 +602,13 @@ def suppression_problems(
                 and NOSEMGREP_FLEET.match(tok.string.strip())
                 and len(tok.line.rstrip("\r\n")) > 100
             ):
-                line_probs.append(f"{where}: {LONG_WORD} line exceeds 100 columns")
+                covered = (
+                    valid_exceptions is not None
+                    and ("E501", name) in valid_exceptions
+                    and _has_trailing_noqa_e501(tok.string.strip())
+                )
+                if not covered:
+                    line_probs.append(f"{where}: {LONG_WORD} line exceeds 100 columns")
             problems.extend(line_probs)
     except tokenize.TokenError as err:
         problems.append(f"{name}:1: tokenize error: {err}")

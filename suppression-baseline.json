@@ -1,5 +1,6 @@
 {
   "markdownlint": 13,
-  "noqa": 3,
-  "nosemgrep": 12
+  "noqa": 4,
+  "nosec": 2,
+  "nosemgrep": 16
 }

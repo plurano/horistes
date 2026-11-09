@@ -146,3 +146,68 @@ def test_ignore_word_in_multiline_string_names_its_line() -> None:
     problems = suppression_problems(planted('NOTE = """first\nsecond\n    {sg}"""\n'), "test.py")
     assert len(problems) == 1
     assert problems[0].startswith("test.py:3: invalid opengrep ignore word outside a comment: ")
+
+
+LONG_NOSEMGREP_E501 = (
+    f"# {exceptions.LONG_WORD}: dangerous-subprocess-use-audit expires 2026-11-12 "
+    "category B: long reason that easily exceeds one hundred columns  # noqa: E501\n"
+)
+
+
+def test_trailing_noqa_e501_positive() -> None:
+    """Positive: own-line fleet rule over 100 cols with trailing noqa E501 and entry passes."""
+    today = datetime.date(2026, 11, 9)
+    valid = {("E501", "test.py")}
+    probs = suppression_problems(
+        LONG_NOSEMGREP_E501, "test.py", today=today, valid_exceptions=valid
+    )
+    assert probs == []
+
+
+def test_trailing_noqa_e501_negative_without_entry() -> None:
+    """Negative: same line without register entry raises invalid noqa and exceeds 100 columns."""
+    today = datetime.date(2026, 11, 9)
+    probs = suppression_problems(
+        LONG_NOSEMGREP_E501, "test.py", today=today, valid_exceptions=set()
+    )
+    assert len(probs) == 2
+    assert "invalid noqa suppression: # noqa: E501" in probs[0]
+    assert f"{exceptions.LONG_WORD} line exceeds 100 columns" in probs[1]
+
+
+@pytest.mark.parametrize(
+    ("payload", "valid", "expected_probs"),
+    [
+        (
+            LONG_NOSEMGREP_E501,
+            {("E501", "other.py")},
+            [
+                "test.py:1: invalid noqa suppression: # noqa: E501",
+                f"test.py:1: {exceptions.LONG_WORD} line exceeds 100 columns",
+            ],
+        ),
+        (
+            LONG_NOSEMGREP_E501.replace("E501", "E731"),
+            {("E501", "test.py")},
+            [
+                "test.py:1: invalid noqa suppression: # noqa: E731",
+                f"test.py:1: {exceptions.LONG_WORD} line exceeds 100 columns",
+            ],
+        ),
+        (
+            "# noqa: E501\n",
+            set(),
+            ["test.py:1: invalid noqa suppression: # noqa: E501"],
+        ),
+    ],
+    ids=["entry-other-path", "trailing-e731", "standalone-noqa"],
+)
+def test_trailing_noqa_e501_boundaries(
+    payload: str,
+    valid: set[tuple[str, str]],
+    expected_probs: list[str],
+) -> None:
+    """Boundary conditions: wrong path, wrong code and standalone noqa are refused."""
+    today = datetime.date(2026, 11, 9)
+    probs = suppression_problems(payload, "test.py", today=today, valid_exceptions=valid)
+    assert probs == expected_probs

@@ -126,16 +126,16 @@ exceptions:
       error refuses; MEL category D; revisit when horistes ships release
       tags or zizmor judges branch history itself (the upstream issue)
     expires: "2027-03-09"
-  - rule: ruff E501 on the opengrep suppression of the gh call
+  - rule: E501
     path: tools/forge.py
     issue: plurano/horistes#161
     category: D
     entered: "2026-11-09"
     reason: >-
-      the nosemgrep line above the gh call in download() names the full
+      the opengrep suppression above the gh call in download() names the full
       rule id, its expiry, its category and its reason on one line, which
-      runs past 100 columns at that nesting; ruff exempts no nosemgrep
-      comment, so a trailing noqa E501 binds that line alone; MEL category
+      runs past 100 columns at that nesting; ruff exempts no opengrep
+      suppression, so a trailing noqa E501 binds that line alone; MEL category
       D; revisit when issue 161 settles the suppression form or the GH
       override leaves download()
     expires: "2027-03-09"
