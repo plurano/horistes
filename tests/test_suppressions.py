@@ -35,6 +35,11 @@ PLANTED_REFUSALS: list[tuple[str, str, str]] = [
     ("bare-nosec", "# nosec\n", "code"),
     ("nosec-no-reason", "# nosec B101\n", "code"),
     ("nosec-reason-no-id", "# nosec # reason without id\n", "code"),
+    (
+        "nosec-no-hash-before-expires",
+        "# nosec B101 expires 2026-11-12 category B: valid test reason\n",
+        "code",
+    ),
     ("short-alias", "# {sem}\n", "code"),
     (
         "opengrep-alias",
@@ -67,7 +72,7 @@ ACCEPTED_BOUNDARIES: list[tuple[str, str]] = [
         "ignore-word-two-ids",
         "# {sg}: rule-one, rule-two expires 2026-11-12 category B: valid test reason\n",
     ),
-    ("nosec-two-ids", "# nosec B101, B102 expires 2026-11-12 category B: valid test reason\n"),
+    ("nosec-two-ids", "# nosec B101, B102 # expires 2026-11-12 category B: valid test reason\n"),
     ("nosec-hash-expiry", "# nosec B602 # expires 2026-11-12 category B: valid test reason\n"),
     ("split-word-string", 'TEXT = "no" + "semgrep"\n'),
     ("nosec-in-string", 'TEXT = "# nosec"\n'),

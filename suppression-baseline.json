@@ -2,5 +2,5 @@
   "markdownlint": 13,
   "noqa": 4,
   "nosec": 2,
-  "nosemgrep": 16
+  "nosemgrep": 17
 }

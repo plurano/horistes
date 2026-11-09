@@ -115,7 +115,7 @@ expires = 2027-01-20
 # with a day it ends (decision record 0005), and it leaves when a pinned image
 # of the licence tool is on the forge's registry.
 [files.".github/workflows/licence.yml"."docker.io"]
-reason = "image of the licence tool, named by digest; no pinned copy on the forge's registry yet"
+reason = "image of the licence tool named by digest; no pinned copy on the forge's registry yet"
 category = "D"
 expires = 2026-12-31
 

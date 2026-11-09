@@ -30,6 +30,9 @@ OWN = "exceptions.yaml"
 RUFF = "ruff.toml"
 BASELINE = "suppression-baseline.json"
 
+MAX_TRACKED_FILES = 20000
+MAX_FILE_BYTES = 4 * 1024 * 1024
+
 RUFF_TOP = frozenset({"line-length", "target-version", "lint"})
 RUFF_LINT = frozenset({"select", "ignore", "per-file-ignores", "isort"})
 FIELDS = ("rule", "path", "issue", "reason", "expires", "category", "entered")
@@ -59,11 +62,11 @@ NOSEMGREP_FLEET = re.compile(
 NOSEC_DIRECTIVE = re.compile(r"#\s*nosec")
 NOSEC_FLEET = re.compile(
     r"^#\s*nosec(?::|\s+)\s*(?P<rules>B\d{3}(?:[ ,]+B\d{3})*)"
-    r"\s+(?:#\s*)?expires\s+(?P<day>\d{4}-\d{2}-\d{2})"
+    r"\s+#\s*expires\s+(?P<day>\d{4}-\d{2}-\d{2})"
     r"\s+category\s+(?P<cat>[A-Z]):\s+(?P<why>[^\n]+)$"
 )
 
-NOQA_DIRECTIVE = re.compile(r"#\s*noqa\b")
+NOQA_DIRECTIVE = re.compile(r"#\s*(?:(?:ruff|flake8):\s*)?noqa\b", re.IGNORECASE)
 NOQA_FLEET = re.compile(
     r"^#\s*noqa:\s*(?P<rules>[A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)"
     r"\s+expires\s+(?P<day>\d{4}-\d{2}-\d{2})"
@@ -116,7 +119,7 @@ RUFF_ENTRY = re.compile(
 )
 
 
-def _reason_problem(why: str) -> str:
+def reason_problem(why: str) -> str:
     """Validate that reason is non-empty, contains at least one letter and no commas."""
     stripped = why.strip()
     if not stripped:
@@ -164,7 +167,7 @@ def category_problem(
 
 def _check_fleet_match(match: re.Match[str], today: datetime.date) -> str:
     """Check reason, category and expiry from a matched fleet directive."""
-    why_prob = _reason_problem(match.group("why"))
+    why_prob = reason_problem(match.group("why"))
     if why_prob:
         return why_prob
     cat = match.group("cat")
@@ -335,6 +338,10 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
     found = [f"has the unknown field `{key}`" for key in unknown]
     empty = [key for key in FIELDS if not isinstance(entry.get(key), str) or not entry[key].strip()]
     found += [f"has no `{key}` (a text that is not empty)" for key in empty]
+    if "reason" not in empty:
+        r_prob = reason_problem(str(entry.get("reason", "")))
+        if r_prob:
+            found.append(r_prob)
     if "issue" not in empty and not ISSUE.match(entry["issue"]):
         found.append(f"names the issue `{entry['issue']}`, not as owner/name#number")
     if "path" not in empty and not _tracked_file(root, entry["path"]):
@@ -491,7 +498,7 @@ def _check_directive(
     today: datetime.date,
     valid_exceptions: set[tuple[str, str]],
     path: str,
-    rules_pattern: str,
+    rules_pattern: str | re.Pattern[str],
 ) -> list[str]:
     """Check one inline comment directive against fleet format or covered exceptions."""
     match = pattern.match(comment)
@@ -499,7 +506,8 @@ def _check_directive(
         prob = _check_fleet_match(match, today)
         return [f"{where}: invalid {kind} suppression: {prob}"] if prob else []
     rules_match = re.match(rules_pattern, comment)
-    if rules_match and _is_covered(rules_match.group(1), path, valid_exceptions):
+    rules = rules_match.group(1) if rules_match else None
+    if rules and _is_covered(rules, path, valid_exceptions):
         return []
     return [f"{where}: invalid {kind} suppression: {comment}"]
 
@@ -536,8 +544,11 @@ def comment_problems(
     if noqa_match:
         if counts is not None:
             counts["noqa"] = counts.get("noqa", 0) + 1
-        noqa_comment = comment[noqa_match.start() :]
-        rule_pat = r"^#\s*noqa:\s*([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)"
+        noqa_comment = comment[noqa_match.start() :].strip()
+        rule_pat = re.compile(
+            r"^#\s*(?:(?:ruff|flake8):\s*)?noqa:\s*([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)",
+            re.IGNORECASE,
+        )
         probs = _check_directive(
             noqa_comment, NOQA_FLEET, "noqa", where, now, valid, path, rule_pat
         )
@@ -615,6 +626,72 @@ def suppression_problems(
     return problems
 
 
+def opengrep_problems(
+    text: str,
+    name: str,
+    today: datetime.date,
+    valid_exceptions: set[tuple[str, str]],
+    counts: dict[str, int],
+) -> list[str]:
+    """Judge opengrep ignore lines for every non-python tracked text file.
+
+    suppression-baseline.json is exempt by name because its keys name the kinds
+    of suppressions, including the opengrep ignore word.
+    """
+    if name == BASELINE:
+        return []
+    problems = []
+    rule_pat = r"^#\s*" + LONG_WORD + r":\s*([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)"
+    for line_no, line in enumerate(text.splitlines(), 1):
+        match = OPENGREP_AFTER_CODE.search(line)
+        if not match:
+            continue
+        counts[LONG_WORD] = counts.get(LONG_WORD, 0) + 1
+        hash_idx = line.rfind("#", 0, match.start())
+        directive = line[hash_idx:].strip() if hash_idx != -1 else line.strip()
+        where = f"{name}:{line_no}"
+        probs = _check_directive(
+            directive,
+            NOSEMGREP_FLEET,
+            "opengrep",
+            where,
+            today,
+            valid_exceptions,
+            name,
+            rule_pat,
+        )
+        problems.extend(probs)
+    return problems
+
+
+def _shellcheck_line_problem(
+    line: str,
+    where: str,
+    today: datetime.date,
+    valid_exceptions: set[tuple[str, str]],
+    name: str,
+    counts: dict[str, int],
+) -> list[str]:
+    """Check one line for a shellcheck directive; update counts and return problems."""
+    if not SHELLCHECK_DIRECTIVE.search(line):
+        return []
+    counts["shellcheck"] = counts.get("shellcheck", 0) + 1
+    match = SHELLCHECK_FLEET.search(line.strip())
+    if match:
+        prob = _check_fleet_match(match, today)
+        return [f"{where}: invalid shellcheck suppression: {prob}"] if prob else []
+    extract = re.search(
+        r"#\s*shellcheck\s+disable=([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)",
+        line,
+    )
+    rules_str = extract.group(1) if extract else ""
+    if not rules_str or not _is_covered(rules_str, name, valid_exceptions):
+        return [
+            f"{where}: invalid shellcheck suppression: not in fleet format and not covered by {OWN}"
+        ]
+    return []
+
+
 def yaml_problems(
     text: str,
     name: str,
@@ -628,22 +705,12 @@ def yaml_problems(
         where = f"{name}:{line_no}"
         if YAMLLINT_DIRECTIVE.search(line):
             problems.append(f"{where}: invalid yamllint suppression: {line.strip()}")
-        elif ZIZMOR_DIRECTIVE.search(line):
+        if ZIZMOR_DIRECTIVE.search(line):
             problems.append(f"{where}: invalid zizmor suppression: {line.strip()}")
-        elif OPENGREP_AFTER_CODE.search(line):
-            counts[LONG_WORD] = counts.get(LONG_WORD, 0) + 1
-            rule_pat = r"#\s*" + LONG_WORD + r":\s*([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)"
-            probs = _check_directive(
-                line.strip(),
-                NOSEMGREP_FLEET,
-                "opengrep",
-                where,
-                today,
-                valid_exceptions,
-                name,
-                rule_pat,
-            )
-            problems.extend(probs)
+        problems.extend(
+            _shellcheck_line_problem(line, where, today, valid_exceptions, name, counts)
+        )
+    problems.extend(opengrep_problems(text, name, today, valid_exceptions, counts))
     return problems
 
 
@@ -691,25 +758,9 @@ def sh_problems(
     problems = []
     for line_no, line in enumerate(text.splitlines(), 1):
         where = f"{name}:{line_no}"
-        if not SHELLCHECK_DIRECTIVE.search(line):
-            continue
-        counts["shellcheck"] = counts.get("shellcheck", 0) + 1
-        match = SHELLCHECK_FLEET.search(line.strip())
-        if match:
-            prob = _check_fleet_match(match, today)
-            if prob:
-                problems.append(f"{where}: invalid shellcheck suppression: {prob}")
-            continue
-        extract = re.search(
-            r"#\s*shellcheck\s+disable=([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)",
-            line,
+        problems.extend(
+            _shellcheck_line_problem(line, where, today, valid_exceptions, name, counts)
         )
-        rules_str = extract.group(1) if extract else ""
-        if not rules_str or not _is_covered(rules_str, name, valid_exceptions):
-            problems.append(
-                f"{where}: invalid shellcheck suppression: "
-                f"not in fleet format and not covered by {OWN}"
-            )
     return problems
 
 
@@ -739,6 +790,12 @@ def _scan_tracked_file(
     if not file_path.is_file():
         return [], 0
     try:
+        size = file_path.stat().st_size
+    except OSError as err:
+        raise ciwf.ReadError(f"{rel}: {err}") from err
+    if size > MAX_FILE_BYTES:
+        raise ciwf.ReadError(f"{rel}: size {size} exceeds cap of {MAX_FILE_BYTES} bytes")
+    try:
         text = file_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return [], 1
@@ -747,14 +804,16 @@ def _scan_tracked_file(
     file_probs = _reuse_problems(rel, text)
     if rel == ".codacy.yml":
         file_probs.extend(f"{rel}: {p}" for p in codacy_problems(text))
-    if rel.endswith(".py"):
+    if rel.endswith((".py", ".pyi")):
         file_probs.extend(suppression_problems(text, rel, today, valid_exceptions, counts))
     elif rel.endswith((".yml", ".yaml", ".yml.tmpl", ".yaml.tmpl")):
         file_probs.extend(yaml_problems(text, rel, today, valid_exceptions, counts))
-    elif rel.endswith(".md"):
-        file_probs.extend(md_problems(text, rel, today, valid_exceptions, counts))
-    elif rel.endswith((".sh", ".bash")):
-        file_probs.extend(sh_problems(text, rel, today, valid_exceptions, counts))
+    else:
+        file_probs.extend(opengrep_problems(text, rel, today, valid_exceptions, counts))
+        if rel.endswith(".md"):
+            file_probs.extend(md_problems(text, rel, today, valid_exceptions, counts))
+        elif rel.endswith((".sh", ".bash")):
+            file_probs.extend(sh_problems(text, rel, today, valid_exceptions, counts))
     return file_probs, 0
 
 
@@ -762,15 +821,19 @@ def _tree_directives(
     root: Path,
     today: datetime.date,
     valid_exceptions: set[tuple[str, str]],
-) -> tuple[list[str], dict[str, int], int]:
+) -> tuple[list[str], dict[str, int], list[str]]:
     """Scan all tracked files below root for directives and tally their counts by kind."""
+    tracked = _tracked_files(root)
+    if len(tracked) > MAX_TRACKED_FILES:
+        raise ciwf.ReadError(f"{len(tracked)} tracked files exceeds cap of {MAX_TRACKED_FILES}")
     problems: list[str] = []
     counts: dict[str, int] = {}
-    skipped = 0
-    for rel in _tracked_files(root):
+    skipped: list[str] = []
+    for rel in tracked:
         file_probs, file_skipped = _scan_tracked_file(rel, root, today, valid_exceptions, counts)
         problems.extend(file_probs)
-        skipped += file_skipped
+        if file_skipped:
+            skipped.append(rel)
     return problems, counts, skipped
 
 
@@ -804,7 +867,7 @@ def _ratchet_problems(root: Path, counts: dict[str, int]) -> list[str]:
     return problems
 
 
-def problems(root: Path, today: datetime.date) -> tuple[list[str], int, int, int]:
+def problems(root: Path, today: datetime.date) -> tuple[list[str], int, int, list[str]]:
     """What is wrong in the four places and tracked files, and how many entries they hold."""
     findings, accepted = _findings(root, today)
     linted, ignored = _actionlint(root, today)
@@ -833,7 +896,11 @@ def main() -> int:
     if found:
         return 1
     max_days = max(CATEGORY_DAYS.values())
-    skipped_text = f", {skipped} tracked file(s) skipped as not UTF-8" if skipped else ""
+    skipped_text = (
+        f", {len(skipped)} tracked file(s) skipped as not UTF-8: {', '.join(sorted(skipped))}"
+        if skipped
+        else ""
+    )
     ciwf.say(
         f"PASS: {accepted} accepted finding(s) and {excepted} exception(s), "
         f"each with a reason and a day at most {max_days} days ahead{skipped_text}"

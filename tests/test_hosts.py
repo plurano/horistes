@@ -241,6 +241,27 @@ def test_exception_that_ends_later_than_the_longest_time_fails(tree):
     )
 
 
+def test_host_exception_with_comma_reason_refused(tree):
+    bad = DATED.replace('reason = "public transparency log"', 'reason = "bad, reason with comma"')
+    done = scan(tree, planted(LOG), bad, "--today", "2026-10-11")
+    assert done.returncode == 1
+    assert "reason contains a comma" in done.stderr
+
+
+def test_host_exception_with_empty_reason_refused(tree):
+    bad = DATED.replace('reason = "public transparency log"', 'reason = ""')
+    done = scan(tree, planted(LOG), bad, "--today", "2026-10-11")
+    assert done.returncode == 1
+    assert "host rekor.sigstore.dev is declared without a reason" in done.stderr
+
+
+def test_host_exception_with_missing_reason_refused(tree):
+    bad = DATED.replace('reason = "public transparency log"\n', "")
+    done = scan(tree, planted(LOG), bad, "--today", "2026-10-11")
+    assert done.returncode == 1
+    assert "host rekor.sigstore.dev is declared without a reason" in done.stderr
+
+
 @pytest.mark.parametrize(
     ("entry", "message"),
     [

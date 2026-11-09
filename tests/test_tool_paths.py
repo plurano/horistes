@@ -28,14 +28,41 @@ def tool_variables(makefile: str) -> frozenset[str]:
 
 def environ_reads(source: str, names: frozenset[str]) -> list[int]:
     """The lines of `source` that read one of `names` from the environment directly."""
+    tree = ast.parse(source)
+    os_names: set[str] = set()
+    environ_names: set[str] = set()
+    getenv_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "os":
+                    os_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "os":
+            for alias in node.names:
+                if alias.name == "environ":
+                    environ_names.add(alias.asname or alias.name)
+                elif alias.name == "getenv":
+                    getenv_names.add(alias.asname or alias.name)
+
+    call_targets = DIRECT_CALLS | {
+        *(f"{n}.environ.get" for n in os_names),
+        *(f"{n}.getenv" for n in os_names),
+        *(f"{n}.get" for n in environ_names),
+        *getenv_names,
+    }
+    map_targets = DIRECT_MAPS | {
+        *(f"{n}.environ" for n in os_names),
+        *environ_names,
+    }
+
     found = []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             key = node.args[0] if node.args else None
-            direct = ast.unparse(node.func) in DIRECT_CALLS
+            direct = ast.unparse(node.func) in call_targets
         elif isinstance(node, ast.Subscript):
             key = node.slice
-            direct = ast.unparse(node.value) in DIRECT_MAPS
+            direct = ast.unparse(node.value) in map_targets
         else:
             continue
         if direct and isinstance(key, ast.Constant) and key.value in names:
@@ -71,8 +98,31 @@ def test_no_test_reads_a_tool_variable_directly():
         ('import os\nos.environ.get("ZIZMOR_OFFLINE")\n', []),
         ('tool = external("REUSE", "reuse")\n', []),
         ("text = 'os.environ.get(\"REUSE\")'\n", []),
+        ('import os as x\nx.environ.get("REUSE")\n', [2]),
+        ('import os as x\nx.getenv("REUSE")\n', [2]),
+        ('import os as x\ntool = x.environ["REUSE"]\n', [2]),
+        ('from os import environ as e\ne.get("REUSE")\n', [2]),
+        ('from os import environ as e\ntool = e["REUSE"]\n', [2]),
+        ('from os import getenv as g\ng("REUSE")\n', [2]),
+        ('import os as x\nx.environ.get("OTHER_VAR")\n', []),
+        ('from os import getenv as g\ng("OTHER_VAR")\n', []),
     ],
-    ids=["get", "subscript", "getenv", "other-variable", "helper", "string"],
+    ids=[
+        "get",
+        "subscript",
+        "getenv",
+        "other-variable",
+        "helper",
+        "string",
+        "alias-os-environ-get",
+        "alias-os-getenv",
+        "alias-os-subscript",
+        "alias-environ-get",
+        "alias-environ-subscript",
+        "alias-getenv",
+        "alias-os-other-variable",
+        "alias-getenv-other-variable",
+    ],
 )
 def test_environ_reads_3d(source, lines):
     assert environ_reads(source, NAMES) == lines

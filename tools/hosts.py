@@ -203,6 +203,9 @@ def _switch_problem(spec: dict, inputs: dict, today: datetime.date) -> str:
     category = spec["category"]
     if category not in ("A", "B", "C", "D"):
         return f"is an exception with category `{category}`, not one of A, B, C, D"
+    reason_prob = exceptions.reason_problem(str(spec.get("reason", "")))
+    if reason_prob:
+        return f"is an exception whose {reason_prob}"
     problem = exceptions.category_problem(expires, category, str(spec.get("reason", "")), today)
     return f"is an exception that {problem}" if problem else ""
 

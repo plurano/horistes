@@ -30,10 +30,10 @@ hook files cannot be modified directly in this repository without causing contex
 - One reader, `tools/exceptions.py check` (`make check-exceptions`), judges all suppressions across
   all tracked files, while dated host exceptions in `hosts.toml` are checked by `tools/hosts.py check`.
 - Per-category caps replace the flat 90-day cap of ADR-0010, superseding it.
-- A bandit suppression puts a second `#` before the expiry
+- A bandit suppression requires a second `#` before the expiry
   (`# nosec B602 # expires 2027-03-09 category D: reason`): bandit reads test ids only up to
-  the next `#`, so the words after it raise no warning, while the form without it prints one
-  warning per word (measured with bandit 1.9.4; both forms suppress the finding).
+  the next `#`, so the words after it raise no warning; bandit prints one warning per word
+  for the form without it (measured with bandit 1.9.4), and the reader refuses that form.
 - Inline directives in files must match the fleet format, or be covered by an entry in
   `exceptions.yaml` ([ADR-0007](0007-one-own-exception-list.md)).
 - REUSE ignore markers are prohibited in source files and stay refused by `tools/exceptions.py`;

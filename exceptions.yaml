@@ -14,7 +14,7 @@ exceptions:
     entered: "2026-11-07"
     reason: >-
       project answers are in .bestpractices.json; registration on
-      bestpractices.dev approved, waiting for completion
+      bestpractices.dev approved and waiting for completion
     expires: "2026-11-17"
   - rule: MD013
     path: CLAUDE.md
@@ -133,9 +133,9 @@ exceptions:
     entered: "2026-11-09"
     reason: >-
       the opengrep suppression above the gh call in download() names the full
-      rule id, its expiry, its category and its reason on one line, which
+      rule id and its expiry and its category and its reason on one line; this
       runs past 100 columns at that nesting; ruff exempts no opengrep
-      suppression, so a trailing noqa E501 binds that line alone; MEL category
+      suppression; a trailing noqa E501 binds that line alone; MEL category
       D; revisit when issue 161 settles the suppression form or the GH
       override leaves download()
     expires: "2027-03-09"

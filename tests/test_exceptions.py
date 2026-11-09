@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import shutil
 import subprocess
 import sys
@@ -430,7 +431,7 @@ def test_category_d_wrong_interval_refused(tree):
     assert "2027-01-29" in done.stderr
 
 
-def test_mutation_empty_category_days_lets_wrong_interval_pass(tree):
+def test_mutation_empty_category_days_fails_valid_category_c_entry(tree):
     source = (ROOT / "tools" / "exceptions.py").read_text(encoding="utf-8")
     mutated = source.replace('CATEGORY_DAYS = {"B": 3, "C": 10, "D": 120}', "CATEGORY_DAYS = {}")
     assert mutated != source
@@ -443,10 +444,12 @@ def test_mutation_empty_category_days_lets_wrong_interval_pass(tree):
             dst = tree.root / "tools" / dep
             dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     files = {
-        OWN: _with_category("C", "2026-10-11", "2026-10-22"),
+        OWN: _with_category("C", "2026-10-11", "2026-10-21"),
         SUBJECT: "{}\n",
     }
     tree.write(files)
+    real_done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert real_done.returncode == 0, real_done.stderr
     # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs mutant on tree
     done = subprocess.run(
         [sys.executable, "-B", str(mutant), "check", "--root", str(tree.root), "--today", TODAY],
@@ -455,7 +458,8 @@ def test_mutation_empty_category_days_lets_wrong_interval_pass(tree):
         check=False,
         timeout=60,
     )
-    assert done.returncode != 0
+    assert done.returncode == 1
+    assert "category `C` is not one of A, B, C, D" in done.stderr
 
 
 LINTED = ".github/actionlint.yaml"
@@ -818,11 +822,11 @@ def test_reason_problem_3d():
     """3D unit tests for reason validation."""
     import exceptions
 
-    assert exceptions._reason_problem("") == "reason is empty"
-    assert exceptions._reason_problem("   ") == "reason is empty"
-    assert exceptions._reason_problem("bad, reason with comma") == "reason contains a comma"
-    assert exceptions._reason_problem("1234567") == "reason has no letter"
-    assert exceptions._reason_problem("valid reason text") == ""
+    assert exceptions.reason_problem("") == "reason is empty"
+    assert exceptions.reason_problem("   ") == "reason is empty"
+    assert exceptions.reason_problem("bad, reason with comma") == "reason contains a comma"
+    assert exceptions.reason_problem("1234567") == "reason has no letter"
+    assert exceptions.reason_problem("valid reason text") == ""
 
 
 def test_yaml_suppressions_3d(tree):
@@ -947,6 +951,12 @@ def test_ratchet_3d(tree):
     assert "lower noqa in suppression-baseline.json to 1" in probs_shrink[0]
 
 
+def _run_reuse(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    """Run a reuse command in the target directory."""
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs reuse
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False, timeout=300)
+
+
 def test_reuse_lint_template_empty_note_3d(tmp_path):
     """3D test: template SPDX empty notes pass reuse lint; fails without them on identifier."""
     reuse = [*rooted(external("REUSE", "reuse")), "lint"]
@@ -965,7 +975,7 @@ def test_reuse_lint_template_empty_note_3d(tmp_path):
     subprocess.run(["git", "add", "-A"], cwd=dest, capture_output=True, check=True, timeout=60)
 
     # 1. Positive: template empty notes pass reuse lint without an override table -> rc 0
-    proc1 = subprocess.run(reuse, cwd=dest, capture_output=True, text=True, timeout=300)
+    proc1 = _run_reuse(reuse, cwd=dest)
     assert proc1.returncode == 0, proc1.stdout + proc1.stderr
 
     # 2. Negative: plain License-Identifier without empty note fails naming invalid SPDX expression
@@ -977,7 +987,7 @@ def test_reuse_lint_template_empty_note_3d(tmp_path):
         "# SPDX-" + "License-Identifier:",
     )
     tmpl.write_text(plain_identifier, encoding="utf-8")
-    proc2 = subprocess.run(reuse, cwd=dest, capture_output=True, text=True, timeout=300)
+    proc2 = _run_reuse(reuse, cwd=dest)
     assert proc2.returncode != 0
     assert "invalid spdx" in (proc2.stdout + proc2.stderr).lower()
 
@@ -988,10 +998,18 @@ def test_reuse_lint_template_empty_note_3d(tmp_path):
         "# SPDX-" + "FileCopyrightText:",
     )
     tmpl.write_text(plain_copyright, encoding="utf-8")
-    proc3 = subprocess.run(reuse, cwd=dest, capture_output=True, text=True, timeout=300)
+    proc3 = _run_reuse(reuse, cwd=dest)
     assert proc3.returncode == 0, proc3.stdout + proc3.stderr
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores chmod permissions",
+)
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows ignores chmod 000 permissions",
+)
 def test_scan_tracked_file_oserror_exits_3(tree):
     """An unreadable tracked file raises ReadError and causes check to exit 3 naming the file."""
     tree.write({"unreadable.py": "# test\n"})
@@ -1198,7 +1216,7 @@ def test_entry_problems_not_mapping(entry: object) -> None:
         ),
         (
             "_tracked_file",
-            subprocess.TimeoutExpired(cmd=["git"], timeout=30),
+            subprocess.TimeoutExpired("git", 30),
             "timed out after 30 seconds",
         ),
         (
@@ -1208,19 +1226,17 @@ def test_entry_problems_not_mapping(entry: object) -> None:
         ),
         (
             "_tracked_files",
-            subprocess.TimeoutExpired(cmd=["git"], timeout=30),
+            subprocess.TimeoutExpired("git", 30),
             "timed out after 30 seconds",
         ),
         (
             "_tracked_files",
-            subprocess.CompletedProcess(
-                args=["git"], returncode=128, stdout=b"", stderr=b"fatal: corrupted git tree\n"
-            ),
+            subprocess.CompletedProcess(["git"], 128, b"", b"fatal: corrupted git tree\n"),
             "fatal: corrupted git tree",
         ),
         (
             "_tracked_files",
-            subprocess.CompletedProcess(args=["git"], returncode=2, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(["git"], 2, b"", b""),
             "git exited with 2",
         ),
     ],
@@ -1247,7 +1263,7 @@ def test_git_helpers_failure_modes(
     def mock_run(*args: object, **kwargs: object) -> object:
         cmd = args[0] if args else kwargs.get("args", [])
         if isinstance(cmd, list) and "rev-parse" in cmd:
-            return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+            return subprocess.CompletedProcess(["git", "rev-parse"], 0, "", "")
         if isinstance(simulated_error, Exception):
             raise simulated_error
         return simulated_error
@@ -1420,3 +1436,355 @@ def test_ratchet_baseline_error_cases(
             assert expected_prob in probs[0]
         else:
             assert probs == []
+
+
+def test_bare_type_ignore_refused_no_traceback(tree):
+    """Bare type: ignore is refused as invalid with no traceback in stderr."""
+    tree.write({"mod.py": "x = f()  # type: ignore\n"})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid type: ignore suppression" in done.stderr
+    assert "Traceback" not in done.stderr
+    assert "AttributeError" not in done.stderr
+
+
+def test_empty_bracket_type_ignore_refused_no_traceback(tree):
+    """Empty bracket type: ignore[] is refused with no traceback in stderr."""
+    tree.write({"mod.py": "x = f()  # type: ignore[]\n"})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid type: ignore suppression" in done.stderr
+    assert "Traceback" not in done.stderr
+
+
+def test_type_ignore_fleet_format_passes(tree):
+    """Fleet format type: ignore directive passes check."""
+    tree.write(
+        {
+            "mod.py": "x = f()  # type: ignore[arg-type] # expires 2026-10-14 category B: why\n",
+            "suppression-baseline.json": '{"type: ignore": 1}\n',
+        }
+    )
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 0, done.stderr
+
+
+def test_shell_script_bare_opengrep_refused(tree):
+    """.sh file holding bare opengrep ignore word is refused."""
+    sg = "no" + "semgrep"
+    tree.write({"script.sh": f"#!/bin/sh\n# {sg}\necho 1\n"})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid opengrep suppression" in done.stderr
+
+
+def test_shell_script_fleet_opengrep_passes(tree):
+    """.sh file holding fleet-form opengrep suppression passes."""
+    sg = "no" + "semgrep"
+    tree.write(
+        {
+            "script.sh": (
+                f"#!/bin/sh\n# {sg}: some-rule expires 2026-10-14 category B: why\necho 1\n"
+            ),
+            "suppression-baseline.json": f'{{"{sg}": 1}}\n',
+        }
+    )
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 0, done.stderr
+
+
+def test_toml_file_bare_opengrep_refused(tree):
+    """.toml file holding bare opengrep ignore word is refused."""
+    sg = "no" + "semgrep"
+    tree.write({"conf.toml": f"[tool]\n# {sg}\nval = 1\n"})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid opengrep suppression" in done.stderr
+
+
+def test_suppression_baseline_key_not_counted_as_opengrep(tree):
+    """suppression-baseline.json key names kind and is exempt from opengrep scan."""
+    sg = "no" + "semgrep"
+    tree.write({"suppression-baseline.json": f'{{"{sg}": 0}}\n'})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 0, done.stderr
+
+
+def test_yaml_trailing_fleet_opengrep_directive_passes(tree):
+    """Trailing fleet-form opengrep suppression on YAML line passes."""
+    sg = "no" + "semgrep"
+    tree.write(
+        {
+            "wf.yml": f"run: x  # {sg}: some-rule expires 2026-10-14 category B: valid reason\n",
+            "suppression-baseline.json": f'{{"{sg}": 1}}\n',
+        }
+    )
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 0, done.stderr
+
+
+def test_yaml_trailing_bare_opengrep_directive_refused(tree):
+    """Trailing bare opengrep suppression on YAML line is refused."""
+    sg = "no" + "semgrep"
+    tree.write({"wf.yml": f"run: x  # {sg}\n"})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid opengrep suppression" in done.stderr
+
+
+def test_yaml_trailing_bare_opengrep_no_hash_refused(tree):
+    """Trailing bare opengrep word without hash on YAML line is refused."""
+    sg = "no" + "semgrep"
+    tree.write({"wf.yml": f"run: {sg}\n"})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid opengrep suppression" in done.stderr
+
+
+def test_yaml_yamllint_and_bare_opengrep_on_same_line():
+    """One YAML line with yamllint directive and bare opengrep yields two problems and 1 count."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+    counts = {}
+    sg = "no" + "semgrep"
+    probs = exceptions.yaml_problems(
+        f"# yamllint disable-line # {sg}\n", "test.yml", today, set(), counts
+    )
+    assert len(probs) == 2
+    assert any("invalid yamllint suppression" in p for p in probs)
+    assert any("invalid opengrep suppression" in p for p in probs)
+    assert counts.get(exceptions.LONG_WORD) == 1
+
+
+def test_yaml_yamllint_zizmor_and_shellcheck_on_same_line_each_refused():
+    """One YAML line with yamllint, zizmor and shellcheck directives yields one problem per kind."""
+    import exceptions
+
+    counts = {}
+    line = (
+        "run: x  # yamllint disable-line"
+        " # zizmor: ignore[unpinned-uses] # shellcheck disable=SC2086\n"
+    )
+    probs = exceptions.yaml_problems(line, "test.yml", datetime.date(2026, 11, 9), set(), counts)
+    assert len(probs) == 3, probs
+    for kind in ("yamllint", "zizmor", "shellcheck"):
+        assert sum(f"invalid {kind} suppression" in p for p in probs) == 1, (kind, probs)
+    assert counts == {"shellcheck": 1}
+
+
+def test_yaml_shellcheck_bare_directive_refused():
+    """Shellcheck disable in YAML run block without fleet format or exception is refused."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+    counts = {}
+    yaml_text = "run: |\n  # shellcheck disable=SC2086\n  echo $var\n"
+    probs = exceptions.yaml_problems(yaml_text, "test.yml", today, set(), counts)
+    assert len(probs) == 1
+    assert "invalid shellcheck suppression" in probs[0]
+    assert counts.get("shellcheck") == 1
+
+
+def test_yaml_shellcheck_fleet_directive_passes():
+    """Shellcheck disable in YAML run block in fleet format passes and increments count."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+    counts = {}
+    yaml_text = (
+        "run: |\n  # shellcheck disable=SC2086 expires 2026-11-12 category B: word splitting\n"
+        "  echo $var\n"
+    )
+    probs = exceptions.yaml_problems(yaml_text, "test.yml", today, set(), counts)
+    assert probs == []
+    assert counts.get("shellcheck") == 1
+
+
+def test_pyi_file_bare_noqa_refused(tree):
+    """.pyi stub file holding bare # noqa is judged like Python and refused."""
+    tree.write({"stubs.pyi": "def func(val) -> int: ...  # noqa\n"})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid noqa suppression" in done.stderr
+
+
+def test_pyi_file_fleet_noqa_passes(tree):
+    """.pyi stub file holding fleet-format noqa passes."""
+    tree.write(
+        {
+            "stubs.pyi": (
+                "def func(val) -> int: ...  "
+                "# noqa: E501 expires 2026-10-14 category B: valid reason\n"
+            ),
+            "suppression-baseline.json": '{"noqa": 1}\n',
+        }
+    )
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 0, done.stderr
+
+
+def test_own_entry_with_comma_reason_refused(tree):
+    """exceptions.yaml entry with comma in reason is refused."""
+    entry = (
+        "  - rule: E501\n"
+        f"    path: {SUBJECT}\n"
+        "    issue: owner/repo#1\n"
+        "    category: B\n"
+        "    entered: '2026-10-01'\n"
+        "    expires: '2026-10-04'\n"
+        "    reason: bad, reason with comma\n"
+    )
+    done = own(tree, "---\nexceptions:\n" + entry)
+    assert done.returncode == 1
+    assert "reason contains a comma" in done.stderr
+
+
+def test_own_entry_with_letterless_reason_refused(tree):
+    """exceptions.yaml entry with letterless reason 123 is refused."""
+    entry = (
+        "  - rule: E501\n"
+        f"    path: {SUBJECT}\n"
+        "    issue: owner/repo#1\n"
+        "    category: B\n"
+        "    entered: '2026-10-01'\n"
+        "    expires: '2026-10-04'\n"
+        "    reason: '12345'\n"
+    )
+    done = own(tree, "---\nexceptions:\n" + entry)
+    assert done.returncode == 1
+    assert "reason has no letter" in done.stderr
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        "# NOQA: F401",
+        "#noqa:F401",
+        "# noqa",
+        "# ruff: noqa: F401",
+        "# flake8: noqa",
+    ],
+    ids=["upper-noqa", "no-space-noqa", "bare-noqa", "ruff-file-level", "flake8-file-level"],
+)
+def test_honoured_noqa_spellings_without_coverage_refused(tree, comment):
+    """Honoured noqa spellings without exceptions.yaml coverage are refused."""
+    tree.write({"mod.py": f"import sys\n{comment}\n"})
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid noqa suppression" in done.stderr
+
+
+def test_file_level_ruff_noqa_with_covering_exception_passes(tree):
+    """File-level # ruff: noqa: E501 with covering exceptions.yaml E501 entry passes."""
+    entry = (
+        "  - rule: E501\n"
+        "    path: target.py\n"
+        "    issue: owner/repo#1\n"
+        "    category: B\n"
+        "    entered: '2026-10-11'\n"
+        "    expires: '2026-10-14'\n"
+        "    reason: valid exception reason\n"
+    )
+    tree.write(
+        {
+            OWN: "---\nexceptions:\n" + entry,
+            "target.py": "# ruff: noqa: E501\n",
+            "suppression-baseline.json": '{"noqa": 1}\n',
+        }
+    )
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 0, done.stderr
+
+
+def test_file_level_flake8_noqa_with_covering_exception_still_refused(tree):
+    """File-level # flake8: noqa is refused even with covering exceptions.yaml entry."""
+    entry = (
+        "  - rule: E501\n"
+        "    path: target.py\n"
+        "    issue: owner/repo#1\n"
+        "    category: B\n"
+        "    entered: '2026-10-11'\n"
+        "    expires: '2026-10-14'\n"
+        "    reason: valid exception reason\n"
+    )
+    tree.write(
+        {
+            OWN: "---\nexceptions:\n" + entry,
+            "target.py": "# flake8: noqa\n",
+            "suppression-baseline.json": '{"noqa": 1}\n',
+        }
+    )
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 1
+    assert "invalid noqa suppression" in done.stderr
+
+
+def test_scalar_limit_max_tracked_files_exceeded(monkeypatch, tree, capsys):
+    """Tracking more files than MAX_TRACKED_FILES raises ReadError naming count and cap."""
+    import exceptions
+
+    monkeypatch.setattr(exceptions, "MAX_TRACKED_FILES", 1)
+    tree.write({"a.py": "# a\n", "b.py": "# b\n"})
+    monkeypatch.setattr(
+        sys, "argv", ["exceptions.py", "check", "--root", str(tree.root), "--today", TODAY]
+    )
+    rc = exceptions.main()
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert "tracked files exceeds cap of 1" in captured.err
+
+
+def test_scalar_limit_max_tracked_files_at_cap_passes(monkeypatch, tree):
+    """Tracking files exactly at MAX_TRACKED_FILES passes."""
+    import exceptions
+
+    # Tree has ruff.toml + a.py = 2 tracked files
+    monkeypatch.setattr(exceptions, "MAX_TRACKED_FILES", 2)
+    tree.write({"a.py": "# a\n"})
+    monkeypatch.setattr(
+        sys, "argv", ["exceptions.py", "check", "--root", str(tree.root), "--today", TODAY]
+    )
+    rc = exceptions.main()
+    assert rc == 0
+
+
+def test_scalar_limit_max_file_bytes_exceeded(monkeypatch, tree, capsys):
+    """A tracked file exceeding MAX_FILE_BYTES raises ReadError naming file, size and cap."""
+    import exceptions
+
+    monkeypatch.setattr(exceptions, "MAX_FILE_BYTES", 10)
+    tree.write({"large.py": "# " + "x" * 20 + "\n"})
+    monkeypatch.setattr(
+        sys, "argv", ["exceptions.py", "check", "--root", str(tree.root), "--today", TODAY]
+    )
+    rc = exceptions.main()
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert "large.py" in captured.err
+    assert "size 23 exceeds cap of 10 bytes" in captured.err
+
+
+def test_scalar_limit_max_file_bytes_at_cap_passes(monkeypatch, tree):
+    """A tracked file with size exactly at MAX_FILE_BYTES passes."""
+    import exceptions
+
+    # Tree has ruff.toml (22 bytes) and boundary.py (22 bytes)
+    monkeypatch.setattr(exceptions, "MAX_FILE_BYTES", 22)
+    tree.write({"boundary.py": "# " + "b" * 19 + "\n"})
+    monkeypatch.setattr(
+        sys, "argv", ["exceptions.py", "check", "--root", str(tree.root), "--today", TODAY]
+    )
+    rc = exceptions.main()
+    assert rc == 0
+
+
+def test_planted_binary_file_named_in_stdout(tree):
+    """Pass line output names skipped non-UTF-8 binary files sorted after count."""
+    tree.write({"suppression-baseline.json": '{"noqa": 0}\n'})
+    (tree.root / "b.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+    (tree.root / "a.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+    tree.git("add", "a.png", "b.png")
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 0, done.stderr
+    assert "2 tracked file(s) skipped as not UTF-8: a.png, b.png" in done.stdout
