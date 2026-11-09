@@ -28,6 +28,8 @@ message.
   (>= 3.12) and git alone, with zero third-party dependencies, no `.venv`, and no stamp.
   `tests/test_commit_message_tool.py` refuses an import outside `sys.stdlib_module_names` and
   runs the command line under `-I -S -B`; the CI floor job runs it on Python 3.12.
+  An older `python3` gets exit status 2 and a message naming the 3.12 floor before any
+  judging, so the hook never judges on an interpreter the floor job does not run.
 - The gate's range test (`tests/test_commit_messages.py`) imports the same module, so the hook
   and the gate judge by one implementation.
 - The `check-message` target in `Makefile` drops the `check-tools-stamp` prerequisite and

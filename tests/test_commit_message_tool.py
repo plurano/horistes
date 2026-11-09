@@ -16,8 +16,9 @@ import sys
 import time
 from pathlib import Path
 
+import commit_message
 import pytest
-from commit_message import MAX_MESSAGE, MESSAGE_BYTES
+from commit_message import FLOOR, MAX_MESSAGE, MESSAGE_BYTES, below_floor
 from conftest import ROOT
 
 SIGN_OFF = "Signed-off-by: A Person <person@example.org>"
@@ -84,6 +85,7 @@ def run_tool(
         "GIT_COMMITTER_EMAIL": "person@example.org",
         **(env or {}),
     }
+    # nosemgrep: dangerous-subprocess-use-audit runs tools/commit_message.py via sys.executable
     return subprocess.run(
         [sys.executable, *call_flags, tool, *arguments],
         cwd=repo,
@@ -93,6 +95,28 @@ def run_tool(
         check=False,
         env=call_env,
     )
+
+
+def test_floor_refuses_an_older_python():
+    assert below_floor((3, 11, 9, "final", 0)) == (
+        "the commit message judge needs Python 3.12 or newer (ADR-0074); this python3 is 3.11"
+    )
+
+
+def test_floor_takes_the_floor_and_newer():
+    assert below_floor((*FLOOR, 0, "final", 0)) is None
+    assert below_floor((3, 13, 1, "final", 0)) is None
+    assert below_floor((4, 0)) is None
+
+
+def test_floor_refuses_before_judging(tmp_path, monkeypatch, capsys):
+    repo = git_repo(tmp_path)
+    msg_file = repo / "clean.txt"
+    msg_file.write_text(CLEAN, encoding="utf-8")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(commit_message, "FLOOR", (sys.version_info[0] + 1, 0))
+    assert commit_message.main(["check", str(msg_file)]) == 2
+    assert "or newer (ADR-0074); this python3 is" in capsys.readouterr().err
 
 
 def test_cli_clean_message_passes(tmp_path):

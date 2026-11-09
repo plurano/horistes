@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 DEADLINE = 20  # seconds for one git call
+FLOOR = (3, 12)  # oldest Python the CI floor job runs the judge on (ADR-0074)
 MAX_COMMITS = 500
 MAX_MESSAGE = 65536
 MESSAGE_BYTES = 4 * MAX_MESSAGE  # UTF-8 takes at most 4 bytes per character
@@ -238,8 +239,21 @@ def refused(repo: Path, base: str) -> dict[str, list[str]]:
     return found
 
 
+def below_floor(version: tuple[int, ...]) -> str | None:
+    """The refusal for a Python older than FLOOR, or None when version meets it."""
+    if tuple(version[:2]) >= FLOOR:
+        return None
+    return (
+        f"the commit message judge needs Python {FLOOR[0]}.{FLOOR[1]} or newer (ADR-0074); "
+        f"this python3 is {version[0]}.{version[1]}"
+    )
+
+
 def _message_findings(message_file: str) -> list[str]:
     """Findings on one message file, judged as the commit git is about to make here."""
+    refusal = below_floor(tuple(sys.version_info))
+    if refusal is not None:
+        raise JudgeError(refusal)
     top = run_git(Path.cwd(), "rev-parse", "--show-toplevel", env=ALONE)
     if top.returncode != 0:
         raise JudgeError(f"{Path.cwd()}: not a git repository")
