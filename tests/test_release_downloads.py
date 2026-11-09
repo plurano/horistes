@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 import yaml
-from conftest import ROOT
+from conftest import ROOT, STUB_GH_TOKEN
 
 VERIFIED_DOWNLOAD_SH = ROOT / "actions/verified-download/verified-download.sh"
 
@@ -79,7 +79,7 @@ if not token:
     sys.exit(1)
 
 if (
-    len(args) != 10
+    len(args) != 9
     or args[0] != "release"
     or args[1] != "download"
     or args[2].startswith("-")
@@ -88,24 +88,21 @@ if (
     or args[5] != "--pattern"
     or not args[6]
     or args[7] != "--output"
-    or not args[8]
-    or args[9] != "--clobber"
+    or args[8] != "-"
 ):
     sys.stderr.write(f"gh stub: args differ from required shape: {args}\\n")
     sys.exit(1)
 
-out_path = args[8]
 mode = os.environ.get("STUB_MODE", "healthy")
 fix_path = os.environ.get("STUB_FIXTURE")
 
 if mode in ("outage", "healthy"):
-    if fix_path and out_path:
-        Path(out_path).write_bytes(Path(fix_path).read_bytes())
+    if fix_path:
+        sys.stdout.buffer.write(Path(fix_path).read_bytes())
     sys.exit(0)
 
 if mode == "wrong_bytes":
-    if out_path:
-        Path(out_path).write_bytes(b"corrupted bytes payload\\n")
+    sys.stdout.buffer.write(b"corrupted bytes payload\\n")
     sys.exit(0)
 
 if mode == "missing_asset":
@@ -218,7 +215,7 @@ def run_step_script(
         {
             "PATH": f"{stub_bin}:{env.get('PATH', '')}",
             "RUNNER_TEMP": str(tmp_path),
-            "GH_TOKEN": "test-dummy-token",
+            "GH_TOKEN": STUB_GH_TOKEN,
             "STUB_MODE": mode,
             "STUB_FIXTURE": str(fix_path),
             "STUB_LOG": str(gh_log),
@@ -317,8 +314,7 @@ def test_behaviour_outage_fallback(tmp_path: Path, step_entry: tuple) -> None:
         "--pattern",
         asset,
         "--output",
-        str(tmp_path / f"{tool}.tar.gz"),
-        "--clobber",
+        "-",
     ]
     assert gh_calls[0].split() == expected_args
 

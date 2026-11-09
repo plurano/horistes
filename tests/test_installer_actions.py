@@ -7,21 +7,28 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import secrets
 import shutil
+import signal
 import subprocess
 import tarfile
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import yaml
-from conftest import ROOT
+from conftest import ROOT, STUB_GH_TOKEN
 
 INSTALL_GITLEAKS_SH = ROOT / "actions/install-gitleaks/install-gitleaks.sh"
 VERIFIED_DOWNLOAD_SH = ROOT / "actions/verified-download/verified-download.sh"
 ACTION_INSTALL_GITLEAKS_YML = ROOT / "actions/install-gitleaks/action.yml"
 ACTION_VERIFIED_DOWNLOAD_YML = ROOT / "actions/verified-download/action.yml"
 DEFAULT_VERSION = "8.30.1"
+# The endless gh stub offers this many chunks of this size, 64 MiB in all.
+ENDLESS_CHUNK = 65536
+ENDLESS_CHUNKS = 1024
+ENDLESS_BYTES = ENDLESS_CHUNK * ENDLESS_CHUNKS
 
 
 def make_archive(dest_dir: Path, name: str, version: str, shape: str = "regular") -> Path:
@@ -73,6 +80,9 @@ while (($# > 0)); do
   esac
 done
 printf '%s\\n' "$url" >>"{logs_dir}/curl.log"
+if [[ -n "${{CURL_HANG:-}}" ]]; then
+  exec sleep "${{CURL_HANG}}"
+fi
 if [[ "$url" != https://* ]]; then
   printf 'curl: (1) Protocol not supported: %s\\n' "$url" >&2
   exit 1
@@ -98,8 +108,8 @@ import time
 from pathlib import Path
 
 args = sys.argv[1:]
-log_path = Path('{logs_dir}') / 'gh.log'
-with open(log_path, 'a', encoding='utf-8') as handle:
+logs = Path('{logs_dir}')
+with open(logs / 'gh.log', 'a', encoding='utf-8') as handle:
     handle.write(' '.join(args) + '\\n')
 
 token = os.environ.get('GH_TOKEN')
@@ -108,7 +118,7 @@ if not token:
     sys.exit(1)
 
 if (
-    len(args) != 10
+    len(args) != 9
     or args[0] != 'release'
     or args[1] != 'download'
     or args[2].startswith('-')
@@ -117,36 +127,42 @@ if (
     or args[5] != '--pattern'
     or not args[6]
     or args[7] != '--output'
-    or not args[8]
-    or args[9] != '--clobber'
+    or args[8] != '-'
 ):
     sys.stderr.write(f'gh stub: args differ from required shape: {{args}}\\n')
     sys.exit(1)
 
-out_path = args[8]
 mode = os.environ.get('STUB_GH_MODE', 'healthy')
 fix_path = os.environ.get('FIXTURE_ARCHIVE')
+out = sys.stdout.buffer
 
 if mode == 'healthy':
-    if fix_path and out_path:
-        Path(out_path).write_bytes(Path(fix_path).read_bytes())
+    if fix_path:
+        out.write(Path(fix_path).read_bytes())
     sys.exit(0)
 
 if mode == 'wrong_bytes':
-    if out_path:
-        Path(out_path).write_bytes(b'corrupted bytes payload\\n')
+    out.write(b'corrupted bytes payload\\n')
     sys.exit(0)
 
-if mode == 'over_size':
-    if out_path:
-        size = int(os.environ.get('STUB_GH_OVER_SIZE', '2097152'))
-        Path(out_path).write_bytes(b'x' * size)
+if mode == 'endless':
+    written = 0
+    chunk = b'x' * {endless_chunk}
+    try:
+        for _ in range({endless_chunks}):
+            out.write(chunk)
+            out.flush()
+            written += len(chunk)
+    except BrokenPipeError:
+        (logs / 'gh_written').write_text(str(written), encoding='utf-8')
+        os._exit(1)
+    (logs / 'gh_written').write_text(str(written), encoding='utf-8')
     sys.exit(0)
 
 if mode == 'hang':
     time.sleep(float(os.environ.get('STUB_GH_HANG', '30')))
-    if fix_path and out_path:
-        Path(out_path).write_bytes(Path(fix_path).read_bytes())
+    if fix_path:
+        out.write(Path(fix_path).read_bytes())
     sys.exit(0)
 
 if mode == 'missing_asset':
@@ -178,7 +194,12 @@ def setup_fake_environment(tmp_path: Path) -> tuple[Path, Path, Path]:
     curl_file.chmod(0o755)
 
     gh_file = bin_dir / "gh"
-    gh_file.write_text(GH_STUB_TEMPLATE.format(logs_dir=logs_dir), encoding="utf-8")
+    gh_file.write_text(
+        GH_STUB_TEMPLATE.format(
+            logs_dir=logs_dir, endless_chunk=ENDLESS_CHUNK, endless_chunks=ENDLESS_CHUNKS
+        ),
+        encoding="utf-8",
+    )
     gh_file.chmod(0o755)
 
     uname_file = bin_dir / "uname"
@@ -198,6 +219,7 @@ def run_bash_cmd(
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     if env_extra:
         env.update(env_extra)
+    # nosemgrep: dangerous-subprocess-use-audit callers pass fixed argv with stubs on PATH
     return subprocess.run(cmd, env=env, capture_output=True, text=True, check=False, timeout=60)
 
 
@@ -541,38 +563,73 @@ def test_action_full_inputs_download(tmp_path: Path) -> None:
 # fetch_verified fallback tests
 # ---------------------------------------------------------------------------
 
+RELEASE_URL = (
+    "https://github.com/rhysd/actionlint/releases/download/v1.7.7/"
+    "actionlint_1.7.7_linux_amd64.tar.gz"
+)
+# The bounds reach fetch_verified through the environment, so a planted value
+# arrives as written, with no expansion by the calling script.
+FETCH_SCRIPT = (
+    '. "$VERIFIED_DOWNLOAD"\n'
+    'fetch_verified "$FETCH_URL" "$FETCH_SHA256" '
+    '"$FETCH_MAX_BYTES" "$FETCH_TIMEOUT" "$FETCH_OUTPUT"\n'
+)
+FALLBACK_SCRIPT = (
+    '. "$VERIFIED_DOWNLOAD"\n'
+    'fetch_release_fallback "$FETCH_URL" "$FETCH_MAX_BYTES" "$FETCH_TIMEOUT" "$FETCH_OUTPUT"\n'
+)
 
-def test_fetch_verified_fallback_outage(tmp_path: Path) -> None:
-    """Under outage, fetch_verified falls back to gh release download and verifies digest."""
+
+class Fetched(NamedTuple):
+    """What one fetch left behind: the process, the stub logs, the output and its source."""
+
+    res: subprocess.CompletedProcess[str]
+    logs_dir: Path
+    output: Path
+    fixture: Path
+
+
+def fetch_release(
+    tmp_path: Path,
+    env: dict[str, str],
+    *,
+    url: str = RELEASE_URL,
+    max_bytes: str = "1048576",
+    timeout_seconds: str = "60",
+    payload: bytes = b"sample payload contents\n",
+    script: str = FETCH_SCRIPT,
+) -> Fetched:
+    """Run `script` against the stubs, pinned to the digest of `payload`."""
     bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"sample payload contents\n")
-    digest = sha256_of(fixture_file)
-    output_file = tmp_path / "downloaded.txt"
-    url = "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz"
-
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{digest}" 1048576 60 "{output_file}"\n'
-    )
+    fixture = tmp_path / "data.txt"
+    fixture.write_bytes(payload)
+    output = tmp_path / "downloaded.txt"
     res = run_bash_cmd(
         ["bash", "-c", script],
         bin_dir,
         env_extra={
-            "FIXTURE_ARCHIVE": str(fixture_file),
-            "CURL_OUTAGE": "1",
-            "GH_TOKEN": "test-dummy-token",
+            "VERIFIED_DOWNLOAD": str(VERIFIED_DOWNLOAD_SH),
+            "FETCH_URL": url,
+            "FETCH_SHA256": sha256_of(fixture),
+            "FETCH_MAX_BYTES": max_bytes,
+            "FETCH_TIMEOUT": timeout_seconds,
+            "FETCH_OUTPUT": str(output),
+            "FIXTURE_ARCHIVE": str(fixture),
+            "GH_TOKEN": STUB_GH_TOKEN,
+            **env,
         },
     )
-    assert res.returncode == 0, res.stderr
-    assert output_file.read_bytes() == fixture_file.read_bytes()
-    assert "::warning title=Release download fallback::" in res.stdout
-    assert "failed; fetching it with gh release download" in res.stdout
+    return Fetched(res, logs_dir, output, fixture)
 
-    gh_log = logs_dir / "gh.log"
-    assert gh_log.is_file(), "gh log file was not created"
-    calls = gh_log.read_text(encoding="utf-8").splitlines()
-    assert len(calls) == 1
+
+def test_fetch_verified_fallback_outage(tmp_path: Path) -> None:
+    """Under outage, fetch_verified streams the asset from gh release download and verifies it."""
+    got = fetch_release(tmp_path, {"CURL_OUTAGE": "1"})
+    assert got.res.returncode == 0, got.res.stderr
+    assert got.output.read_bytes() == got.fixture.read_bytes()
+    assert "::warning title=Release download fallback::" in got.res.stdout
+    assert "failed; fetching it with gh release download" in got.res.stdout
+    calls = (got.logs_dir / "gh.log").read_text(encoding="utf-8").splitlines()
     expected_args = [
         "release",
         "download",
@@ -582,204 +639,221 @@ def test_fetch_verified_fallback_outage(tmp_path: Path) -> None:
         "--pattern",
         "actionlint_1.7.7_linux_amd64.tar.gz",
         "--output",
-        str(output_file),
-        "--clobber",
+        "-",
     ]
-    assert calls[0].split() == expected_args
+    assert [call.split() for call in calls] == [expected_args]
 
 
 def test_fetch_verified_fallback_healthy_curl(tmp_path: Path) -> None:
     """When curl succeeds, gh is not called and no warning is emitted."""
-    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"healthy curl payload\n")
-    digest = sha256_of(fixture_file)
-    output_file = tmp_path / "downloaded.txt"
-    url = "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz"
-
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{digest}" 1048576 60 "{output_file}"\n'
-    )
-    res = run_bash_cmd(
-        ["bash", "-c", script],
-        bin_dir,
-        env_extra={
-            "FIXTURE_ARCHIVE": str(fixture_file),
-            "GH_TOKEN": "test-dummy-token",
-        },
-    )
-    assert res.returncode == 0, res.stderr
-    assert output_file.read_bytes() == fixture_file.read_bytes()
-    assert "::warning title=Release download fallback::" not in res.stdout
-    assert not (logs_dir / "gh.log").exists()
+    got = fetch_release(tmp_path, {})
+    assert got.res.returncode == 0, got.res.stderr
+    assert got.output.read_bytes() == got.fixture.read_bytes()
+    assert "::warning title=Release download fallback::" not in got.res.stdout
+    assert not (got.logs_dir / "gh.log").exists()
 
 
-def test_fetch_verified_fallback_non_github_url_fails(tmp_path: Path) -> None:
-    """Non-github URL fails without calling gh when curl fails."""
-    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"data\n")
-    digest = sha256_of(fixture_file)
-    output_file = tmp_path / "out.txt"
-    url = "https://example.com/releases/download/v1.0.0/asset.tar.gz"
-
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{digest}" 1048576 60 "{output_file}"\n'
-    )
-    res = run_bash_cmd(
-        ["bash", "-c", script],
-        bin_dir,
-        env_extra={
-            "CURL_FAIL": "1",
-            "GH_TOKEN": "test-dummy-token",
-        },
-    )
-    assert res.returncode != 0
-    assert not (logs_dir / "gh.log").exists()
-
-
-def test_fetch_verified_fallback_url_with_glob_refused(tmp_path: Path) -> None:
-    """URL containing wildcard glob is refused by regex and does not call gh."""
-    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"data\n")
-    digest = sha256_of(fixture_file)
-    output_file = tmp_path / "out.txt"
-    url = "https://github.com/rhysd/actionlint/releases/download/v1.7.7/*.tar.gz"
-
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{digest}" 1048576 60 "{output_file}"\n'
-    )
-    res = run_bash_cmd(
-        ["bash", "-c", script],
-        bin_dir,
-        env_extra={
-            "CURL_OUTAGE": "1",
-            "GH_TOKEN": "test-dummy-token",
-        },
-    )
-    assert res.returncode != 0
-    assert not (logs_dir / "gh.log").exists()
+@pytest.mark.parametrize(
+    ("url", "env"),
+    [
+        ("https://example.com/releases/download/v1.0.0/asset.tar.gz", {"CURL_FAIL": "1"}),
+        (
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.7/*.tar.gz",
+            {"CURL_OUTAGE": "1"},
+        ),
+        (
+            "https://example.com/rhysd/actionlint/releases/download/v1.7.7/actionlint.tar.gz",
+            {"CURL_FAIL": "1"},
+        ),
+        (
+            "https://github.com.example.org/rhysd/actionlint/releases/download/v1.7.7/a.tar.gz",
+            {"CURL_FAIL": "1"},
+        ),
+        (
+            "http://github.com/rhysd/actionlint/releases/download/v1.7.7/a.tar.gz",
+            {"CURL_FAIL": "1"},
+        ),
+    ],
+    ids=["non-github", "glob-asset", "other-host", "lookalike-host", "plain-http"],
+)
+def test_fetch_verified_fallback_refuses_a_url_off_the_release_path(
+    tmp_path: Path, url: str, env: dict[str, str]
+) -> None:
+    """A URL that is not a github.com release asset never reaches gh."""
+    got = fetch_release(tmp_path, env, url=url)
+    assert got.res.returncode != 0
+    assert not (got.logs_dir / "gh.log").exists()
 
 
 def test_fetch_verified_fallback_missing_gh_fails(tmp_path: Path) -> None:
     """When gh is missing from PATH, fallback fails and names the missing tool."""
     bin_dir, _, _ = setup_fake_environment(tmp_path)
     (bin_dir / "gh").unlink()
-    no_gh_dir = tmp_path / "no_gh_bin"
-    no_gh_dir.mkdir()
-    for tool in ("bash", "sh", "sha256sum", "awk", "timeout", "wc"):
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    for tool in ("bash", "sh", "sha256sum", "awk", "wc", "sleep", "head", "rm"):
         real = shutil.which(tool)
         if real:
-            (no_gh_dir / tool).symlink_to(real)
-
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"data\n")
-    digest = sha256_of(fixture_file)
-    output_file = tmp_path / "out.txt"
-    url = "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz"
-
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{digest}" 1048576 60 "{output_file}"\n'
-    )
+            (tools_dir / tool).symlink_to(real)
+    env = {
+        "PATH": f"{bin_dir}:{tools_dir}",
+        "CURL_OUTAGE": "1",
+        "VERIFIED_DOWNLOAD": str(VERIFIED_DOWNLOAD_SH),
+        "FETCH_URL": RELEASE_URL,
+        "FETCH_SHA256": "0" * 64,
+        "FETCH_MAX_BYTES": "1048576",
+        "FETCH_TIMEOUT": "60",
+        "FETCH_OUTPUT": str(tmp_path / "out.txt"),
+    }
+    # nosemgrep: dangerous-subprocess-use-audit runs bash on a fixed script with stub tools on PATH
     res = subprocess.run(
-        ["bash", "-c", script],
-        env={
-            "PATH": f"{bin_dir}:{no_gh_dir}",
-            "CURL_OUTAGE": "1",
-        },
+        ["bash", "-c", FETCH_SCRIPT],
+        env=env,
         capture_output=True,
         text=True,
         check=False,
         timeout=60,
     )
     assert res.returncode != 0
-    assert f"no gh on PATH for the release download fallback of {url}" in res.stderr
+    assert f"no gh on PATH for the release download fallback of {RELEASE_URL}" in res.stderr
 
 
 def test_fetch_verified_fallback_gh_wrong_bytes_fails(tmp_path: Path) -> None:
     """When gh writes wrong bytes, digest mismatch causes failure."""
-    bin_dir, _, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"data\n")
-    digest = sha256_of(fixture_file)
-    output_file = tmp_path / "out.txt"
-    url = "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz"
-
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{digest}" 1048576 60 "{output_file}"\n'
-    )
-    res = run_bash_cmd(
-        ["bash", "-c", script],
-        bin_dir,
-        env_extra={
-            "CURL_OUTAGE": "1",
-            "GH_TOKEN": "test-dummy-token",
-            "STUB_GH_MODE": "wrong_bytes",
-        },
-    )
-    assert res.returncode != 0
-    assert f"archive digest mismatch for {url}" in res.stderr
+    got = fetch_release(tmp_path, {"CURL_OUTAGE": "1", "STUB_GH_MODE": "wrong_bytes"})
+    assert got.res.returncode != 0
+    assert f"archive digest mismatch for {RELEASE_URL}" in got.res.stderr
 
 
-def test_fetch_verified_fallback_gh_max_bytes_exceeded_fails(tmp_path: Path) -> None:
-    """When downloaded size exceeds max_bytes, size error message is emitted."""
-    bin_dir, _, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"data\n")
-    digest = sha256_of(fixture_file)
-    output_file = tmp_path / "out.txt"
-    url = "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz"
+def test_fetch_verified_fallback_stops_an_endless_asset_at_the_bound(tmp_path: Path) -> None:
+    """gh's stream is cut one byte past max-bytes, so the fetch stops and leaves no file.
 
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\nfetch_verified "{url}" "{digest}" 1024 60 "{output_file}"\n'
+    The stub offers ENDLESS_BYTES; the pipe takes about one buffer before head
+    exits, so gh writes far less than it offers.
+    """
+    got = fetch_release(tmp_path, {"CURL_OUTAGE": "1", "STUB_GH_MODE": "endless"}, max_bytes="1024")
+    assert got.res.returncode != 0
+    assert (
+        f"release download for {RELEASE_URL} exceeded max bytes 1024; stopped and removed"
+        in got.res.stderr
     )
-    res = run_bash_cmd(
-        ["bash", "-c", script],
-        bin_dir,
-        env_extra={
-            "CURL_OUTAGE": "1",
-            "GH_TOKEN": "test-dummy-token",
-            "STUB_GH_MODE": "over_size",
-            "STUB_GH_OVER_SIZE": "2048",
-        },
+    assert not got.output.exists()
+    written = int((got.logs_dir / "gh_written").read_text(encoding="utf-8"))
+    assert written < ENDLESS_BYTES // 16, written
+
+
+@pytest.mark.parametrize(
+    ("slack", "lands"), [(0, True), (-1, False)], ids=["at-the-bound", "one-byte-over"]
+)
+def test_fetch_verified_fallback_size_bound_is_inclusive(
+    tmp_path: Path, slack: int, lands: bool
+) -> None:
+    """An asset of exactly max-bytes lands; one byte more is refused and removed."""
+    payload = b"exact payload\n"
+    got = fetch_release(
+        tmp_path,
+        {"CURL_OUTAGE": "1"},
+        max_bytes=str(len(payload) + slack),
+        payload=payload,
     )
-    assert res.returncode != 0
-    assert "exceeded max bytes" in res.stderr
-    assert url in res.stderr
-    assert "2048" in res.stderr
-    assert "1024" in res.stderr
+    assert (got.res.returncode == 0) is lands, got.res.stderr
+    assert got.output.exists() is lands
 
 
 def test_fetch_verified_fallback_gh_exit_1_fails(tmp_path: Path) -> None:
-    """When gh exits 1 (missing asset), fallback fails."""
-    bin_dir, _, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"data\n")
-    digest = sha256_of(fixture_file)
-    output_file = tmp_path / "out.txt"
-    url = "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz"
+    """When gh exits 1 (missing asset), fallback fails, names the status and leaves no file."""
+    got = fetch_release(tmp_path, {"CURL_OUTAGE": "1", "STUB_GH_MODE": "missing_asset"})
+    assert got.res.returncode != 0
+    assert "no assets match the file pattern" in got.res.stderr
+    assert f"gh release download for {RELEASE_URL} failed with status 1" in got.res.stderr
+    assert not got.output.exists()
 
+
+def test_fetch_verified_fallback_gh_is_bounded_by_the_timeout(tmp_path: Path) -> None:
+    """A gh that hangs past the timeout is stopped; the call fails instead of waiting."""
+    started = time.monotonic()
+    got = fetch_release(
+        tmp_path,
+        {"CURL_OUTAGE": "1", "STUB_GH_MODE": "hang", "STUB_GH_HANG": "20"},
+        timeout_seconds="1",
+    )
+    assert got.res.returncode != 0
+    assert time.monotonic() - started < 15
+    assert (got.logs_dir / "gh.log").is_file()
+    assert not got.output.exists()
+
+
+def test_fetch_verified_curl_is_bounded_by_the_timeout(tmp_path: Path) -> None:
+    """A curl that hangs past the timeout is stopped and the fallback still runs."""
+    started = time.monotonic()
+    got = fetch_release(tmp_path, {"CURL_HANG": "20"}, timeout_seconds="1")
+    assert got.res.returncode == 0, got.res.stderr
+    assert time.monotonic() - started < 15
+    assert got.output.read_bytes() == got.fixture.read_bytes()
+    assert (got.logs_dir / "gh.log").is_file()
+
+
+@pytest.mark.parametrize("script", [FETCH_SCRIPT, FALLBACK_SCRIPT], ids=["fetch", "fallback"])
+@pytest.mark.parametrize(
+    ("max_bytes", "timeout_seconds", "named"),
+    [
+        ("x[$(touch {marker})]", "60", "invalid max bytes"),
+        ("1048576", "x[$(touch {marker})]", "invalid timeout seconds"),
+        ("0", "60", "invalid max bytes"),
+        ("1048576", "0", "invalid timeout seconds"),
+        ("-1", "60", "invalid max bytes"),
+        ("1048576", "1000000", "invalid timeout seconds"),
+    ],
+    ids=[
+        "max-substitution",
+        "timeout-substitution",
+        "max-zero",
+        "timeout-zero",
+        "negative",
+        "timeout-7-digits",
+    ],
+)
+def test_bounds_that_are_not_plain_numbers_are_refused(
+    tmp_path: Path, script: str, max_bytes: str, timeout_seconds: str, named: str
+) -> None:
+    """Both entry points refuse a bound before bash arithmetic could evaluate it."""
+    marker = tmp_path / "marker"
+    got = fetch_release(
+        tmp_path,
+        {"CURL_OUTAGE": "1"},
+        max_bytes=max_bytes.format(marker=marker),
+        timeout_seconds=timeout_seconds.format(marker=marker),
+        script=script,
+    )
+    assert got.res.returncode != 0
+    assert named in got.res.stderr
+    assert not marker.exists()
+    assert not (got.logs_dir / "curl.log").exists()
+    assert not (got.logs_dir / "gh.log").exists()
+
+
+def test_run_with_deadline_leaves_no_sleep_behind(tmp_path: Path) -> None:
+    """Stopping the deadline watcher at any point stops its sleep as well.
+
+    A child that exits at once races the watcher's start; the old watcher left
+    about one sleep in twelve calls running.
+    """
+    seconds = str(700 + secrets.randbelow(200))
     script = (
         f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{digest}" 1048576 60 "{output_file}"\n'
+        f"for _ in $(seq 100); do run_with_deadline {seconds} true; done\n"
     )
-    res = run_bash_cmd(
-        ["bash", "-c", script],
-        bin_dir,
-        env_extra={
-            "CURL_OUTAGE": "1",
-            "GH_TOKEN": "test-dummy-token",
-            "STUB_GH_MODE": "missing_asset",
-        },
-    )
-    assert res.returncode != 0
-    assert "no assets match the file pattern" in res.stderr
+    res = run_bash_cmd(["bash", "-c", script], tmp_path)
+    assert res.returncode == 0, res.stderr
+    listing = run_bash_cmd(["ps", "-eo", "pid=,args="], tmp_path)
+    left = [
+        int(fields[0])
+        for fields in (line.split() for line in listing.stdout.splitlines())
+        if fields[1:] == ["sleep", seconds]
+    ]
+    for pid in left:
+        os.kill(pid, signal.SIGTERM)
+    assert left == []
 
 
 def test_install_gitleaks_outage_fallback(tmp_path: Path) -> None:
@@ -795,7 +869,7 @@ def test_install_gitleaks_outage_fallback(tmp_path: Path) -> None:
         env_extra={
             "FIXTURE_ARCHIVE": str(archive),
             "CURL_OUTAGE": "1",
-            "GH_TOKEN": "test-dummy-token",
+            "GH_TOKEN": STUB_GH_TOKEN,
         },
     )
     assert res.returncode == 0, res.stderr
@@ -815,65 +889,3 @@ def test_action_yml_declares_gh_token_env() -> None:
         assert step_env.get("GH_TOKEN") == "${{ github.token }}", (
             f"{action_path.name} missing GH_TOKEN in step env"
         )
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://example.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz",
-        "https://github.com.example.org/rhysd/actionlint/releases/download/v1.7.7/actionlint.tar.gz",
-        "http://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz",
-    ],
-    ids=["other-host", "lookalike-host", "plain-http"],
-)
-def test_fetch_verified_fallback_refuses_a_release_path_off_github(
-    tmp_path: Path, url: str
-) -> None:
-    """A release-shaped path on another host or scheme never reaches gh."""
-    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"data\n")
-    output_file = tmp_path / "out.txt"
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{sha256_of(fixture_file)}" 1048576 60 "{output_file}"\n'
-    )
-    res = run_bash_cmd(
-        ["bash", "-c", script],
-        bin_dir,
-        env_extra={
-            "FIXTURE_ARCHIVE": str(fixture_file),
-            "CURL_FAIL": "1",
-            "GH_TOKEN": "test-dummy-token",
-        },
-    )
-    assert res.returncode != 0
-    assert not (logs_dir / "gh.log").exists()
-
-
-def test_fetch_verified_fallback_gh_is_bounded_by_the_timeout(tmp_path: Path) -> None:
-    """A gh that hangs past the timeout is stopped; the call fails instead of waiting."""
-    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
-    fixture_file = tmp_path / "data.txt"
-    fixture_file.write_bytes(b"late payload\n")
-    output_file = tmp_path / "out.txt"
-    url = "https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz"
-    script = (
-        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
-        f'fetch_verified "{url}" "{sha256_of(fixture_file)}" 1048576 1 "{output_file}"\n'
-    )
-    started = time.monotonic()
-    res = run_bash_cmd(
-        ["bash", "-c", script],
-        bin_dir,
-        env_extra={
-            "FIXTURE_ARCHIVE": str(fixture_file),
-            "CURL_OUTAGE": "1",
-            "GH_TOKEN": "test-dummy-token",
-            "STUB_GH_MODE": "hang",
-            "STUB_GH_HANG": "20",
-        },
-    )
-    assert res.returncode != 0
-    assert time.monotonic() - started < 15
-    assert (logs_dir / "gh.log").is_file()

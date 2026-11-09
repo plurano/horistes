@@ -22,13 +22,17 @@ inputs:
     required: false
     default: "33554432"
   timeout-seconds:
-    description: Maximum download time in seconds.
+    description: >-
+      Maximum time in seconds for curl with its retries, and again for the gh release download fallback;
+      one call takes at most twice this.
     required: false
     default: "120"
 
 outputs:
   lib:
-    description: Absolute path of verified-download.sh so callers can source it directly.
+    description: >-
+      Absolute path of verified-download.sh so callers can source it directly;
+      a step that sources it sets GH_TOKEN for the gh release download fallback.
     value: ${{ steps.download.outputs.lib }}
 
 runs:

@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import ast
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 from conftest import ROOT
 
@@ -195,13 +197,25 @@ def test_caller_template_planted_missing_result_job_fails() -> None:
     assert any("result" in p for p in problems)
 
 
+# A path the job reads from its sparse checkout: literal characters only, so a
+# reference this scan cannot resolve (a variable, a glob, quotes inside the path)
+# is refused rather than read as a shorter path.
+SOURCE_PATH = re.compile(r"workflow-check-source(/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)?(.?)")
+PATH_END = frozenset(" \t\n'\";|&)<>")
+
+
 def _sourced_tool_paths(steps: list[dict]) -> set[str]:
-    """Paths under workflow-check-source/ that any run step of the job reads."""
+    """Paths under workflow-check-source/ that any run step of the job reads.
+
+    Raises ValueError for a reference whose path this scan cannot resolve.
+    """
     found: set[str] = set()
     for step in steps:
-        for word in str(step.get("run", "")).replace('"', " ").split():
-            if word.startswith("workflow-check-source/"):
-                found.add(word.removeprefix("workflow-check-source/"))
+        for match in SOURCE_PATH.finditer(str(step.get("run", ""))):
+            path, after = match.groups()
+            if not path or (after and after not in PATH_END):
+                raise ValueError(f"unresolved workflow-check-source reference: {match.group(0)!r}")
+            found.add(path.removeprefix("/"))
     return found
 
 
@@ -217,3 +231,32 @@ def test_planted_dropped_sourced_script_is_found() -> None:
     dropped = "actions/verified-download/verified-download.sh"
     planted = [p for p in _sparse_paths() if p != dropped]
     assert _sourced_tool_paths(steps) - set(planted) == {dropped}
+
+
+@pytest.mark.parametrize(
+    ("run", "path"),
+    [
+        (". 'workflow-check-source/tools/extra.sh'", "tools/extra.sh"),
+        ('tool="workflow-check-source/tools/extra.sh"; . "$tool"', "tools/extra.sh"),
+        ("python3 workflow-check-source/tools/extra.py|tee log", "tools/extra.py"),
+    ],
+    ids=["single-quoted", "assigned", "piped"],
+)
+def test_planted_quoted_or_embedded_path_is_found(run: str, path: str) -> None:
+    assert _sourced_tool_paths([{"run": run}]) == {path}
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        '. "workflow-check-source/$TOOL"',
+        ". workflow-check-source/tools/${NAME}.sh",
+        ". workflow-check-source/tools/*.sh",
+        'src=workflow-check-source; . "$src/tools/extra.sh"',
+        '. workflow-check-source"/tools/extra.sh"',
+    ],
+    ids=["variable", "braced-variable", "glob", "bare-directory", "quote-split"],
+)
+def test_planted_unresolved_reference_is_refused(run: str) -> None:
+    with pytest.raises(ValueError, match="unresolved workflow-check-source reference"):
+        _sourced_tool_paths([{"run": run}])

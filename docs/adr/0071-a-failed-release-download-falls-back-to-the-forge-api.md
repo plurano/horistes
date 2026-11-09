@@ -35,28 +35,44 @@ of calling `fetch_verified` from `actions/verified-download/verified-download.sh
 - `fetch_verified` keeps its `curl` call unchanged. When that call fails and the URL is
   a forge release-download address whose owner, repository, tag and asset match an
   allow-list of plain names, `fetch_release_fallback` fetches the same asset with
-  `gh release download <tag> --repo <owner/repo> --pattern <asset> --output <file>
-  --clobber` under `timeout`, which reads the release through `api.github.com`. It
-  prints a `::warning title=Release download fallback::` annotation naming the failed
-  address.
+  `gh release download <tag> --repo <owner/repo> --pattern <asset> --output -`, which
+  reads the release through `api.github.com`. It prints a
+  `::warning title=Release download fallback::` annotation naming the failed address.
+- `gh` writes to a pipe that `head -c` cuts one byte past the caller's byte bound, so
+  an oversized asset stops at that size instead of filling the disk; a fetch over the
+  bound, or one where `gh` or `head` fails, is refused and leaves no file.
+- `run_with_deadline`, a bash function built on `sleep` and `kill`, stops `curl` (with
+  its retries) and `gh` each after the caller's timeout; GNU `timeout` is absent on
+  macOS runners. One call therefore takes at most twice `timeout-seconds`. Stopping
+  the watcher at any point also stops its `sleep`, so no process outlives the call.
+- `download_bounds_valid` refuses a byte bound or a timeout that is not a plain
+  positive decimal before any arithmetic runs: bash arithmetic evaluates other text,
+  command substitutions in array subscripts included. Both `fetch_verified` and
+  `fetch_release_fallback` call it.
 - The SHA-256 check after either path is unchanged, so the fallback installs only the
-  pinned bytes. The fallback also refuses a file larger than the caller's byte bound.
+  pinned bytes.
 - Any other URL, a name outside the allow-list, or a runner without `gh` fails as
   before, with no second request.
 - `gh` reads `GH_TOKEN`; the `verified-download` and `install-gitleaks` actions and the
-  actionlint steps set it to `${{ github.token }}`.
+  actionlint steps set it to `${{ github.token }}`. A caller that sources the script
+  through the `lib` output sets it in its own step.
 - The actionlint steps of `ci.yml` and `workflow-check.yml` source
   `verified-download.sh` and call `fetch_verified`; the gitleaks step of `ci.yml` uses
   `./actions/install-gitleaks`. No workflow step downloads a release asset on its own;
   `tests/test_release_downloads.py` holds that.
 - The shared workflow check adds `actions/verified-download/verified-download.sh` to
   its sparse checkout; `tests/test_workflow_check_gate.py` refuses a run step that
-  reads a `workflow-check-source/` file the sparse checkout leaves out.
+  reads a `workflow-check-source/` file the sparse checkout leaves out, and a
+  reference to that directory whose path it cannot resolve (a variable, a glob).
 - `ci.yml` joins the zizmor `self-repository` entries in `.github/zizmor.yml` with the
   same expiry and reason as the other callers of a local action.
 - `tests/test_installer_actions.py` runs the fallback against stub `curl` and `gh`:
   outage, healthy path, other host, lookalike host, plain HTTP, missing `gh`, wrong
-  bytes, oversize file, failed `gh` and a `gh` that hangs past the timeout.
+  bytes, an endless asset cut at the bound, an asset exactly at the bound and one byte
+  over, failed `gh`, a `curl` and a `gh` that hang past the timeout, bounds that are
+  not plain numbers (command substitutions among them) at both entry points, and 100
+  deadline calls that leave no `sleep` behind. The `gh` stubs take the
+  `--output -` shape only.
 
 ## Consequences
 
