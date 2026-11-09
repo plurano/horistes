@@ -207,8 +207,12 @@ hashes.
   a tool or a model: a trailer whose key is not `Signed-off-by` or `Migration`,
   a co-author line, or a line that opens with "generated with". The engine's
   own message check passes such a message; this test retires when the pinned
-  engine refuses it. The message of a squash merge is written on the forge, so
-  it is read only afterwards, on the run of `main`.
+  engine refuses it. The commit-msg hook judges each message by the same rules
+  when it is written (`make check-message`), and the squash helper runs that
+  hook on the squash message before it sends it
+  ([ADR-0072](docs/adr/0072-the-commit-msg-hook-judges-each-message.md)). A
+  squash message written on the forge by hand is read only afterwards, on the
+  run of `main`.
 - No tracked file holds the address this repository had under its working name
   (`tests/test_name.py`): the forge does not redirect a call to it. Two
   accepted records keep it and are named in the test

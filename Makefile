@@ -16,7 +16,7 @@ ACTIONLINT_VERSION := 1.7.12
 GITLEAKS ?= gitleaks
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
-.PHONY: verify verify-all tools check-tools-stamp requirements requirements-fuzz lint-yaml lint-python lint-workflows \
+.PHONY: verify verify-all tools check-tools-stamp check-message requirements requirements-fuzz lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
 	interface-snapshot list-pins check-pins pin check-runners check-links check-examples
 
@@ -58,6 +58,18 @@ check-tools-stamp:
 		printf '%s\n' '$(VENV)/.stamp does not match requirements/tools.txt; run make tools' >&2; \
 		exit 1; \
 	fi
+
+# The commit-msg hook judges one message by the rules of
+# tests/test_commit_messages.py (ADR-0072): lefthook names the message file in
+# MESSAGE_FILE. Without it the test would be skipped and pass, so the target
+# refuses to run. It installs nothing: a stale .venv fails as in pre-push.
+check-message: check-tools-stamp
+	@if [ -z "$$MESSAGE_FILE" ]; then \
+		printf '%s\n' 'check-message needs MESSAGE_FILE, the commit message file to judge' >&2; \
+		exit 2; \
+	fi
+	@PYTHONOPTIMIZE= PYTEST_ADDOPTS= $(BIN)/python -B -m pytest \
+		tests/test_commit_messages.py::test_message_file_passes_the_judge
 
 # Recompile the pins; a release younger than three days is left out. The
 # header of the output records this command and Renovate reruns it from there,
