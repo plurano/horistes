@@ -152,7 +152,7 @@ def test_workflow_actionlint_installed_and_run() -> None:
     install = [s for s in steps if s.get("name") == "Install the pinned actionlint"]
     assert len(install) == 1
     assert "${ACTIONLINT_SHA256}" in install[0]["run"]
-    assert "sha256sum --check --strict" in install[0]["run"]
+    assert "fetch_verified" in install[0]["run"]
 
     lint_step = [s for s in steps if s.get("name") == "Run actionlint on caller workflows"]
     assert len(lint_step) == 1
@@ -193,3 +193,27 @@ def test_caller_template_planted_missing_result_job_fails() -> None:
     mutilated = yaml.dump(doc)
     problems = render.caller_problems(mutilated, ROOT)
     assert any("result" in p for p in problems)
+
+
+def _sourced_tool_paths(steps: list[dict]) -> set[str]:
+    """Paths under workflow-check-source/ that any run step of the job reads."""
+    found: set[str] = set()
+    for step in steps:
+        for word in str(step.get("run", "")).replace('"', " ").split():
+            if word.startswith("workflow-check-source/"):
+                found.add(word.removeprefix("workflow-check-source/"))
+    return found
+
+
+def test_sparse_checkout_holds_every_file_a_step_reads() -> None:
+    steps = ciwf.load(WORKFLOW)["jobs"]["check"]["steps"]
+    read = _sourced_tool_paths(steps)
+    assert "actions/verified-download/verified-download.sh" in read
+    assert read - set(_sparse_paths()) == set()
+
+
+def test_planted_dropped_sourced_script_is_found() -> None:
+    steps = ciwf.load(WORKFLOW)["jobs"]["check"]["steps"]
+    dropped = "actions/verified-download/verified-download.sh"
+    planted = [p for p in _sparse_paths() if p != dropped]
+    assert _sourced_tool_paths(steps) - set(planted) == {dropped}

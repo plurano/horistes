@@ -160,8 +160,8 @@ equal to what the train asks the forge for.
 
 | File | Purpose | Inputs | Outputs | Hosts beyond the forge |
 | :--- | :--- | :--- | :--- | :--- |
-| `actions/verified-download/action.yml` | bounded, digest-verified release download over HTTPS ([ADR-0058](docs/adr/0058-shared-installer-actions.md)) | `url` (required); `sha256` (required); `output` (required); `max-bytes` (default `33554432`); `timeout-seconds` (default `120`) | `lib` (absolute path of `verified-download.sh`) | host of `url` (HTTPS only) |
-| `actions/install-gitleaks/action.yml` | installs pinned Gitleaks release binary after SHA-256 verification on Linux/x86_64 ([ADR-0058](docs/adr/0058-shared-installer-actions.md)) | `version` (required, no leading `v`); `sha256` (required); `install-dir` (required) | `path` (absolute path of installed `gitleaks` binary) | `github.com` |
+| `actions/verified-download/action.yml` | bounded, digest-verified release download over HTTPS; a failed `github.com` release download falls back to `gh release download` ([ADR-0058](docs/adr/0058-shared-installer-actions.md), [ADR-0071](docs/adr/0071-a-failed-release-download-falls-back-to-the-forge-api.md)) | `url` (required); `sha256` (required); `output` (required); `max-bytes` (default `33554432`); `timeout-seconds` (default `120`) | `lib` (absolute path of `verified-download.sh`) | host of `url` (HTTPS only); `api.github.com` on the fallback |
+| `actions/install-gitleaks/action.yml` | installs pinned Gitleaks release binary after SHA-256 verification on Linux/x86_64 ([ADR-0058](docs/adr/0058-shared-installer-actions.md), [ADR-0071](docs/adr/0071-a-failed-release-download-falls-back-to-the-forge-api.md)) | `version` (required, no leading `v`); `sha256` (required); `install-dir` (required) | `path` (absolute path of installed `gitleaks` binary) | `github.com`; `api.github.com` on the fallback |
 
 ## Layout
 

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: EUPL-1.2
 ---
 name: Verified download
-description: Bounded, digest-verified release download over HTTPS.
+description: Bounded, digest-verified release download over HTTPS with GitHub CLI release fallback.
 
 inputs:
   url:
@@ -37,6 +37,7 @@ runs:
     - id: download
       shell: bash
       env:
+        GH_TOKEN: ${{ github.token }}
         DOWNLOAD_URL: ${{ inputs.url }}
         DOWNLOAD_SHA256: ${{ inputs.sha256 }}
         DOWNLOAD_OUTPUT: ${{ inputs.output }}

@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: EUPL-1.2
 ---
 name: Install Gitleaks
-description: Installs the pinned Gitleaks release binary after SHA-256 verification on Linux/x86_64.
+description: >-
+  Installs the pinned Gitleaks release binary after SHA-256 verification on Linux/x86_64
+  with release download fallback.
 
 inputs:
   version:
@@ -26,6 +28,7 @@ runs:
     - id: install
       shell: bash
       env:
+        GH_TOKEN: ${{ github.token }}
         GITLEAKS_VERSION: ${{ inputs.version }}
         GITLEAKS_SHA256: ${{ inputs.sha256 }}
         INSTALL_DIR: ${{ inputs.install-dir }}

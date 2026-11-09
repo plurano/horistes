@@ -60,6 +60,7 @@ jobs:
           path: workflow-check-source
           persist-credentials: false
           sparse-checkout: |
+            actions/verified-download/verified-download.sh
             tools/pins.py
             tools/ciwf.py
             tools/forge.py
@@ -100,12 +101,16 @@ jobs:
 
       - name: Install the pinned actionlint
         if: github.event.pull_request.draft != true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           archive="$RUNNER_TEMP/actionlint.tar.gz"
-          curl --fail --silent --show-error --location --max-time 120 --retry 2 \
-            --output "$archive" \
-            "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
-          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict
+          asset="actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+          # shellcheck source=actions/verified-download/verified-download.sh
+          . workflow-check-source/actions/verified-download/verified-download.sh
+          fetch_verified \
+            "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/${asset}" \
+            "${ACTIONLINT_SHA256}" 33554432 120 "$archive"
           tar -xzf "$archive" -C "$RUNNER_TEMP/bin" actionlint
 
       - name: Run actionlint on caller workflows
