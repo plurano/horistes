@@ -18,25 +18,47 @@ HASH_COMMAND = (
     "print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "
     "requirements/tools.txt)"
 )
+HASH_FAILED = "cannot hash requirements/tools.txt"
 
 
-def _run_make_check(
+def _run_make(
     tmp_dir: Path,
-    *,
+    target: str = "check-tools-stamp",
+    *extra_args: str,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run `make -s -C <tmp_dir> -f <ROOT>/Makefile check-tools-stamp`.
+    """Run `make -s -C <tmp_dir> -f <ROOT>/Makefile <target> [*extra_args]`.
 
-    `make` is looked up on the `PATH` of `env` when one is given.
+    The target defaults to `check-tools-stamp`; `make` is looked up on the
+    `PATH` of `env` when one is given.
     """
     return subprocess.run(
-        ["make", "-s", "-C", str(tmp_dir), "-f", str(ROOT / "Makefile"), "check-tools-stamp"],
+        [
+            "make",
+            "-s",
+            "-C",
+            str(tmp_dir),
+            "-f",
+            str(ROOT / "Makefile"),
+            target,
+            *extra_args,
+        ],
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
         env=env,
     )
+
+
+def _setup_stub_venv(tmp_path: Path) -> Path:
+    """Create executable .venv/bin/python stub script that exits 0."""
+    bin_dir = tmp_path / ".venv" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "python"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    return stub
 
 
 def _setup_tree(tmp_path: Path, tools_content: str = "pytest==8.0.0\n") -> tuple[Path, Path]:
@@ -56,7 +78,7 @@ def test_check_tools_stamp_positive(tmp_path: Path) -> None:
     tools_txt, stamp = _setup_tree(tmp_path)
     h = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
     stamp.write_text(f"{h}\n", encoding="utf-8")
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode == 0
     assert proc.stderr == ""
 
@@ -66,7 +88,7 @@ def test_check_tools_stamp_negative_stale(tmp_path: Path) -> None:
     _, stamp = _setup_tree(tmp_path, "pytest==8.0.0\n")
     stale_hash = hashlib.sha256(b"pytest==7.0.0\n").hexdigest()
     stamp.write_text(f"{stale_hash}\n", encoding="utf-8")
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode != 0
     assert "make tools" in proc.stderr
     assert ".venv/.stamp" in proc.stderr
@@ -76,7 +98,7 @@ def test_check_tools_stamp_negative_stale(tmp_path: Path) -> None:
 def test_check_tools_stamp_negative_missing_stamp(tmp_path: Path) -> None:
     """Negative: .venv exists without .stamp -> rc != 0 and stderr names 'make tools'."""
     _setup_tree(tmp_path)
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode != 0
     assert "make tools" in proc.stderr
 
@@ -86,14 +108,14 @@ def test_check_tools_stamp_negative_missing_venv(tmp_path: Path) -> None:
     req_dir = tmp_path / "requirements"
     req_dir.mkdir(parents=True, exist_ok=True)
     (req_dir / "tools.txt").write_text("pytest==8.0.0\n", encoding="utf-8")
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode != 0
     assert "make tools" in proc.stderr
 
 
 def test_check_tools_stamp_negative_missing_requirements(tmp_path: Path) -> None:
     """Negative: no requirements/tools.txt and no stamp fails; empty equals empty is no match."""
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode != 0
     assert "requirements/tools.txt" in proc.stderr
 
@@ -103,7 +125,7 @@ def test_check_tools_stamp_boundary_without_trailing_newline(tmp_path: Path) -> 
     tools_txt, stamp = _setup_tree(tmp_path)
     h = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
     stamp.write_text(h, encoding="utf-8")
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode == 0
     assert proc.stderr == ""
 
@@ -113,7 +135,7 @@ def test_check_tools_stamp_boundary_extra_line(tmp_path: Path) -> None:
     tools_txt, stamp = _setup_tree(tmp_path)
     h = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
     stamp.write_text(f"{h}\nextra-line\n", encoding="utf-8")
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode != 0
     assert "make tools" in proc.stderr
 
@@ -123,7 +145,7 @@ def test_check_tools_stamp_boundary_uppercase_hex(tmp_path: Path) -> None:
     tools_txt, stamp = _setup_tree(tmp_path)
     h = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
     stamp.write_text(f"{h.upper()}\n", encoding="utf-8")
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode != 0
     assert "make tools" in proc.stderr
 
@@ -133,7 +155,7 @@ def test_check_tools_stamp_boundary_empty_requirements(tmp_path: Path) -> None:
     tools_txt, stamp = _setup_tree(tmp_path, tools_content="")
     h = hashlib.sha256(b"").hexdigest()
     stamp.write_text(f"{h}\n", encoding="utf-8")
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode == 0
     assert proc.stderr == ""
 
@@ -149,7 +171,7 @@ def test_check_tools_stamp_writes_nothing_on_failure(tmp_path: Path) -> None:
         (p.relative_to(tmp_path).as_posix(), p.read_bytes() if p.is_file() else b"") for p in paths
     ]
 
-    proc = _run_make_check(tmp_path)
+    proc = _run_make(tmp_path)
     assert proc.returncode != 0
 
     after_paths = sorted(tmp_path.rglob("*"))
@@ -207,14 +229,14 @@ def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
     h = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
     stamp.write_text(f"{h}\n", encoding="utf-8")
 
-    proc = _run_make_check(tmp_path, env=restricted_env)
+    proc = _run_make(tmp_path, env=restricted_env)
     assert proc.returncode == 0
     assert proc.stderr == ""
 
     stale_hash = hashlib.sha256(b"stale-tools-content\n").hexdigest()
     stamp.write_text(f"{stale_hash}\n", encoding="utf-8")
 
-    proc_stale = _run_make_check(tmp_path, env=restricted_env)
+    proc_stale = _run_make(tmp_path, env=restricted_env)
     assert proc_stale.returncode != 0
     assert "make tools" in proc_stale.stderr
 
@@ -226,3 +248,89 @@ def test_makefile_shares_hashlib_command() -> None:
     assert "sha256sum" not in makefile_text
     assert "shasum" not in makefile_text
     assert "check-tools-stamp" in makefile_text
+
+
+def test_tools_negative_hash_command_fails(tmp_path: Path) -> None:
+    """Negative: stub venv python, failing PYTHON -> rc != 0, stamp unchanged."""
+    _setup_tree(tmp_path)
+    _setup_stub_venv(tmp_path)
+    old_stamp = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+    stamp = tmp_path / ".venv" / ".stamp"
+    stamp.write_bytes(old_stamp)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    nopython = bin_dir / "nopython"
+    nopython.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    nopython.chmod(0o755)
+
+    proc = _run_make(tmp_path, "tools", f"PYTHON={nopython}")
+    assert proc.returncode != 0
+    assert stamp.read_bytes() == old_stamp
+    assert HASH_FAILED in proc.stderr
+
+
+def test_tools_negative_python_nonexistent(tmp_path: Path) -> None:
+    """Negative: stub venv python, missing PYTHON -> rc != 0, stamp unchanged."""
+    _setup_tree(tmp_path)
+    _setup_stub_venv(tmp_path)
+    old_stamp = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+    stamp = tmp_path / ".venv" / ".stamp"
+    stamp.write_bytes(old_stamp)
+
+    nonexistent = tmp_path / "bin" / "does-not-exist"
+    proc = _run_make(tmp_path, "tools", f"PYTHON={nonexistent}")
+    assert proc.returncode != 0
+    assert stamp.read_bytes() == old_stamp
+    assert HASH_FAILED in proc.stderr
+
+
+def test_tools_boundary_missing_requirements(tmp_path: Path) -> None:
+    """Boundary: missing tools.txt, stub venv -> rc != 0, stamp unchanged, hash failure named."""
+    py_path = shutil.which("python3")
+    if py_path is None:
+        pytest.skip("python3 not found on PATH")
+
+    _setup_stub_venv(tmp_path)
+    stamp = tmp_path / ".venv" / ".stamp"
+    old_stamp = b"old-stamp-bytes\n"
+    stamp.write_bytes(old_stamp)
+
+    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    assert proc.returncode != 0
+    assert stamp.read_bytes() == old_stamp
+    assert HASH_FAILED in proc.stderr
+
+
+def test_tools_positive_stale_stamp(tmp_path: Path) -> None:
+    """Positive: real python3, stub venv python, stale stamp -> rc 0, stamp updated."""
+    py_path = shutil.which("python3")
+    if py_path is None:
+        pytest.skip("python3 not found on PATH")
+
+    tools_txt, stamp = _setup_tree(tmp_path)
+    _setup_stub_venv(tmp_path)
+    stale_stamp = b"stale-stamp-bytes\n"
+    stamp.write_bytes(stale_stamp)
+
+    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    assert proc.returncode == 0
+    expected_hash = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
+    assert stamp.read_text(encoding="utf-8") == f"{expected_hash}\n"
+
+
+def test_tools_positive_matching_stamp(tmp_path: Path) -> None:
+    """Positive: matching stamp -> rc 0, stamp unchanged."""
+    py_path = shutil.which("python3")
+    if py_path is None:
+        pytest.skip("python3 not found on PATH")
+
+    tools_txt, stamp = _setup_tree(tmp_path)
+    _setup_stub_venv(tmp_path)
+    expected_hash = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
+    matching_stamp = f"{expected_hash}\n"
+    stamp.write_text(matching_stamp, encoding="utf-8")
+
+    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    assert proc.returncode == 0
+    assert stamp.read_text(encoding="utf-8") == matching_stamp

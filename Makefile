@@ -37,11 +37,12 @@ verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-e
 # hashes requirements/tools.txt records.
 # Linked worktrees share .venv by symlink: compare content, not mtime.
 # Hashed with Python's hashlib: macOS ships no coreutils hash command.
+# A failed hash stops `tools` before it installs or writes the stamp.
 TOOLS_HASH = $$($(PYTHON) -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' requirements/tools.txt)
 TOOLS_STAMP = $$(cat $(VENV)/.stamp 2>/dev/null)
 
 tools:
-	@hash=$(TOOLS_HASH); \
+	@hash=$(TOOLS_HASH) || { printf '%s\n' 'cannot hash requirements/tools.txt' >&2; exit 1; }; \
 	if [ "$(TOOLS_STAMP)" != "$$hash" ]; then \
 		if [ ! -x $(BIN)/python ]; then $(PYTHON) -m venv $(VENV); fi && \
 		$(BIN)/python -m pip install --quiet --disable-pip-version-check --require-hashes -r requirements/tools.txt && \
