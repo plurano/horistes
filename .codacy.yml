@@ -23,7 +23,7 @@ engines:
     # tests/test_exceptions.py:694 dangerous-subprocess-use-audit — test helper,
     # subprocess.run with static argument list, not user input
     # tests/test_lint.py:95 dangerous-subprocess-use-audit — test helper, runs the
-    # zizmor command the Makefile sets (tests/conftest.py:345 external) with static
+    # zizmor command the Makefile sets (tests/conftest.py:350 external) with static
     # flags and the test's own temporary tree; entered 2026-11-08, category B,
     # expires 2026-11-11
     # tests/test_merge_guard.py:21 dangerous-subprocess-use-audit — test mock,

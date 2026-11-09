@@ -23,7 +23,7 @@ import re
 import shlex
 
 import pytest
-from conftest import ROOT
+from conftest import ROOT, TRAIN_BOT
 
 CONFIG = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
 PRESET = json.loads((ROOT / "default.json").read_text(encoding="utf-8"))
@@ -53,10 +53,6 @@ SHARED = {
     "prHeader",
     "packageRules",
 }
-# The commit address of the merge-train app's bot user (numeric user id, then the
-# app slug), read from GET /users/plurano-merge-train[bot]. Renovate compares an
-# entry for equality before it reads it as a glob, so the brackets stay literal.
-TRAIN_BOT = "342223998+plurano-merge-train[bot]@users.noreply.github.com"
 RULE = {
     "description",
     "matchManagers",

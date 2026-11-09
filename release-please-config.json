@@ -1,5 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.6.0/schemas/config.json",
+  "signoff": "plurano-merge-train[bot] <342223998+plurano-merge-train[bot]@users.noreply.github.com>",
   "packages": {
     ".": {
       "release-type": "simple",

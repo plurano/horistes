@@ -27,6 +27,11 @@ import ciwf
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# The commit address of the merge-train app's bot user (numeric user id, then the
+# app slug), read from GET /users/plurano-merge-train[bot]. Renovate compares an
+# entry for equality before it reads it as a glob, so the brackets stay literal.
+TRAIN_BOT = "342223998+plurano-merge-train[bot]@users.noreply.github.com"
+
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
 
 REUSABLE = f"""\
