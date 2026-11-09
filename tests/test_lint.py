@@ -14,7 +14,7 @@ import shutil
 import subprocess
 
 import pytest
-from conftest import ACTION, CHECKOUT, REUSABLE, ROOT, external
+from conftest import ACTION, CHECKOUT, REUSABLE, ROOT, external, rooted
 
 WORKFLOW = ".github/workflows/licence.yml"
 UNPINNED = REUSABLE.replace(CHECKOUT, "actions/checkout@v7")
@@ -93,18 +93,6 @@ def zizmor(tree):
         str(tree.root),
     ]
     return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
-
-
-def rooted(cmd):
-    """The command with a relative tool path read from the checkout, as the Makefile passes it.
-
-    The planted tree is the working directory, so `.venv/bin/x` would name a
-    file inside it.
-    """
-    head = cmd[0]
-    if os.sep in head and not os.path.isabs(head):
-        return [str(ROOT / head), *cmd[1:]]
-    return cmd
 
 
 def yamllint(tree, *args):
@@ -360,3 +348,25 @@ def test_makefile_lint_python_recipe_passes_config_flag():
     for line in content.splitlines():
         if "$(BIN)/ruff check" in line or "$(BIN)/ruff format" in line:
             assert "--config ruff.toml" in line
+
+
+def test_rooted_reads_a_relative_tool_path_from_the_checkout() -> None:
+    """Positive: a Makefile path such as `.venv/bin/ruff` is read from the checkout."""
+    assert rooted([".venv/bin/ruff", "check"]) == [str(ROOT / ".venv/bin/ruff"), "check"]
+
+
+@pytest.mark.parametrize(
+    "head", ["ruff", os.path.abspath("bin/ruff")], ids=["bare-name", "absolute"]
+)
+def test_rooted_keeps_a_bare_name_or_absolute_path(head: str) -> None:
+    """Negative: a name found on PATH, or an absolute path, is passed through."""
+    assert rooted([head, "check"]) == [head, "check"]
+
+
+def test_rooted_reads_the_makefile_separator_under_a_backslash_sep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary: where `os.sep` is a backslash, the Makefile's `/` path is still rooted."""
+    monkeypatch.setattr(os, "sep", "\\")
+    assert rooted([".venv/bin/ruff"]) == [str(ROOT / ".venv/bin/ruff")]
+    assert rooted(["ruff"]) == ["ruff"]

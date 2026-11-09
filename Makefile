@@ -147,7 +147,7 @@ test: tools
 	data=$$(mktemp -d) && \
 	trap 'rm -rf "$$data"' EXIT && \
 	PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
-		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" \
+		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" LEFTHOOK_BIN="$(BIN)/lefthook" \
 		$(BIN)/python -X dev -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest && \
 	$(BIN)/python -B -m coverage combine --rcfile=pyproject.toml --data-file="$$data/.coverage" && \
 	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage" && \

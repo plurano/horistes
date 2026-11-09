@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
@@ -13,7 +14,7 @@ from pathlib import Path
 import coverage
 import coverage.cmdline
 import pytest
-from conftest import ROOT
+from conftest import ROOT, measured
 
 FLOOR = 94
 RCFILE = "--rcfile=pyproject.toml"
@@ -36,13 +37,145 @@ GATE_COVERAGE = [
 ASSIGNMENT = re.compile(r"[A-Z][A-Z0-9_]*=")
 
 
+def coverage_config_problems(config: dict[str, object]) -> list[str]:
+    """Return reasons why tool.coverage is misconfigured, or an empty list if valid."""
+    problems: list[str] = []
+    tool = config.get("tool")
+    if not isinstance(tool, dict):
+        return ["missing or invalid [tool] table"]
+    coverage_table = tool.get("coverage")
+    if not isinstance(coverage_table, dict):
+        return ["missing or invalid [tool.coverage] table"]
+    run = coverage_table.get("run")
+    if not isinstance(run, dict):
+        problems.append("missing or invalid [tool.coverage.run] table")
+    else:
+        if run.get("branch") is not True:
+            problems.append(f"branch must be True, got {run.get('branch')!r}")
+        if run.get("source") != ["tools"]:
+            problems.append(f"source must be ['tools'], got {run.get('source')!r}")
+    report = coverage_table.get("report")
+    if not isinstance(report, dict):
+        problems.append("missing or invalid [tool.coverage.report] table")
+    else:
+        fail_under = report.get("fail_under")
+        # `nan < FLOOR` is false, so the comparison alone lets a NaN through;
+        # coverage itself refuses one with a ConfigError.
+        if (
+            not isinstance(fail_under, (int, float))
+            or not math.isfinite(fail_under)
+            or fail_under < FLOOR
+        ):
+            problems.append(f"fail_under must be a finite number >= {FLOOR}, got {fail_under!r}")
+    return problems
+
+
 def test_floor_is_set_and_never_lowered() -> None:
-    """Read pyproject.toml and assert tool.coverage.report.fail_under is >= FLOOR."""
+    """Read pyproject.toml and assert coverage floor, source, and branch settings."""
     with open(ROOT / "pyproject.toml", "rb") as f:
         config = tomllib.load(f)
-    report = config.get("tool", {}).get("coverage", {}).get("report", {})
-    assert "fail_under" in report
-    assert report["fail_under"] >= FLOOR
+    assert coverage_config_problems(config) == []
+
+
+@pytest.mark.parametrize(
+    ("run_patch", "expected_substring"),
+    [
+        ({"source": ["tools", "tests"]}, "source"),
+        ({"source": []}, "source"),
+        ({}, "source"),
+        ({"source": ["tools"], "branch": False}, "branch"),
+    ],
+    ids=["source-extra", "source-empty", "source-missing", "branch-false"],
+)
+def test_coverage_config_problems_refuses_invalid_run_config(
+    run_patch: dict[str, object], expected_substring: str
+) -> None:
+    """Planted: coverage_config_problems flags invalid or missing run settings."""
+    config: dict[str, object] = {
+        "tool": {
+            "coverage": {
+                "run": {"branch": True, **run_patch},
+                "report": {"fail_under": FLOOR},
+            }
+        }
+    }
+    problems = coverage_config_problems(config)
+    assert any(expected_substring in p for p in problems), problems
+
+
+def _planted_floor(value: str) -> dict[str, object]:
+    """A coverage config read from TOML text, `fail_under` written as `value`."""
+    return tomllib.loads(
+        "[tool.coverage.run]\n"
+        'source = ["tools"]\n'
+        "branch = true\n"
+        "[tool.coverage.report]\n"
+        f"fail_under = {value}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [str(FLOOR - 1), "nan", "inf", "-inf", f'"{FLOOR}"'],
+    ids=["lowered", "nan", "inf", "minus-inf", "string"],
+)
+def test_coverage_config_problems_refuses_lowered_floor(value: str) -> None:
+    """Planted: fail_under below FLOOR, not finite, or not a number is refused."""
+    problems = coverage_config_problems(_planted_floor(value))
+    assert any("fail_under" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("value", [str(FLOOR), f"{FLOOR}.0", "100"], ids=["floor", "float", "full"])
+def test_coverage_config_problems_accepts_floor_and_above(value: str) -> None:
+    """Boundary: fail_under at FLOOR, as int or float, and at 100 passes."""
+    assert coverage_config_problems(_planted_floor(value)) == []
+
+
+def test_measured_forwards_coverage_process_config_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When COVERAGE_PROCESS_CONFIG is set, measured returns a new dict carrying it."""
+    cfg = "planted-coverage.rc"
+    monkeypatch.setenv("COVERAGE_PROCESS_CONFIG", cfg)
+    original = {"PATH": "/bin", "HOME": "/root"}
+    passed = dict(original)
+    result = measured(passed)
+    assert result.get("COVERAGE_PROCESS_CONFIG") == cfg
+    assert result["PATH"] == "/bin"
+    assert result["HOME"] == "/root"
+    assert passed == original
+    assert result is not passed
+
+
+def test_measured_returns_copy_without_coverage_process_config_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When COVERAGE_PROCESS_CONFIG is unset, measured returns an equal copy without the key."""
+    monkeypatch.delenv("COVERAGE_PROCESS_CONFIG", raising=False)
+    original = {"PATH": "/bin", "HOME": "/root"}
+    passed = dict(original)
+    result = measured(passed)
+    assert result == original
+    assert result is not passed
+    assert "COVERAGE_PROCESS_CONFIG" not in result
+
+
+@pytest.mark.parametrize("set_env", [True, False], ids=["set", "unset"])
+def test_measured_boundary_empty_input_dict(monkeypatch: pytest.MonkeyPatch, set_env: bool) -> None:
+    """Boundary: empty env input is handled correctly whether variable is set or unset."""
+    cfg = "planted-coverage.rc"
+    if set_env:
+        monkeypatch.setenv("COVERAGE_PROCESS_CONFIG", cfg)
+    else:
+        monkeypatch.delenv("COVERAGE_PROCESS_CONFIG", raising=False)
+    empty: dict[str, str] = {}
+    result = measured(empty)
+    assert result is not empty
+    if set_env:
+        assert result == {"COVERAGE_PROCESS_CONFIG": cfg}
+    else:
+        assert result == {}
+    assert empty == {}
 
 
 def test_precision_is_set_to_at_least_two_decimals() -> None:

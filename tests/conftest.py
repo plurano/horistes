@@ -355,6 +355,19 @@ def external(variable: str, default: str) -> list[str]:
     return shlex.split(os.environ.get(variable, default))
 
 
+def rooted(cmd: list[str]) -> list[str]:
+    """The command with a relative tool path read from the checkout, as the Makefile passes it.
+
+    The planted tree is the working directory, so `.venv/bin/x` would name a
+    file inside it. The Makefile writes `/`; a native separator counts too, so
+    the rule holds where `os.sep` is a backslash.
+    """
+    head = cmd[0]
+    if ("/" in head or os.sep in head) and not os.path.isabs(head):
+        return [str(ROOT / head), *cmd[1:]]
+    return cmd
+
+
 def measured(env: dict[str, str]) -> dict[str, str]:
     """Pass COVERAGE_PROCESS_CONFIG to a child process if set in the parent environment."""
     if "COVERAGE_PROCESS_CONFIG" in os.environ:
