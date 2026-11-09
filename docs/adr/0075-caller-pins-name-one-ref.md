@@ -53,9 +53,14 @@ for one move.
 on a 40-hex commit unless the line comment after the value is one bare ref:
 `[A-Za-z0-9][A-Za-z0-9._/-]*`, so `# main`, `# v1.2.3` and `# release/v2` pass,
 and `# main 2026-11-02 (#96)`, `# v1.2.3 main`, `# tag=v1.2.3`, `#` alone and a
-missing comment fail. The comment is read from where the composed YAML value
-ends, so a `#` inside a quoted value is not taken for one. The check is local:
-it asks no host and needs no token.
+missing comment fail. The ref must also be a name git accepts: no `..` or
+`//`, no trailing `/` or `.`, and no component that starts with `.` or ends
+in `.lock`, so `# main..bad` and `# release/` fail (`tests/test_pins.py`,
+`test_git_forbidden_refs_fail_bare_ref_check`, which also asks
+`git check-ref-format`). The comment is read from where the composed YAML value
+ends, so a `#` inside a quoted value is not taken for one. This comment rule
+is local: it asks no host. Only the branch-history judgement below asks the
+forge.
 
 The builtin `github-actions` manager stays the one mechanism that moves these
 pins. No custom manager is added, for the double extraction measured above.
@@ -68,20 +73,32 @@ matches its digest updates
 
 A comment on a branch is judged against that branch's history. When zizmor
 reports `ref-version-mismatch` with the annotation
-`branch points to commit <hex>`, `tools/pins.py check` asks the forge compare
-API `repos/<owner>/<name>/compare/<commit>...<ref>`, with the forge client's
-60-second deadline (`tools/forge.py`, `DEADLINE_SECONDS`). Only status `ahead`
-or `identical` drops the finding. Any other status (`behind`, `diverged`, an
-unknown one), a missing status or a failed call keeps the finding and appends
-the reason, so the check fails closed (`tests/test_pins.py`,
+`branch points to commit <hex>`, `tools/pins.py check` first asks
+`repos/<owner>/<name>/git/matching-refs/tags/<ref>` to check whether the ref
+also names a tag: if a tag of that exact name exists, or the answer cannot
+be read, the finding stays and no compare is asked. It then compares against
+`refs/heads/<ref>` via
+`repos/<owner>/<name>/compare/<commit>...refs/heads/<ref>`. Each attempt
+ends after 60 s (`DEADLINE_SECONDS`), only a rate limit is retried, at most
+4 attempts with 20, 40 and 60 s waits (`RETRIES`, `WAIT_SECONDS`), so each
+call ends within 360 s and one finding, with its two calls, within 720 s.
+When the reported line holds more than one use, as when a YAML alias repeats
+a step whose anchor sits on that line, the finding stays and no call is asked
+(`test_two_uses_on_one_line_keeps_finding_and_asks_no_compare`,
+`test_aliased_step_keeps_finding_and_asks_no_compare`).
+Only status `ahead` or `identical` drops the finding.
+Any other status (`behind`, `diverged`, an unknown one), a missing status or
+a failed call keeps the finding and appends the reason, so the check fails
+closed (`tests/test_pins.py`,
 `test_branch_comment_off_history_or_failing_compare_fails`). A tag mismatch
 asks no compare.
 
 Dropping that zizmor finding is a declared exception in `exceptions.yaml`
 (file `tools/pins.py`, MEL category D, 120 days), tracked by zizmor upstream
 issue 2378. It is revisited when this repository ships release tags or zizmor
-judges branch history itself. This decision supersedes the clause of
-ADR-0016 that a commit no release names is not judged.
+judges branch history itself. This decision supersedes the clauses of
+ADR-0016 that a commit no release names is not judged and that `# tag=v4.2.2`
+is a valid comment.
 
 ## Consequences
 

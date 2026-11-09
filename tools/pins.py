@@ -331,6 +331,7 @@ def _comment(value: yaml.ScalarNode, lines: list[str]) -> str | None:
 
 
 def _call(pairs: dict, workflow: bool, lines: list[str]) -> Call | None:
+    """One Call from a mapping of step or job keys, or None when no uses scalar is present."""
     if "uses" not in pairs or not isinstance(pairs["uses"][1], yaml.ScalarNode):
         return None
     key, value = pairs["uses"]
@@ -510,6 +511,16 @@ def listing(root: Path, work: Path) -> int:
     return 0
 
 
+def _bare_ref(text: str) -> bool:
+    """True when text is a valid single bare Git reference name."""
+    if not BARE_REF.fullmatch(text):
+        return False
+    if ".." in text or "//" in text or text.endswith(("/", ".")):
+        return False
+    parts = text.split("/")
+    return not any(p.startswith(".") or p.endswith(".lock") for p in parts)
+
+
 def _comments(root: Path, documents: list) -> tuple[list[Finding], int]:
     """Findings on outside uses on a commit whose comment is not one bare ref, and count of them."""
     findings, bare = [], 0
@@ -521,7 +532,7 @@ def _comments(root: Path, documents: list) -> tuple[list[Finding], int]:
             if not COMMIT.fullmatch(ref):
                 continue
             stripped = call.comment.strip() if call.comment is not None else ""
-            if not stripped or not BARE_REF.fullmatch(stripped):
+            if not stripped or not _bare_ref(stripped):
                 said = (
                     "the comment must name one ref, such as `# main` or `# v1.2.3`, "
                     "or the update bot skips the pin (ADR-0075)"
@@ -534,7 +545,7 @@ def _comments(root: Path, documents: list) -> tuple[list[Finding], int]:
     return findings, bare
 
 
-def _branch_status(call: Call) -> tuple[bool, str]:
+def _branch_status(call: Call, token: str | None = None) -> tuple[bool, str]:
     """Drop status and appended reason for one outside commit use under a branch comment."""
     name, _, commit = call.uses.partition("@")
     parts = name.split("/")
@@ -543,9 +554,20 @@ def _branch_status(call: Call) -> tuple[bool, str]:
     ref = call.comment.strip() if call.comment else ""
     if not ref:
         return False, "; the forge compare could not be read: no ref in comment"
-    asked = f"repos/{parts[0]}/{parts[1]}/compare/{commit}...{ref}"
+    matching_path = f"repos/{parts[0]}/{parts[1]}/git/matching-refs/tags/{ref}"
     try:
-        answer = forge.api(asked)
+        tags = forge.api(matching_path, token=token)
+    except forge.ForgeError as err:
+        return False, f"; the forge tag lookup could not be read: {str(err)[:200]}"
+    if not isinstance(tags, list):
+        return False, "; the forge tag lookup could not be read: answer is not a list"
+    if not all(isinstance(t, dict) for t in tags):
+        return False, "; the forge tag lookup could not be read: answer is not a list of mappings"
+    if any(t.get("ref") == f"refs/tags/{ref}" for t in tags):
+        return False, f"; `{ref}` also names a tag, so the comment is not judged as a branch"
+    asked = f"repos/{parts[0]}/{parts[1]}/compare/{commit}...refs/heads/{ref}"
+    try:
+        answer = forge.api(asked, token=token)
     except forge.ForgeError as err:
         return False, f"; the forge compare could not be read: {str(err)[:200]}"
     if not isinstance(answer, dict):
@@ -561,20 +583,21 @@ def _branch_status(call: Call) -> tuple[bool, str]:
 
 
 def _judge_branches(
-    root: Path, documents: list, findings: list[Finding]
+    root: Path, documents: list, findings: list[Finding], token: str | None = None
 ) -> tuple[list[Finding], int]:
     """Filter branch-points-to-commit findings against forge compare; drop those on history."""
-    calls = {
-        (path, call.line): call for path, kind, _ in documents for call in _calls(root / path, kind)
-    }
+    calls: dict[tuple[str, int], list[Call]] = {}
+    for path, kind, _ in documents:
+        for call in _calls(root / path, kind):
+            calls.setdefault((path, call.line), []).append(call)
     kept: list[Finding] = []
     lagging = 0
     for finding in findings:
         if not BRANCH_ANNOTATION.fullmatch(finding.note):
             kept.append(finding)
             continue
-        call = calls.get((finding.path, finding.line))
-        if call is None:
+        on_line = calls.get((finding.path, finding.line), [])
+        if not on_line:
             kept.append(
                 Finding(
                     finding.path,
@@ -584,7 +607,18 @@ def _judge_branches(
                 )
             )
             continue
-        drop, reason = _branch_status(call)
+        if len(on_line) > 1:
+            kept.append(
+                Finding(
+                    finding.path,
+                    finding.line,
+                    f"{finding.text}; the forge compare was not asked: "
+                    "more than one use on this line",
+                    finding.note,
+                )
+            )
+            continue
+        drop, reason = _branch_status(on_line[0], token=token)
         if drop:
             lagging += 1
         else:
@@ -595,13 +629,14 @@ def _judge_branches(
 
 
 def check(root: Path, work: Path, rewrite: bool) -> int:
+    """Scan the tree (after a fix pass when rewrite), judge every finding; exit code."""
     documents, named = _tree(root)
     token = _token()
     found = _scan(work, named, token)
     if rewrite:
         _engine_run(work, list(named), token, fix=True)
         found = _scan(work, named, token)
-    comment_findings, lagging = _judge_branches(root, documents, found[COMMENT])
+    comment_findings, lagging = _judge_branches(root, documents, found[COMMENT], token=token)
     late, uses, keys = _inputs(root, documents)
     floating, jobs, _ = _labels(root, documents)
     comments, bare = _comments(root, documents)

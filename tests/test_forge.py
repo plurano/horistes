@@ -10,6 +10,7 @@ failing script step leaves only its exit code as annotation.
 from __future__ import annotations
 
 import hashlib
+import json
 import shlex
 import subprocess
 import sys
@@ -257,6 +258,45 @@ def test_request_other_than_a_get_is_refused_by_the_stand_in(tree):
     command = [*shlex.split(env["GH"]), "api", "-X", "DELETE", "repos/x/y"]
     done = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
     assert done.returncode == 2
+
+
+def test_stand_in_client_sees_gh_token_when_passed_and_caller_env_otherwise(tree, monkeypatch):
+    """The gh stand-in sees GH_TOKEN equal to passed token or the caller's env otherwise."""
+    spy_script = """\
+import json
+import os
+import sys
+
+log_file = os.environ["SPY_LOG"]
+with open(log_file, "a", encoding="utf-8") as f:
+    f.write(json.dumps({"token": os.environ.get("GH_TOKEN")}) + "\\n")
+sys.stdout.write(json.dumps({"status": "ok"}))
+"""
+    tree.write({"spy_gh.py": spy_script})
+    spy_log = tree.root / "spy.log"
+    monkeypatch.setenv("GH", shlex.join([sys.executable, "-B", str(tree.root / "spy_gh.py")]))
+    monkeypatch.setenv("SPY_LOG", str(spy_log))
+    monkeypatch.setenv("GH_TOKEN", "caller-env-token")
+
+    res = forge.api("repos/x/y", token="fake-token-for-test")
+    assert res == {"status": "ok"}
+    calls = [json.loads(line) for line in spy_log.read_text(encoding="utf-8").splitlines()]
+    assert calls[-1]["token"] == "fake-token-for-test"
+
+    res = forge.api("repos/x/y")
+    assert res == {"status": "ok"}
+    calls = [json.loads(line) for line in spy_log.read_text(encoding="utf-8").splitlines()]
+    assert calls[-1]["token"] == "caller-env-token"
+
+    raw = forge.download("repos/x/y", token="fake-token-for-download")
+    assert b"status" in raw
+    calls = [json.loads(line) for line in spy_log.read_text(encoding="utf-8").splitlines()]
+    assert calls[-1]["token"] == "fake-token-for-download"
+
+    raw = forge.download("repos/x/y")
+    assert b"status" in raw
+    calls = [json.loads(line) for line in spy_log.read_text(encoding="utf-8").splitlines()]
+    assert calls[-1]["token"] == "caller-env-token"
 
 
 SCORE_FILE = ".github/workflows/scorecard.yml"

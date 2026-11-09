@@ -16,6 +16,8 @@ import base64
 import datetime
 import json
 import shlex
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -247,6 +249,7 @@ ONE_REF = "or the update bot skips the pin (ADR-0075)"
     ids=["tag", "branch", "other-release", "no-comment", "words", "job-on-tag", "job-comment"],
 )
 def test_use_that_is_not_a_commit_under_its_release_fails(tree, old, new, line, message):
+    """Each planted use off its release fails, and every FAIL line names that use's line."""
     answers = dict(ANSWERS)
     for ref in ("v4", "main"):
         answers[at("actions/checkout", "action.yml", ref)] = ANSWERS[
@@ -537,19 +540,82 @@ def test_engine_that_is_not_there_is_an_error(tree):
     assert done.stderr.startswith("ERROR: ")
 
 
+FORBIDDEN_REFS = [
+    "main..bad",
+    "release/",
+    "main.",
+    "a//b",
+    "a/.b",
+    "main.lock",
+    "a.lock/b",
+]
+
+ALLOWED_REFS = [
+    "main",
+    "v1.2.3",
+    "release/v2",
+]
+
+
+@pytest.mark.parametrize("ref", FORBIDDEN_REFS)
+def test_git_forbidden_refs_fail_bare_ref_check(ref):
+    """Git-forbidden ref names fail _bare_ref and agree with git check-ref-format."""
+    assert pins._bare_ref(ref) is False
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        pytest.skip("git not on PATH")
+    res = subprocess.run(
+        [git_bin, "check-ref-format", f"refs/heads/{ref}"],
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert res.returncode != 0
+
+
+@pytest.mark.parametrize("ref", ALLOWED_REFS)
+def test_git_allowed_refs_pass_bare_ref_check(ref):
+    """Git-allowed ref names pass _bare_ref and agree with git check-ref-format."""
+    assert pins._bare_ref(ref) is True
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        pytest.skip("git not on PATH")
+    res = subprocess.run(
+        [git_bin, "check-ref-format", f"refs/heads/{ref}"],
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert res.returncode == 0
+
+
 RED_COMMENTS = [
     "# main 2026-11-02 (#96)",
     "# v1.2.3 main",
     "# tag=v1.2.3",
     "",
     "#",
+    *(f"# {r}" for r in FORBIDDEN_REFS),
 ]
 
 
 @pytest.mark.parametrize(
     "comment",
     RED_COMMENTS,
-    ids=["dated", "words", "tag-equals", "none", "hash-only"],
+    ids=[
+        "dated",
+        "words",
+        "tag-equals",
+        "none",
+        "hash-only",
+        "two-dots",
+        "trailing-slash",
+        "trailing-dot",
+        "double-slash",
+        "dot-component",
+        "lock-suffix",
+        "lock-component",
+    ],
 )
 @pytest.mark.parametrize(
     ("target", "line", "lead"),
@@ -560,6 +626,7 @@ RED_COMMENTS = [
     ids=["step-uses", "job-uses"],
 )
 def test_outside_commit_use_with_red_comment_fails(tree, comment, target, line, lead):
+    """An outside commit pin commented with a non-bare or forbidden ref fails."""
     suffix = f" {comment}\n" if comment else "\n"
     new = f"{lead}{suffix}"
     done = run(tree, workflow=planted(target, new))
@@ -583,6 +650,7 @@ GREEN_COMMENTS = [
     ids=["main", "version", "no-space", "branch", "trailing-spaces"],
 )
 def test_outside_commit_use_with_green_comment_passes(tree, comment):
+    """An outside commit pin commented with a bare ref passes."""
     new = f"    uses: plurano/shared/.github/workflows/licence.yml@{SHARED} {comment}\n"
     engine = {"releases": {f"actions/checkout@{CHECKOUT}": "v4.2.2"}}
     done = run(tree, workflow=planted(CALL, new), engine=engine)
@@ -592,6 +660,7 @@ def test_outside_commit_use_with_green_comment_passes(tree, comment):
 
 
 def test_quoted_uses_holding_hash_inside_quotes_with_good_comment_passes(tree):
+    """A quoted uses value with a hash inside passes when followed by a bare ref comment."""
     new = f'    uses: "plurano/shared/.github/workflows/licence.yml#part@{SHARED}" # main\n'
     answers = {
         **ANSWERS,
@@ -605,6 +674,7 @@ def test_quoted_uses_holding_hash_inside_quotes_with_good_comment_passes(tree):
 
 
 def test_use_on_tag_gets_no_comment_finding_from_this_check(tree):
+    """A use on a tag gets an unpinned-uses finding, not a comment error."""
     new = "        uses: actions/checkout@v4.2.2 # main 2026-11-02 (#96)\n"
     done = run(tree, workflow=planted(USE, new))
     assert done.returncode == 1, done.stdout
@@ -613,6 +683,7 @@ def test_use_on_tag_gets_no_comment_finding_from_this_check(tree):
 
 
 def test_pin_on_red_comment_tree_fails_and_writes_no_comment_change(tree):
+    """Running pin on a tree with a non-bare ref comment fails without rewriting."""
     bad = planted(
         CALL,
         f"    uses: plurano/shared/.github/workflows/licence.yml@{SHARED}"
@@ -628,7 +699,8 @@ ACTION_LICENCE = "plurano/shared/.github/workflows/licence.yml"
 MAIN_HEAD = "5e08088c776c1234567890abcdef1234567890ab"
 CALL_MAIN = f"    uses: {ACTION_LICENCE}@{SHARED} # main\n"
 WORKFLOW_MAIN = planted(CALL, CALL_MAIN)
-COMPARE_PATH = f"repos/plurano/shared/compare/{SHARED}...main"
+TAGS_PATH = "repos/plurano/shared/git/matching-refs/tags/main"
+COMPARE_PATH = f"repos/plurano/shared/compare/{SHARED}...refs/heads/main"
 ENGINE_BRANCH = {
     "releases": {k: v for k, v in RELEASES.items() if SHARED not in k},
     "branches": {ACTION_LICENCE: {"main": MAIN_HEAD}},
@@ -637,11 +709,13 @@ ENGINE_BRANCH = {
 
 @pytest.mark.parametrize("status", ["ahead", "identical"])
 def test_branch_comment_on_commit_in_branch_history_passes(tree, status):
-    answers = {**ANSWERS, COMPARE_PATH: {"status": status}}
+    """A commit in the branch history passes forge compare."""
+    answers = {**ANSWERS, TAGS_PATH: [], COMPARE_PATH: {"status": status}}
     done = run(tree, workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
     assert done.returncode == 0, done.stderr
     if status == "ahead":
         assert "1 behind its branch head on its history" in done.stdout
+    assert TAGS_PATH in tree.forge_calls()
     assert COMPARE_PATH in tree.forge_calls()
 
 
@@ -665,14 +739,15 @@ def test_branch_comment_on_commit_in_branch_history_passes(tree, status):
             {"fail": "gh: Server Error (HTTP 500)"},
             (
                 "; the forge compare could not be read: GET "
-                f"repos/plurano/shared/compare/{SHARED}...main: gh: Server Error (HTTP 500)"
+                f"repos/plurano/shared/compare/{SHARED}...refs/heads/main: "
+                "gh: Server Error (HTTP 500)"
             ),
         ),
         (
             None,
             (
                 "; the forge compare could not be read: GET "
-                f"repos/plurano/shared/compare/{SHARED}...main: gh: Not Found (HTTP 404)"
+                f"repos/plurano/shared/compare/{SHARED}...refs/heads/main: gh: Not Found (HTTP 404)"
             ),
         ),
         (["ahead"], "; the forge compare could not be read: answer is not a mapping"),
@@ -690,7 +765,12 @@ def test_branch_comment_on_commit_in_branch_history_passes(tree, status):
     ],
 )
 def test_branch_comment_off_history_or_failing_compare_fails(tree, answer, reason):
-    answers = dict(ANSWERS) if answer is None else {**ANSWERS, COMPARE_PATH: answer}
+    """Off-history commit or a failing compare call fails the check."""
+    answers = (
+        {**ANSWERS, TAGS_PATH: []}
+        if answer is None
+        else {**ANSWERS, TAGS_PATH: [], COMPARE_PATH: answer}
+    )
     done = run(tree, workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
     assert done.returncode == 1, done.stdout
     failures = [text for text in done.stderr.splitlines() if text.startswith("FAIL")]
@@ -699,6 +779,54 @@ def test_branch_comment_off_history_or_failing_compare_fails(tree, answer, reaso
     assert failure.startswith(f"FAIL: {WORKFLOW}:23: ")
     assert "branch points to commit 5e08088c776c" in failure
     assert reason in failure
+
+
+def test_branch_comment_with_tag_twin_fails_and_asks_no_compare(tree):
+    """When the ref also names a tag, finding stays and compare is not asked."""
+    answers = {
+        **ANSWERS,
+        TAGS_PATH: [{"ref": "refs/tags/main"}],
+        COMPARE_PATH: {"status": "ahead"},
+    }
+    done = run(tree, workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
+    assert done.returncode == 1, done.stdout
+    assert "FAIL: .github/workflows/build.yml:23: " in done.stderr
+    assert "; `main` also names a tag, so the comment is not judged as a branch" in done.stderr
+    assert TAGS_PATH in tree.forge_calls()
+    assert COMPARE_PATH not in tree.forge_calls()
+
+
+def test_branch_comment_tag_lookup_error_fails(tree):
+    """When matching-refs tag query fails, finding stays and compare is not asked."""
+    answers = {**ANSWERS, TAGS_PATH: {"fail": "gh: Server Error (HTTP 500)"}}
+    done = run(tree, workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
+    assert done.returncode == 1, done.stdout
+    assert "; the forge tag lookup could not be read: GET " in done.stderr
+    assert "matching-refs/tags/main: gh: Server Error (HTTP 500)" in done.stderr
+    assert COMPARE_PATH not in tree.forge_calls()
+
+
+def test_branch_comment_tag_lookup_not_a_list_fails(tree):
+    """When matching-refs tag query returns a non-list, finding stays and compare is not asked."""
+    answers = {**ANSWERS, TAGS_PATH: {"status": "ok"}}
+    done = run(tree, workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
+    assert done.returncode == 1, done.stdout
+    assert "; the forge tag lookup could not be read: answer is not a list" in done.stderr
+    assert COMPARE_PATH not in tree.forge_calls()
+
+
+def test_branch_comment_tag_prefix_match_is_not_a_twin(tree):
+    """A tag that only starts with the ref name is not a twin and compare is asked."""
+    answers = {
+        **ANSWERS,
+        TAGS_PATH: [{"ref": "refs/tags/main-old"}],
+        COMPARE_PATH: {"status": "ahead"},
+    }
+    done = run(tree, workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
+    assert done.returncode == 0, done.stderr
+    assert "1 behind its branch head on its history" in done.stdout
+    assert TAGS_PATH in tree.forge_calls()
+    assert COMPARE_PATH in tree.forge_calls()
 
 
 @pytest.mark.parametrize(
@@ -714,7 +842,9 @@ def test_branch_comment_off_history_or_failing_compare_fails(tree, answer, reaso
 def test_branch_status_refuses_a_call_it_cannot_ask_about(monkeypatch, uses, comment, reason):
     """A use with no owner/repo@commit or no ref keeps its finding and asks no compare."""
     asked: list[str] = []
-    monkeypatch.setattr(pins.forge, "api", lambda path: asked.append(path) or {"status": "ahead"})
+    monkeypatch.setattr(
+        pins.forge, "api", lambda path, **kwargs: asked.append(path) or {"status": "ahead"}
+    )
     drop, said = pins._branch_status(pins.Call(23, uses, True, {}, comment))
     assert drop is False
     assert said == f"; the forge compare could not be read: {reason}"
@@ -722,12 +852,20 @@ def test_branch_status_refuses_a_call_it_cannot_ask_about(monkeypatch, uses, com
 
 
 def test_branch_status_asks_one_compare_for_a_branch_comment(monkeypatch):
-    """A commit use under a branch comment asks exactly its compare and drops on ahead."""
+    """A commit use under a branch comment asks tag matching and compare and drops on ahead."""
     asked: list[str] = []
-    monkeypatch.setattr(pins.forge, "api", lambda path: asked.append(path) or {"status": "ahead"})
+
+    def fake_api(path: str, *, token: str | None = None) -> object:
+        """Stand-in forge API answering matching-refs and compare requests."""
+        asked.append(path)
+        if "matching-refs" in path:
+            return []
+        return {"status": "ahead"}
+
+    monkeypatch.setattr(pins.forge, "api", fake_api)
     call = pins.Call(23, f"{ACTION_LICENCE}@{SHARED}", True, {}, " main ")
     assert pins._branch_status(call) == (True, "")
-    assert asked == [COMPARE_PATH]
+    assert asked == [TAGS_PATH, COMPARE_PATH]
 
 
 def test_branch_finding_without_its_call_keeps_finding_and_asks_nothing(tmp_path, monkeypatch):
@@ -735,7 +873,9 @@ def test_branch_finding_without_its_call_keeps_finding_and_asks_nothing(tmp_path
     (tmp_path / WORKFLOW).parent.mkdir(parents=True)
     (tmp_path / WORKFLOW).write_text(WORKFLOW_MAIN, encoding="utf-8")
     asked: list[str] = []
-    monkeypatch.setattr(pins.forge, "api", lambda path: asked.append(path) or {"status": "ahead"})
+    monkeypatch.setattr(
+        pins.forge, "api", lambda path, **kwargs: asked.append(path) or {"status": "ahead"}
+    )
     note = "branch points to commit 5e08088c776c"
     lost = pins.Finding(WORKFLOW, 99, f"{WORKFLOW}:99: x: {note}", note)
     other = pins.Finding(WORKFLOW, 23, f"{WORKFLOW}:23: x: points to unknown ref", "")
@@ -754,7 +894,90 @@ def test_branch_finding_without_its_call_keeps_finding_and_asks_nothing(tmp_path
     ]
 
 
+def test_two_uses_on_one_line_keeps_finding_and_asks_no_compare(tmp_path, monkeypatch):
+    """When more than one use sits on one line, finding is kept and no compare is asked."""
+    content = (
+        "name: Flow\n"
+        "on: workflow_dispatch\n"
+        "jobs:\n"
+        "  j:\n"
+        '    steps: [{uses: "actions/checkout@v4"}, {uses: "actions/checkout@v4"}]\n'
+    )
+    (tmp_path / WORKFLOW).parent.mkdir(parents=True)
+    (tmp_path / WORKFLOW).write_text(content, encoding="utf-8")
+    asked: list[str] = []
+    monkeypatch.setattr(
+        pins.forge, "api", lambda path, **kw: asked.append(path) or {"status": "ahead"}
+    )
+    note = "branch points to commit 5e08088c776c"
+    finding = pins.Finding(WORKFLOW, 5, f"{WORKFLOW}:5: uses: {note}", note)
+    documents = pins.ciwf.files(tmp_path)
+    kept, lagging = pins._judge_branches(tmp_path, documents, [finding])
+    assert lagging == 0
+    assert asked == []
+    assert len(kept) == 1
+    assert (
+        kept[0].text
+        == f"{finding.text}; the forge compare was not asked: more than one use on this line"
+    )
+
+
+def test_aliased_step_keeps_finding_and_asks_no_compare(tmp_path, monkeypatch):
+    """A step reused through a YAML alias gives two uses on the anchor's line; none is judged."""
+    content = (
+        "name: Flow\n"
+        "on: workflow_dispatch\n"
+        "jobs:\n"
+        "  a:\n"
+        "    runs-on: ubuntu-24.04\n"
+        "    steps:\n"
+        "      - &step\n"
+        f"        uses: {ACTION_LICENCE}@{SHARED} # main\n"
+        "  b:\n"
+        "    runs-on: ubuntu-24.04\n"
+        "    steps:\n"
+        "      - *step\n"
+    )
+    (tmp_path / WORKFLOW).parent.mkdir(parents=True)
+    (tmp_path / WORKFLOW).write_text(content, encoding="utf-8")
+    asked: list[str] = []
+    monkeypatch.setattr(
+        pins.forge, "api", lambda path, **kw: asked.append(path) or {"status": "ahead"}
+    )
+    note = "branch points to commit 5e08088c776c"
+    finding = pins.Finding(WORKFLOW, 8, f"{WORKFLOW}:8: uses: {note}", note)
+    kept, lagging = pins._judge_branches(tmp_path, pins.ciwf.files(tmp_path), [finding])
+    assert (lagging, asked) == (0, [])
+    assert [k.text for k in kept] == [
+        f"{finding.text}; the forge compare was not asked: more than one use on this line"
+    ]
+
+
+def test_branch_compare_receives_token_from_zizmor_github_token(monkeypatch):
+    """With only ZIZMOR_GITHUB_TOKEN set, the compare call receives that token."""
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("ZIZMOR_GITHUB_TOKEN", "fake-token-for-test")
+    assert pins._token() == "fake-token-for-test"
+
+    received_tokens: list[str | None] = []
+
+    def spy_api(path: str, *, token: str | None = None) -> object:
+        """Spy recording token parameter passed to forge API."""
+        received_tokens.append(token)
+        if "matching-refs" in path:
+            return []
+        return {"status": "ahead"}
+
+    monkeypatch.setattr(pins.forge, "api", spy_api)
+    call = pins.Call(23, f"{ACTION_LICENCE}@{SHARED}", True, {}, " main ")
+    drop, _ = pins._branch_status(call, token=pins._token())
+    assert drop is True
+    assert received_tokens == ["fake-token-for-test", "fake-token-for-test"]
+
+
 def test_branch_comment_at_branch_head_passes_without_compare(tree):
+    """A commit at the branch head passes without asking forge compare."""
     engine = {
         "releases": {k: v for k, v in RELEASES.items() if SHARED not in k},
         "branches": {ACTION_LICENCE: {"main": SHARED}},
@@ -765,6 +988,7 @@ def test_branch_comment_at_branch_head_passes_without_compare(tree):
 
 
 def test_tag_mismatch_asks_no_compare(tree):
+    """A release tag mismatch asks no compare call to the forge."""
     done = run(
         tree,
         workflow=planted(CALL, CALL.replace(f"{SHARED} # v1.2.0", f"{SHARED} # v1.1.9")),
@@ -784,13 +1008,28 @@ def test_tag_mismatch_asks_no_compare(tree):
 
 
 def test_pin_on_diverged_branch_fails_and_leaves_file_unchanged(tree):
-    answers = {**ANSWERS, COMPARE_PATH: {"status": "diverged"}}
+    """pin on diverged branch fails and leaves the workflow file unchanged."""
+    answers = {**ANSWERS, TAGS_PATH: [], COMPARE_PATH: {"status": "diverged"}}
     done = run(tree, command="pin", workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
     assert done.returncode == 1, done.stdout
     assert (tree.root / WORKFLOW).read_text(encoding="utf-8") == WORKFLOW_MAIN
 
 
+def test_pin_rewrite_to_branch_comment_judges_fresh_document_and_passes(tree):
+    """pin on a tree whose fix pass writes @commit # main and rescan finds branch ahead passes."""
+    workflow = planted(CALL, f"    uses: {ACTION_LICENCE}@main\n")
+    engine = {
+        "tags": {**TAGS, f"{ACTION_LICENCE}@main": [SHARED, "main"]},
+        "branches": {ACTION_LICENCE: {"main": MAIN_HEAD}},
+    }
+    answers = {**ANSWERS, TAGS_PATH: [], COMPARE_PATH: {"status": "ahead"}}
+    done = run(tree, command="pin", workflow=workflow, answers=answers, engine=engine)
+    assert done.returncode == 0, done.stderr
+    assert "1 behind its branch head on its history" in done.stdout
+
+
 def test_branch_rule_exception_in_exceptions_yaml():
+    """exceptions.yaml holds the declared exception for branch comment history check."""
     exceptions_data = yaml.safe_load((ROOT / "exceptions.yaml").read_text(encoding="utf-8"))
     entries = [
         e
