@@ -177,7 +177,7 @@ equal to what the train asks the forge for.
 | `apps/` | manifests of the forge apps the workflows use, with their computed rights ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md)) |
 | `interface.lock.json` | recorded interface of every workflow and action |
 | `hosts.toml` | hosts and outside actions the workflows may reach; a host without a switch has a day it ends and a MEL category ([ADR-0073](docs/adr/0073-suppressions-name-a-mel-category.md)); a host for public repositories only is marked ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)), and its workflow refuses another repository in a job of its own ([ADR-0015](docs/adr/0015-refusal-outside-a-public-repository-is-a-failed-job.md)) that runs on every call and is given the visibility and every such input ([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)) |
-| `exceptions.yaml` | exceptions to rules no other list can carry, each with its issue and a day it ends ([ADR-0007](docs/adr/0007-one-own-exception-list.md)) |
+| `exceptions.yaml` | exceptions to rules no other list can carry, each with its issue, a MEL category and a day it ends ([ADR-0007](docs/adr/0007-one-own-exception-list.md), [ADR-0073](docs/adr/0073-suppressions-name-a-mel-category.md)) |
 | `docs/adr/` | decision records |
 
 ## Gate

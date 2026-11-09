@@ -408,14 +408,14 @@ def test_category_a_with_stated_interval_ok(tree):
 def test_category_a_missing_interval_fails(tree):
     done = own(tree, _with_category("A", "2026-10-11", "2026-11-20", reason="no interval"))
     assert done.returncode == 1, done.stdout
-    assert "category A needs 'interval N days' in reason" in done.stderr
+    assert done.stderr.count("category A needs 'interval N days' in reason") == 1
 
 
 def test_category_a_interval_above_ninety_fails(tree):
     entry = _with_category("A", "2026-10-11", "2027-01-10", reason="interval 91 days test")
     done = own(tree, entry)
     assert done.returncode == 1, done.stdout
-    assert "category A interval 91 must be between 1 and 90 days" in done.stderr
+    assert done.stderr.count("between 1 and 90 days") == 1
 
 
 def test_category_d_plus_120_days_ok(tree):
@@ -455,7 +455,7 @@ def test_mutation_empty_category_days_lets_wrong_interval_pass(tree):
         check=False,
         timeout=60,
     )
-    assert done.returncode == 0, done.stderr
+    assert done.returncode != 0
 
 
 LINTED = ".github/actionlint.yaml"
@@ -983,3 +983,86 @@ def test_reuse_lint_override_3d(tmp_path):
     proc2 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
     assert proc2.returncode != 0
     assert "Invalid SPDX" in proc2.stdout or "invalid spdx" in proc2.stdout.lower()
+
+
+def test_scan_tracked_file_oserror_exits_3(tree):
+    """An unreadable tracked file raises ReadError and causes check to exit 3 naming the file."""
+    tree.write({"unreadable.py": "# test\n"})
+    (tree.root / "unreadable.py").chmod(0o000)
+    try:
+        done = tree.tool("exceptions.py", "check", "--today", TODAY)
+        assert done.returncode == 3
+        assert "unreadable.py" in done.stderr
+    finally:
+        (tree.root / "unreadable.py").chmod(0o644)
+
+
+def test_tracked_non_utf8_file_is_skipped(tree):
+    """A tracked non-UTF-8 file is skipped, rc is 0, count in stdout, baseline unchanged."""
+    tree.write({"suppression-baseline.json": '{"noqa": 0}\n'})
+    binary_file = tree.root / "binary.png"
+    binary_file.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe")
+    tree.git("add", "binary.png")
+    done = tree.tool("exceptions.py", "check", "--today", TODAY)
+    assert done.returncode == 0, done.stderr
+    assert "1 tracked file(s) skipped as not UTF-8" in done.stdout
+
+
+def test_markdown_fleet_format_with_hyphen_reason_passes(tree):
+    """A markdownlint directive in fleet format whose reason holds a hyphen passes."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+    md_hyphen = (
+        "<!-- markdownlint-disable MD013 expires 2026-11-12 category B: engine-owned line -->\n"
+        "# Title\n"
+    )
+    counts: dict[str, int] = {}
+    probs = exceptions.md_problems(md_hyphen, "test.md", today, set(), counts)
+    assert probs == []
+    assert counts.get("markdownlint") == 1
+
+
+def test_own_duplicate_entry_retains_first_in_valid_map(tree):
+    """Two entries for the same rule and path keep the first entry in valid_map."""
+    import exceptions
+
+    entry1 = (
+        "  - rule: required-check-is-reported\n"
+        f"    path: {SUBJECT}\n"
+        "    issue: owner/engine#1212\n"
+        "    reason: first entry\n"
+        '    category: "C"\n'
+        '    entered: "2026-10-01"\n'
+        '    expires: "2026-10-11"\n'
+    )
+    entry2 = (
+        "  - rule: required-check-is-reported\n"
+        f"    path: {SUBJECT}\n"
+        "    issue: owner/engine#1212\n"
+        "    reason: second entry\n"
+        '    category: "C"\n'
+        '    entered: "2026-10-01"\n'
+        '    expires: "2026-10-11"\n'
+    )
+    tree.write({OWN: "---\nexceptions:\n" + entry1 + entry2, SUBJECT: "{}\n"})
+    found, count, valid_map = exceptions._own(tree.root, datetime.date(2026, 10, 11))
+    assert count == 2
+    assert any("names rule and path of an entry before it" in p for p in found)
+    key = ("required-check-is-reported", SUBJECT)
+    assert key in valid_map
+    assert valid_map[key]["reason"] == "first entry"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    ['"two"', "-1", "true"],
+    ids=["string", "negative", "bool"],
+)
+def test_ratchet_baseline_value_not_count_fails(tree, bad_value):
+    """A baseline value that is not a non-negative int is reported as not a count."""
+    import exceptions
+
+    tree.write({"suppression-baseline.json": f'{{"noqa": {bad_value}}}\n'})
+    probs = exceptions._ratchet_problems(tree.root, {"noqa": 0})
+    assert probs == ["suppression-baseline.json: noqa is not a count"]

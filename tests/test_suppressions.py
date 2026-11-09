@@ -68,6 +68,7 @@ ACCEPTED_BOUNDARIES: list[tuple[str, str]] = [
         "# {sg}: rule-one, rule-two expires 2026-11-12 category B: valid test reason\n",
     ),
     ("nosec-two-ids", "# nosec B101, B102 expires 2026-11-12 category B: valid test reason\n"),
+    ("nosec-hash-expiry", "# nosec B602 # expires 2026-11-12 category B: valid test reason\n"),
     ("split-word-string", 'TEXT = "no" + "semgrep"\n'),
     ("nosec-in-string", 'TEXT = "# nosec"\n'),
     ("own-line-prose", "# This helper explains why {sg} is not used here.\n"),

@@ -93,7 +93,7 @@ MARKDOWNLINT_FLEET = re.compile(
     r"^<!--\s*markdownlint-disable(?:-line|-next-line|-file)?(?::)?\s*"
     r"(?P<rules>[A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)"
     r"\s+expires\s+(?P<day>\d{4}-\d{2}-\d{2})"
-    r"\s+category\s+(?P<cat>[A-Z]):\s+(?P<why>[^->]+?)\s*-->$"
+    r"\s+category\s+(?P<cat>[A-Z]):\s+(?P<why>.+?)\s*-->$"
 )
 
 SHELLCHECK_FLEET = re.compile(
@@ -128,6 +128,21 @@ def _reason_problem(why: str) -> str:
     return ""
 
 
+def category_interval(category: str, reason: str) -> tuple[int | None, str]:
+    """Compute and validate interval in days for a category and reason."""
+    if category in CATEGORY_DAYS:
+        return CATEGORY_DAYS[category], ""
+    if category != "A":
+        return None, f"category `{category}` is not one of A, B, C, D"
+    match = INTERVAL_PATTERN.search(reason)
+    if not match:
+        return None, "category A needs 'interval N days' in reason"
+    interval = int(match.group(1))
+    if 1 <= interval <= 90:
+        return interval, ""
+    return None, f"category A interval {interval} must be between 1 and 90 days"
+
+
 def category_problem(
     day: datetime.date,
     category: str,
@@ -137,36 +152,17 @@ def category_problem(
     """Why an expiration day is refused under fleet MEL rules; empty when valid."""
     if day < today:
         return f"expired on {day}"
-    if category not in ("A", "B", "C", "D"):
-        return f"category `{category}` is not one of A, B, C, D"
-    if category == "A":
-        match = INTERVAL_PATTERN.search(reason)
-        if not match:
-            return "category A needs 'interval N days' in reason"
-        interval = int(match.group(1))
-        if interval < 1 or interval > 90:
-            return f"category A interval {interval} must be between 1 and 90 days"
-    else:
-        interval = CATEGORY_DAYS.get(category, 120)
+    interval, prob = category_interval(category, reason)
+    if prob:
+        return prob
+    if interval is None:
+        return f"category `{category}` has no interval"
     if day - today > datetime.timedelta(days=interval):
         return f"ends on {day}, more than {interval} days ahead"
     return ""
 
 
-def day_problem(
-    day: datetime.date,
-    today: datetime.date,
-    longest: datetime.timedelta = datetime.timedelta(days=90),
-) -> str:
-    """Why a day an exception ends on is refused; empty when it holds."""
-    if day < today:
-        return f"expired on {day}"
-    if day - today > longest:
-        return f"ends on {day}, more than {longest.days} days ahead"
-    return ""
-
-
-def _check_fleet_match(match: re.Match[str], kind: str, today: datetime.date) -> str:
+def _check_fleet_match(match: re.Match[str], today: datetime.date) -> str:
     """Check reason, category and expiry from a matched fleet directive."""
     why_prob = _reason_problem(match.group("why"))
     if why_prob:
@@ -221,7 +217,7 @@ def _findings(root: Path, today: datetime.date) -> tuple[list[str], int]:
                 "`# expires YYYY-MM-DD category <A|B|C|D>: reason`"
             )
             continue
-        prob = _check_fleet_match(stated[entry], "config", today)
+        prob = _check_fleet_match(stated[entry], today)
         if prob:
             found.append(f"{CONFIG}: {rule} for {entry} {prob}")
     return found, len(wanted)
@@ -253,7 +249,7 @@ def _actionlint(root: Path, today: datetime.date) -> tuple[list[str], int]:
                     f"{where}: '{entry}' has no `# expires YYYY-MM-DD category <A|B|C|D>: reason`"
                 )
                 continue
-            prob = _check_fleet_match(stated[entry], "actionlint", today)
+            prob = _check_fleet_match(stated[entry], today)
             if prob:
                 found.append(f"{where}: '{entry}' {prob}")
     return found, count
@@ -315,27 +311,9 @@ def _ruff(root: Path, today: datetime.date) -> tuple[list[str], int]:
             found.append(f"{where} is no one file of the repository")
         if key not in stated:
             found.append(f"{where} has no `# expires YYYY-MM-DD category <A|B|C|D>: reason`")
-        elif prob := _check_fleet_match(stated[key], "ruff", today):
+        elif prob := _check_fleet_match(stated[key], today):
             found.append(f"{where} {prob}")
     return found, len(per_file)
-
-
-def _entry_interval(entry: dict, cat: str, found: list[str]) -> int | None:
-    """Compute and validate interval in days for an exception entry."""
-    if cat in CATEGORY_DAYS:
-        return CATEGORY_DAYS[cat]
-    if cat != "A":
-        return None
-    reason = str(entry.get("reason", ""))
-    match = INTERVAL_PATTERN.search(reason)
-    if not match:
-        found.append("category A needs 'interval N days' in reason")
-        return None
-    interval = int(match.group(1))
-    if 1 <= interval <= 90:
-        return interval
-    found.append(f"category A interval {interval} must be between 1 and 90 days")
-    return None
 
 
 def _parse_entry_date(val: object, field: str, found: list[str]) -> datetime.date | None:
@@ -374,7 +352,13 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
         if "expires" not in empty
         else None
     )
-    interval = _entry_interval(entry, str(cat), found) if isinstance(cat, str) else None
+    interval, interval_prob = (
+        category_interval(str(cat), str(entry.get("reason", "")))
+        if isinstance(cat, str) and cat in ("A", "B", "C", "D")
+        else (None, "")
+    )
+    if interval_prob:
+        found.append(interval_prob)
     if interval is not None and ent_d is not None and exp_d is not None:
         expected = ent_d + datetime.timedelta(days=interval)
         if exp_d != expected:
@@ -383,7 +367,7 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
             )
     if exp_d is not None and isinstance(cat, str) and cat in ("A", "B", "C", "D"):
         prob = category_problem(exp_d, cat, str(entry.get("reason", "")), today)
-        if prob:
+        if prob and prob != interval_prob:
             found.append(prob)
     return found
 
@@ -451,9 +435,10 @@ def _own(root: Path, today: datetime.date) -> tuple[list[str], int, dict[tuple[s
         key = (entry.get("rule"), entry.get("path")) if isinstance(entry, dict) else None
         if key in seen:
             found.append(f"{where} names rule and path of an entry before it")
-        seen.add(key)
-        if not entry_probs and key:
-            valid_map[key] = entry
+        else:
+            if not entry_probs and key:
+                valid_map[key] = entry
+            seen.add(key)
     return found, len(entries), valid_map
 
 
@@ -511,7 +496,7 @@ def _check_directive(
     """Check one inline comment directive against fleet format or covered exceptions."""
     match = pattern.match(comment)
     if match:
-        prob = _check_fleet_match(match, kind, today)
+        prob = _check_fleet_match(match, today)
         return [f"{where}: invalid {kind} suppression: {prob}"] if prob else []
     rules_match = re.match(rules_pattern, comment)
     if rules_match and _is_covered(rules_match.group(1), path, valid_exceptions):
@@ -659,7 +644,7 @@ def md_problems(
         counts["markdownlint"] = counts.get("markdownlint", 0) + 1
         match = MARKDOWNLINT_FLEET.search(line.strip())
         if match:
-            prob = _check_fleet_match(match, "markdownlint", today)
+            prob = _check_fleet_match(match, today)
             if prob:
                 problems.append(f"{where}: invalid markdownlint suppression: {prob}")
             continue
@@ -692,7 +677,7 @@ def sh_problems(
         counts["shellcheck"] = counts.get("shellcheck", 0) + 1
         match = SHELLCHECK_FLEET.search(line.strip())
         if match:
-            prob = _check_fleet_match(match, "shellcheck", today)
+            prob = _check_fleet_match(match, today)
             if prob:
                 problems.append(f"{where}: invalid shellcheck suppression: {prob}")
             continue
@@ -729,15 +714,17 @@ def _scan_tracked_file(
     today: datetime.date,
     valid_exceptions: set[tuple[str, str]],
     counts: dict[str, int],
-) -> list[str]:
+) -> tuple[list[str], int]:
     """Scan one tracked file for suppression directives and invalid patterns."""
     file_path = root / rel
     if not file_path.is_file():
-        return []
+        return [], 0
     try:
         text = file_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return []
+    except UnicodeDecodeError:
+        return [], 1
+    except OSError as err:
+        raise ciwf.ReadError(f"{rel}: {err}") from err
     file_probs = _reuse_problems(rel, text)
     if rel == ".codacy.yml":
         file_probs.extend(f"{rel}: {p}" for p in codacy_problems(text))
@@ -749,20 +736,23 @@ def _scan_tracked_file(
         file_probs.extend(md_problems(text, rel, today, valid_exceptions, counts))
     elif rel.endswith((".sh", ".bash")):
         file_probs.extend(sh_problems(text, rel, today, valid_exceptions, counts))
-    return file_probs
+    return file_probs, 0
 
 
 def _tree_directives(
     root: Path,
     today: datetime.date,
     valid_exceptions: set[tuple[str, str]],
-) -> tuple[list[str], dict[str, int]]:
+) -> tuple[list[str], dict[str, int], int]:
     """Scan all tracked files below root for directives and tally their counts by kind."""
     problems: list[str] = []
     counts: dict[str, int] = {}
+    skipped = 0
     for rel in _tracked_files(root):
-        problems.extend(_scan_tracked_file(rel, root, today, valid_exceptions, counts))
-    return problems, counts
+        file_probs, file_skipped = _scan_tracked_file(rel, root, today, valid_exceptions, counts)
+        problems.extend(file_probs)
+        skipped += file_skipped
+    return problems, counts, skipped
 
 
 def _ratchet_problems(root: Path, counts: dict[str, int]) -> list[str]:
@@ -779,6 +769,12 @@ def _ratchet_problems(root: Path, counts: dict[str, int]) -> list[str]:
     if not isinstance(baseline, dict):
         return [f"{BASELINE}: must be a JSON object"]
     problems = []
+    for kind in sorted(baseline.keys()):
+        val = baseline[kind]
+        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+            problems.append(f"{BASELINE}: {kind} is not a count")
+    if problems:
+        return problems
     for kind in sorted(counts.keys() | baseline.keys()):
         actual = counts.get(kind, 0)
         base = baseline.get(kind, 0)
@@ -789,16 +785,16 @@ def _ratchet_problems(root: Path, counts: dict[str, int]) -> list[str]:
     return problems
 
 
-def problems(root: Path, today: datetime.date) -> tuple[list[str], int, int]:
+def problems(root: Path, today: datetime.date) -> tuple[list[str], int, int, int]:
     """What is wrong in the four places and tracked files, and how many entries they hold."""
     findings, accepted = _findings(root, today)
     linted, ignored = _actionlint(root, today)
     ruffed, ruff_count = _ruff(root, today)
     own, excepted, valid_map = _own(root, today)
-    tree_probs, counts = _tree_directives(root, today, set(valid_map.keys()))
+    tree_probs, counts, skipped = _tree_directives(root, today, set(valid_map.keys()))
     ratchet_probs = _ratchet_problems(root, counts)
     all_problems = findings + linted + ruffed + own + tree_probs + ratchet_probs
-    return all_problems, accepted + ignored + ruff_count, excepted
+    return all_problems, accepted + ignored + ruff_count, excepted, skipped
 
 
 def main() -> int:
@@ -809,7 +805,7 @@ def main() -> int:
     parser.add_argument("--today", type=datetime.date.fromisoformat, default=datetime.date.today())
     args = parser.parse_args()
     try:
-        found, accepted, excepted = problems(args.root, args.today)
+        found, accepted, excepted, skipped = problems(args.root, args.today)
     except (ciwf.ReadError, ValueError) as err:
         ciwf.complain(f"ERROR: {err}")
         return 3
@@ -817,10 +813,11 @@ def main() -> int:
         ciwf.complain(f"FAIL: {line}")
     if found:
         return 1
-    max_days = max(CATEGORY_DAYS.values() or [120])
+    max_days = max(CATEGORY_DAYS.values())
+    skipped_text = f", {skipped} tracked file(s) skipped as not UTF-8" if skipped else ""
     ciwf.say(
         f"PASS: {accepted} accepted finding(s) and {excepted} exception(s), "
-        f"each with a reason and a day at most {max_days} days ahead"
+        f"each with a reason and a day at most {max_days} days ahead{skipped_text}"
     )
     return 0
 
