@@ -70,15 +70,15 @@ LINK = re.compile(r"blob/main/([^\s#)]+)")
 ANCHOR = re.compile(r"blob/main/([^\s#)]+)#L(\d+)(?:-L(\d+))?")
 
 EVIDENCE: dict[str, tuple[str, str]] = {
-    "tools/merge_train.py#L1217-L1246": (
+    "tools/merge_train.py#L1223-L1252": (
         "def app_jwt(",
         'return f"{signing_input}.{b64url(done.stdout)}"',
     ),
-    "tools/merge_train.py#L740": (
+    "tools/merge_train.py#L746": (
         "if hashlib.sha256(content).hexdigest() != sha:",
         "if hashlib.sha256(content).hexdigest() != sha:",
     ),
-    "tools/merge_train.py#L781": (
+    "tools/merge_train.py#L787": (
         "blob_sha = hashlib.sha1(",
         "blob_sha = hashlib.sha1(",
     ),

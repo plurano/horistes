@@ -461,14 +461,11 @@ def is_bot(pull):
     return isinstance(author, dict) and author.get("__typename") == "Bot"
 
 
-def commit_variables(env, conf, pull):
-    """Variables for MERGE and ARM; headline and body when squashing."""
-    base = {"id": pull["id"], "oid": pull["headRefOid"], "method": conf["method"]}
-    if conf["method"] != "SQUASH":
-        return base
+def signed_message(env, conf, pull):
+    """The headline and body for a signed pull request; raises when unsigned or invalid."""
     messages = pull_commits(env, pull["number"])
     try:
-        headline, body = squash_message(pull["title"], pull["number"], messages)
+        return squash_message(pull["title"], pull["number"], messages)
     except NoSignOffError as err:
         if pull["headRefName"].startswith(conf["dependency"]):
             raise UnsignedBotError(f"#{pull['number']}: {err}", SKIP_UNSIGNED) from err
@@ -477,11 +474,20 @@ def commit_variables(env, conf, pull):
         raise RefusedError(f"#{pull['number']}: {err}") from err
     except ValueError as err:
         raise RefusedError(f"#{pull['number']}: {err}") from err
+
+
+def commit_variables(env, conf, pull):
+    """Variables for MERGE and ARM; headline and body when squashing."""
+    headline, body = signed_message(env, conf, pull)
+    base = {"id": pull["id"], "oid": pull["headRefOid"], "method": conf["method"]}
+    if conf["method"] != "SQUASH":
+        return base
     return {**base, "headline": headline, "body": body}
 
 
 def land(env, conf, pull, queue):
     if queue:
+        signed_message(env, conf, pull)
         data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
         if not data["enqueuePullRequest"]["mergeQueueEntry"]:
             raise RefusedError(f"#{pull['number']}: no merge queue entry")
