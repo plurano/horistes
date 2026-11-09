@@ -40,6 +40,13 @@ CLEAN = f"fix(x): mend a thing\n\nThe body says why.\n\n{SIGN_OFF}\n"
 CO_AUTHOR = "Co-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>"
 PLANTED = f"{CLEAN}{CO_AUTHOR}\n"
 SPACED = "message file.txt"
+# A name that runs `touch planted` when a shell line pastes it inside single quotes.
+HOSTILE = "a'$(touch planted)'b c.txt"
+UNQUOTED = "MESSAGE_FILE={1} make --no-print-directory check-message"
+QUOTED = "MESSAGE_FILE='{1}' make --no-print-directory check-message"
+OTHER = "Other Person <other@example.org>"
+OTHER_CLEAN = CLEAN.replace(SIGN_OFF, f"Signed-off-by: {OTHER}")
+UNSIGNED = "Merge branch 'side'\n"
 LINKED = ("Makefile", "pyproject.toml", "requirements", "tests", "tools")
 # Links, a shell stub and lefthook's shell lines need a POSIX system.
 POSIX_SHELL = pytest.mark.skipif(
@@ -94,8 +101,29 @@ def hook(
     )
 
 
-def test_job_names_the_message_file_in_quotes():
-    assert RUN == "MESSAGE_FILE='{1}' make --no-print-directory check-message"
+def test_job_reads_the_message_file_from_a_quoted_here_document():
+    assert RUN == (
+        "MESSAGE_FILE=$(cat <<'GIT_ARGUMENT'\n{1}\nGIT_ARGUMENT\n"
+        ") make --no-print-directory check-message\n"
+    )
+
+
+@POSIX_SHELL
+def test_message_file_name_with_shell_syntax_is_one_literal_path(tmp_path):
+    tree = planted(tmp_path)
+    done = hook(tree, CLEAN, name=HOSTILE)
+    output = done.stdout + done.stderr
+    assert done.returncode == 0, output
+    assert "1 passed" in output, output
+    assert not (tree.root / "planted").exists()
+
+
+@POSIX_SHELL
+def test_planted_single_quoted_file_runs_shell_syntax_in_the_name(tmp_path):
+    tree = planted(tmp_path, QUOTED)
+    done = hook(tree, CLEAN, name=HOSTILE)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert (tree.root / "planted").exists()
 
 
 @POSIX_SHELL
@@ -152,7 +180,7 @@ def test_sign_off_of_another_author_is_refused(tmp_path):
 
 @POSIX_SHELL
 def test_planted_unquoted_file_splits_at_the_space(tmp_path):
-    done = hook(planted(tmp_path, RUN.replace("'{1}'", "{1}")), CLEAN)
+    done = hook(planted(tmp_path, UNQUOTED), CLEAN)
     assert done.returncode != 0, done.stdout + done.stderr
 
 
@@ -217,16 +245,37 @@ def test_check_message_refuses_a_stale_stamp(tmp_path):
     assert "run make tools" in output
 
 
-def commit(tree: Tree, message: str) -> subprocess.CompletedProcess[str]:
-    """`git commit -F` of one new file in the planted repository, hooks installed."""
+def install(tree: Tree) -> dict[str, str]:
+    """Install the planted repository's hooks; return the environment to run git in."""
     env = environment(tree)
+    subprocess.run(
+        ["lefthook", "install"],
+        cwd=tree.root,
+        env=env,
+        check=True,
+        timeout=DEADLINE,
+        capture_output=True,
+    )
+    return env
+
+
+def commit(tree: Tree, message: str, *options: str) -> subprocess.CompletedProcess[str]:
+    """`git commit -F` of one changed file in the planted repository, hooks installed.
+
+    `options` go to git commit, as `--author` or `--amend` do.
+    """
     tree.write({"message.txt": message, "file.txt": message})
-    for arguments in (["lefthook", "install"], ["git", "add", "file.txt"]):
-        subprocess.run(
-            arguments, cwd=tree.root, env=env, check=True, timeout=DEADLINE, capture_output=True
-        )
+    env = install(tree)
+    subprocess.run(
+        ["git", "add", "file.txt"],
+        cwd=tree.root,
+        env=env,
+        check=True,
+        timeout=DEADLINE,
+        capture_output=True,
+    )
     return subprocess.run(
-        ["git", "commit", "-q", "-F", "message.txt"],
+        ["git", "commit", "-q", *options, "-F", "message.txt"],
         cwd=tree.root,
         env=env,
         capture_output=True,
@@ -254,3 +303,98 @@ def test_git_commit_runs_the_judge(tmp_path, message, lands):
     )
     assert (done.returncode == 0) is lands, done.stdout + done.stderr
     assert (head.returncode == 0) is lands
+
+
+@POSIX_SHELL
+@pytest.mark.parametrize(
+    ("message", "lands"),
+    [(OTHER_CLEAN, True), (CLEAN, False)],
+    ids=["author-signs", "committer-signs"],
+)
+def test_git_commit_judges_the_author_option(tmp_path, message, lands):
+    done = commit(planted(tmp_path), message, f"--author={OTHER}")
+    output = done.stdout + done.stderr
+    assert (done.returncode == 0) is lands, output
+    assert lands or "is not the author other@example.org" in output
+
+
+@POSIX_SHELL
+@pytest.mark.parametrize(
+    ("message", "lands"),
+    [(OTHER_CLEAN, True), (CLEAN, False)],
+    ids=["author-signs", "committer-signs"],
+)
+def test_git_commit_amend_judges_the_author_it_keeps(tmp_path, message, lands):
+    tree = planted(tmp_path)
+    first = commit(tree, OTHER_CLEAN, f"--author={OTHER}")
+    assert first.returncode == 0, first.stdout + first.stderr
+    done = commit(tree, message, "--amend")
+    output = done.stdout + done.stderr
+    assert (done.returncode == 0) is lands, output
+    assert lands or "is not the author other@example.org" in output
+
+
+def git_in(tree: Tree, env: dict[str, str], *arguments: str) -> subprocess.CompletedProcess[str]:
+    """One git call in the planted repository with the hooks' environment."""
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=tree.root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=DEADLINE,
+        check=False,
+    )
+
+
+def ran(done: subprocess.CompletedProcess[str]) -> subprocess.CompletedProcess[str]:
+    """The finished call, after checking it exited 0."""
+    assert done.returncode == 0, (done.args, done.stdout + done.stderr)
+    return done
+
+
+def two_branches(tmp_path: Path) -> tuple[Tree, dict[str, str]]:
+    """A planted repository on main; main and side each add one file after the first commit."""
+    tree = planted(tmp_path)
+    ran(commit(tree, CLEAN))
+    env = install(tree)
+    ran(git_in(tree, env, "checkout", "-q", "-b", "side"))
+    tree.write({"side.txt": "side\n"})
+    ran(git_in(tree, env, "add", "side.txt"))
+    ran(git_in(tree, env, "commit", "-q", "-F", "message.txt"))
+    ran(git_in(tree, env, "checkout", "-q", "main"))
+    tree.write({"main.txt": "main\n"})
+    ran(git_in(tree, env, "add", "main.txt"))
+    ran(git_in(tree, env, "commit", "-q", "-F", "message.txt"))
+    return tree, env
+
+
+def parent_count(tree: Tree, env: dict[str, str]) -> int:
+    """How many parents HEAD has."""
+    line = ran(git_in(tree, env, "rev-list", "--parents", "-n", "1", "HEAD")).stdout
+    return len(line.split()) - 1
+
+
+@POSIX_SHELL
+def test_git_merge_of_a_clean_merge_without_sign_off_passes(tmp_path):
+    tree, env = two_branches(tmp_path)
+    done = git_in(tree, env, "merge", "--no-ff", "-q", "-m", UNSIGNED, "side")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert parent_count(tree, env) == 2
+
+
+@POSIX_SHELL
+@pytest.mark.parametrize(
+    ("own", "lands"), [(False, True), (True, False)], ids=["clean", "own-content"]
+)
+def test_git_commit_of_a_merge_without_sign_off_judges_its_tree(tmp_path, own, lands):
+    tree, env = two_branches(tmp_path)
+    ran(git_in(tree, env, "merge", "--no-ff", "--no-commit", "-q", "side"))
+    tree.write({"message.txt": UNSIGNED, "extra.txt": "own content\n"})
+    if own:
+        ran(git_in(tree, env, "add", "extra.txt"))
+    done = git_in(tree, env, "commit", "-q", "-F", "message.txt")
+    output = done.stdout + done.stderr
+    assert (done.returncode == 0) is lands, output
+    assert parent_count(tree, env) == (2 if lands else 1)
+    assert lands or "no trailer Signed-off-by" in output
