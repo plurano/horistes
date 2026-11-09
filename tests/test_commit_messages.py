@@ -663,7 +663,7 @@ def test_range_with_a_message_not_in_utf8_is_a_judge_error(tmp_path):
     header = f"tree {tree}\nparent {base}\nauthor {person}\ncommitter {person}\n\n"
     # git commit-tree rewrites bytes that are not UTF-8; hash-object stores them as given.
     raw = header.encode("ascii") + f"fix: caf\xe9 bytes\n\n{SIGN_OFF}\n".encode("latin-1")
-    # nosemgrep: dangerous-subprocess-use-audit runs git hash-object with fixed argv in tmp_path
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs git hash-object
     made = subprocess.run(
         ["git", "-C", str(tmp_path), "hash-object", "-t", "commit", "-w", "--stdin"],
         input=raw,

@@ -85,7 +85,7 @@ def run_tool(
         "GIT_COMMITTER_EMAIL": "person@example.org",
         **(env or {}),
     }
-    # nosemgrep: dangerous-subprocess-use-audit runs tools/commit_message.py via sys.executable
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs the judge tool
     return subprocess.run(
         [sys.executable, *call_flags, tool, *arguments],
         cwd=repo,
