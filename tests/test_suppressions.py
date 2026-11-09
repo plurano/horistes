@@ -14,12 +14,19 @@ import pytest
 import yaml
 from conftest import ROOT
 
-NOSEMGREP_DIRECTIVE = re.compile(r"\bnosemgrep\b")
+# Opengrep 1.30.0 (Nosemgrep.ml) takes nosem, nosemgrep and noopengrep, in any
+# case, as one ignore word. On a line with code it reads the word anywhere in the
+# line; on the line above a finding, only when no letter or digit comes first.
+OPENGREP_IGNORE_WORD = r"\b(?:nosem|nosemgrep|noopengrep)\b"
+OPENGREP_AFTER_CODE = re.compile(OPENGREP_IGNORE_WORD, re.IGNORECASE)
+OPENGREP_OWN_LINE = re.compile(r"^[^a-zA-Z0-9]*\s*" + OPENGREP_IGNORE_WORD, re.IGNORECASE)
 NOSEMGREP_VALID = re.compile(
     r"^#\s*nosemgrep:\s*[A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*\s+[^,\n]*[A-Za-z][^,\n]*$"
 )
 
-NOSEC_DIRECTIVE = re.compile(r"\bnosec\b")
+# Bandit 1.9.4 (NOSEC_COMMENT in bandit/core/manager.py) takes a `#`, optional
+# space and lower-case `nosec` anywhere in a comment, even inside a longer word.
+NOSEC_DIRECTIVE = re.compile(r"#\s*nosec")
 NOSEC_VALID = re.compile(r"^#\s*nosec\s+B\d{3}(?:[ ,]+B\d{3})*\s*#\s*[^#\n]*[A-Za-z][^#\n]*$")
 
 PRUNE_DIRS = {
@@ -39,6 +46,13 @@ PLANTED_REFUSALS: list[tuple[str, str, str]] = [
     ("bare-nosec", "# nosec\n", "code"),
     ("nosec-no-reason", "# nosec B101\n", "code"),
     ("nosec-reason-no-id", "# nosec # reason without id\n", "code"),
+    ("nosem-alias", "# nosem\n", "code"),
+    ("noopengrep-alias", "# noopengrep: rule-id valid test reason\n", "code"),
+    ("upper-case-nosemgrep", "# NOSEMGREP: rule-id valid test reason\n", "code"),
+    ("word-first-prose", "# nosemgrep is not wanted here\n", "code"),
+    ("prose-after-code", "run(cmd)  # we avoid nosemgrep here\n", "code"),
+    ("nosec-in-longer-word", "x = 1  # nosecurity\n", "code"),
+    ("nosec-after-second-hash", "x = 1  # note # nosec\n", "code"),
     (
         "engine-exclude",
         "engines:\n  opengrep:\n    exclude_paths:\n      - 'tests/a.py'\n",
@@ -51,7 +65,21 @@ ACCEPTED_BOUNDARIES: list[tuple[str, str]] = [
     ("nosemgrep-two-ids", "# nosemgrep: rule-one, rule-two valid test reason\n"),
     ("nosec-two-ids", "# nosec B101, B102 # valid test reason\n"),
     ("string-literal", 'TEXT = "# nosemgrep bare inside string literal"\n'),
+    ("own-line-prose", "# This helper explains why nosemgrep is not used here.\n"),
+    ("nosec-prose", "x = 1  # see the nosec docs before adding one\n"),
+    ("nosec-upper-case", "x = 1  # NOSEC\n"),
 ]
+
+
+def comment_problems(comment: str, after_code: bool, where: str) -> list[str]:
+    """Read one comment as opengrep and Bandit read it; refuse a suppression without a reason."""
+    problems: list[str] = []
+    opengrep = OPENGREP_AFTER_CODE if after_code else OPENGREP_OWN_LINE
+    if opengrep.search(comment) and not NOSEMGREP_VALID.match(comment):
+        problems.append(f"{where}: invalid nosemgrep suppression: {comment}")
+    if NOSEC_DIRECTIVE.search(comment) and not NOSEC_VALID.match(comment):
+        problems.append(f"{where}: invalid nosec suppression: {comment}")
+    return problems
 
 
 def suppression_problems(text: str, name: str) -> list[str]:
@@ -62,12 +90,9 @@ def suppression_problems(text: str, name: str) -> list[str]:
         for tok in tokens:
             if tok.type != tokenize.COMMENT:
                 continue
-            line = tok.start[0]
-            comment = tok.string.strip()
-            if NOSEMGREP_DIRECTIVE.search(comment) and not NOSEMGREP_VALID.match(comment):
-                problems.append(f"{name}:{line}: invalid nosemgrep suppression: {comment}")
-            if NOSEC_DIRECTIVE.search(comment) and not NOSEC_VALID.match(comment):
-                problems.append(f"{name}:{line}: invalid nosec suppression: {comment}")
+            after_code = bool(tok.line[: tok.start[1]].strip())
+            where = f"{name}:{tok.start[0]}"
+            problems.extend(comment_problems(tok.string.strip(), after_code, where))
     except tokenize.TokenError as err:
         problems.append(f"{name}:1: tokenize error: {err}")
     return problems
