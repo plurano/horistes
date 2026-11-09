@@ -23,18 +23,25 @@ download_bounds_valid() {
 }
 
 # run_with_deadline <seconds> <command> [arguments...]
-# runs the command and sends it TERM once the seconds pass; returns its status.
-# The watcher sets its TERM trap before it starts sleep and the trap stops every
-# job it started, so stopping the watcher at any point leaves no sleep behind.
+# runs the command and sends it TERM once the seconds pass, then KILL if it is
+# still running 5 seconds later; returns its status. The command thus ends at
+# most 5 seconds after its deadline. The watcher sets its TERM trap before it
+# starts sleep and the trap stops every job it started, so stopping the watcher
+# at any point leaves no sleep behind.
 run_with_deadline() {
-	local seconds="$1"
+	local seconds="$1" grace_seconds=5
 	shift
 	"$@" &
 	local child=$!
 	(
 		trap 'kill $(jobs -p) 2>/dev/null; exit 0' TERM
 		sleep "$seconds" &
-		wait "$!" && kill -TERM "$child" 2>/dev/null
+		wait "$!"
+		if kill -TERM "$child" 2>/dev/null; then
+			sleep "$grace_seconds" &
+			wait "$!"
+			kill -KILL "$child" 2>/dev/null
+		fi
 	) </dev/null >/dev/null 2>&1 &
 	local watcher=$! status=0
 	wait "$child" || status=$?
@@ -68,7 +75,8 @@ fetch_release_fallback() {
 	local -a statuses=(1 1)
 	# The if keeps errexit off for the pipeline. Both branches read PIPESTATUS:
 	# without pipefail the pipeline succeeds when only gh fails.
-	if run_with_deadline "$timeout_seconds" gh release download "$tag" --repo "$repo" --pattern "$asset" --output - |
+	# The host is named: without it gh takes GH_HOST or the checkout's remote host.
+	if run_with_deadline "$timeout_seconds" gh release download "$tag" --repo "github.com/$repo" --pattern "$asset" --output - |
 		head -c "$((max_bytes + 1))" >"$output"; then
 		statuses=("${PIPESTATUS[@]}")
 	else
@@ -93,7 +101,8 @@ fetch_release_fallback() {
 
 # fetch_verified <url> <expected-sha256> <max-bytes> <timeout-seconds> <output>
 # downloads url over HTTPS only and fails unless the file's SHA-256 matches.
-# timeout-seconds bounds curl with its retries, and again the fallback.
+# timeout-seconds bounds curl with its retries, and again the fallback; each
+# phase ends at most 5 seconds after its deadline (run_with_deadline).
 fetch_verified() {
 	local url="$1" expected="$2" max_bytes="$3" timeout_seconds="$4" output="$5" actual
 	if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then

@@ -103,6 +103,7 @@ fi
 
 GH_STUB_TEMPLATE = """#!/usr/bin/env python3
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -123,7 +124,7 @@ if (
     or args[1] != 'download'
     or args[2].startswith('-')
     or args[3] != '--repo'
-    or not args[4]
+    or not args[4].startswith('github.com/')
     or args[5] != '--pattern'
     or not args[6]
     or args[7] != '--output'
@@ -160,6 +161,13 @@ if mode == 'endless':
     sys.exit(0)
 
 if mode == 'hang':
+    time.sleep(float(os.environ.get('STUB_GH_HANG', '30')))
+    if fix_path:
+        out.write(Path(fix_path).read_bytes())
+    sys.exit(0)
+
+if mode == 'ignore_term':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(float(os.environ.get('STUB_GH_HANG', '30')))
     if fix_path:
         out.write(Path(fix_path).read_bytes())
@@ -213,6 +221,8 @@ def run_bash_cmd(
     cmd: list[str],
     bin_dir: Path,
     env_extra: dict[str, str] | None = None,
+    *,
+    timeout: float = 60,
 ) -> subprocess.CompletedProcess[str]:
     """Run bash command with fake bin on PATH."""
     env = os.environ.copy()
@@ -220,7 +230,9 @@ def run_bash_cmd(
     if env_extra:
         env.update(env_extra)
     # nosemgrep: dangerous-subprocess-use-audit callers pass fixed argv with stubs on PATH
-    return subprocess.run(cmd, env=env, capture_output=True, text=True, check=False, timeout=60)
+    return subprocess.run(
+        cmd, env=env, capture_output=True, text=True, check=False, timeout=timeout
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +647,7 @@ def test_fetch_verified_fallback_outage(tmp_path: Path) -> None:
         "download",
         "v1.7.7",
         "--repo",
-        "rhysd/actionlint",
+        "github.com/rhysd/actionlint",
         "--pattern",
         "actionlint_1.7.7_linux_amd64.tar.gz",
         "--output",
@@ -832,6 +844,16 @@ def test_bounds_that_are_not_plain_numbers_are_refused(
     assert not (got.logs_dir / "gh.log").exists()
 
 
+def sleeps_running(tmp_path: Path, seconds: str) -> list[int]:
+    """PIDs of running `sleep <seconds>` processes."""
+    listing = run_bash_cmd(["ps", "-eo", "pid=,args="], tmp_path)
+    return [
+        int(fields[0])
+        for fields in (line.split() for line in listing.stdout.splitlines())
+        if fields[1:] == ["sleep", seconds]
+    ]
+
+
 def test_run_with_deadline_leaves_no_sleep_behind(tmp_path: Path) -> None:
     """Stopping the deadline watcher at any point stops its sleep as well.
 
@@ -845,15 +867,62 @@ def test_run_with_deadline_leaves_no_sleep_behind(tmp_path: Path) -> None:
     )
     res = run_bash_cmd(["bash", "-c", script], tmp_path)
     assert res.returncode == 0, res.stderr
-    listing = run_bash_cmd(["ps", "-eo", "pid=,args="], tmp_path)
-    left = [
-        int(fields[0])
-        for fields in (line.split() for line in listing.stdout.splitlines())
-        if fields[1:] == ["sleep", seconds]
-    ]
+    left = sleeps_running(tmp_path, seconds)
     for pid in left:
         os.kill(pid, signal.SIGTERM)
     assert left == []
+
+
+def test_run_with_deadline_kills_a_command_that_ignores_term(tmp_path: Path) -> None:
+    """A command still running 5 seconds after TERM gets KILL, so the call ends."""
+    seconds = str(700 + secrets.randbelow(200))
+    script = (
+        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
+        f"run_with_deadline 1 bash -c 'trap \"\" TERM; exec sleep {seconds}'\n"
+    )
+    started = time.monotonic()
+    try:
+        res = run_bash_cmd(["bash", "-c", script], tmp_path, timeout=30)
+        elapsed = time.monotonic() - started
+    finally:
+        left = sleeps_running(tmp_path, seconds)
+        for pid in left:
+            os.kill(pid, signal.SIGKILL)
+    assert res.returncode == 128 + signal.SIGKILL, res.stderr
+    assert 5 <= elapsed < 15, elapsed
+    assert left == []
+
+
+def test_run_with_deadline_gives_a_command_time_to_clean_up(tmp_path: Path) -> None:
+    """A command that ends within 5 seconds of TERM returns its own status, not KILL's."""
+    seconds = str(700 + secrets.randbelow(200))
+    script = (
+        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
+        f"run_with_deadline 1 bash -c "
+        f"'trap \"kill \\$!; sleep 0.5; exit 7\" TERM; sleep {seconds} & wait'\n"
+    )
+    try:
+        res = run_bash_cmd(["bash", "-c", script], tmp_path, timeout=30)
+    finally:
+        left = sleeps_running(tmp_path, seconds)
+        for pid in left:
+            os.kill(pid, signal.SIGKILL)
+    assert res.returncode == 7, res.stderr
+    assert left == []
+
+
+def test_fetch_verified_fallback_gh_ignoring_term_is_killed(tmp_path: Path) -> None:
+    """A gh that ignores TERM is killed after the grace; the call fails instead of waiting."""
+    started = time.monotonic()
+    got = fetch_release(
+        tmp_path,
+        {"CURL_OUTAGE": "1", "STUB_GH_MODE": "ignore_term", "STUB_GH_HANG": "20"},
+        timeout_seconds="1",
+    )
+    assert got.res.returncode != 0
+    assert time.monotonic() - started < 15
+    assert f"gh release download for {RELEASE_URL} failed with status 137" in got.res.stderr
+    assert not got.output.exists()
 
 
 def test_install_gitleaks_outage_fallback(tmp_path: Path) -> None:

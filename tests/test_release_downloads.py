@@ -84,7 +84,7 @@ if (
     or args[1] != "download"
     or args[2].startswith("-")
     or args[3] != "--repo"
-    or not args[4]
+    or not args[4].startswith("github.com/")
     or args[5] != "--pattern"
     or not args[6]
     or args[7] != "--output"
@@ -310,7 +310,7 @@ def test_behaviour_outage_fallback(tmp_path: Path, step_entry: tuple) -> None:
         "download",
         tag,
         "--repo",
-        repo,
+        f"github.com/{repo}",
         "--pattern",
         asset,
         "--output",

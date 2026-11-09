@@ -24,7 +24,8 @@ inputs:
   timeout-seconds:
     description: >-
       Maximum time in seconds for curl with its retries, and again for the gh release download fallback;
-      one call takes at most twice this.
+      a command still running 5 seconds after its deadline is killed,
+      so one call takes at most twice this plus 10 seconds.
     required: false
     default: "120"
 

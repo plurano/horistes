@@ -35,16 +35,19 @@ of calling `fetch_verified` from `actions/verified-download/verified-download.sh
 - `fetch_verified` keeps its `curl` call unchanged. When that call fails and the URL is
   a forge release-download address whose owner, repository, tag and asset match an
   allow-list of plain names, `fetch_release_fallback` fetches the same asset with
-  `gh release download <tag> --repo <owner/repo> --pattern <asset> --output -`, which
-  reads the release through `api.github.com`. It prints a
+  `gh release download <tag> --repo github.com/<owner/repo> --pattern <asset> --output -`,
+  which reads the release through `api.github.com`. The host is named because `gh`
+  otherwise takes `GH_HOST` or the host of the checkout's remote. It prints a
   `::warning title=Release download fallback::` annotation naming the failed address.
 - `gh` writes to a pipe that `head -c` cuts one byte past the caller's byte bound, so
   an oversized asset stops at that size instead of filling the disk; a fetch over the
   bound, or one where `gh` or `head` fails, is refused and leaves no file.
 - `run_with_deadline`, a bash function built on `sleep` and `kill`, stops `curl` (with
   its retries) and `gh` each after the caller's timeout; GNU `timeout` is absent on
-  macOS runners. One call therefore takes at most twice `timeout-seconds`. Stopping
-  the watcher at any point also stops its `sleep`, so no process outlives the call.
+  macOS runners. It sends `TERM` at the deadline and `KILL` to a command still
+  running 5 seconds later, so one call takes at most twice `timeout-seconds` plus 10
+  seconds. Stopping the watcher at any point also stops its `sleep`, so no process
+  outlives the call.
 - `download_bounds_valid` refuses a byte bound or a timeout that is not a plain
   positive decimal before any arithmetic runs: bash arithmetic evaluates other text,
   command substitutions in array subscripts included. Both `fetch_verified` and
@@ -69,10 +72,11 @@ of calling `fetch_verified` from `actions/verified-download/verified-download.sh
 - `tests/test_installer_actions.py` runs the fallback against stub `curl` and `gh`:
   outage, healthy path, other host, lookalike host, plain HTTP, missing `gh`, wrong
   bytes, an endless asset cut at the bound, an asset exactly at the bound and one byte
-  over, failed `gh`, a `curl` and a `gh` that hang past the timeout, bounds that are
-  not plain numbers (command substitutions among them) at both entry points, and 100
+  over, failed `gh`, a `curl` and a `gh` that hang past the timeout, a `gh` that
+  ignores `TERM`, a command given time to clean up after `TERM`, bounds that are not
+  plain numbers (command substitutions among them) at both entry points, and 100
   deadline calls that leave no `sleep` behind. The `gh` stubs take the
-  `--output -` shape only.
+  `--output -` shape with a `github.com/` repository only.
 
 ## Consequences
 
