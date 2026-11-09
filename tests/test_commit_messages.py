@@ -180,7 +180,7 @@ def refused(repo: Path, base: str) -> dict[str, list[str]]:
     assert len(commits) <= MAX_COMMITS, f"more than {MAX_COMMITS} commits since {base}"
     found: dict[str, list[str]] = {}
     for sha in commits:
-        read = git(repo, "log", "-1", "--format=%ae%x00%P%x00%B", sha)
+        read = git(repo, "log", "-1", "--format=format:%ae%x00%P%x00%B", sha)
         author, parents, message = read.split("\x00", 2)
         too_long = oversize(message)
         if too_long:
@@ -538,20 +538,32 @@ def test_message_length_boundary():
     assert oversize(over) == [f"message of {MAX_MESSAGE + 1} characters, over {MAX_MESSAGE}"]
 
 
-def test_planted_oversize_message_is_refused(tmp_path):
-    """Boundary: a commit whose message git reports at MAX_MESSAGE passes; one over is refused."""
-    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
-    base = commit(tmp_path, GOOD)
+def plant_message(repo: Path, length: int) -> str:
+    """Commit a message git stores as exactly length characters, read back; the commit."""
     header = "feat(x): add\n\n"
     trailer = f"\n{SIGN_OFF}\n"
-    body_len = MAX_MESSAGE - len(header) - len(trailer) - 1
-    exact_msg = header + ("x" * body_len) + trailer
-    commit(tmp_path, exact_msg)
+    message = header + "x" * (length - len(header) - len(trailer)) + trailer
+    sha = commit(repo, message)
+    stored = git(repo, "cat-file", "commit", sha).split("\n\n", 1)[1]
+    assert (len(message), stored) == (length, message)
+    return sha
+
+
+@pytest.mark.parametrize("length", [MAX_MESSAGE - 1, MAX_MESSAGE], ids=["one under", "exact"])
+def test_planted_message_up_to_the_limit_passes(tmp_path, length):
+    """Boundary: a commit whose stored message is MAX_MESSAGE characters or fewer passes."""
+    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
+    base = commit(tmp_path, GOOD)
+    plant_message(tmp_path, length)
     assert refused(tmp_path, base) == {}
 
-    over_msg = header + ("x" * (body_len + 1)) + trailer
-    bad = commit(tmp_path, over_msg)
-    assert refused(tmp_path, "HEAD~1") == {
+
+def test_planted_oversize_message_is_refused(tmp_path):
+    """Boundary: a commit whose stored message is one character over MAX_MESSAGE is refused."""
+    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
+    base = commit(tmp_path, GOOD)
+    bad = plant_message(tmp_path, MAX_MESSAGE + 1)
+    assert refused(tmp_path, base) == {
         bad: [f"message of {MAX_MESSAGE + 1} characters, over {MAX_MESSAGE}"]
     }
 
