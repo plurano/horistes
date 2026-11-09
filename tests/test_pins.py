@@ -557,36 +557,33 @@ ALLOWED_REFS = [
 ]
 
 
-@pytest.mark.parametrize("ref", FORBIDDEN_REFS)
-def test_git_forbidden_refs_fail_bare_ref_check(ref):
-    """Git-forbidden ref names fail _bare_ref and agree with git check-ref-format."""
-    assert pins._bare_ref(ref) is False
+def _git_accepts(ref: str) -> bool:
+    """Whether git check-ref-format takes refs/heads/<ref>; the test is skipped without git."""
     git_bin = shutil.which("git")
     if git_bin is None:
         pytest.skip("git not on PATH")
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: git check-ref-format
     res = subprocess.run(
         [git_bin, "check-ref-format", f"refs/heads/{ref}"],
         capture_output=True,
         check=False,
         timeout=30,
     )
-    assert res.returncode != 0
+    return res.returncode == 0
+
+
+@pytest.mark.parametrize("ref", FORBIDDEN_REFS)
+def test_git_forbidden_refs_fail_bare_ref_check(ref):
+    """Git-forbidden ref names fail _bare_ref and agree with git check-ref-format."""
+    assert pins._bare_ref(ref) is False
+    assert not _git_accepts(ref)
 
 
 @pytest.mark.parametrize("ref", ALLOWED_REFS)
 def test_git_allowed_refs_pass_bare_ref_check(ref):
     """Git-allowed ref names pass _bare_ref and agree with git check-ref-format."""
     assert pins._bare_ref(ref) is True
-    git_bin = shutil.which("git")
-    if git_bin is None:
-        pytest.skip("git not on PATH")
-    res = subprocess.run(
-        [git_bin, "check-ref-format", f"refs/heads/{ref}"],
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
-    assert res.returncode == 0
+    assert _git_accepts(ref)
 
 
 RED_COMMENTS = [

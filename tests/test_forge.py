@@ -278,7 +278,7 @@ sys.stdout.write(json.dumps({"status": "ok"}))
     monkeypatch.setenv("SPY_LOG", str(spy_log))
     monkeypatch.setenv("GH_TOKEN", "caller-env-token")
 
-    res = forge.api("repos/x/y", token="fake-token-for-test")
+    res = forge.api("repos/x/y", token="fake-token-for-test")  # nosec B106 # expires 2027-03-09 category D: stand-in token for the gh spy
     assert res == {"status": "ok"}
     calls = [json.loads(line) for line in spy_log.read_text(encoding="utf-8").splitlines()]
     assert calls[-1]["token"] == "fake-token-for-test"
@@ -288,7 +288,7 @@ sys.stdout.write(json.dumps({"status": "ok"}))
     calls = [json.loads(line) for line in spy_log.read_text(encoding="utf-8").splitlines()]
     assert calls[-1]["token"] == "caller-env-token"
 
-    raw = forge.download("repos/x/y", token="fake-token-for-download")
+    raw = forge.download("repos/x/y", token="fake-token-for-download")  # nosec B106 # expires 2027-03-09 category D: stand-in token for the gh spy
     assert b"status" in raw
     calls = [json.loads(line) for line in spy_log.read_text(encoding="utf-8").splitlines()]
     assert calls[-1]["token"] == "fake-token-for-download"
