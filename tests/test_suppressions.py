@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import datetime
+import inspect
 import os
 from pathlib import Path
 
@@ -446,8 +447,9 @@ def test_suppression_problems_tokenize_error(text: str, name: str, expected_err_
 
 
 def test_reader_needs_a_date() -> None:
-    """A reader without a fixed date would judge dated rows against the wall clock."""
-    with pytest.raises(TypeError):
-        suppression_problems("x = 1\n", "test.py")
-    with pytest.raises(TypeError):
-        exceptions.comment_problems("# x", False, "test.py:1")
+    """A reader without a fixed date would judge dated rows against the wall clock,
+    so `today` has no default.
+    """
+    for reader in (suppression_problems, exceptions.comment_problems):
+        param = inspect.signature(reader).parameters["today"]
+        assert param.default is inspect.Parameter.empty
