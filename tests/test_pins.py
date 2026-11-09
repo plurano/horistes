@@ -675,8 +675,19 @@ def test_branch_comment_on_commit_in_branch_history_passes(tree, status):
                 f"repos/plurano/shared/compare/{SHARED}...main: gh: Not Found (HTTP 404)"
             ),
         ),
+        (["ahead"], "; the forge compare could not be read: answer is not a mapping"),
+        ({"status": 3}, "; the forge compare could not be read: status is not text"),
     ],
-    ids=["behind", "diverged", "unknown", "no-status", "error-500", "not-found"],
+    ids=[
+        "behind",
+        "diverged",
+        "unknown",
+        "no-status",
+        "error-500",
+        "not-found",
+        "not-a-mapping",
+        "status-not-text",
+    ],
 )
 def test_branch_comment_off_history_or_failing_compare_fails(tree, answer, reason):
     answers = dict(ANSWERS) if answer is None else {**ANSWERS, COMPARE_PATH: answer}
@@ -688,6 +699,59 @@ def test_branch_comment_off_history_or_failing_compare_fails(tree, answer, reaso
     assert failure.startswith(f"FAIL: {WORKFLOW}:23: ")
     assert "branch points to commit 5e08088c776c" in failure
     assert reason in failure
+
+
+@pytest.mark.parametrize(
+    ("uses", "comment", "reason"),
+    [
+        (f"plurano@{SHARED}", " main", "target is not owner/repo@commit"),
+        (f"{ACTION_LICENCE}@v1.2.0", " main", "target is not owner/repo@commit"),
+        (f"{ACTION_LICENCE}@{SHARED}", "  ", "no ref in comment"),
+        (f"{ACTION_LICENCE}@{SHARED}", None, "no ref in comment"),
+    ],
+    ids=["no-repo", "not-a-commit", "blank-comment", "no-comment"],
+)
+def test_branch_status_refuses_a_call_it_cannot_ask_about(monkeypatch, uses, comment, reason):
+    """A use with no owner/repo@commit or no ref keeps its finding and asks no compare."""
+    asked: list[str] = []
+    monkeypatch.setattr(pins.forge, "api", lambda path: asked.append(path) or {"status": "ahead"})
+    drop, said = pins._branch_status(pins.Call(23, uses, True, {}, comment))
+    assert drop is False
+    assert said == f"; the forge compare could not be read: {reason}"
+    assert asked == []
+
+
+def test_branch_status_asks_one_compare_for_a_branch_comment(monkeypatch):
+    """A commit use under a branch comment asks exactly its compare and drops on ahead."""
+    asked: list[str] = []
+    monkeypatch.setattr(pins.forge, "api", lambda path: asked.append(path) or {"status": "ahead"})
+    call = pins.Call(23, f"{ACTION_LICENCE}@{SHARED}", True, {}, " main ")
+    assert pins._branch_status(call) == (True, "")
+    assert asked == [COMPARE_PATH]
+
+
+def test_branch_finding_without_its_call_keeps_finding_and_asks_nothing(tmp_path, monkeypatch):
+    """A branch finding on a line holding no use stays; any other finding passes unchanged."""
+    (tmp_path / WORKFLOW).parent.mkdir(parents=True)
+    (tmp_path / WORKFLOW).write_text(WORKFLOW_MAIN, encoding="utf-8")
+    asked: list[str] = []
+    monkeypatch.setattr(pins.forge, "api", lambda path: asked.append(path) or {"status": "ahead"})
+    note = "branch points to commit 5e08088c776c"
+    lost = pins.Finding(WORKFLOW, 99, f"{WORKFLOW}:99: x: {note}", note)
+    other = pins.Finding(WORKFLOW, 23, f"{WORKFLOW}:23: x: points to unknown ref", "")
+    documents = pins.ciwf.files(tmp_path)
+    kept, lagging = pins._judge_branches(tmp_path, documents, [lost, other])
+    assert lagging == 0
+    assert asked == []
+    assert kept == [
+        pins.Finding(
+            WORKFLOW,
+            99,
+            f"{lost.text}; the forge compare could not be read: no call found",
+            note,
+        ),
+        other,
+    ]
 
 
 def test_branch_comment_at_branch_head_passes_without_compare(tree):
