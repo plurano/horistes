@@ -361,6 +361,17 @@ jobs:
           _REVIEW_HOLD = frozenset({"CHANGES_REQUESTED", "COMMENTED"})
 
 
+          def is_bot_dependency(pull, conf):
+              """Whether a pull request is a bot-authored dependency update."""
+              if not pull["headRefName"].startswith(conf["dependency"]):
+                  return False
+              author = pull.get("author")
+              if not isinstance(author, dict):
+                  return False
+              login = author.get("login") or ""
+              return author.get("__typename") == "Bot" or login.endswith("[bot]")
+
+
           def review_settle(pull, conf, now):
               """Why a person-authored PR waits for its reviews to settle, or None.
 
@@ -369,10 +380,10 @@ jobs:
               holds the PR from landing.  Bot PRs (dependency prefix AND bot author)
               skip this check.  Approved, dismissed, and pending reviews do not hold.
               """
+              if is_bot_dependency(pull, conf):
+                  return None
               author_field = pull.get("author") or {}
               pr_author = author_field.get("login", "") if isinstance(author_field, dict) else ""
-              if pull["headRefName"].startswith(conf["dependency"]) and pr_author.endswith("[bot]"):
-                  return None
               head_oid = pull["headRefOid"]
               nodes = pull["latest"]["nodes"]
               if not nodes:
@@ -746,7 +757,7 @@ jobs:
                 nodes {
                   number id title body createdAt isDraft isCrossRepository baseRefName headRefName headRefOid
                   mergeStateStatus isInMergeQueue
-                  author { login }
+                  author { login __typename }
                   autoMergeRequest { enabledAt commitHeadline mergeMethod }
                   labels(first: 50) { nodes { name } }
                   reviews(last: 20) {

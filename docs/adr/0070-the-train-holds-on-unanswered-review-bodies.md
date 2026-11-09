@@ -1,0 +1,104 @@
+<!--
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+-->
+
+# ADR-0070: The train holds on unanswered review bodies
+
+- **Status**: Accepted (amends [ADR-0067](0067-the-train-settles-reviews-before-landing.md))
+- **Date**: 2026-11-09
+- **Authors**: Lusoris
+
+## Context
+
+The merge train periodically sweeps every repository the app is installed on, landing
+the oldest clean pull request ([ADR-0029](0029-a-forge-app-drives-the-merge-train.md)).
+Inline review threads block landing through the forge's `mergeStateStatus`, and
+`review_settle()` in `.github/workflows/merge-train.yml` holds when a submitted review
+on the current head is newer than the author's last push or review reply
+([ADR-0067](0067-the-train-settles-reviews-before-landing.md)). Neither mechanism
+gates findings placed only in a bot review's top-level body (such as CodeRabbit nitpick
+or outside-diff-range comments, Sourcery overall or human-review assessments, or Codacy
+blocking overviews and unchecked test suggestions), especially when a later push moves
+the head commit without answering an earlier review body.
+
+In pull request 147 of this repository, the pull request reached `CLEAN` merge state and
+merged while a CodeRabbit review body carried an unanswered outside-diff-range finding.
+In addition, GraphQL returns bot logins without the `[bot]` suffix (for example
+`renovate` with `__typename: "Bot"`), so the `endswith("[bot]")` check in
+`review_settle()` from [ADR-0067](0067-the-train-settles-reviews-before-landing.md)
+did not match live GraphQL pull request authors.
+
+The rules heredoc in `.github/workflows/merge-train.yml` is near the 4096-field cap per
+workflow `run:` script ([ADR-0053](0053-the-train-sweep-is-a-checked-out-file.md)), so
+new review-body parsing and GraphQL queries belong in `tools/merge_train.py`.
+
+## Decision
+
+- Amend [ADR-0067](0067-the-train-settles-reviews-before-landing.md) in
+  `.github/workflows/merge-train.yml` (`train_rules.py`):
+  - Request `author { login __typename }` on the pull request node in `QUERY`.
+  - Add `is_bot_dependency(pull, conf)`, which returns `True` when `headRefName` starts
+    with a configured `dependency` prefix and the pull request author has
+    `__typename == "Bot"` or a `login` ending with `"[bot]"`.
+  - Use `is_bot_dependency(pull, conf)` in `review_settle()` and export it for
+    `tools/merge_train.py`.
+- Add review-body hold evaluation in `tools/merge_train.py`:
+  - Define the `REVIEW_BODIES` GraphQL query fetching `reviews(first: 100)`
+    (`totalCount`, `databaseId`, `state`, `body`, `author { login __typename }`),
+    `comments(first: 100)` (`totalCount`, `body`, `author { login }`), and
+    `commits(first: 100)` (`totalCount`, `commit { message }`).
+  - Add pure helper `review_body_hold(pull, detail)`:
+    - Hold with `"review body: more than 100 <kind>, cannot read every answer"` when any
+      of `reviews`, `comments`, or `commits` reports `totalCount > 100`.
+    - Inspect candidate reviews on any commit of the pull request where
+      `author.__typename == "Bot"` and `state` is in `{"COMMENTED", "CHANGES_REQUESTED", "APPROVED"}`
+      (`DISMISSED` and `PENDING` are ignored).
+    - Strip HTML comments (`<!--.*?-->`) and detect findings per bot login (after
+      stripping any `"[bot]"` suffix):
+      - `coderabbitai`: finding when any count in
+        `(Nitpick|Outside diff range|Duplicate|Additional) comments` (`: N` or ` (N)`)
+        is greater than zero; empty body has no finding; a non-empty body with no count
+        match and no `Actionable comments posted:` fails closed as an unknown shape;
+        the autofix checkbox is not a finding.
+      - `sourcery-ai`: finding when `## Overall Comments`, `**Security issues**`, or
+        `Needs a human reviewer` appears in the body, or when a non-empty body lacks
+        `Hey - I've` (unknown shape).
+      - `codacy-production`: finding when `No blocking issues noticed` is absent or any
+        line matches `^- \[ \] `.
+      - Any other bot: finding when the comment-stripped body is non-empty.
+    - Treat a review with findings as answered when `pullrequestreview-<id>` or
+      `review <id>` (case-insensitive, word-bounded) appears in an issue comment by the
+      pull request author, a review body by the pull request author, or any commit
+      message of the pull request.
+    - Return `"review body: <login> review <id> has findings without a reply naming pullrequestreview-<id>"`
+      (with `" (and N more)"` when multiple reviews remain unanswered), or `None`.
+  - In `run()` in `tools/merge_train.py` (`hold_review_bodies()`), after computing
+    initial `verdict()` rows and before building `notes`, fetch `REVIEW_BODIES` only for
+    rows whose reason is in `("land", "behind", "red")` or that have `autoMergeRequest`
+    set, and that are not `is_bot_dependency(pull, conf)`. Replace the row's reason with
+    the hold reason when held; leave all other rows untouched without fetching.
+  - Extend `disarm_red_scanning()` in `tools/merge_train.py` so an armed pull request
+    held by a review body is disarmed via `DISARM` with note `"disarmed: <hold reason>"`,
+    preserving `"disarmed: code-scanning check failed"` when code scanning is red.
+
+## Consequences
+
+- **Positive**:
+  - Pull requests wait while any bot review body on any commit of the pull request
+    carries an unanswered finding; authors unblock landing by replying in an issue
+    comment or review body naming `pullrequestreview-<id>` (or `review <id>`), or by
+    pushing a fix commit whose message names that review identifier.
+  - Live GraphQL bot dependency pull requests (`__typename: "Bot"` without `[bot]`) are
+    recognized consistently across `review_settle()` and `hold_review_bodies()`.
+  - `REVIEW_BODIES` is fetched only for actionable or armed non-bot pull requests,
+    preserving GraphQL rate budget on held, draft, or bot-dependency pull requests.
+  - Coverage in `tests/test_merge_train.py` verifies live bot exemption, per-bot body
+    classification, author comment/review/commit answers, pagination bounds, disarming
+    of armed pull requests, and query field selection.
+- **Negative**:
+  - Race window on armed pull requests: if a pull request is already armed for forge
+    auto-merge when a bot posts a late review body, the forge may merge the pull request
+    before the next merge-train sweep runs and disarms it.
+  - Unrecognized bot review body formats fail closed and require an explicit author
+    reply or parser update.

@@ -50,6 +50,7 @@ from train_rules import (
     has_red_code_scanning,
     head_since,
     in_flight,
+    is_bot_dependency,
     is_red,
     is_security,
     issues_to_close,
@@ -102,6 +103,33 @@ CONFLICT = "merge conflict between base and head"
 MERGE_IN_PROGRESS = "Merge already in progress"
 UNGRANTED = "The permissions requested are not granted"
 SKIP_UNSIGNED = "skipped: dependency update without Signed-off-by, a person lands it"
+REVIEW_BODIES = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100) {
+        totalCount
+        nodes { databaseId state body author { login __typename } }
+      }
+      comments(first: 100) {
+        totalCount
+        nodes { body author { login } }
+      }
+      commits(first: 100) {
+        totalCount
+        nodes { commit { message } }
+      }
+    }
+  }
+}
+"""
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_CODERABBIT_COUNTS = re.compile(
+    r"(?:Nitpick|Outside diff range|Duplicate|Additional) comments(?::\s*|\s+\()(\d+)"
+)
+_SOURCERY_MARKERS = ("## Overall Comments", "**Security issues**", "Needs a human reviewer")
+_UNCHECKED_BOX = re.compile(r"^- \[ \] ", re.M)
+_BODY_REVIEW_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED", "APPROVED"})
 
 
 class RefusedError(Exception):
@@ -850,11 +878,122 @@ def re_arm_drifted(env, conf, served, held, notes):
 
 
 def disarm_red_scanning(env, rows, notes):
-    """Disarm auto-merge on any pull request with a red code-scanning check."""
-    for pull, _reason in rows:
-        if pull.get("autoMergeRequest") and has_red_code_scanning(pull):
+    """Disarm auto-merge on any pull request held by red code scanning or a review body."""
+    for pull, reason in rows:
+        if not pull.get("autoMergeRequest"):
+            continue
+        cause = has_red_code_scanning(pull) or (
+            reason if reason.startswith("review body: ") else None
+        )
+        if cause:
             graphql(env, DISARM, {"id": pull["id"]})
-            notes[pull["number"]] = "disarmed: code-scanning check failed"
+            notes[pull["number"]] = f"disarmed: {cause}"
+
+
+def _coderabbit_finding(body):
+    """Whether a non-empty comment-stripped CodeRabbit review body carries a finding."""
+    counts = [int(n) for n in _CODERABBIT_COUNTS.findall(body)]
+    return any(n > 0 for n in counts) or (not counts and "Actionable comments posted:" not in body)
+
+
+def _sourcery_finding(body):
+    """Whether a non-empty comment-stripped Sourcery review body carries a finding."""
+    return "Hey - I've" not in body or any(marker in body for marker in _SOURCERY_MARKERS)
+
+
+def _codacy_finding(body):
+    """Whether a comment-stripped Codacy review body carries a finding."""
+    return "No blocking issues noticed" not in body or bool(_UNCHECKED_BOX.search(body))
+
+
+def _bot_body_has_finding(login, raw_body):
+    """Whether a bot review body carries a finding after stripping HTML comments."""
+    body = _HTML_COMMENT.sub("", raw_body or "").strip()
+    if login == "codacy-production":
+        return _codacy_finding(body)
+    if not body:
+        return False
+    if login == "coderabbitai":
+        return _coderabbit_finding(body)
+    if login == "sourcery-ai":
+        return _sourcery_finding(body)
+    return True
+
+
+def _answer_texts(pr_author, detail):
+    """Issue comments and review bodies by the PR author, plus all PR commit messages."""
+    comments = (detail.get("comments") or {}).get("nodes") or []
+    reviews = (detail.get("reviews") or {}).get("nodes") or []
+    commits = (detail.get("commits") or {}).get("nodes") or []
+    texts = [
+        node.get("body") or ""
+        for node in comments
+        if (node.get("author") or {}).get("login") == pr_author
+    ]
+    texts += [
+        node.get("body") or ""
+        for node in reviews
+        if (node.get("author") or {}).get("login") == pr_author
+    ]
+    texts += [(node.get("commit") or {}).get("message") or "" for node in commits]
+    return texts
+
+
+def _is_review_answered(review_id, texts):
+    """Whether any text names pullrequestreview-<id> or review <id>."""
+    pattern = re.compile(rf"\b(?:pullrequestreview-{review_id}|review\s+{review_id})\b", re.I)
+    return any(pattern.search(text) for text in texts)
+
+
+def review_body_hold(pull, detail):
+    """Why a pull request waits for an unanswered bot review body finding, or None."""
+    for kind in ("reviews", "comments", "commits"):
+        if ((detail.get(kind) or {}).get("totalCount") or 0) > 100:
+            return f"review body: more than 100 {kind}, cannot read every answer"
+    author_field = pull.get("author")
+    pr_author = (author_field.get("login") or "") if isinstance(author_field, dict) else ""
+    texts = _answer_texts(pr_author, detail)
+    unanswered = []
+    for review in (detail.get("reviews") or {}).get("nodes") or []:
+        author = review.get("author") or {}
+        if author.get("__typename") != "Bot" or review.get("state") not in _BODY_REVIEW_STATES:
+            continue
+        login = (author.get("login") or "").removesuffix("[bot]")
+        review_id = review.get("databaseId")
+        if _bot_body_has_finding(login, review.get("body")) and not _is_review_answered(
+            review_id, texts
+        ):
+            unanswered.append((login, review_id))
+    if not unanswered:
+        return None
+    login, review_id = unanswered[0]
+    reason = (
+        f"review body: {login} review {review_id} has findings "
+        f"without a reply naming pullrequestreview-{review_id}"
+    )
+    if len(unanswered) > 1:
+        return f"{reason} (and {len(unanswered) - 1} more)"
+    return reason
+
+
+def pull_review_bodies(env, number):
+    """The reviews, issue comments, and commits of one pull request for body-hold checks."""
+    owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+    data = graphql(env, REVIEW_BODIES, {"owner": owner, "name": name, "number": number})
+    return data["repository"]["pullRequest"]
+
+
+def hold_review_bodies(env, conf, rows):
+    """Replace verdict reasons with review-body holds on eligible pull requests."""
+    updated = []
+    for pull, reason in rows:
+        eligible = reason in ("land", "behind", "red") or bool(pull.get("autoMergeRequest"))
+        if eligible and not is_bot_dependency(pull, conf):
+            hold = review_body_hold(pull, pull_review_bodies(env, pull["number"]))
+            if hold:
+                reason = hold
+        updated.append((pull, reason))
+    return updated
 
 
 def land_clean(env, conf, repo, served, notes):
@@ -884,6 +1023,7 @@ def run(env, conf, repo, now):
     pulls = repo["pullRequests"]["nodes"]
     replaced = superseded(pulls)
     rows = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
+    rows = hold_review_bodies(env, conf, rows)
     notes = {pull["number"]: reason for pull, reason in rows}
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"

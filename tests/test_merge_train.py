@@ -343,6 +343,8 @@ class Forge:
         self.commits: dict[int, list[tuple[str, int]]] = {}
         self.merge_states: dict[int, str] = {}
         self.commit_counts: dict[int, int] = {}
+        self.review_details: dict[int, dict] = {}
+        self.review_body_calls: list[int] = []
         self.merged_pulls: dict[str, list[dict]] = {}
         self.issue_right = True
         self.ungranted: set[int] = set()
@@ -524,14 +526,33 @@ class Forge:
             return {"data": {"enablePullRequestAutoMerge": {"pullRequest": armed}}}
         if "createCommitOnBranch" in query:
             return self._handle_commit_mutation(full, variables)
+        return self._read_graphql(full, query, variables)
+
+    def _read_graphql(self, full: str, query: str, variables: dict) -> dict:
         if "mergeStateStatus" in query and "pullRequest(" in query:
             return self.pull_merge_state(full, variables)
+        if "reviews(first: 100)" in query:
+            return self.pull_review_bodies(full, variables)
         if "pullRequest(" in query:
             return self.pull_commits(full, variables)
         if "states: MERGED" in query:
             nodes = self.merged_pulls.get(full, [])
             return {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
         return self.pull_page(full, query, variables)
+
+    def pull_review_bodies(self, full: str, variables: dict) -> dict:
+        owner, name = full.split("/")
+        number = variables["number"]
+        assert variables == {"owner": owner, "name": name, "number": number}, variables
+        self.review_body_calls.append(number)
+        empty = {"totalCount": 0, "nodes": []}
+        detail = self.review_details.get(number, {})
+        pr = {
+            "reviews": detail.get("reviews", empty),
+            "comments": detail.get("comments", empty),
+            "commits": detail.get("commits", empty),
+        }
+        return {"data": {"repository": {"pullRequest": pr}}}
 
     def pull_commits(self, full: str, variables: dict) -> dict:
         owner, name = full.split("/")
@@ -5500,8 +5521,357 @@ def test_pending_review_does_not_crash(tmp_path):
 def test_the_query_reads_author_and_reviews(tmp_path):
     """The GraphQL pull query requests the PR author and recent reviews."""
     rules = load_rules(tmp_path)
+    assert "author { login __typename }" in rules.QUERY
     assert "author { login }" in rules.QUERY
     assert "reviews(last: 20)" in rules.QUERY
+
+
+def _detail(
+    reviews: list[dict] = (),
+    comments: list[dict] = (),
+    commits: list[str] = (),
+    review_total: int | None = None,
+) -> dict:
+    """Build a REVIEW_BODIES pullRequest payload for Forge.review_details."""
+    rev_list = list(reviews)
+    com_list = list(comments)
+    msg_list = [{"commit": {"message": m}} for m in commits]
+    return {
+        "reviews": {
+            "totalCount": len(rev_list) if review_total is None else review_total,
+            "nodes": rev_list,
+        },
+        "comments": {"totalCount": len(com_list), "nodes": com_list},
+        "commits": {"totalCount": len(msg_list), "nodes": msg_list},
+    }
+
+
+def _bot_review(
+    review_id: int,
+    login: str,
+    body: str,
+    state: str = "COMMENTED",
+    typename: str = "Bot",
+) -> dict:
+    """One review node for REVIEW_BODIES."""
+    return {
+        "databaseId": review_id,
+        "state": state,
+        "body": body,
+        "author": {"login": login, "__typename": typename},
+    }
+
+
+def test_planted_review_settle_skips_live_bot_pr(tmp_path):
+    """A live-shaped bot dependency PR (__typename Bot, no [bot] suffix) skips review settle."""
+    rules = load_rules(tmp_path)
+    no_author = {"headRefName": "renovate/x", "author": None}
+    assert not rules.is_bot_dependency(no_author, {"dependency": ("renovate/",)})
+    head_time = (NOW - timedelta(minutes=10)).isoformat()
+    review_time = (NOW - timedelta(minutes=3)).isoformat()
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/x",
+        author={"login": "renovate", "__typename": "Bot"},
+        createdAt=OLD,
+        committedDate=head_time,
+        reviews=[
+            {
+                "submittedAt": review_time,
+                "state": "COMMENTED",
+                "author": {"login": "coderabbitai"},
+                "commit": {"oid": f"{1:040x}"},
+            }
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_planted_unanswered_coderabbit_nitpick_body_holds(tmp_path):
+    """An unanswered CodeRabbit nitpick review body on an older commit holds the PR."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(
+        reviews=[
+            _bot_review(
+                101,
+                "coderabbitai",
+                "<!-- coderabbit-ai-generated:v1 -->\n<summary>Nitpick comments: 1</summary>",
+            )
+        ]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    expected = (
+        "review body: coderabbitai review 101 has findings "
+        "without a reply naming pullrequestreview-101"
+    )
+    assert expected in summary
+    assert f"| #1 | CLEAN | {expected} |" in summary
+
+
+def test_planted_multiple_unanswered_review_bodies_report_more_count(tmp_path):
+    """Multiple unanswered bot review bodies append (and N more) to the hold reason."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(
+        reviews=[
+            _bot_review(101, "coderabbitai", "**Outside diff range comments (1)**"),
+            _bot_review(102, "sourcery-ai", "Hey - I've found 1 issue\n**Security issues**:\n- x"),
+        ]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "without a reply naming pullrequestreview-101 (and 1 more)" in summary
+
+
+def test_planted_generic_author_comment_without_id_still_held(tmp_path):
+    """An author comment without the review id or a non-author comment with the id stays held."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(202, "coderabbitai", "Nitpick comments: 1")],
+        comments=[
+            {"body": "Fixed everything, thanks!", "author": {"login": "person"}},
+            {"body": "Addressed pullrequestreview-202", "author": {"login": "bystander"}},
+        ],
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "pullrequestreview-202" in summary
+
+
+def test_author_comment_or_review_naming_id_allows_landing(tmp_path):
+    """An author issue comment naming pullrequestreview-<id> or review naming review <id> lands."""
+    for comments, extra_reviews in (
+        ([{"body": "Addressed in pullrequestreview-303.", "author": {"login": "person"}}], []),
+        (
+            [],
+            [
+                {
+                    "databaseId": 304,
+                    "state": "COMMENTED",
+                    "body": "Skipped review 303 as intentional.",
+                    "author": {"login": "person", "__typename": "User"},
+                }
+            ],
+        ),
+    ):
+        p = pull(1, "CLEAN", author={"login": "person"})
+        forge = Forge(repository(p))
+        forge.review_details[1] = _detail(
+            reviews=[
+                _bot_review(303, "coderabbitai", "Outside diff range comments (1)"),
+                *extra_reviews,
+            ],
+            comments=comments,
+        )
+        done, summary = train(tmp_path, forge)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert forge.writes == [landed(1)]
+        assert "### fleet/app: landed #1" in summary
+
+
+def test_commit_message_naming_review_id_allows_landing(tmp_path):
+    """A commit message on the PR naming pullrequestreview-<id> unblocks landing."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(404, "coderabbitai", "Nitpick comments: 1")],
+        commits=["fix: handle terminator (pullrequestreview-404)\n\nSigned-off-by: P <p@e.org>"],
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_clean_coderabbit_codacy_and_sourcery_bodies_land(tmp_path):
+    """Clean CodeRabbit (empty or actionable-only), clean Codacy, and clean Sourcery land."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(
+        reviews=[
+            _bot_review(501, "coderabbitai", "<!-- coderabbit-ai-generated:v1 -->"),
+            _bot_review(
+                502,
+                "coderabbitai",
+                "**Actionable comments posted: 1**\n- [ ] <!-- id --> Fix comments: Fix on PR",
+            ),
+            _bot_review(
+                503,
+                "codacy-production",
+                "### Pull Request Overview\n**No blocking issues noticed**\n- [x] Covered",
+            ),
+            _bot_review(
+                504,
+                "sourcery-ai",
+                "Hey - I've reviewed your changes and they look great!\n**Approved.**",
+                state="APPROVED",
+            ),
+        ]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+@pytest.mark.parametrize(
+    ("login", "body"),
+    [
+        (
+            "codacy-production",
+            "### Pull Request Overview\n**No blocking issues noticed**\n- [ ] Add test",
+        ),
+        (
+            "codacy-production",
+            "### Pull Request Overview\n:warning: **Resolve issues before merging**",
+        ),
+        (
+            "sourcery-ai",
+            "Hey - I've reviewed your changes!\n**Needs a human reviewer.**",
+        ),
+        (
+            "sourcery-ai",
+            "Hey - I've found 1 issue\n## Overall Comments\n- Check edge case",
+        ),
+    ],
+)
+def test_planted_codacy_and_sourcery_findings_hold(tmp_path, login, body):
+    """Codacy unchecked boxes/blocking overview and Sourcery human-review/overall comments hold."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(reviews=[_bot_review(601, login, body)])
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"review body: {login} review 601 has findings" in summary
+
+
+@pytest.mark.parametrize(
+    ("login", "body"),
+    [
+        ("other-review-bot", "Found 1 potential bug in handler."),
+        ("coderabbitai", "Unexpected summary format without known markers."),
+        ("sourcery-ai", "Unrecognized Sourcery review body format."),
+    ],
+)
+def test_planted_unknown_bot_and_unknown_shapes_hold(tmp_path, login, body):
+    """An unknown bot non-empty body or unknown CodeRabbit/Sourcery shape fails closed."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(reviews=[_bot_review(701, login, body)])
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"review body: {login} review 701 has findings" in summary
+
+
+def test_dismissed_bot_review_and_person_review_body_land(tmp_path):
+    """A DISMISSED bot review with a nitpick and a User review body do not hold."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(
+        reviews=[
+            _bot_review(801, "coderabbitai", "Nitpick comments: 1", state="DISMISSED"),
+            _bot_review(802, "reviewer", "Please check this", state="COMMENTED", typename="User"),
+        ]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_bot_dependency_pr_skips_review_bodies_fetch_and_lands(tmp_path):
+    """A live-shaped bot dependency PR lands without fetching REVIEW_BODIES."""
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/pkg-1.x",
+        author={"login": "renovate", "__typename": "Bot"},
+        createdAt=OLD,
+    )
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(901, "coderabbitai", "Nitpick comments: 1")]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.review_body_calls == []
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_planted_review_bodies_over_100_holds(tmp_path):
+    """More than 100 reviews holds the PR because not every answer can be read."""
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(reviews=[], review_total=101)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review body: more than 100 reviews, cannot read every answer" in summary
+
+
+def test_planted_armed_pr_held_by_review_body_is_disarmed(tmp_path):
+    """An armed PR held by an unanswered bot review body is disarmed with a disarmed note."""
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        autoMergeRequest={"enabledAt": OLD},
+    )
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(1101, "coderabbitai", "Nitpick comments: 1")]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)]
+    expected = (
+        "disarmed: review body: coderabbitai review 1101 has findings "
+        "without a reply naming pullrequestreview-1101"
+    )
+    assert expected in summary
+
+
+def test_row_with_other_hold_reason_skips_review_bodies_fetch(tmp_path):
+    """A PR already held by another rule (such as a hold label) does not fetch REVIEW_BODIES."""
+    p = pull(1, "CLEAN", author={"login": "person"}, labels=("hold",))
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.review_body_calls == []
+    assert "| #1 | CLEAN | labelled hold |" in summary
+
+
+def test_review_bodies_query_fields(tmp_path, monkeypatch):
+    """REVIEW_BODIES queries reviews, comments, and commits with totalCount on each."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    q = merge_train.REVIEW_BODIES
+    for token in (
+        "reviews(first: 100)",
+        "databaseId",
+        "state",
+        "body",
+        "author { login __typename }",
+        "comments(first: 100)",
+        "author { login }",
+        "commits(first: 100)",
+        "commit { message }",
+    ):
+        assert token in q
+    assert q.count("totalCount") == 3
 
 
 def test_planted_code_scanning_failure_holds_clean_pull(tmp_path):
