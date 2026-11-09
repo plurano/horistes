@@ -30,9 +30,17 @@ Two credit rules, on one message each:
   "generated with".
 
 The base is `BASE_REF` as the gate receives it, or `origin/main`. A base that
-does not name a commit fails the test; it is never skipped. The message of a
-squash merge is written on the forge and is read here only after it landed, on
-the run of the default branch.
+does not name a commit fails the test; it is never skipped.
+
+One-message mode: with `MESSAGE_FILE` set, `test_message_file_passes_the_judge`
+judges that file by the same rules, as the message of a commit with one parent
+whose author is git's author identity (`git var GIT_AUTHOR_IDENT`). The
+commit-msg hook runs it through `make check-message`, and the squash helper runs
+that hook on the message it is about to send, so a squash message is judged
+before it lands (ADR-0072). Without `MESSAGE_FILE` the test is skipped; the
+range test above still runs. The file is read as git hands it to the hook,
+before git strips comment lines or the diff of `git commit -v`, so a line there
+that breaks a rule is refused too.
 """
 
 from __future__ import annotations
@@ -48,6 +56,8 @@ from conftest import ROOT
 DEADLINE = 20  # seconds for one git call
 MAX_COMMITS = 500
 MAX_MESSAGE = 65536
+# The message file of one-message mode, as the commit-msg hook names it.
+MESSAGE_FILE = os.environ.get("MESSAGE_FILE", "")
 TRAILERS = {"signed-off-by", "migration"}
 FOOTER = re.compile(r"^\W*(generated with\b|co-authored-by\s*:)", re.IGNORECASE)
 FORGE_BOT = re.compile(r"\d+\+[a-z0-9-]+\[bot\]@users\.noreply\.github\.com", re.IGNORECASE)
@@ -172,6 +182,22 @@ def signed_off(repo: Path, sha: str, author: str, parents: str, message: str) ->
     return unsigned(message) + foreign_sign_off(author, message)
 
 
+def judged(repo: Path, sha: str, author: str, parents: str, message: str) -> list[str]:
+    """Findings on one message: its length first, then sign-off and credit.
+
+    A message that is no commit yet passes an empty sha and no parents.
+    """
+    return oversize(message) or signed_off(repo, sha, author, parents, message) + credited(message)
+
+
+def author_email() -> str:
+    """The email of git's author identity, as git hands it to a commit hook."""
+    ident = git(ROOT, "var", "GIT_AUTHOR_IDENT")
+    match = re.search(r"<([^<>\s]+)>", ident)
+    assert match, f"git var GIT_AUTHOR_IDENT names no email: {ident.strip()!r}"
+    return match.group(1)
+
+
 def refused(repo: Path, base: str) -> dict[str, list[str]]:
     """Commits between the base and HEAD, merges included, that break a sign-off or credit rule."""
     git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
@@ -182,11 +208,7 @@ def refused(repo: Path, base: str) -> dict[str, list[str]]:
     for sha in commits:
         read = git(repo, "log", "-1", "--format=format:%ae%x00%P%x00%B", sha)
         author, parents, message = read.split("\x00", 2)
-        too_long = oversize(message)
-        if too_long:
-            found[sha] = too_long
-            continue
-        lines = signed_off(repo, sha, author, parents, message) + credited(message)
+        lines = judged(repo, sha, author, parents, message)
         if lines:
             found[sha] = lines
     return found
@@ -195,6 +217,60 @@ def refused(repo: Path, base: str) -> dict[str, list[str]]:
 def test_commits_of_this_change_credit_no_tool():
     base = os.environ.get("BASE_REF", "origin/main")
     assert refused(ROOT, base) == {}
+
+
+@pytest.mark.skipif(
+    not MESSAGE_FILE, reason="one-message mode: the commit-msg hook sets MESSAGE_FILE"
+)
+def test_message_file_passes_the_judge():
+    message = Path(MESSAGE_FILE).read_text(encoding="utf-8")
+    findings = judged(ROOT, "", author_email(), "", message)
+    assert findings == [], f"{MESSAGE_FILE}: " + "; ".join(findings)
+
+
+CO_AUTHOR = "Co-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>"
+
+
+def test_judged_clean_message_has_no_finding():
+    assert judged(ROOT, "", "person@example.org", "", GOOD) == []
+
+
+def test_judged_planted_bot_co_author_is_refused():
+    planted = GOOD + CO_AUTHOR + "\n"
+    assert judged(ROOT, "", "person@example.org", "", planted) == ["trailer Co-authored-by"]
+
+
+def test_judged_message_of_another_author_is_refused():
+    found = judged(ROOT, "", "other@example.org", "", GOOD)
+    assert found == ["sign-off person@example.org is not the author other@example.org"]
+
+
+def test_judged_unsigned_message_is_refused():
+    assert judged(ROOT, "", "person@example.org", "", "feat(x): add a thing\n") == [
+        "no trailer Signed-off-by"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("length", "found"),
+    [
+        (MAX_MESSAGE, ["trailer Co-authored-by"]),
+        (MAX_MESSAGE + 1, [f"message of {MAX_MESSAGE + 1} characters, over {MAX_MESSAGE}"]),
+    ],
+    ids=["exact", "one over"],
+)
+def test_judged_length_comes_first(length, found):
+    head, tail = "feat(x): add a thing\n\n", f"\n\n{SIGN_OFF}\n{CO_AUTHOR}\n"
+    message = head + "x" * (length - len(head) - len(tail)) + tail
+    assert len(message) == length
+    assert judged(ROOT, "", "person@example.org", "", message) == found
+
+
+@pytest.mark.parametrize("email", ["person@example.org", "other@example.net"])
+def test_author_email_reads_the_author_git_hands_the_hook(monkeypatch, email):
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "A Person")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", email)
+    assert author_email() == email
 
 
 @pytest.mark.parametrize(
