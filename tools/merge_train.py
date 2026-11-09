@@ -103,6 +103,7 @@ CONFLICT = "merge conflict between base and head"
 MERGE_IN_PROGRESS = "Merge already in progress"
 UNGRANTED = "The permissions requested are not granted"
 SKIP_UNSIGNED = "skipped: dependency update without Signed-off-by, a person lands it"
+SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its producer signs it"
 REVIEW_BODY = "review body: "
 # Pull requests whose review bodies one run reads in one repository (ADR-0070).
 REVIEW_READS = 10
@@ -148,9 +149,16 @@ _BODY_REVIEW_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED", "APPROVED"})
 class RefusedError(Exception):
     """A forge call that failed or was refused."""
 
+    unsigned_bots = ()
+
 
 class UnsignedBotError(RefusedError):
-    """A dependency update whose commits carry no sign-off; the train skips it."""
+    """A pull request whose commits carry no sign-off; the train skips it."""
+
+    def __init__(self, message, note=SKIP_UNSIGNED):
+        """Record the refusal message and the user-facing skip note."""
+        super().__init__(message)
+        self.note = note
 
 
 class MergeInProgressError(RefusedError):
@@ -447,25 +455,39 @@ def pull_merge_state(env, number):
     return pr.get("mergeStateStatus")
 
 
-def commit_variables(env, conf, pull):
-    """Variables for MERGE and ARM; headline and body when squashing."""
-    base = {"id": pull["id"], "oid": pull["headRefOid"], "method": conf["method"]}
-    if conf["method"] != "SQUASH":
-        return base
+def is_bot(pull):
+    """True when the pull request author is a bot account."""
+    author = pull.get("author") if isinstance(pull, dict) else None
+    return isinstance(author, dict) and author.get("__typename") == "Bot"
+
+
+def signed_message(env, conf, pull):
+    """The headline and body for a signed pull request; raises when unsigned or invalid."""
     messages = pull_commits(env, pull["number"])
     try:
-        headline, body = squash_message(pull["title"], pull["number"], messages)
+        return squash_message(pull["title"], pull["number"], messages)
     except NoSignOffError as err:
         if pull["headRefName"].startswith(conf["dependency"]):
-            raise UnsignedBotError(f"#{pull['number']}: {err}") from err
+            raise UnsignedBotError(f"#{pull['number']}: {err}", SKIP_UNSIGNED) from err
+        if is_bot(pull):
+            raise UnsignedBotError(f"#{pull['number']}: {err}", SKIP_UNSIGNED_BOT) from err
         raise RefusedError(f"#{pull['number']}: {err}") from err
     except ValueError as err:
         raise RefusedError(f"#{pull['number']}: {err}") from err
+
+
+def commit_variables(env, conf, pull):
+    """Variables for MERGE and ARM; headline and body when squashing."""
+    headline, body = signed_message(env, conf, pull)
+    base = {"id": pull["id"], "oid": pull["headRefOid"], "method": conf["method"]}
+    if conf["method"] != "SQUASH":
+        return base
     return {**base, "headline": headline, "body": body}
 
 
 def land(env, conf, pull, queue):
     if queue:
+        signed_message(env, conf, pull)
         data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
         if not data["enqueuePullRequest"]["mergeQueueEntry"]:
             raise RefusedError(f"#{pull['number']}: no merge queue entry")
@@ -517,8 +539,8 @@ def advance(env, conf, repo, rows, notes):
                 continue
             try:
                 arm(env, conf, pull)
-            except UnsignedBotError:
-                notes[pull["number"]] = SKIP_UNSIGNED
+            except UnsignedBotError as err:
+                notes[pull["number"]] = err.note
                 continue
             notes[pull["number"]] = "armed, updated from the default branch"
         else:
@@ -880,6 +902,8 @@ def re_arm_drifted(env, conf, served, held, notes):
     """Re-arm an armed squash pull request whose headline drifted from its title.
 
     A pull request a review body holds was disarmed this run and stays disarmed.
+    A pull request left disarmed for lack of sign-off ends the run, so later steps
+    do not read it as armed.
     """
     for pull, reason in served:
         if reason.startswith(REVIEW_BODY):
@@ -889,7 +913,11 @@ def re_arm_drifted(env, conf, served, held, notes):
                 notes[pull["number"]] = "not re-armed: code-scanning check failed"
                 continue
             graphql(env, DISARM, {"id": pull["id"]})
-            arm(env, conf, pull)
+            try:
+                arm(env, conf, pull)
+            except UnsignedBotError as err:
+                notes[pull["number"]] = err.note
+                return f"disarmed #{pull['number']}: its commits carry no Signed-off-by"
             notes[pull["number"]] = "re-armed: title changed after arming"
             return f"re-armed #{pull['number']}"
     return None
@@ -1104,8 +1132,8 @@ def land_clean(env, conf, repo, served, notes):
         if reason == "land" and not late_review_hold(env, conf, pull, notes):
             try:
                 done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
-            except UnsignedBotError:
-                notes[pull["number"]] = SKIP_UNSIGNED
+            except UnsignedBotError as err:
+                notes[pull["number"]] = err.note
                 continue
             return f"{done} #{pull['number']}"
     return None
@@ -1120,13 +1148,15 @@ def lander_lease(repo, now):
         raise RefusedError(f"{err}") from err
 
 
-def run(env, conf, repo, now):
+def run(env, conf, repo, now, notes=None):
     """Execute one merge train cycle across served pull requests."""
+    if notes is None:
+        notes = {}
     pulls = repo["pullRequests"]["nodes"]
     replaced = superseded(pulls)
     verdicts = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
     rows = hold_review_bodies(env, conf, verdicts)
-    notes = {pull["number"]: reason for pull, reason in rows}
+    notes.update({pull["number"]: reason for pull, reason in rows})
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
     disarm_red_scanning(env, rows, notes)
@@ -1299,17 +1329,28 @@ def close_issues(env, conf, installation, target, now):
     return lines
 
 
+def unsigned_bot_entries(target, notes):
+    """The formatted unsigned bot pull requests skipped during this repository run."""
+    return [
+        f"{target['full_name']} #{num}" for num, note in notes.items() if note == SKIP_UNSIGNED_BOT
+    ]
+
+
 def one(env, conf, installation, target, now):
     """The train in one repository, with a token for that repository alone."""
     rights = WRITE_RIGHTS if conf["switch"] == "on" else READ_RIGHTS
     token = mint(env, conf, installation, rights, [target["name"]])
     local = {**env, "GITHUB_REPOSITORY": target["full_name"], "TRAIN_TOKEN": token}
     closed = []
+    notes = {}
     try:
         repo = fetch(local)
-        rows, notes, outcome = run(local, conf, repo, now)
+        rows, notes, outcome = run(local, conf, repo, now, notes)
         if conf["switch"] == "on":
             closed = close_issues(local, conf, installation, target, now)
+    except RefusedError as err:
+        err.unsigned_bots = unsigned_bot_entries(target, notes)
+        raise
     finally:
         revoke(env, token)
     moved = any(
@@ -1321,12 +1362,20 @@ def one(env, conf, installation, target, now):
     if closed:
         section = section or f"### {target['full_name']}: {outcome}\n"
         section += "\n" + "\n".join(closed) + "\n"
-    return outcome, section, moved, bool(repo["releaseConfig"] and repo["releaseManifest"])
+    unsigned_bots = unsigned_bot_entries(target, notes)
+    return (
+        outcome,
+        section,
+        moved,
+        bool(repo["releaseConfig"] and repo["releaseManifest"]),
+        unsigned_bots,
+    )
 
 
 def sweep(env, conf, started):
     """Run the train in every repository; the per-account tally, the sections, the refusals."""
     accounts, sections, refusals, skipped, releases, off, identity = {}, [], [], [], [], [], {}
+    unsigned_bots = []
     for installation in pages(env, app_jwt(env, conf), "/app/installations"):
         account = installation["account"]["login"]
         if installation.get("suspended_at"):
@@ -1347,7 +1396,7 @@ def sweep(env, conf, started):
             tally["repositories"] += 1
             try:
                 now = datetime.now(UTC)
-                outcome, section, moved, release = one(
+                outcome, section, moved, release, unsigned = one(
                     env, {**conf, **identity}, installation, target, now
                 )
             except UngrantedError as err:
@@ -1362,16 +1411,18 @@ def sweep(env, conf, started):
             except RefusedError as err:
                 tally["refused"] += 1
                 refusals.append(f"{target['full_name']}: {err}")
+                unsigned_bots.extend(err.unsigned_bots)
                 continue
             tally["landed"] += outcome.startswith("landed")
             tally["updated"] += moved
             sections.append(section)
+            unsigned_bots.extend(unsigned)
             if release:
                 if target["full_name"].lower() in conf["release_off"]:
                     off.append(target["full_name"])
                 else:
                     releases.append({"owner": account, "name": target["name"]})
-    return accounts, [s for s in sections if s], refusals, skipped, releases, off
+    return accounts, [s for s in sections if s], refusals, skipped, releases, off, unsigned_bots
 
 
 def append(path, text):
@@ -1379,7 +1430,8 @@ def append(path, text):
         handle.write(text)
 
 
-def summary(env, accounts, sections, refusals, skipped, releases, off):
+def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots):
+    """Render the sweep report to standard output and the job step summary."""
     lines = [
         "## Merge train sweep",
         "",
@@ -1396,6 +1448,13 @@ def summary(env, accounts, sections, refusals, skipped, releases, off):
             )
     if refusals:
         lines += ["", "Refused:", ""] + [f"- {line}" for line in refusals]
+    if unsigned_bots:
+        lines += [
+            "",
+            "Bot pull requests without Signed-off-by, their producers sign them:",
+            "",
+            *(f"- {entry}" for entry in unsigned_bots),
+        ]
     if skipped:
         lines += ["", f"Not reached within {SWEEP_SECONDS} s: {', '.join(skipped)}"]
     if len(releases) > MAX_RELEASES:
@@ -1413,17 +1472,20 @@ def summary(env, accounts, sections, refusals, skipped, releases, off):
 
 
 def main(env):
+    """Run one full train sweep across all installed repositories and report."""
     try:
         conf = settings(env)
     except InvalidSettingError as err:
         sys.stdout.write(f"::error title=Merge train setting::{err}\n")
         return 3
     try:
-        accounts, sections, refusals, skipped, releases, off = sweep(env, conf, time.monotonic())
+        accounts, sections, refusals, skipped, releases, off, unsigned_bots = sweep(
+            env, conf, time.monotonic()
+        )
     except RefusedError as err:
         sys.stdout.write(f"::error title=Merge train refused::{err}\n")
         return 1
-    summary(env, accounts, sections, refusals, skipped, releases, off)
+    summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots)
     for line in refusals:
         sys.stdout.write(f"::error title=Merge train refused::{line}\n")
     if skipped:

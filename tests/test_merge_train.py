@@ -3628,6 +3628,136 @@ def test_after_an_unsigned_dependency_update_the_next_clean_pull_lands(tmp_path)
     assert forge.writes == [landed(2)]
 
 
+@pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
+def test_unsigned_bot_pull_request_is_skipped_and_listed(tmp_path, state):
+    """An unsigned bot PR is skipped on non-dependency branches and listed in summary."""
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(repository(pull(1, state, author=bot, headRefName="fix/x")))
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        f"| #1 | {state} | skipped: bot pull request without Signed-off-by, its producer signs it |"
+        in summary
+    )
+    assert "Bot pull requests without Signed-off-by, their producers sign them:" in summary
+    assert "- fleet/app #1" in summary.splitlines()
+
+
+def test_unsigned_person_pull_request_on_non_dependency_head_is_refused(tmp_path):
+    """An unsigned PR authored by a person on a non-dependency head fails the run."""
+    user = {"login": "someone", "__typename": "User"}
+    forge = Forge(repository(pull(1, "CLEAN", author=user, headRefName="fix/x")))
+    forge.commits[1] = [("fix: manual commit without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "no Signed-off-by on its commits" in summary
+
+
+def test_unsigned_bot_on_dependency_head_yields_dependency_skip_note(tmp_path):
+    """On dependency branches, the dependency skip note takes precedence for bot authors."""
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(repository(pull(1, "CLEAN", author=bot, headRefName="renovate/configure")))
+    forge.commits[1] = [("chore: configure renovate", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        "| #1 | CLEAN | skipped: dependency update without Signed-off-by, a person lands it |"
+        in summary
+    )
+    assert "Bot pull requests without Signed-off-by, their producers sign them:" not in summary
+
+
+def test_unsigned_author_without_typename_is_refused(tmp_path):
+    """An author without __typename on a non-dependency head is treated as a person and refused."""
+    author = {"login": "someone"}
+    forge = Forge(repository(pull(1, "CLEAN", author=author, headRefName="fix/x")))
+    forge.commits[1] = [("fix: missing typename commit", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "no Signed-off-by on its commits" in summary
+
+
+def test_after_an_unsigned_bot_pull_request_the_next_clean_pull_lands(tmp_path):
+    """A clean pull request lands even when preceded by an unsigned bot pull request."""
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(
+        repository(
+            pull(1, "CLEAN", author=bot, headRefName="fix/x"),
+            pull(2, "CLEAN"),
+        )
+    )
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+
+
+def test_unsigned_bot_listed_in_summary_when_later_pull_is_refused(tmp_path):
+    """An unsigned bot skipped before a later refusal is retained in the sweep summary."""
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(
+        repository(
+            pull(1, "CLEAN", author=bot, headRefName="fix/x"),
+            pull(2, "CLEAN"),
+        )
+    )
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    forge.refuse_merge = "refused here"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "Refused:" in summary
+    assert "Bot pull requests without Signed-off-by, their producers sign them:" in summary
+    assert "- fleet/app #1" in summary.splitlines()
+
+
+def test_planted_sweep_without_unsigned_bots_extend_drops_skipped_bot(tmp_path):
+    """Planted mutant: without unsigned_bots.extend on RefusedError, skipped bots are lost."""
+    target = "                unsigned_bots.extend(err.unsigned_bots)"
+    assert script().count(target) == 1
+    flow = script().replace(target, "                pass")
+    assert flow != script()
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(
+        repository(
+            pull(1, "CLEAN", author=bot, headRefName="fix/x"),
+            pull(2, "CLEAN"),
+        )
+    )
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    forge.refuse_merge = "refused here"
+    done, summary = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "- fleet/app #1" not in summary.splitlines()
+
+
+def test_without_the_bot_pr_skip_the_unsigned_bot_fails_the_run(tmp_path):
+    """Planted mutant: disabling the bot check causes unsigned bot PRs to fail the run."""
+    flow = script().replace(
+        "if is_bot(pull):",
+        "if False:",
+    )
+    assert flow != script(), "the bot skip condition is where the test expects it"
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(repository(pull(1, "CLEAN", author=bot, headRefName="fix/x")))
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    done, summary = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "no Signed-off-by on its commits" in summary + done.stdout
+
+
+def test_no_summary_list_block_when_no_bot_pull_request_is_skipped(tmp_path):
+    """When no bot pull request without sign-off is skipped, the summary list block is absent."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "Bot pull requests without Signed-off-by, their producers sign them:" not in summary
+
+
 def test_without_the_bot_skip_the_unsigned_update_fails_the_run(tmp_path):
     """The planted case: without the skip, an unsigned bot update fails the run."""
     flow = script().replace(
@@ -3640,6 +3770,103 @@ def test_without_the_bot_skip_the_unsigned_update_fails_the_run(tmp_path):
     done, summary = train(tmp_path, forge, flow)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "no Signed-off-by on its commits" in summary + done.stdout
+
+
+def test_queue_unsigned_user_pull_request_is_refused(tmp_path):
+    user = {"login": "someone", "__typename": "User"}
+    forge = Forge(repository(pull(1, "CLEAN", author=user, headRefName="fix/x"), queue=True))
+    forge.commits[1] = [("fix: manual commit without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "no Signed-off-by on its commits" in summary
+
+
+def test_queue_unsigned_bot_pull_request_is_skipped_and_listed(tmp_path):
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(repository(pull(1, "CLEAN", author=bot, headRefName="fix/x"), queue=True))
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        "| #1 | CLEAN | skipped: bot pull request without Signed-off-by, its producer signs it |"
+        in summary
+    )
+    assert "Bot pull requests without Signed-off-by, their producers sign them:" in summary
+    assert "- fleet/app #1" in summary.splitlines()
+
+
+def test_queue_signed_pull_request_is_queued(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN"), queue=True))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [queued(1)]
+
+
+def test_queue_unsigned_dependency_head_is_skipped(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN", headRefName="renovate/x"), queue=True))
+    forge.commits[1] = [("chore: configure renovate", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        "| #1 | CLEAN | skipped: dependency update without Signed-off-by, a person lands it |"
+        in summary
+    )
+
+
+def test_queue_unsigned_bot_followed_by_signed_pull_request_queues_second(tmp_path):
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(
+        repository(
+            pull(1, "CLEAN", author=bot, headRefName="fix/x"),
+            pull(2, "CLEAN"),
+            queue=True,
+        )
+    )
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [queued(2)]
+    assert (
+        "| #1 | CLEAN | skipped: bot pull request without Signed-off-by, its producer signs it |"
+        in summary
+    )
+
+
+def test_merge_method_merge_unsigned_user_is_refused(tmp_path):
+    user = {"login": "someone", "__typename": "User"}
+    forge = Forge(repository(pull(1, "CLEAN", author=user, headRefName="fix/x")))
+    forge.commits[1] = [("fix: manual commit without trailer", 1)]
+    done, summary = train(tmp_path, forge, merge_method="merge")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "no Signed-off-by on its commits" in summary
+
+
+def test_merge_method_merge_unsigned_bot_is_skipped(tmp_path):
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(repository(pull(1, "CLEAN", author=bot, headRefName="fix/x")))
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    done, summary = train(tmp_path, forge, merge_method="merge")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        "| #1 | CLEAN | skipped: bot pull request without Signed-off-by, its producer signs it |"
+        in summary
+    )
+
+
+def test_queue_co_authored_by_commits_refused(tmp_path):
+    mutant = module().replace('elif not low.startswith("co-authored-by:"):', "else:")
+    assert mutant != module()
+    forge = Forge(repository(pull(1, "CLEAN"), queue=True))
+    forge.commits[1] = list(PLANTED_COMMITS)
+    done, summary = train(tmp_path, forge, helper=mutant)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "fleet/app: #1: squash message holds a Co-authored-by line" in summary
 
 
 def test_pull_with_more_than_100_commits_is_refused(tmp_path):
@@ -3655,7 +3882,7 @@ def test_pull_with_more_than_100_commits_is_refused(tmp_path):
 @pytest.mark.parametrize(("state", "kind"), [("CLEAN", "merge"), ("BEHIND", "arm")])
 def test_merge_method_merge_sends_no_headline_or_body(tmp_path, state, kind):
     forge = Forge(repository(pull(1, state)))
-    forge.commits[1] = [("feat: unsigned", 1)]
+    forge.commits[1] = [("feat: signed\n\nSigned-off-by: Dev <dev@example.org>", 1)]
     done, _ = train(tmp_path, forge, merge_method="merge")
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.messages == [(kind, "PR_1", None, None)]
@@ -4337,6 +4564,83 @@ def test_retitled_armed_pull_request_is_re_armed_with_new_headline(tmp_path):
     ]
     assert "### fleet/app: re-armed #1" in summary, summary
     assert "| #1 | BLOCKED | re-armed: title changed after arming |" in summary, summary
+
+
+def test_unsigned_bot_retitled_armed_pull_request_is_disarmed_and_skipped(tmp_path):
+    """An armed bot pull request retitled without sign-off is disarmed and skipped."""
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    retitled = pull(
+        1,
+        "BLOCKED",
+        author=bot,
+        headRefName="fix/x",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    forge.commits[1] = [("chore: automated update without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)], forge.writes
+    assert (
+        "| #1 | BLOCKED | skipped: bot pull request without Signed-off-by, its producer signs it |"
+        in summary
+    )
+    assert "### fleet/app: disarmed #1: its commits carry no Signed-off-by" in summary
+    assert "- fleet/app #1" in summary.splitlines()
+
+
+def test_unsigned_person_retitled_armed_pull_request_is_disarmed_and_refused(tmp_path):
+    """An armed person's pull request retitled without sign-off is disarmed and refused."""
+    user = {"login": "someone", "__typename": "User"}
+    retitled = pull(
+        1,
+        "BLOCKED",
+        author=user,
+        headRefName="fix/x",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    forge.commits[1] = [("chore: manual update without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)], forge.writes
+    assert "no Signed-off-by on its commits" in summary
+
+
+def test_planted_re_arm_drifted_without_unsigned_bot_error_refuses_bot(tmp_path):
+    """Planted mutant: unhandled UnsignedBotError in re_arm_drifted refuses the run."""
+    target = (
+        "            try:\n"
+        "                arm(env, conf, pull)\n"
+        "            except UnsignedBotError as err:\n"
+        '                notes[pull["number"]] = err.note\n'
+        "                return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
+    )
+    mutant = (
+        "            try:\n"
+        "                arm(env, conf, pull)\n"
+        "            except KeyError as err:\n"
+        '                notes[pull["number"]] = err.note\n'
+        "                return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
+    )
+    assert script().count(target) == 1
+    flow = script().replace(target, mutant)
+    assert flow != script()
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    retitled = pull(
+        1,
+        "BLOCKED",
+        author=bot,
+        headRefName="fix/x",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    forge.commits[1] = [("chore: automated update without trailer", 1)]
+    done, _ = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
 
 
 def test_planted_drifted_that_never_fires_leaves_stale_headline_armed(tmp_path):
