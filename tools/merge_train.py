@@ -50,6 +50,7 @@ from train_rules import (
     has_red_code_scanning,
     head_since,
     in_flight,
+    is_bot_dependency,
     is_red,
     is_security,
     issues_to_close,
@@ -102,6 +103,46 @@ CONFLICT = "merge conflict between base and head"
 MERGE_IN_PROGRESS = "Merge already in progress"
 UNGRANTED = "The permissions requested are not granted"
 SKIP_UNSIGNED = "skipped: dependency update without Signed-off-by, a person lands it"
+REVIEW_BODY = "review body: "
+# Pull requests whose review bodies one run reads in one repository (ADR-0070).
+REVIEW_READS = 10
+REVIEW_BODIES = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100) {
+        totalCount
+        nodes { databaseId state body author { login __typename } }
+      }
+      comments(first: 100) {
+        totalCount
+        nodes { body author { login } }
+      }
+      commits(first: 100) {
+        totalCount
+        nodes { commit { message } }
+      }
+    }
+  }
+}
+"""
+_CODERABBIT_COUNTS = re.compile(
+    r"(?:Nitpick|Outside diff range|Duplicate|Additional) comments(?::\s*|\s+\()(\d+)"
+)
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+_SOURCERY_MARKERS = re.compile(
+    r"high level feedback|## Overall Comments|security issue|"
+    r"Needs a human reviewer|Approval pending",
+    re.I,
+)
+_SOURCERY_LINKED_MET = re.compile(r"(\d{1,6})\s{1,8}of\s{1,8}(\d{1,6})\s{1,8}met", re.I)
+_SOURCERY_CLEAN_OPENERS = (
+    "Hey - I've found",
+    "Hey - I've reviewed your changes",
+    "### Sourcery assessment",
+)
+_UNCHECKED_BOX = re.compile(r"^- \[ \] ", re.M)
+_BODY_REVIEW_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED", "APPROVED"})
 
 
 class RefusedError(Exception):
@@ -836,8 +877,13 @@ def regenerate(env, conf, repo, rows, notes):
 
 
 def re_arm_drifted(env, conf, served, held, notes):
-    """Re-arm an armed squash pull request whose headline drifted from its title."""
-    for pull, _ in served:
+    """Re-arm an armed squash pull request whose headline drifted from its title.
+
+    A pull request a review body holds was disarmed this run and stays disarmed.
+    """
+    for pull, reason in served:
+        if reason.startswith(REVIEW_BODY):
+            continue
         if pull["number"] not in held and drifted(pull, conf):
             if has_red_code_scanning(pull):
                 notes[pull["number"]] = "not re-armed: code-scanning check failed"
@@ -850,17 +896,212 @@ def re_arm_drifted(env, conf, served, held, notes):
 
 
 def disarm_red_scanning(env, rows, notes):
-    """Disarm auto-merge on any pull request with a red code-scanning check."""
-    for pull, _reason in rows:
-        if pull.get("autoMergeRequest") and has_red_code_scanning(pull):
+    """Disarm auto-merge on any pull request held by red code scanning or a review body."""
+    for pull, reason in rows:
+        if not pull.get("autoMergeRequest"):
+            continue
+        cause = has_red_code_scanning(pull) or (reason if reason.startswith(REVIEW_BODY) else None)
+        if cause:
             graphql(env, DISARM, {"id": pull["id"]})
-            notes[pull["number"]] = "disarmed: code-scanning check failed"
+            notes[pull["number"]] = f"disarmed: {cause}"
+
+
+def _strip_html_comments(text):
+    """Text without its closed <!-- --> comments, in one pass over the text.
+
+    The result equals re.sub(r"<!--.*?-->", "", text, flags=re.S): an opener with no
+    closer after it stays, with the rest of the text. The regular expression rescans
+    the rest of the text at every such opener, quadratic on a bot's body.
+    """
+    out, pos = [], 0
+    for _ in range(text.count("<!--") + 1):
+        start = text.find("<!--", pos)
+        end = -1 if start < 0 else text.find("-->", start + 4)
+        if end < 0:
+            break
+        out.append(text[pos:start])
+        pos = end + 3
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _has_review_info(body):
+    """Whether a <summary> element holds "Review info", ASCII letters in any case.
+
+    Same answer as the expression <summary>(?:(?!</summary>).)*?Review info.*?</summary>
+    for ASCII text, in one pass; a non-ASCII letter that only re.I folds reads as no
+    match, which holds the pull request.
+    """
+    lower = body.translate(_ASCII_LOWER)
+    pos = 0
+    for _ in range(lower.count("<summary>") + 1):
+        start = lower.find("<summary>", pos)
+        if start < 0:
+            return False
+        end = lower.find("</summary>", start + 9)
+        if end < 0:
+            return False
+        if lower.find("review info", start + 9, end) >= 0:
+            return True
+        pos = end + 10
+    return False
+
+
+def _coderabbit_finding(body):
+    """Whether a non-empty comment-stripped CodeRabbit review body carries a finding."""
+    counts = [int(n) for n in _CODERABBIT_COUNTS.findall(body)]
+    if any(n > 0 for n in counts) or "[!CAUTION]" in body:
+        return True
+    return "Actionable comments posted:" not in body and not _has_review_info(body)
+
+
+def _sourcery_finding(body):
+    """Whether a non-empty comment-stripped Sourcery review body carries a finding."""
+    if _SOURCERY_MARKERS.search(body):
+        return True
+    if any(int(m.group(1)) < int(m.group(2)) for m in _SOURCERY_LINKED_MET.finditer(body)):
+        return True
+    return not any(opener in body for opener in _SOURCERY_CLEAN_OPENERS)
+
+
+def _codacy_finding(body):
+    """Whether a comment-stripped Codacy review body carries a finding."""
+    return "No blocking issues noticed" not in body or bool(_UNCHECKED_BOX.search(body))
+
+
+def _bot_body_has_finding(login, raw_body):
+    """Whether a bot review body carries a finding after stripping HTML comments."""
+    body = _strip_html_comments(raw_body or "").strip()
+    if login == "codacy-production":
+        return _codacy_finding(body)
+    if not body:
+        return False
+    if login == "coderabbitai":
+        return _coderabbit_finding(body)
+    if login == "sourcery-ai":
+        return _sourcery_finding(body)
+    return True
+
+
+def _answer_texts(pr_author, detail):
+    """Issue comments and review bodies by the PR author, plus all PR commit messages."""
+    comments = (detail.get("comments") or {}).get("nodes") or []
+    reviews = (detail.get("reviews") or {}).get("nodes") or []
+    commits = (detail.get("commits") or {}).get("nodes") or []
+    texts = [
+        node.get("body") or ""
+        for node in comments
+        if (node.get("author") or {}).get("login") == pr_author
+    ]
+    texts += [
+        node.get("body") or ""
+        for node in reviews
+        if (node.get("author") or {}).get("login") == pr_author
+    ]
+    texts += [(node.get("commit") or {}).get("message") or "" for node in commits]
+    return texts
+
+
+def _is_review_answered(review_id, texts):
+    """Whether any text names pullrequestreview-<id> or review <id>."""
+    pattern = re.compile(rf"\b(?:pullrequestreview-{review_id}|review\s+{review_id})\b", re.I)
+    return any(pattern.search(text) for text in texts)
+
+
+def review_body_hold(pull, detail):
+    """Why a pull request waits for an unanswered bot review body finding, or None."""
+    for kind in ("reviews", "comments", "commits"):
+        if ((detail.get(kind) or {}).get("totalCount") or 0) > 100:
+            return f"{REVIEW_BODY}more than 100 {kind}, cannot read every answer"
+    author_field = pull.get("author")
+    pr_author = (author_field.get("login") or "") if isinstance(author_field, dict) else ""
+    texts = _answer_texts(pr_author, detail)
+    unanswered = []
+    for review in (detail.get("reviews") or {}).get("nodes") or []:
+        author = review.get("author") or {}
+        if author.get("__typename") != "Bot" or review.get("state") not in _BODY_REVIEW_STATES:
+            continue
+        login = (author.get("login") or "").removesuffix("[bot]")
+        review_id = review.get("databaseId")
+        if _bot_body_has_finding(login, review.get("body")) and not _is_review_answered(
+            review_id, texts
+        ):
+            unanswered.append((login, review_id))
+    if not unanswered:
+        return None
+    login, review_id = unanswered[0]
+    reason = (
+        f"{REVIEW_BODY}{login} review {review_id} has findings "
+        f"without a reply naming pullrequestreview-{review_id}"
+    )
+    if len(unanswered) > 1:
+        return f"{reason} (and {len(unanswered) - 1} more)"
+    return reason
+
+
+def pull_review_bodies(env, number):
+    """The reviews, issue comments, and commits of one pull request for body-hold checks."""
+    owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+    data = graphql(env, REVIEW_BODIES, {"owner": owner, "name": name, "number": number})
+    return (data.get("repository") or {}).get("pullRequest")
+
+
+def read_review_hold(env, pull):
+    """The review-body hold of one pull request, or None; a failed read holds it."""
+    try:
+        detail = pull_review_bodies(env, pull["number"])
+    except RefusedError as err:
+        return f"{REVIEW_BODY}cannot read: {err}"[:200]
+    if not detail:
+        return f"{REVIEW_BODY}cannot read: the forge returned no pull request"
+    return review_body_hold(pull, detail)
+
+
+def review_body_eligible(pull, reason, conf):
+    """Whether the train reads the review bodies of a pull request in this verdict."""
+    served = reason in ("land", "behind", "red") or bool(pull.get("autoMergeRequest"))
+    return served and not is_bot_dependency(pull, conf)
+
+
+def hold_review_bodies(env, conf, rows):
+    """Replace verdict reasons with review-body holds; read at most REVIEW_READS pull requests.
+
+    Reads go in serving order, security updates and the oldest first. An eligible pull
+    request past the bound is held unread and read in a later run.
+    """
+    eligible = [
+        pull
+        for pull, reason in serving_order(rows, conf)
+        if review_body_eligible(pull, reason, conf)
+    ]
+    holds = {pull["number"]: read_review_hold(env, pull) for pull in eligible[:REVIEW_READS]}
+    unread = frozenset(pull["number"] for pull in eligible[REVIEW_READS:])
+    over = f"{REVIEW_BODY}not read: more than {REVIEW_READS} pull requests to read in one run"
+    updated = []
+    for pull, reason in rows:
+        number = pull["number"]
+        updated.append((pull, over if number in unread else holds.get(number) or reason))
+    return updated
+
+
+def late_review_hold(env, conf, pull, notes):
+    """Read the review bodies again just before landing; True holds, disarmed if armed."""
+    if is_bot_dependency(pull, conf):
+        return False
+    hold = read_review_hold(env, pull)
+    if not hold:
+        return False
+    if pull.get("autoMergeRequest"):
+        graphql(env, DISARM, {"id": pull["id"]})
+        hold = f"disarmed: {hold}"
+    notes[pull["number"]] = hold
+    return True
 
 
 def land_clean(env, conf, repo, served, notes):
     """Land or enqueue the oldest clean pull request, or None."""
     for pull, reason in served:
-        if reason == "land":
+        if reason == "land" and not late_review_hold(env, conf, pull, notes):
             try:
                 done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
             except UnsignedBotError:
@@ -883,14 +1124,16 @@ def run(env, conf, repo, now):
     """Execute one merge train cycle across served pull requests."""
     pulls = repo["pullRequests"]["nodes"]
     replaced = superseded(pulls)
-    rows = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
+    verdicts = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
+    rows = hold_review_bodies(env, conf, verdicts)
     notes = {pull["number"]: reason for pull, reason in rows}
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
     disarm_red_scanning(env, rows, notes)
     lease = lander_lease(repo, now)
     served = serving_order(rows, conf)
-    held = hold_for_security(env, repo, served, notes, conf)
+    # A security update a review body holds is still the fix the others wait for (record 0062).
+    held = hold_for_security(env, repo, serving_order(verdicts, conf), notes, conf)
     served = [
         (pull, f"labelled {SECURITY_HOLD_LABEL}" if pull["number"] in held else reason)
         for pull, reason in served
