@@ -5776,6 +5776,167 @@ def test_planted_unknown_bot_and_unknown_shapes_hold(tmp_path, login, body):
     assert f"review body: {login} review 701 has findings" in summary
 
 
+@pytest.mark.parametrize(
+    ("login", "body", "expected"),
+    [
+        (
+            "sourcery-ai",
+            "### Sourcery assessment\n\n**Approved.**",
+            False,
+        ),
+        (
+            "coderabbitai",
+            (
+                "<details><summary>Prompt to fix all issues</summary></details>\n"
+                "<details><summary>Review info</summary></details>"
+            ),
+            False,
+        ),
+        (
+            "coderabbitai",
+            (
+                "<summary>Prompt to fix all issues</summary>\n"
+                "<h6><summary><picture></picture> Review info</summary></h6>"
+            ),
+            False,
+        ),
+        (
+            "sourcery-ai",
+            (
+                "Hey - I've found 2 issues\n\n"
+                "### Sourcery assessment\n\n"
+                "**Approval pending.** 2 findings to address first.\n\n"
+                "Blocking findings: `test.py:10`"
+            ),
+            True,
+        ),
+        (
+            "sourcery-ai",
+            (
+                "Hey - I've reviewed your changes\n\n"
+                "### Linked issues\n"
+                "**[#2] Test issue** · 4 of 5 met\n"
+                "**[#3] Second issue** · 2 of 2 met"
+            ),
+            True,
+        ),
+        (
+            "sourcery-ai",
+            "New security issues found",
+            True,
+        ),
+        (
+            "coderabbitai",
+            (
+                "Additional comments: 1\n"
+                "Verification ran but could not confirm this finding\n"
+                "<summary>Review info</summary>"
+            ),
+            True,
+        ),
+        (
+            "codacy-production",
+            (
+                "### Pull Request Overview\n\n"
+                ":eyes: **Worth a closer look**\n\n"
+                "#### Test suggestions\n"
+                "- [x] Validate coverage floor\n"
+                "- [x] Verify stamps"
+            ),
+            True,
+        ),
+        (
+            "coderabbitai",
+            ("**Actionable comments posted: 1**\n\n- [ ] <!-- autofix --> Fix comments: Fix on PR"),
+            False,
+        ),
+        (
+            "sourcery-ai",
+            (
+                "Hey - I've found 3 issues\n\n"
+                "<details><summary>Prompt for AI Agents</summary>\n"
+                "## Individual Comments\n\n"
+                "### Comment 1\n"
+                "</details>\n\n"
+                "### Sourcery assessment\n\n"
+                "**Approval pending.** 3 findings to address first.\n\n"
+                "Blocking findings: `Makefile:129`, `Makefile:128`"
+            ),
+            True,
+        ),
+        (
+            "sourcery-ai",
+            (
+                "Hey - I've found 3 issues\n\n"
+                "<details><summary>Prompt for AI Agents</summary>\n"
+                "## Individual Comments\n\n"
+                "### Comment 1\n"
+                "</details>"
+            ),
+            False,
+        ),
+    ],
+    ids=[
+        "pr138-5819334919-sourcery-bare-approved",
+        "pr139-5818723044-coderabbit-prompt-review-info",
+        "pr150-5820146659-coderabbit-prompt-review-info-alt",
+        "pr153-5820899825-sourcery-approval-pending",
+        "pr150-5820192615-sourcery-linked-issues-partly-unmet",
+        "pr139-5819112049-sourcery-new-security-issues",
+        "pr140-5819221013-coderabbit-additional-comments-count",
+        "pr153-5820891475-codacy-worth-closer-look-all-checked",
+        "pr139-5818983092-coderabbit-actionable-comments-autofix-box",
+        "pr140-5818710917-sourcery-found-issues-approval-pending",
+        "synthetic-sourcery-found-issues-inline-only-no-assessment",
+    ],
+)
+def test_bot_body_has_finding_table(tmp_path, monkeypatch, login, body, expected):
+    """Classification over bot review body shapes; ids name the live review each row copies."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    assert merge_train._bot_body_has_finding(login, body) == expected
+
+
+def test_planted_sourcery_approval_pending_held_until_answered(tmp_path):
+    """Sourcery Approval pending body holds until an author comment names the review id."""
+    body = (
+        "Hey - I've found 2 issues\n\n"
+        "### Sourcery assessment\n\n"
+        "**Approval pending.** 2 findings to address first.\n\n"
+        "Blocking findings: `tests/test_foo.py:10`"
+    )
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _detail(reviews=[_bot_review(601, "sourcery-ai", body)])
+    held_dir = tmp_path / "held"
+    held_dir.mkdir()
+    done, summary = train(held_dir, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    expected_hold = (
+        "review body: sourcery-ai review 601 has findings "
+        "without a reply naming pullrequestreview-601"
+    )
+    assert expected_hold in summary
+
+    # Same with author comment naming pullrequestreview-601 -> lands.
+    forge_answered = Forge(repository(p))
+    forge_answered.review_details[1] = _detail(
+        reviews=[_bot_review(601, "sourcery-ai", body)],
+        comments=[
+            {
+                "body": "Addressed in pullrequestreview-601.",
+                "author": {"login": "person"},
+            }
+        ],
+    )
+    landed_dir = tmp_path / "landed"
+    landed_dir.mkdir()
+    done, summary = train(landed_dir, forge_answered)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge_answered.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
 def test_dismissed_bot_review_and_person_review_body_land(tmp_path):
     """A DISMISSED bot review with a nitpick and a User review body do not hold."""
     p = pull(1, "CLEAN", author={"login": "person"})

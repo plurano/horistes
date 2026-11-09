@@ -55,15 +55,19 @@ new review-body parsing and GraphQL queries belong in `tools/merge_train.py`.
       `author.__typename == "Bot"` and `state` is in `{"COMMENTED", "CHANGES_REQUESTED", "APPROVED"}`
       (`DISMISSED` and `PENDING` are ignored).
     - Strip HTML comments (`<!--.*?-->`) and detect findings per bot login (after
-      stripping any `"[bot]"` suffix):
+      stripping any `"[bot]"` suffix; shapes taken from live reviews 2026-11-09):
       - `coderabbitai`: finding when any count in
         `(Nitpick|Outside diff range|Duplicate|Additional) comments` (`: N` or ` (N)`)
-        is greater than zero; empty body has no finding; a non-empty body with no count
-        match and no `Actionable comments posted:` fails closed as an unknown shape;
-        the autofix checkbox is not a finding.
-      - `sourcery-ai`: finding when `## Overall Comments`, `**Security issues**`, or
-        `Needs a human reviewer` appears in the body, or when a non-empty body lacks
-        `Hey - I've` (unknown shape).
+        is greater than zero, or when `[!CAUTION]` appears in the body; empty body has no
+        finding; clean when body holds `Actionable comments posted:` or a `Review info`
+        summary; otherwise fails closed as an unknown shape; the autofix checkbox is not
+        a finding.
+      - `sourcery-ai`: finding when any marker appears (case-insensitive:
+        `high level feedback`, `## Overall Comments`, `security issue`,
+        `Needs a human reviewer`, `Approval pending`), or when any linked-issue line
+        `(\d+) of (\d+) met` has first < second; clean when body holds a known Sourcery
+        opener or assessment (`Hey - I've found`, `Hey - I've reviewed your changes`,
+        `### Sourcery assessment`); otherwise fails closed as an unknown shape.
       - `codacy-production`: finding when `No blocking issues noticed` is absent or any
         line matches `^- \[ \] `.
       - Any other bot: finding when the comment-stripped body is non-empty.
@@ -102,3 +106,8 @@ new review-body parsing and GraphQL queries belong in `tools/merge_train.py`.
     before the next merge-train sweep runs and disarms it.
   - Unrecognized bot review body formats fail closed and require an explicit author
     reply or parser update.
+  - Every Sourcery `Hey - I've found N issues` review in PRs 138 to 153 ends with
+    `**Approval pending.**` and a `Blocking findings:` list, so each such review holds
+    until the author names it, even when the same findings sit in inline threads the
+    thread gate already covers. The body is Sourcery's own blocking verdict, so it counts
+    as a finding; one author comment naming the review clears it.

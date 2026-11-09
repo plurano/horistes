@@ -127,7 +127,20 @@ _HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 _CODERABBIT_COUNTS = re.compile(
     r"(?:Nitpick|Outside diff range|Duplicate|Additional) comments(?::\s*|\s+\()(\d+)"
 )
-_SOURCERY_MARKERS = ("## Overall Comments", "**Security issues**", "Needs a human reviewer")
+_CODERABBIT_REVIEW_INFO = re.compile(
+    r"<summary>(?:(?!</summary>).)*?Review info.*?</summary>", re.S | re.I
+)
+_SOURCERY_MARKERS = re.compile(
+    r"high level feedback|## Overall Comments|security issue|"
+    r"Needs a human reviewer|Approval pending",
+    re.I,
+)
+_SOURCERY_LINKED_MET = re.compile(r"(\d+)\s+of\s+(\d+)\s+met", re.I)
+_SOURCERY_CLEAN_OPENERS = (
+    "Hey - I've found",
+    "Hey - I've reviewed your changes",
+    "### Sourcery assessment",
+)
 _UNCHECKED_BOX = re.compile(r"^- \[ \] ", re.M)
 _BODY_REVIEW_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED", "APPROVED"})
 
@@ -893,12 +906,18 @@ def disarm_red_scanning(env, rows, notes):
 def _coderabbit_finding(body):
     """Whether a non-empty comment-stripped CodeRabbit review body carries a finding."""
     counts = [int(n) for n in _CODERABBIT_COUNTS.findall(body)]
-    return any(n > 0 for n in counts) or (not counts and "Actionable comments posted:" not in body)
+    if any(n > 0 for n in counts) or "[!CAUTION]" in body:
+        return True
+    return "Actionable comments posted:" not in body and not _CODERABBIT_REVIEW_INFO.search(body)
 
 
 def _sourcery_finding(body):
     """Whether a non-empty comment-stripped Sourcery review body carries a finding."""
-    return "Hey - I've" not in body or any(marker in body for marker in _SOURCERY_MARKERS)
+    if _SOURCERY_MARKERS.search(body):
+        return True
+    if any(int(m.group(1)) < int(m.group(2)) for m in _SOURCERY_LINKED_MET.finditer(body)):
+        return True
+    return not any(opener in body for opener in _SOURCERY_CLEAN_OPENERS)
 
 
 def _codacy_finding(body):
