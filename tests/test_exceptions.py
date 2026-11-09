@@ -947,8 +947,8 @@ def test_ratchet_3d(tree):
     assert "lower noqa in suppression-baseline.json to 1" in probs_shrink[0]
 
 
-def test_reuse_lint_override_3d(tmp_path):
-    """3D test: reuse lint passes with override table, fails without override table."""
+def test_reuse_lint_template_empty_note_3d(tmp_path):
+    """3D test: template SPDX empty notes pass reuse lint; fails without them on identifier."""
     import os
 
     reuse_bin = (
@@ -968,21 +968,32 @@ def test_reuse_lint_override_3d(tmp_path):
     subprocess.run(["git", "init", "-b", "main"], cwd=dest, capture_output=True, check=True)
     subprocess.run(["git", "add", "-A"], cwd=dest, capture_output=True, check=True)
 
-    # 1. With override table -> rc 0
+    # 1. Positive: template empty notes pass reuse lint without an override table -> rc 0
     proc1 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
     assert proc1.returncode == 0, proc1.stdout + proc1.stderr
 
-    # 2. Mutate REUSE.toml: remove the override table
-    toml_text = (dest / "REUSE.toml").read_text(encoding="utf-8")
-    assert 'precedence = "override"' in toml_text
-    blocks = toml_text.split("[[annotations]]")
-    kept_blocks = [b for b in blocks if 'precedence = "override"' not in b]
-    (dest / "REUSE.toml").write_text("[[annotations]]".join(kept_blocks), encoding="utf-8")
-
-    # Run reuse lint again -> must fail with invalid SPDX expressions
+    # 2. Negative: plain License-Identifier without empty note fails naming invalid SPDX expression
+    tmpl = dest / "templates" / "callers" / "licence.yml.tmpl"
+    original = tmpl.read_text(encoding="utf-8")
+    assert "# SPDX-<%/* */%>License-Identifier:" in original
+    plain_identifier = original.replace(
+        "# SPDX-<%/* */%>License-Identifier:",
+        "# SPDX-" + "License-Identifier:",
+    )
+    tmpl.write_text(plain_identifier, encoding="utf-8")
     proc2 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
     assert proc2.returncode != 0
-    assert "Invalid SPDX" in proc2.stdout or "invalid spdx" in proc2.stdout.lower()
+    assert "invalid spdx" in (proc2.stdout + proc2.stderr).lower()
+
+    # 3. Boundary: plain FileCopyrightText without empty note passes (copyright text is free form)
+    assert "# SPDX-<%/* */%>FileCopyrightText:" in original
+    plain_copyright = original.replace(
+        "# SPDX-<%/* */%>FileCopyrightText:",
+        "# SPDX-" + "FileCopyrightText:",
+    )
+    tmpl.write_text(plain_copyright, encoding="utf-8")
+    proc3 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
+    assert proc3.returncode == 0, proc3.stdout + proc3.stderr
 
 
 def test_scan_tracked_file_oserror_exits_3(tree):

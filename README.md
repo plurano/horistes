@@ -263,9 +263,10 @@ Identifier = "EUPL-1.2"
 
 Every rendered caller starts with the consumer's own licence header, written
 from `.Licence`, so the consumer's licence check accepts the file
-([#3](https://github.com/plurano/horistes/issues/3)). An override table in
-`REUSE.toml` covers `templates/callers/*.tmpl` and `tests/test_render.py` so this
-repository's licence check ignores the field lines. `.Licence.CopyrightText` and
+([#3](https://github.com/plurano/horistes/issues/3)). The empty note inside each
+field line (`# SPDX-<%/* */%>...`) renders as nothing and keeps this
+repository's licence check from reading the line as a tag, while REUSE ignore
+markers stay refused by `tools/exceptions.py`. `.Licence.CopyrightText` and
 `.Licence.Identifier` are working names, like the `.Shared` fields, until the
 engine renders caller templates. The consumer's `LICENSES/` must hold the named
 licence; `reuse lint` otherwise fails and names the missing licence.

@@ -45,11 +45,12 @@ never collides with another caller's.
 
 Licence header: the rendered caller starts with the consumer's own header,
 written from .Licence (working names, as above), so the consumer's licence
-check accepts it (#3). An override table in REUSE.toml covers the templates so
-this repository's licence check ignores the field lines.
+check accepts it (#3). The empty note inside each field line renders as
+nothing and keeps this repository's licence check from reading the line as a
+tag; no REUSE.toml table and no ignore marker covers the template.
 */ -%>
-# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>
-# SPDX-License-Identifier: <% .Licence.Identifier %>
+# SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>
 ---
 # Scorecard: the supply-chain checks of this repository, reported to code
 # scanning. The job is the shared workflow of <% .Shared.Repository %>, named

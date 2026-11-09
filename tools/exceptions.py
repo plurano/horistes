@@ -722,7 +722,7 @@ def _reuse_problems(name: str, text: str) -> list[str]:
         if REUSE_START in line or REUSE_END in line:
             problems.append(
                 f"{name}:{line_no}: invalid REUSE suppression: "
-                "marker not permitted, use REUSE.toml override"
+                "marker not permitted, use the empty-note form in templates"
             )
     return problems
 

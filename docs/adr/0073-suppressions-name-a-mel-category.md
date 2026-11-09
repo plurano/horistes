@@ -36,8 +36,9 @@ hook files cannot be modified directly in this repository without causing contex
   warning per word (measured with bandit 1.9.4; both forms suppress the finding).
 - Inline directives in files must match the fleet format, or be covered by an entry in
   `exceptions.yaml` ([ADR-0007](0007-one-own-exception-list.md)).
-- REUSE ignore markers are prohibited in source files; licensing exceptions are managed
-  declaratively in the REUSE override table in `REUSE.toml`.
+- REUSE ignore markers are prohibited in source files and stay refused by `tools/exceptions.py`;
+  caller templates keep licence field lines from being read as tags via an empty template
+  note (`# SPDX-<%/* */%>...`).
 - Eleven engine-owned lines are tracked in `exceptions.yaml` under issue `cordanaLLM/praetor#1878`
   with category `C` until emitted by an updated engine release.
 - A ratchet baseline in `suppression-baseline.json` records the count of directive lines by kind

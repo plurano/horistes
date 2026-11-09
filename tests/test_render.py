@@ -39,8 +39,8 @@ GOOD = f"""\
 <%- /*
 Required check: the job `result` reports the calling job's name ({ISSUE}).
 */ -%>
-# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>
-# SPDX-License-Identifier: <% .Licence.Identifier %>
+# SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>
 ---
 name: Licence check
 on:
@@ -449,15 +449,15 @@ PLANTED = [
     ),
     pytest.param(
         GOOD.replace(
-            "# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>\n"
-            "# SPDX-License-Identifier: <% .Licence.Identifier %>\n",
+            "# SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>\n"
+            "# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>\n",
             "",
         ),
         "the rendered caller does not start with the two SPDX header lines",
         id="no-spdx-header",
     ),
     pytest.param(
-        GOOD.replace("# SPDX-" + "License-Identifier: <% .Licence.Identifier %>\n", ""),
+        GOOD.replace("# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>\n", ""),
         "the rendered caller does not start with the two SPDX header lines",
         id="spdx-missing-identifier",
     ),
