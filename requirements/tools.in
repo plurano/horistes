@@ -4,6 +4,7 @@
 # The tools of the local gate and of CI, one version for both. Compile with
 # `make requirements`; it leaves out every release younger than three days.
 coverage
+lefthook
 pytest
 pyyaml
 reuse
