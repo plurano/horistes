@@ -8,9 +8,7 @@ a skipped linter would read as a green gate.
 
 from __future__ import annotations
 
-import hashlib
 import os
-import shutil
 import subprocess
 
 import pytest
@@ -59,16 +57,6 @@ except ImportError:
     safe_load_all = None
     YAMLError = Exception
 """
-
-
-def actionlint_sha_line() -> str:
-    """The sha256 verification line from the actionlint installation in ci.yml."""
-    gate = ROOT / ".github/workflows/ci.yml"
-    for line in gate.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if "ACTIONLINT_SHA256" in stripped and "sha256sum" in stripped:
-            return stripped
-    raise AssertionError("actionlint sha256 check line not found in .github/workflows/ci.yml")
 
 
 def actionlint(tree):
@@ -176,46 +164,6 @@ def test_actionlint_refuses(tree, workflow, finding):
     done = actionlint(tree.write({WORKFLOW: workflow}))
     assert done.returncode != 0
     assert finding in done.stdout
-
-
-def test_actionlint_sha256_verification_refuses_planted_wrong_digest(tmp_path):
-    """The sha256 verification line in ci.yml fails on a bad digest and passes on a match."""
-    line = actionlint_sha_line()
-    archive = tmp_path / "actionlint.tar.gz"
-    archive.write_bytes(b"planted actionlint archive payload\n")
-    right_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    wrong_digest = "0" * 64
-    shell = shutil.which("bash") or "sh"
-
-    # nosemgrep: dangerous-subprocess-use-audit runs the ci.yml sha256 line on a planted archive
-    passed = subprocess.run(
-        [shell, "-c", line],
-        env={
-            "PATH": os.environ["PATH"],
-            "ACTIONLINT_SHA256": right_digest,
-            "archive": str(archive),
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    assert passed.returncode == 0, passed.stdout + passed.stderr
-
-    # nosemgrep: dangerous-subprocess-use-audit runs the ci.yml sha256 line with a wrong digest
-    failed = subprocess.run(
-        [shell, "-c", line],
-        env={
-            "PATH": os.environ["PATH"],
-            "ACTIONLINT_SHA256": wrong_digest,
-            "archive": str(archive),
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    assert failed.returncode != 0
 
 
 @pytest.mark.parametrize(

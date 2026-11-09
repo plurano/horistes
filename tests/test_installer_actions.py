@@ -7,18 +7,28 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import secrets
+import shutil
+import signal
 import subprocess
 import tarfile
+import time
 from pathlib import Path
+from typing import NamedTuple
 
+import pytest
 import yaml
-from conftest import ROOT
+from conftest import ROOT, STUB_GH_TOKEN
 
 INSTALL_GITLEAKS_SH = ROOT / "actions/install-gitleaks/install-gitleaks.sh"
 VERIFIED_DOWNLOAD_SH = ROOT / "actions/verified-download/verified-download.sh"
 ACTION_INSTALL_GITLEAKS_YML = ROOT / "actions/install-gitleaks/action.yml"
 ACTION_VERIFIED_DOWNLOAD_YML = ROOT / "actions/verified-download/action.yml"
 DEFAULT_VERSION = "8.30.1"
+# The endless gh stub offers this many chunks of this size, 64 MiB in all.
+ENDLESS_CHUNK = 65536
+ENDLESS_CHUNKS = 1024
+ENDLESS_BYTES = ENDLESS_CHUNK * ENDLESS_CHUNKS
 
 
 def make_archive(dest_dir: Path, name: str, version: str, shape: str = "regular") -> Path:
@@ -55,54 +65,153 @@ def corrupt_digest(digest: str) -> str:
     return f"{first}{digest[1:]}"
 
 
+CURL_STUB_TEMPLATE = """#!/usr/bin/env bash
+set -euo pipefail
+output=''
+url=''
+while (($# > 0)); do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    --retry | --connect-timeout | --max-time | --max-filesize | --proto | --proto-redir)
+      printf '%s %s\\n' "$1" "$2" >>"{logs_dir}/curl_args.log"
+      shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\\n' "$url" >>"{logs_dir}/curl.log"
+if [[ -n "${{CURL_HANG:-}}" ]]; then
+  exec sleep "${{CURL_HANG}}"
+fi
+if [[ "$url" != https://* ]]; then
+  printf 'curl: (1) Protocol not supported: %s\\n' "$url" >&2
+  exit 1
+fi
+if [[ -n "${{CURL_OUTAGE:-}}" ]]; then
+  if [[ "$url" == *"github.com"* ]]; then
+    printf 'curl: (22) The requested URL returned error: 504\\n' >&2
+    exit 22
+  fi
+fi
+if [[ -n "${{CURL_FAIL:-}}" ]]; then
+  exit 1
+fi
+if [[ -n "${{FIXTURE_ARCHIVE:-}}" && -n "$output" ]]; then
+  cp "${{FIXTURE_ARCHIVE}}" "$output"
+fi
+"""
+
+GH_STUB_TEMPLATE = """#!/usr/bin/env python3
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+args = sys.argv[1:]
+logs = Path('{logs_dir}')
+with open(logs / 'gh.log', 'a', encoding='utf-8') as handle:
+    handle.write(' '.join(args) + '\\n')
+
+token = os.environ.get('GH_TOKEN')
+if not token:
+    sys.stderr.write('gh stub: GH_TOKEN unset or empty\\n')
+    sys.exit(1)
+
+if (
+    len(args) != 9
+    or args[0] != 'release'
+    or args[1] != 'download'
+    or args[2].startswith('-')
+    or args[3] != '--repo'
+    or not args[4].startswith('github.com/')
+    or args[5] != '--pattern'
+    or not args[6]
+    or args[7] != '--output'
+    or args[8] != '-'
+):
+    sys.stderr.write(f'gh stub: args differ from required shape: {{args}}\\n')
+    sys.exit(1)
+
+mode = os.environ.get('STUB_GH_MODE', 'healthy')
+fix_path = os.environ.get('FIXTURE_ARCHIVE')
+out = sys.stdout.buffer
+
+if mode == 'healthy':
+    if fix_path:
+        out.write(Path(fix_path).read_bytes())
+    sys.exit(0)
+
+if mode == 'wrong_bytes':
+    out.write(b'corrupted bytes payload\\n')
+    sys.exit(0)
+
+if mode == 'endless':
+    written = 0
+    chunk = b'x' * {endless_chunk}
+    try:
+        for _ in range({endless_chunks}):
+            out.write(chunk)
+            out.flush()
+            written += len(chunk)
+    except BrokenPipeError:
+        (logs / 'gh_written').write_text(str(written), encoding='utf-8')
+        os._exit(1)
+    (logs / 'gh_written').write_text(str(written), encoding='utf-8')
+    sys.exit(0)
+
+if mode == 'hang':
+    time.sleep(float(os.environ.get('STUB_GH_HANG', '30')))
+    if fix_path:
+        out.write(Path(fix_path).read_bytes())
+    sys.exit(0)
+
+if mode == 'ignore_term':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(float(os.environ.get('STUB_GH_HANG', '30')))
+    if fix_path:
+        out.write(Path(fix_path).read_bytes())
+    sys.exit(0)
+
+if mode == 'missing_asset':
+    sys.stderr.write('no assets match the file pattern\\n')
+    sys.exit(1)
+
+sys.stderr.write(f'gh stub: unknown mode {{mode}}\\n')
+sys.exit(1)
+"""
+
+UNAME_STUB_SH = """#!/usr/bin/env bash
+case "$1" in
+  -s) printf '%s\\n' "${FAKE_UNAME_S:-Linux}" ;;
+  -m) printf '%s\\n' "${FAKE_UNAME_M:-x86_64}" ;;
+  *) exit 2 ;;
+esac
+"""
+
+
 def setup_fake_environment(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """Create fake curl and uname binaries on PATH and return paths."""
+    """Create fake curl, uname and gh binaries on PATH and return paths."""
     bin_dir = tmp_path / "bin"
     logs_dir = tmp_path / "logs"
     bin_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    curl_sh = (
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        "output=''\n"
-        "url=''\n"
-        "while (($# > 0)); do\n"
-        '  case "$1" in\n'
-        '    --output) output="$2"; shift 2 ;;\n'
-        "    --retry | --connect-timeout | --max-time | --max-filesize | --proto | --proto-redir)\n"
-        f'      printf \'%s %s\\n\' "$1" "$2" >>"{logs_dir}/curl_args.log"\n'
-        "      shift 2 ;;\n"
-        "    -*) shift ;;\n"
-        '    *) url="$1"; shift ;;\n'
-        "  esac\n"
-        "done\n"
-        f'printf \'%s\\n\' "$url" >>"{logs_dir}/curl.log"\n'
-        'if [[ "$url" != https://* ]]; then\n'
-        "  printf 'curl: (1) Protocol not supported: %s\\n' \"$url\" >&2\n"
-        "  exit 1\n"
-        "fi\n"
-        'if [[ -n "${CURL_FAIL:-}" ]]; then\n'
-        "  exit 1\n"
-        "fi\n"
-        'if [[ -n "${FIXTURE_ARCHIVE:-}" && -n "$output" ]]; then\n'
-        '  cp "${FIXTURE_ARCHIVE}" "$output"\n'
-        "fi\n"
-    )
     curl_file = bin_dir / "curl"
-    curl_file.write_text(curl_sh, encoding="utf-8")
+    curl_file.write_text(CURL_STUB_TEMPLATE.format(logs_dir=logs_dir), encoding="utf-8")
     curl_file.chmod(0o755)
 
-    uname_sh = (
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        "  -s) printf '%s\\n' \"${FAKE_UNAME_S:-Linux}\" ;;\n"
-        "  -m) printf '%s\\n' \"${FAKE_UNAME_M:-x86_64}\" ;;\n"
-        "  *) exit 2 ;;\n"
-        "esac\n"
+    gh_file = bin_dir / "gh"
+    gh_file.write_text(
+        GH_STUB_TEMPLATE.format(
+            logs_dir=logs_dir, endless_chunk=ENDLESS_CHUNK, endless_chunks=ENDLESS_CHUNKS
+        ),
+        encoding="utf-8",
     )
+    gh_file.chmod(0o755)
+
     uname_file = bin_dir / "uname"
-    uname_file.write_text(uname_sh, encoding="utf-8")
+    uname_file.write_text(UNAME_STUB_SH, encoding="utf-8")
     uname_file.chmod(0o755)
 
     return bin_dir, logs_dir, curl_file
@@ -112,13 +221,18 @@ def run_bash_cmd(
     cmd: list[str],
     bin_dir: Path,
     env_extra: dict[str, str] | None = None,
+    *,
+    timeout: float = 60,
 ) -> subprocess.CompletedProcess[str]:
     """Run bash command with fake bin on PATH."""
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     if env_extra:
         env.update(env_extra)
-    return subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    # nosemgrep: dangerous-subprocess-use-audit callers pass fixed argv with stubs on PATH
+    return subprocess.run(
+        cmd, env=env, capture_output=True, text=True, check=False, timeout=timeout
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -455,3 +569,392 @@ def test_action_full_inputs_download(tmp_path: Path) -> None:
     )
     assert res.returncode == 0, res.stderr
     assert output_file.read_bytes() == fixture_file.read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# fetch_verified fallback tests
+# ---------------------------------------------------------------------------
+
+RELEASE_URL = (
+    "https://github.com/rhysd/actionlint/releases/download/v1.7.7/"
+    "actionlint_1.7.7_linux_amd64.tar.gz"
+)
+# The bounds reach fetch_verified through the environment, so a planted value
+# arrives as written, with no expansion by the calling script.
+FETCH_SCRIPT = (
+    '. "$VERIFIED_DOWNLOAD"\n'
+    'fetch_verified "$FETCH_URL" "$FETCH_SHA256" '
+    '"$FETCH_MAX_BYTES" "$FETCH_TIMEOUT" "$FETCH_OUTPUT"\n'
+)
+FALLBACK_SCRIPT = (
+    '. "$VERIFIED_DOWNLOAD"\n'
+    'fetch_release_fallback "$FETCH_URL" "$FETCH_MAX_BYTES" "$FETCH_TIMEOUT" "$FETCH_OUTPUT"\n'
+)
+
+
+class Fetched(NamedTuple):
+    """What one fetch left behind: the process, the stub logs, the output and its source."""
+
+    res: subprocess.CompletedProcess[str]
+    logs_dir: Path
+    output: Path
+    fixture: Path
+
+
+def fetch_release(
+    tmp_path: Path,
+    env: dict[str, str],
+    *,
+    url: str = RELEASE_URL,
+    max_bytes: str = "1048576",
+    timeout_seconds: str = "60",
+    payload: bytes = b"sample payload contents\n",
+    script: str = FETCH_SCRIPT,
+) -> Fetched:
+    """Run `script` against the stubs, pinned to the digest of `payload`."""
+    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
+    fixture = tmp_path / "data.txt"
+    fixture.write_bytes(payload)
+    output = tmp_path / "downloaded.txt"
+    res = run_bash_cmd(
+        ["bash", "-c", script],
+        bin_dir,
+        env_extra={
+            "VERIFIED_DOWNLOAD": str(VERIFIED_DOWNLOAD_SH),
+            "FETCH_URL": url,
+            "FETCH_SHA256": sha256_of(fixture),
+            "FETCH_MAX_BYTES": max_bytes,
+            "FETCH_TIMEOUT": timeout_seconds,
+            "FETCH_OUTPUT": str(output),
+            "FIXTURE_ARCHIVE": str(fixture),
+            "GH_TOKEN": STUB_GH_TOKEN,
+            **env,
+        },
+    )
+    return Fetched(res, logs_dir, output, fixture)
+
+
+def test_fetch_verified_fallback_outage(tmp_path: Path) -> None:
+    """Under outage, fetch_verified streams the asset from gh release download and verifies it."""
+    got = fetch_release(tmp_path, {"CURL_OUTAGE": "1"})
+    assert got.res.returncode == 0, got.res.stderr
+    assert got.output.read_bytes() == got.fixture.read_bytes()
+    assert "::warning title=Release download fallback::" in got.res.stdout
+    assert "failed; fetching it with gh release download" in got.res.stdout
+    calls = (got.logs_dir / "gh.log").read_text(encoding="utf-8").splitlines()
+    expected_args = [
+        "release",
+        "download",
+        "v1.7.7",
+        "--repo",
+        "github.com/rhysd/actionlint",
+        "--pattern",
+        "actionlint_1.7.7_linux_amd64.tar.gz",
+        "--output",
+        "-",
+    ]
+    assert [call.split() for call in calls] == [expected_args]
+
+
+def test_fetch_verified_fallback_healthy_curl(tmp_path: Path) -> None:
+    """When curl succeeds, gh is not called and no warning is emitted."""
+    got = fetch_release(tmp_path, {})
+    assert got.res.returncode == 0, got.res.stderr
+    assert got.output.read_bytes() == got.fixture.read_bytes()
+    assert "::warning title=Release download fallback::" not in got.res.stdout
+    assert not (got.logs_dir / "gh.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("url", "env"),
+    [
+        ("https://example.com/releases/download/v1.0.0/asset.tar.gz", {"CURL_FAIL": "1"}),
+        (
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.7/*.tar.gz",
+            {"CURL_OUTAGE": "1"},
+        ),
+        (
+            "https://example.com/rhysd/actionlint/releases/download/v1.7.7/actionlint.tar.gz",
+            {"CURL_FAIL": "1"},
+        ),
+        (
+            "https://github.com.example.org/rhysd/actionlint/releases/download/v1.7.7/a.tar.gz",
+            {"CURL_FAIL": "1"},
+        ),
+        (
+            "http://github.com/rhysd/actionlint/releases/download/v1.7.7/a.tar.gz",
+            {"CURL_FAIL": "1"},
+        ),
+    ],
+    ids=["non-github", "glob-asset", "other-host", "lookalike-host", "plain-http"],
+)
+def test_fetch_verified_fallback_refuses_a_url_off_the_release_path(
+    tmp_path: Path, url: str, env: dict[str, str]
+) -> None:
+    """A URL that is not a github.com release asset never reaches gh."""
+    got = fetch_release(tmp_path, env, url=url)
+    assert got.res.returncode != 0
+    assert not (got.logs_dir / "gh.log").exists()
+
+
+def test_fetch_verified_fallback_missing_gh_fails(tmp_path: Path) -> None:
+    """When gh is missing from PATH, fallback fails and names the missing tool."""
+    bin_dir, _, _ = setup_fake_environment(tmp_path)
+    (bin_dir / "gh").unlink()
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    for tool in ("bash", "sh", "sha256sum", "awk", "wc", "sleep", "head", "rm"):
+        real = shutil.which(tool)
+        if real:
+            (tools_dir / tool).symlink_to(real)
+    env = {
+        "PATH": f"{bin_dir}:{tools_dir}",
+        "CURL_OUTAGE": "1",
+        "VERIFIED_DOWNLOAD": str(VERIFIED_DOWNLOAD_SH),
+        "FETCH_URL": RELEASE_URL,
+        "FETCH_SHA256": "0" * 64,
+        "FETCH_MAX_BYTES": "1048576",
+        "FETCH_TIMEOUT": "60",
+        "FETCH_OUTPUT": str(tmp_path / "out.txt"),
+    }
+    # nosemgrep: dangerous-subprocess-use-audit runs bash on a fixed script with stub tools on PATH
+    res = subprocess.run(
+        ["bash", "-c", FETCH_SCRIPT],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert res.returncode != 0
+    assert f"no gh on PATH for the release download fallback of {RELEASE_URL}" in res.stderr
+
+
+def test_fetch_verified_fallback_gh_wrong_bytes_fails(tmp_path: Path) -> None:
+    """When gh writes wrong bytes, digest mismatch causes failure."""
+    got = fetch_release(tmp_path, {"CURL_OUTAGE": "1", "STUB_GH_MODE": "wrong_bytes"})
+    assert got.res.returncode != 0
+    assert f"archive digest mismatch for {RELEASE_URL}" in got.res.stderr
+
+
+def test_fetch_verified_fallback_stops_an_endless_asset_at_the_bound(tmp_path: Path) -> None:
+    """gh's stream is cut one byte past max-bytes, so the fetch stops and leaves no file.
+
+    The stub offers ENDLESS_BYTES; the pipe takes about one buffer before head
+    exits, so gh writes far less than it offers.
+    """
+    got = fetch_release(tmp_path, {"CURL_OUTAGE": "1", "STUB_GH_MODE": "endless"}, max_bytes="1024")
+    assert got.res.returncode != 0
+    assert (
+        f"release download for {RELEASE_URL} exceeded max bytes 1024; stopped and removed"
+        in got.res.stderr
+    )
+    assert not got.output.exists()
+    written = int((got.logs_dir / "gh_written").read_text(encoding="utf-8"))
+    assert written < ENDLESS_BYTES // 16, written
+
+
+@pytest.mark.parametrize(
+    ("slack", "lands"), [(0, True), (-1, False)], ids=["at-the-bound", "one-byte-over"]
+)
+def test_fetch_verified_fallback_size_bound_is_inclusive(
+    tmp_path: Path, slack: int, lands: bool
+) -> None:
+    """An asset of exactly max-bytes lands; one byte more is refused and removed."""
+    payload = b"exact payload\n"
+    got = fetch_release(
+        tmp_path,
+        {"CURL_OUTAGE": "1"},
+        max_bytes=str(len(payload) + slack),
+        payload=payload,
+    )
+    assert (got.res.returncode == 0) is lands, got.res.stderr
+    assert got.output.exists() is lands
+
+
+def test_fetch_verified_fallback_gh_exit_1_fails(tmp_path: Path) -> None:
+    """When gh exits 1 (missing asset), fallback fails, names the status and leaves no file."""
+    got = fetch_release(tmp_path, {"CURL_OUTAGE": "1", "STUB_GH_MODE": "missing_asset"})
+    assert got.res.returncode != 0
+    assert "no assets match the file pattern" in got.res.stderr
+    assert f"gh release download for {RELEASE_URL} failed with status 1" in got.res.stderr
+    assert not got.output.exists()
+
+
+def test_fetch_verified_fallback_gh_is_bounded_by_the_timeout(tmp_path: Path) -> None:
+    """A gh that hangs past the timeout is stopped; the call fails instead of waiting."""
+    started = time.monotonic()
+    got = fetch_release(
+        tmp_path,
+        {"CURL_OUTAGE": "1", "STUB_GH_MODE": "hang", "STUB_GH_HANG": "20"},
+        timeout_seconds="1",
+    )
+    assert got.res.returncode != 0
+    assert time.monotonic() - started < 15
+    assert (got.logs_dir / "gh.log").is_file()
+    assert not got.output.exists()
+
+
+def test_fetch_verified_curl_is_bounded_by_the_timeout(tmp_path: Path) -> None:
+    """A curl that hangs past the timeout is stopped and the fallback still runs."""
+    started = time.monotonic()
+    got = fetch_release(tmp_path, {"CURL_HANG": "20"}, timeout_seconds="1")
+    assert got.res.returncode == 0, got.res.stderr
+    assert time.monotonic() - started < 15
+    assert got.output.read_bytes() == got.fixture.read_bytes()
+    assert (got.logs_dir / "gh.log").is_file()
+
+
+@pytest.mark.parametrize("script", [FETCH_SCRIPT, FALLBACK_SCRIPT], ids=["fetch", "fallback"])
+@pytest.mark.parametrize(
+    ("max_bytes", "timeout_seconds", "named"),
+    [
+        ("x[$(touch {marker})]", "60", "invalid max bytes"),
+        ("1048576", "x[$(touch {marker})]", "invalid timeout seconds"),
+        ("0", "60", "invalid max bytes"),
+        ("1048576", "0", "invalid timeout seconds"),
+        ("-1", "60", "invalid max bytes"),
+        ("1048576", "1000000", "invalid timeout seconds"),
+    ],
+    ids=[
+        "max-substitution",
+        "timeout-substitution",
+        "max-zero",
+        "timeout-zero",
+        "negative",
+        "timeout-7-digits",
+    ],
+)
+def test_bounds_that_are_not_plain_numbers_are_refused(
+    tmp_path: Path, script: str, max_bytes: str, timeout_seconds: str, named: str
+) -> None:
+    """Both entry points refuse a bound before bash arithmetic could evaluate it."""
+    marker = tmp_path / "marker"
+    got = fetch_release(
+        tmp_path,
+        {"CURL_OUTAGE": "1"},
+        max_bytes=max_bytes.format(marker=marker),
+        timeout_seconds=timeout_seconds.format(marker=marker),
+        script=script,
+    )
+    assert got.res.returncode != 0
+    assert named in got.res.stderr
+    assert not marker.exists()
+    assert not (got.logs_dir / "curl.log").exists()
+    assert not (got.logs_dir / "gh.log").exists()
+
+
+def sleeps_running(tmp_path: Path, seconds: str) -> list[int]:
+    """PIDs of running `sleep <seconds>` processes."""
+    listing = run_bash_cmd(["ps", "-eo", "pid=,args="], tmp_path)
+    return [
+        int(fields[0])
+        for fields in (line.split() for line in listing.stdout.splitlines())
+        if fields[1:] == ["sleep", seconds]
+    ]
+
+
+def test_run_with_deadline_leaves_no_sleep_behind(tmp_path: Path) -> None:
+    """Stopping the deadline watcher at any point stops its sleep as well.
+
+    A child that exits at once races the watcher's start; the old watcher left
+    about one sleep in twelve calls running.
+    """
+    seconds = str(700 + secrets.randbelow(200))
+    script = (
+        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
+        f"for _ in $(seq 100); do run_with_deadline {seconds} true; done\n"
+    )
+    res = run_bash_cmd(["bash", "-c", script], tmp_path)
+    assert res.returncode == 0, res.stderr
+    left = sleeps_running(tmp_path, seconds)
+    for pid in left:
+        os.kill(pid, signal.SIGTERM)
+    assert left == []
+
+
+def test_run_with_deadline_kills_a_command_that_ignores_term(tmp_path: Path) -> None:
+    """A command still running 5 seconds after TERM gets KILL, so the call ends."""
+    seconds = str(700 + secrets.randbelow(200))
+    script = (
+        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
+        f"run_with_deadline 1 bash -c 'trap \"\" TERM; exec sleep {seconds}'\n"
+    )
+    started = time.monotonic()
+    try:
+        res = run_bash_cmd(["bash", "-c", script], tmp_path, timeout=30)
+        elapsed = time.monotonic() - started
+    finally:
+        left = sleeps_running(tmp_path, seconds)
+        for pid in left:
+            os.kill(pid, signal.SIGKILL)
+    assert res.returncode == 128 + signal.SIGKILL, res.stderr
+    assert 5 <= elapsed < 15, elapsed
+    assert left == []
+
+
+def test_run_with_deadline_gives_a_command_time_to_clean_up(tmp_path: Path) -> None:
+    """A command that ends within 5 seconds of TERM returns its own status, not KILL's."""
+    seconds = str(700 + secrets.randbelow(200))
+    script = (
+        f'. "{VERIFIED_DOWNLOAD_SH}"\n'
+        f"run_with_deadline 1 bash -c "
+        f"'trap \"kill \\$!; sleep 0.5; exit 7\" TERM; sleep {seconds} & wait'\n"
+    )
+    try:
+        res = run_bash_cmd(["bash", "-c", script], tmp_path, timeout=30)
+    finally:
+        left = sleeps_running(tmp_path, seconds)
+        for pid in left:
+            os.kill(pid, signal.SIGKILL)
+    assert res.returncode == 7, res.stderr
+    assert left == []
+
+
+def test_fetch_verified_fallback_gh_ignoring_term_is_killed(tmp_path: Path) -> None:
+    """A gh that ignores TERM is killed after the grace; the call fails instead of waiting."""
+    started = time.monotonic()
+    got = fetch_release(
+        tmp_path,
+        {"CURL_OUTAGE": "1", "STUB_GH_MODE": "ignore_term", "STUB_GH_HANG": "20"},
+        timeout_seconds="1",
+    )
+    assert got.res.returncode != 0
+    assert time.monotonic() - started < 15
+    assert f"gh release download for {RELEASE_URL} failed with status 137" in got.res.stderr
+    assert not got.output.exists()
+
+
+def test_install_gitleaks_outage_fallback(tmp_path: Path) -> None:
+    """install-gitleaks.sh succeeds during curl outage via gh fallback."""
+    bin_dir, logs_dir, _ = setup_fake_environment(tmp_path)
+    archive = make_archive(tmp_path, "good", DEFAULT_VERSION, shape="regular")
+    digest = sha256_of(archive)
+    install_dir = tmp_path / "installed_bin"
+
+    res = run_bash_cmd(
+        ["bash", str(INSTALL_GITLEAKS_SH), DEFAULT_VERSION, digest, str(install_dir)],
+        bin_dir,
+        env_extra={
+            "FIXTURE_ARCHIVE": str(archive),
+            "CURL_OUTAGE": "1",
+            "GH_TOKEN": STUB_GH_TOKEN,
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    assert f"installed verified gitleaks {DEFAULT_VERSION}" in res.stdout
+    installed_binary = install_dir / "gitleaks"
+    assert installed_binary.is_file()
+    assert (logs_dir / "gh.log").is_file()
+    assert "::warning title=Release download fallback::" in res.stdout
+
+
+def test_action_yml_declares_gh_token_env() -> None:
+    """Both composite actions declare GH_TOKEN in step environment."""
+    for action_path in [ACTION_VERIFIED_DOWNLOAD_YML, ACTION_INSTALL_GITLEAKS_YML]:
+        data = yaml.safe_load(action_path.read_text(encoding="utf-8"))
+        assert isinstance(data, dict)
+        step_env = data["runs"]["steps"][0].get("env", {})
+        assert step_env.get("GH_TOKEN") == "${{ github.token }}", (
+            f"{action_path.name} missing GH_TOKEN in step env"
+        )
