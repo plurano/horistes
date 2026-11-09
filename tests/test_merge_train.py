@@ -3642,7 +3642,7 @@ def test_unsigned_bot_pull_request_is_skipped_and_listed(tmp_path, state):
         in summary
     )
     assert "Bot pull requests without Signed-off-by, their producers sign them:" in summary
-    assert "- fleet/app #1" in summary
+    assert "- fleet/app #1" in summary.splitlines()
 
 
 def test_unsigned_person_pull_request_on_non_dependency_head_is_refused(tmp_path):
@@ -3695,6 +3695,44 @@ def test_after_an_unsigned_bot_pull_request_the_next_clean_pull_lands(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(2)]
+
+
+def test_unsigned_bot_listed_in_summary_when_later_pull_is_refused(tmp_path):
+    """An unsigned bot skipped before a later refusal is retained in the sweep summary."""
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(
+        repository(
+            pull(1, "CLEAN", author=bot, headRefName="fix/x"),
+            pull(2, "CLEAN"),
+        )
+    )
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    forge.refuse_merge = "refused here"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "Refused:" in summary
+    assert "Bot pull requests without Signed-off-by, their producers sign them:" in summary
+    assert "- fleet/app #1" in summary.splitlines()
+
+
+def test_planted_sweep_without_unsigned_bots_extend_drops_skipped_bot(tmp_path):
+    """Planted mutant: without unsigned_bots.extend on RefusedError, skipped bots are lost."""
+    target = "                unsigned_bots.extend(err.unsigned_bots)"
+    assert script().count(target) == 1
+    flow = script().replace(target, "                pass")
+    assert flow != script()
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    forge = Forge(
+        repository(
+            pull(1, "CLEAN", author=bot, headRefName="fix/x"),
+            pull(2, "CLEAN"),
+        )
+    )
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    forge.refuse_merge = "refused here"
+    done, summary = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "- fleet/app #1" not in summary.splitlines()
 
 
 def test_without_the_bot_pr_skip_the_unsigned_bot_fails_the_run(tmp_path):
@@ -4429,6 +4467,83 @@ def test_retitled_armed_pull_request_is_re_armed_with_new_headline(tmp_path):
     ]
     assert "### fleet/app: re-armed #1" in summary, summary
     assert "| #1 | BLOCKED | re-armed: title changed after arming |" in summary, summary
+
+
+def test_unsigned_bot_retitled_armed_pull_request_is_disarmed_and_skipped(tmp_path):
+    """An armed bot pull request retitled without sign-off is disarmed and skipped."""
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    retitled = pull(
+        1,
+        "BLOCKED",
+        author=bot,
+        headRefName="fix/x",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    forge.commits[1] = [("chore: automated update without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)], forge.writes
+    assert (
+        "| #1 | BLOCKED | skipped: bot pull request without Signed-off-by, its producer signs it |"
+        in summary
+    )
+    assert "### fleet/app: disarmed #1: its commits carry no Signed-off-by" in summary
+    assert "- fleet/app #1" in summary.splitlines()
+
+
+def test_unsigned_person_retitled_armed_pull_request_is_disarmed_and_refused(tmp_path):
+    """An armed person's pull request retitled without sign-off is disarmed and refused."""
+    user = {"login": "someone", "__typename": "User"}
+    retitled = pull(
+        1,
+        "BLOCKED",
+        author=user,
+        headRefName="fix/x",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    forge.commits[1] = [("chore: manual update without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)], forge.writes
+    assert "no Signed-off-by on its commits" in summary
+
+
+def test_planted_re_arm_drifted_without_unsigned_bot_error_refuses_bot(tmp_path):
+    """Planted mutant: unhandled UnsignedBotError in re_arm_drifted refuses the run."""
+    target = (
+        "            try:\n"
+        "                arm(env, conf, pull)\n"
+        "            except UnsignedBotError as err:\n"
+        '                notes[pull["number"]] = err.note\n'
+        "                return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
+    )
+    mutant = (
+        "            try:\n"
+        "                arm(env, conf, pull)\n"
+        "            except KeyError as err:\n"
+        '                notes[pull["number"]] = err.note\n'
+        "                return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
+    )
+    assert script().count(target) == 1
+    flow = script().replace(target, mutant)
+    assert flow != script()
+    bot = {"login": "praetor-ops", "__typename": "Bot"}
+    retitled = pull(
+        1,
+        "BLOCKED",
+        author=bot,
+        headRefName="fix/x",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    forge.commits[1] = [("chore: automated update without trailer", 1)]
+    done, _ = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
 
 
 def test_planted_drifted_that_never_fires_leaves_stale_headline_armed(tmp_path):

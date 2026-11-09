@@ -70,23 +70,23 @@ LINK = re.compile(r"blob/main/([^\s#)]+)")
 ANCHOR = re.compile(r"blob/main/([^\s#)]+)#L(\d+)(?:-L(\d+))?")
 
 EVIDENCE: dict[str, tuple[str, str]] = {
-    "tools/merge_train.py#L1207-L1236": (
+    "tools/merge_train.py#L1217-L1246": (
         "def app_jwt(",
         'return f"{signing_input}.{b64url(done.stdout)}"',
     ),
-    "tools/merge_train.py#L738": (
+    "tools/merge_train.py#L740": (
         "if hashlib.sha256(content).hexdigest() != sha:",
         "if hashlib.sha256(content).hexdigest() != sha:",
     ),
-    "tools/merge_train.py#L779": (
+    "tools/merge_train.py#L781": (
         "blob_sha = hashlib.sha1(",
         "blob_sha = hashlib.sha1(",
     ),
-    "tools/merge_train.py#L226-L264": (
+    "tools/merge_train.py#L228-L266": (
         "def key_bits(",
         "return int(match.group(1)) if match else None",
     ),
-    "tools/merge_train.py#L226-L286": (
+    "tools/merge_train.py#L228-L288": (
         "def key_bits(",
         'f"the app key has {bits} bits; at least {MIN_KEY_BITS} are required"',
     ),

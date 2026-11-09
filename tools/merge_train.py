@@ -149,6 +149,8 @@ _BODY_REVIEW_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED", "APPROVED"})
 class RefusedError(Exception):
     """A forge call that failed or was refused."""
 
+    unsigned_bots = ()
+
 
 class UnsignedBotError(RefusedError):
     """A pull request whose commits carry no sign-off; the train skips it."""
@@ -894,6 +896,8 @@ def re_arm_drifted(env, conf, served, held, notes):
     """Re-arm an armed squash pull request whose headline drifted from its title.
 
     A pull request a review body holds was disarmed this run and stays disarmed.
+    A pull request left disarmed for lack of sign-off ends the run, so later steps
+    do not read it as armed.
     """
     for pull, reason in served:
         if reason.startswith(REVIEW_BODY):
@@ -903,7 +907,11 @@ def re_arm_drifted(env, conf, served, held, notes):
                 notes[pull["number"]] = "not re-armed: code-scanning check failed"
                 continue
             graphql(env, DISARM, {"id": pull["id"]})
-            arm(env, conf, pull)
+            try:
+                arm(env, conf, pull)
+            except UnsignedBotError as err:
+                notes[pull["number"]] = err.note
+                return f"disarmed #{pull['number']}: its commits carry no Signed-off-by"
             notes[pull["number"]] = "re-armed: title changed after arming"
             return f"re-armed #{pull['number']}"
     return None
@@ -1134,13 +1142,15 @@ def lander_lease(repo, now):
         raise RefusedError(f"{err}") from err
 
 
-def run(env, conf, repo, now):
+def run(env, conf, repo, now, notes=None):
     """Execute one merge train cycle across served pull requests."""
+    if notes is None:
+        notes = {}
     pulls = repo["pullRequests"]["nodes"]
     replaced = superseded(pulls)
     verdicts = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
     rows = hold_review_bodies(env, conf, verdicts)
-    notes = {pull["number"]: reason for pull, reason in rows}
+    notes.update({pull["number"]: reason for pull, reason in rows})
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
     disarm_red_scanning(env, rows, notes)
@@ -1313,17 +1323,28 @@ def close_issues(env, conf, installation, target, now):
     return lines
 
 
+def unsigned_bot_entries(target, notes):
+    """The formatted unsigned bot pull requests skipped during this repository run."""
+    return [
+        f"{target['full_name']} #{num}" for num, note in notes.items() if note == SKIP_UNSIGNED_BOT
+    ]
+
+
 def one(env, conf, installation, target, now):
     """The train in one repository, with a token for that repository alone."""
     rights = WRITE_RIGHTS if conf["switch"] == "on" else READ_RIGHTS
     token = mint(env, conf, installation, rights, [target["name"]])
     local = {**env, "GITHUB_REPOSITORY": target["full_name"], "TRAIN_TOKEN": token}
     closed = []
+    notes = {}
     try:
         repo = fetch(local)
-        rows, notes, outcome = run(local, conf, repo, now)
+        rows, notes, outcome = run(local, conf, repo, now, notes)
         if conf["switch"] == "on":
             closed = close_issues(local, conf, installation, target, now)
+    except RefusedError as err:
+        err.unsigned_bots = unsigned_bot_entries(target, notes)
+        raise
     finally:
         revoke(env, token)
     moved = any(
@@ -1335,9 +1356,7 @@ def one(env, conf, installation, target, now):
     if closed:
         section = section or f"### {target['full_name']}: {outcome}\n"
         section += "\n" + "\n".join(closed) + "\n"
-    unsigned_bots = [
-        f"{target['full_name']} #{num}" for num, note in notes.items() if note == SKIP_UNSIGNED_BOT
-    ]
+    unsigned_bots = unsigned_bot_entries(target, notes)
     return (
         outcome,
         section,
@@ -1386,6 +1405,7 @@ def sweep(env, conf, started):
             except RefusedError as err:
                 tally["refused"] += 1
                 refusals.append(f"{target['full_name']}: {err}")
+                unsigned_bots.extend(err.unsigned_bots)
                 continue
             tally["landed"] += outcome.startswith("landed")
             tally["updated"] += moved
