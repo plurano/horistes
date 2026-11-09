@@ -14,7 +14,7 @@ import shutil
 import subprocess
 
 import pytest
-from conftest import ACTION, CHECKOUT, REUSABLE, ROOT, external
+from conftest import ACTION, CHECKOUT, REUSABLE, ROOT, external, rooted
 
 WORKFLOW = ".github/workflows/licence.yml"
 UNPINNED = REUSABLE.replace(CHECKOUT, "actions/checkout@v7")
@@ -93,18 +93,6 @@ def zizmor(tree):
         str(tree.root),
     ]
     return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
-
-
-def rooted(cmd):
-    """The command with a relative tool path read from the checkout, as the Makefile passes it.
-
-    The planted tree is the working directory, so `.venv/bin/x` would name a
-    file inside it.
-    """
-    head = cmd[0]
-    if os.sep in head and not os.path.isabs(head):
-        return [str(ROOT / head), *cmd[1:]]
-    return cmd
 
 
 def yamllint(tree, *args):

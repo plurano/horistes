@@ -5,13 +5,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import ciwf
 import pytest
-from conftest import ROOT
+import yaml
+from conftest import ROOT, Tree, external, rooted
 
 HASH_COMMAND = (
     "$$($(PYTHON) -c 'import hashlib, pathlib, sys; "
@@ -206,6 +208,100 @@ def test_lefthook_pre_push_tools_stamp() -> None:
         other_prio = other_cmd.get("priority")
         effective_prio = float("inf") if other_prio in (None, 0) else other_prio
         assert stamp_prio < effective_prio
+
+
+def _init_repo_tree(tmp_path: Path) -> Tree:
+    tree = Tree(tmp_path / "repo")
+    tree.git("init", "-b", "main")
+    tree.write({"file.txt": "committed\n"})
+    tree.git("add", "file.txt")
+    tree.git("commit", "-m", "init")
+    return tree
+
+
+def _planted_pre_push_config(
+    tools_stamp_run: str, *, piped: bool | None = None
+) -> dict[str, object]:
+    doc = ciwf.load(ROOT / "lefthook.yml")
+    pre_push = doc.get("pre-push", {})
+    commands = pre_push.get("commands", {})
+    planted_commands: dict[str, dict[str, object]] = {}
+    for name in sorted(commands):
+        entry: dict[str, object] = dict(commands[name])
+        if name == "tools-stamp":
+            entry["run"] = tools_stamp_run
+        else:
+            entry["run"] = f"touch {name}.ran"
+        planted_commands[name] = entry
+    cfg = dict(pre_push)
+    cfg["commands"] = planted_commands
+    if piped is not None:
+        cfg["piped"] = piped
+    return {"pre-push": cfg}
+
+
+def _run_planted_lefthook(
+    tree: Tree, config: dict[str, object]
+) -> subprocess.CompletedProcess[str]:
+    """Run `lefthook run pre-push` in the planted repository.
+
+    `lefthook` runs by a literal name, found first on a PATH that starts with
+    the directory of the binary the Makefile sets. The environment is built
+    fresh, so no lefthook setting of the caller reaches the run. A missing
+    lefthook fails the test, never skips it.
+    """
+    tree.write({"lefthook.yml": yaml.safe_dump(config)})
+    found = shutil.which(rooted(external("LEFTHOOK_BIN", "lefthook"))[0])
+    assert found, "lefthook is missing"
+    env = {
+        "PATH": os.pathsep.join([str(Path(found).parent), os.environ.get("PATH", "")]),
+        "HOME": str(tree.root),
+    }
+    return subprocess.run(
+        ["lefthook", "run", "pre-push"],
+        cwd=tree.root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def test_lefthook_pre_push_stop_on_failure_negative(tmp_path: Path) -> None:
+    """Planted: tools-stamp exit 1 stops pre-push execution; no other command runs."""
+    tree = _init_repo_tree(tmp_path)
+    cfg = _planted_pre_push_config("exit 1")
+    proc = _run_planted_lefthook(tree, cfg)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    ran_files = list(tree.root.glob("*.ran"))
+    assert ran_files == [], f"expected no *.ran files, got {ran_files}"
+
+
+def test_lefthook_pre_push_stop_on_failure_positive(tmp_path: Path) -> None:
+    """When tools-stamp succeeds with run: true, all subsequent commands run and exit 0."""
+    tree = _init_repo_tree(tmp_path)
+    cfg = _planted_pre_push_config("true")
+    proc = _run_planted_lefthook(tree, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    ran_names = {p.name for p in tree.root.glob("*.ran")}
+    doc = ciwf.load(ROOT / "lefthook.yml")
+    expected_others = {
+        f"{name}.ran"
+        for name in doc.get("pre-push", {}).get("commands", {})
+        if name != "tools-stamp"
+    }
+    assert ran_names == expected_others
+
+
+def test_lefthook_pre_push_mutation_proof_without_piped(tmp_path: Path) -> None:
+    """Planted: without piped: true, a failing tools-stamp does not prevent subsequent commands."""
+    tree = _init_repo_tree(tmp_path)
+    cfg = _planted_pre_push_config("exit 1", piped=False)
+    proc = _run_planted_lefthook(tree, cfg)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    ran_files = list(tree.root.glob("*.ran"))
+    assert len(ran_files) >= 1, "expected at least one *.ran file when piped is false"
 
 
 def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
