@@ -24,11 +24,13 @@ def _run_make_check(
     tmp_dir: Path,
     *,
     env: dict[str, str] | None = None,
-    make_bin: str = "make",
 ) -> subprocess.CompletedProcess[str]:
-    """Run `make -s -C <tmp_dir> -f <ROOT>/Makefile check-tools-stamp`."""
+    """Run `make -s -C <tmp_dir> -f <ROOT>/Makefile check-tools-stamp`.
+
+    `make` is looked up on the `PATH` of `env` when one is given.
+    """
     return subprocess.run(
-        [make_bin, "-s", "-C", str(tmp_dir), "-f", str(ROOT / "Makefile"), "check-tools-stamp"],
+        ["make", "-s", "-C", str(tmp_dir), "-f", str(ROOT / "Makefile"), "check-tools-stamp"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -198,20 +200,21 @@ def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     (bin_dir / "python3").symlink_to(py_path)
     (bin_dir / "cat").symlink_to(cat_path)
+    (bin_dir / "make").symlink_to(make_bin)
     restricted_env = {"PATH": str(bin_dir)}
 
     tools_txt, stamp = _setup_tree(tmp_path)
     h = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
     stamp.write_text(f"{h}\n", encoding="utf-8")
 
-    proc = _run_make_check(tmp_path, env=restricted_env, make_bin=make_bin)
+    proc = _run_make_check(tmp_path, env=restricted_env)
     assert proc.returncode == 0
     assert proc.stderr == ""
 
     stale_hash = hashlib.sha256(b"stale-tools-content\n").hexdigest()
     stamp.write_text(f"{stale_hash}\n", encoding="utf-8")
 
-    proc_stale = _run_make_check(tmp_path, env=restricted_env, make_bin=make_bin)
+    proc_stale = _run_make_check(tmp_path, env=restricted_env)
     assert proc_stale.returncode != 0
     assert "make tools" in proc_stale.stderr
 
