@@ -252,3 +252,42 @@ def test_cli_character_boundary(tmp_path):
     done_over = run_tool(repo, ["check", str(over_file)])
     assert done_over.returncode == 1, done_over.stdout + done_over.stderr
     assert f"over {MAX_MESSAGE}" in done_over.stderr
+
+
+def two_repositories(tmp_path: Path, monkeypatch) -> tuple[Path, Path, Path]:
+    """Repository `ours` (author ours@example.org), `other` (other@example.org), cwd in other.
+
+    The message is signed off by the author of `ours`; the author comes from each
+    repository's own config, as git reads it for the commit it is about to make.
+    """
+    (tmp_path / "ours").mkdir()
+    (tmp_path / "other").mkdir()
+    ours = git_repo(tmp_path / "ours")
+    other = git_repo(tmp_path / "other")
+    for repo, email in ((ours, "ours@example.org"), (other, "other@example.org")):
+        subprocess.run(["git", "config", "user.email", email], cwd=repo, check=True, timeout=20)
+    for name in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_DIR", "GIT_WORK_TREE", "EMAIL"):
+        monkeypatch.delenv(name, raising=False)
+    message = tmp_path / "message.txt"
+    message.write_text(
+        "fix(x): mend a thing\n\nThe body says why.\n\n"
+        "Signed-off-by: A Person <ours@example.org>\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(other)
+    return ours, other, message
+
+
+def test_judge_follows_the_repository_git_dir_names(tmp_path, monkeypatch, capsys):
+    """GIT_DIR and GIT_WORK_TREE, which git exports to its hooks, pick the repository judged."""
+    ours, _, message = two_repositories(tmp_path, monkeypatch)
+    monkeypatch.setenv("GIT_DIR", str(ours / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(ours))
+    assert commit_message.main(["check", str(message)]) == 0, capsys.readouterr().err
+
+
+def test_judge_without_git_dir_judges_the_working_directory(tmp_path, monkeypatch, capsys):
+    """Without GIT_DIR the judge reads the repository it runs in, whose author differs."""
+    _, _, message = two_repositories(tmp_path, monkeypatch)
+    assert commit_message.main(["check", str(message)]) == 1
+    assert "is not the author other@example.org" in capsys.readouterr().err

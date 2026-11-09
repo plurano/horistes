@@ -252,6 +252,24 @@ def test_check_message_reads_a_make_variable(tmp_path):
 
 
 @POSIX_SHELL
+def test_check_message_judges_a_file_named_like_an_option(tmp_path):
+    """A MESSAGE_FILE named --help is a file to judge, not the help option that exits 0."""
+    tree = planted(tmp_path)
+    done = subprocess.run(
+        ["make", "--no-print-directory", "check-message", "MESSAGE_FILE=--help"],
+        cwd=tree.root,
+        env=environment(tree),
+        capture_output=True,
+        text=True,
+        timeout=DEADLINE,
+        check=False,
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "--help: No such file or directory" in done.stderr
+    assert "usage:" not in done.stdout + done.stderr
+
+
+@POSIX_SHELL
 def test_check_message_runs_in_fresh_tree_without_venv(tmp_path):
     """A fresh tree without .venv passes CLEAN and refuses PLANTED."""
     tree = planted(tmp_path)

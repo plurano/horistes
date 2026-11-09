@@ -33,7 +33,8 @@ message.
 - The gate's range test (`tests/test_commit_messages.py`) imports the same module, so the hook
   and the gate judge by one implementation.
 - The `check-message` target in `Makefile` drops the `check-tools-stamp` prerequisite and
-  runs `python3 -I -B tools/commit_message.py check "$$MESSAGE_FILE"`. It uses the literal
+  runs `python3 -I -B tools/commit_message.py check -- "$$MESSAGE_FILE"`; the `--` keeps a
+  file name such as `--help` a file name. It uses the literal
   word `python3` to prevent an inherited `PYTHON` environment variable from substituting
   another interpreter. The requirement for a non-empty `MESSAGE_FILE` remains.
 - The `commit-msg` hook in `lefthook.yml` continues to run `make check-message` unchanged,
@@ -41,6 +42,13 @@ message.
   and judge messages immediately.
 - The judge uses explicit exceptions (`JudgeError`) and finding lists rather than assertions,
   ensuring `-O` (PYTHONOPTIMIZE) cannot bypass refusals or strip error handling.
+- Every I/O call has a deadline: each git call a `timeout`, and each file read (the message
+  file, `MERGE_HEAD`) a daemon thread the judge leaves after the same 20 seconds. git output
+  is read as UTF-8 whatever the locale; output that is not UTF-8 is a refusal with exit
+  status 2, not a traceback.
+- During a merge the judge reads `HEAD`, `MERGE_HEAD` and the index tree twice and refuses
+  when they differ, so the parents and the tree of the clean-merge exemption come from one
+  state.
 - `check-tools-stamp` remains in place for `pre-push`, `make check`, and CI workflows.
 - This decision supersedes the virtual environment and stamp requirements of
   [ADR-0072](0072-the-commit-msg-hook-judges-each-message.md).

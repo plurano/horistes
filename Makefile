@@ -67,7 +67,7 @@ check-message:
 		printf '%s\n' 'check-message needs MESSAGE_FILE, the commit message file to judge' >&2; \
 		exit 2; \
 	fi
-	@python3 -I -B tools/commit_message.py check "$$MESSAGE_FILE"
+	@python3 -I -B tools/commit_message.py check -- "$$MESSAGE_FILE"
 
 # Recompile the pins; a release younger than three days is left out. The
 # header of the output records this command and Renovate reruns it from there,

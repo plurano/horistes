@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 DEADLINE = 20  # seconds for one git call
@@ -44,16 +45,19 @@ class JudgeError(Exception):
 def run_git(
     repo: Path, *arguments: str, text: str | None = None, env: dict | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """One git call in repo; the caller judges its exit status."""
-    return subprocess.run(
-        ["git", "-C", str(repo), *arguments],
-        input=text,
-        capture_output=True,
-        text=True,
-        timeout=DEADLINE,
-        check=False,
-        env=None if env is None else {**os.environ, **env},
-    )
+    """One git call in repo, its text read as UTF-8; the caller judges its exit status."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *arguments],
+            input=text,
+            capture_output=True,
+            encoding="utf-8",
+            timeout=DEADLINE,
+            check=False,
+            env=None if env is None else {**os.environ, **env},
+        )
+    except UnicodeDecodeError as err:
+        raise JudgeError(f"git {' '.join(arguments)}: output is not UTF-8: {err}") from err
 
 
 def git(repo: Path, *arguments: str, text: str | None = None, env: dict | None = None) -> str:
@@ -182,19 +186,72 @@ def pending(repo: Path) -> tuple[str, str]:
     merging = run_git(repo, "rev-parse", "--verify", "--quiet", "MERGE_HEAD", env=ALONE)
     if merging.returncode != 0:
         return head.stdout.strip(), ""
+    first = merge_snapshot(repo, head.stdout.strip())
+    again = git(repo, "rev-parse", "--verify", "HEAD^{commit}", env=ALONE).strip()
+    if merge_snapshot(repo, again) != first:
+        raise JudgeError(f"{repo}: HEAD, MERGE_HEAD or the index changed while the judge read them")
+    return first
+
+
+def merge_snapshot(repo: Path, head: str) -> tuple[str, str]:
+    """Parents and index tree of the merge in progress in repo, read once.
+
+    `pending` reads it twice and refuses a merge whose state moved in between,
+    so the parents and the tree it judges come from one state.
+    """
     merge_path = git(repo, "rev-parse", "--git-path", "MERGE_HEAD", env=ALONE).strip()
     heads = bounded_text(Path(repo, merge_path), MERGE_HEAD_BYTES, "ascii").split()
     tree = git(repo, "write-tree", env=ALONE).strip()
-    return " ".join([head.stdout.strip(), *heads]), tree
+    return " ".join([head, *heads]), tree
 
 
 def bounded_text(path: str | Path, bound: int, encoding: str) -> str:
     """A regular file as text, refused when it holds more than `bound` bytes.
 
-    It is opened without blocking, so a FIFO with no writer is refused at once
-    instead of holding the commit, and at most `bound` + 1 bytes are read.
+    The read runs in a thread the judge leaves after DEADLINE seconds, so a
+    stalled file system gets a refusal instead of holding the commit.
     """
     name = str(path)
+    data = deadline_read(name, bound)
+    if len(data) > bound:
+        raise JudgeError(f"{name}: over {bound} bytes")
+    try:
+        return data.decode(encoding)
+    except UnicodeDecodeError as err:
+        raise JudgeError(f"{name}: not {encoding}: {err}") from err
+
+
+def deadline_read(name: str, bound: int) -> bytes:
+    """bounded_bytes of one file, refused when it takes longer than DEADLINE seconds.
+
+    The worker is a daemon thread: one that never returns does not hold the exit.
+    """
+    box: list[bytes | JudgeError | OSError] = []
+
+    def work() -> None:
+        try:
+            box.append(bounded_bytes(name, bound))
+        except (JudgeError, OSError) as err:
+            box.append(err)
+
+    worker = threading.Thread(target=work, name="bounded read", daemon=True)
+    worker.start()
+    worker.join(DEADLINE)
+    if worker.is_alive():
+        raise JudgeError(f"{name}: not read within {DEADLINE} seconds")
+    if not box:
+        raise JudgeError(f"{name}: the read ended without a result")
+    if isinstance(box[0], bytes):
+        return box[0]
+    raise box[0]
+
+
+def bounded_bytes(name: str, bound: int) -> bytes:
+    """At most `bound` + 1 bytes of a regular file.
+
+    It is opened without blocking, so a FIFO with no writer is refused at once
+    instead of holding the commit.
+    """
     try:
         descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except OSError as err:
@@ -208,13 +265,7 @@ def bounded_text(path: str | Path, bound: int, encoding: str) -> str:
         os.close(descriptor)
         raise JudgeError(f"{name}: not a regular file")
     with os.fdopen(descriptor, "rb") as handle:
-        data = handle.read(bound + 1)
-    if len(data) > bound:
-        raise JudgeError(f"{name}: over {bound} bytes")
-    try:
-        return data.decode(encoding)
-    except UnicodeDecodeError as err:
-        raise JudgeError(f"{name}: not {encoding}: {err}") from err
+        return handle.read(bound + 1)
 
 
 def message_text(path: str | Path) -> str:

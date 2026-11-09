@@ -41,12 +41,14 @@ the judge rules.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
 import tracemalloc
 from pathlib import Path
 
+import commit_message
 import pytest
 from commit_message import (
     ALONE,
@@ -617,3 +619,89 @@ def test_pending_reads_merge_head_up_to_the_byte_bound(tmp_path, extra, passes):
         return
     with pytest.raises(JudgeError, match=f"over {MERGE_HEAD_BYTES} bytes"):
         pending(tmp_path)
+
+
+def test_pending_refuses_an_index_that_moves_while_it_reads(tmp_path, monkeypatch):
+    """A merge whose index changes between the two reads of pending() is refused, not judged."""
+    branches(tmp_path)
+    git(tmp_path, "merge", "--no-ff", "--no-commit", "--quiet", "feature", env=ALONE)
+    real = commit_message.git
+    moved: list[str] = []
+
+    def racing_git(repo, *arguments, **options):
+        out = real(repo, *arguments, **options)
+        if arguments[:1] == ("write-tree",) and not moved:
+            moved.append(out)
+            Path(repo, "late.txt").write_text("late\n", encoding="utf-8")
+            real(repo, "add", "late.txt", env=ALONE)
+        return out
+
+    monkeypatch.setattr(commit_message, "git", racing_git)
+    with pytest.raises(JudgeError, match="changed while the judge read them"):
+        pending(tmp_path)
+    assert moved
+
+
+def test_pending_takes_a_merge_that_holds_still(tmp_path):
+    """A merge in progress that nothing changes gives HEAD, the merged head and its tree."""
+    branches(tmp_path)
+    git(tmp_path, "merge", "--no-ff", "--no-commit", "--quiet", "feature", env=ALONE)
+    parents, tree = pending(tmp_path)
+    assert parents.split() == [
+        git(tmp_path, "rev-parse", "HEAD").strip(),
+        git(tmp_path, "rev-parse", "feature").strip(),
+    ]
+    assert tree == git(tmp_path, "write-tree").strip()
+
+
+def test_range_with_a_message_not_in_utf8_is_a_judge_error(tmp_path):
+    """A commit message git emits in bytes that are not UTF-8 is a JudgeError, not a traceback."""
+    git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
+    base = commit(tmp_path, GOOD)
+    tree = git(tmp_path, "write-tree").strip()
+    person = "A Person <person@example.org> 1700000000 +0000"
+    header = f"tree {tree}\nparent {base}\nauthor {person}\ncommitter {person}\n\n"
+    # git commit-tree rewrites bytes that are not UTF-8; hash-object stores them as given.
+    raw = header.encode("ascii") + f"fix: caf\xe9 bytes\n\n{SIGN_OFF}\n".encode("latin-1")
+    # nosemgrep: dangerous-subprocess-use-audit runs git hash-object with fixed argv in tmp_path
+    made = subprocess.run(
+        ["git", "-C", str(tmp_path), "hash-object", "-t", "commit", "-w", "--stdin"],
+        input=raw,
+        capture_output=True,
+        timeout=20,
+        check=True,
+        env={**os.environ, **ALONE},
+    )
+    git(tmp_path, "update-ref", "HEAD", made.stdout.decode("ascii").strip())
+    with pytest.raises(JudgeError, match="output is not UTF-8"):
+        refused(tmp_path, base)
+
+
+def test_a_read_that_stalls_is_refused_at_the_deadline(tmp_path, monkeypatch):
+    """A file read that does not return within DEADLINE seconds is refused; the judge goes on."""
+    release = threading.Event()
+
+    def stalled(name, bound):
+        release.wait(30)
+        return b""
+
+    monkeypatch.setattr(commit_message, "bounded_bytes", stalled)
+    monkeypatch.setattr(commit_message, "DEADLINE", 0.2)
+    started = time.monotonic()
+    try:
+        with pytest.raises(JudgeError, match=r"not read within 0\.2 seconds"):
+            message_text(tmp_path / "message.txt")
+    finally:
+        release.set()
+    assert time.monotonic() - started < 5
+
+
+def test_a_read_error_in_the_worker_reaches_the_caller(tmp_path, monkeypatch):
+    """An OSError the reading thread meets reaches the caller; the CLI turns it into rc 2."""
+
+    def broken(name, bound):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(commit_message, "bounded_bytes", broken)
+    with pytest.raises(OSError, match="Input/output error"):
+        message_text(tmp_path / "message.txt")
