@@ -1,43 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 ---
-engines:
-  bandit:
-    # tools/examples.py:15 B404 import subprocess — static argument lists only
-    # tools/examples.py:97 B603/B607 subprocess.run — static argument lists only
-    # tests/test_examples.py:7 B404 import subprocess — test helper, static args
-    # tests/test_examples.py:23 B603 subprocess.run — test helper, static args
-    # tests/test_exceptions.py:8 B404 import subprocess — test helper, static args
-    # tests/test_exceptions.py:402 B603 subprocess.run — test helper, static args
-    # tests/test_exceptions.py:694 B603 subprocess.run — test helper, static args
-    # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
-    exclude_paths:
-      - "tools/examples.py"
-      - "tests/test_examples.py"
-      - "tests/test_exceptions.py"
-  opengrep:
-    # tests/test_examples.py:23 dangerous-subprocess-use-audit — test helper,
-    # subprocess.run with static argument list, not user input
-    # tests/test_exceptions.py:402 dangerous-subprocess-use-audit — test helper,
-    # subprocess.run with static argument list, not user input
-    # tests/test_exceptions.py:694 dangerous-subprocess-use-audit — test helper,
-    # subprocess.run with static argument list, not user input
-    # tests/test_lint.py:95 dangerous-subprocess-use-audit — test helper, runs the
-    # zizmor command the Makefile sets (tests/conftest.py:350 external) with static
-    # flags and the test's own temporary tree; entered 2026-11-08, category B,
-    # expires 2026-11-11
-    # tests/test_merge_guard.py:21 dangerous-subprocess-use-audit — test mock,
-    # CompletedProcess constructor with static args
-    # tests/test_dev_mode.py:64 dangerous-subprocess-use-audit — test helper, runs
-    # the planted suite with sys.executable and `make test` with a probe python,
-    # each with static flags in the test's own temporary tree; entered
-    # 2026-11-08, category B, expires 2026-11-11
-    # Expiry category B (3 days from 2026-11-07 = 2026-11-10)
-    exclude_paths:
-      - "tests/test_dev_mode.py"
-      - "tests/test_examples.py"
-      - "tests/test_exceptions.py"
-      - "tests/test_lint.py"
-      - "tests/test_merge_guard.py"
+# Suppress a finding at its line with the rule id and a reason (tests/test_suppressions.py).
+# Engines take no exclude_paths: a whole-file exclusion hides every rule in that file.
 exclude_paths:
   - ".workingdir/**"
