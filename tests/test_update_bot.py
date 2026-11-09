@@ -253,6 +253,34 @@ def release_age(preset: dict, datasource: str, package: str) -> str | None:
     return current_age
 
 
+def disabled_package_rules(
+    preset: dict,
+    manager: str,
+    datasource: str,
+    update_type: str,
+    package: str,
+    dep_type: str,
+) -> list[dict]:
+    """Rules with `enabled: false` whose every match condition holds for this dependency."""
+    matching = []
+    for rule in preset.get("packageRules", [])[:50]:
+        if rule.get("enabled") is False:
+            if "matchManagers" in rule and manager not in rule["matchManagers"]:
+                continue
+            if "matchDatasources" in rule and datasource not in rule["matchDatasources"]:
+                continue
+            if "matchUpdateTypes" in rule and update_type not in rule["matchUpdateTypes"]:
+                continue
+            if "matchDepTypes" in rule and dep_type not in rule["matchDepTypes"]:
+                continue
+            if "matchPackageNames" in rule and not any(
+                pattern_matches(pattern, package) for pattern in rule["matchPackageNames"][:50]
+            ):
+                continue
+            matching.append(rule)
+    return matching
+
+
 def held_forks(preset: dict) -> list[str]:
     """Forks of outside projects that are not held for three days."""
     problems = []
@@ -1001,3 +1029,42 @@ def test_planted_missing_fork_in_fork_rule_is_refused():
     problems = held_forks(planted)
     assert "github-tags:lusoris/llama-swap" in problems
     assert release_age(planted, "github-tags", "lusoris/llama-swap") is None
+
+
+# Renovate 44.181.7 gives a reusable workflow pin the dependency type `workflow`
+# (measured with --dry-run=lookup) and a step's action pin `action`.
+@pytest.mark.parametrize("dep_type", ["workflow", "action"])
+def test_preset_permits_horistes_digest_updates(dep_type):
+    """default.json lets plurano/horistes digest updates through at once and disables none."""
+    assert release_age(PRESET, "github-digest", "plurano/horistes") is None
+    found = disabled_package_rules(
+        PRESET, "github-actions", "github-digest", "digest", "plurano/horistes", dep_type
+    )
+    assert found == []
+
+
+def test_planted_presets_refuse_disabled_or_aged_horistes_digest():
+    """A preset that disables or delays plurano/horistes digest updates is refused."""
+    planted_disabled = copy.deepcopy(PRESET)
+    planted_disabled["packageRules"].append(
+        {
+            "matchPackageNames": ["plurano/horistes"],
+            "matchUpdateTypes": ["digest"],
+            "enabled": False,
+        }
+    )
+    disabled = disabled_package_rules(
+        planted_disabled,
+        "github-actions",
+        "github-digest",
+        "digest",
+        "plurano/horistes",
+        "workflow",
+    )
+    assert disabled == [planted_disabled["packageRules"][-1]]
+
+    planted_delayed = copy.deepcopy(PRESET)
+    for rule in planted_delayed["packageRules"]:
+        if "github-digest" in rule.get("matchDatasources", []):
+            rule["minimumReleaseAge"] = "3 days"
+    assert release_age(planted_delayed, "github-digest", "plurano/horistes") == "3 days"

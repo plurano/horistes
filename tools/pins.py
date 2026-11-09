@@ -16,6 +16,12 @@ the comment right where the commit is known, and then checks. It moves no
 pin to a newer release. A commit that no release names is not judged: zizmor
 reports nothing for it, whatever its comment says (ADR-0016).
 
+`check` (and `pin`, which runs `check`) also refuses an outside use pinned on a
+commit whose line comment is not exactly one bare ref: Renovate's builtin
+`github-actions` manager skips a pin whose comment is missing or names more than
+one ref (`skipReason: unversioned-reference`), and zizmor does not judge a commit
+that no release names (ADR-0075).
+
 The first two findings are zizmor's (`unpinned-uses`, `ref-version-mismatch`,
 persona pedantic); this tool runs it with every other audit switched off and
 with ignore comments off. Three things zizmor does without an error are
@@ -148,6 +154,8 @@ IMAGE_KEYS = ("args", "entrypoint")
 FLOATING = re.compile(
     r"(?<![\w.-])(?:ubuntu|windows|macos)-latest(?:-x?large)?(?![\w.-])", re.IGNORECASE
 )
+BARE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
 INPUT_EVENTS = ("workflow_call", "workflow_dispatch")
 INPUT_KEYS = ("default", "options")
 JOB_KEYS = ("runs-on", "strategy", "with")
@@ -164,12 +172,16 @@ class Finding(NamedTuple):
 
 
 class Call(NamedTuple):
-    """One `uses`: its line, its text, whether a job calls a workflow, its `with` keys by line."""
+    """One `uses`: its line, its text, whether a job calls a workflow, its `with` keys by line,
+
+    and the comment on the line after the `uses` value, if any.
+    """
 
     line: int
     uses: str
     workflow: bool
     keys: dict[str, int]
+    comment: str | None
 
 
 def _run(command: list[str], seconds: int, env: dict[str, str] | None = None):
@@ -298,13 +310,25 @@ def _pairs(node: yaml.Node | None) -> dict[str, tuple[yaml.Node, yaml.Node]]:
     return {key.value: (key, value) for key, value in node.value}
 
 
-def _call(pairs: dict, workflow: bool) -> Call | None:
+def _comment(value: yaml.ScalarNode, lines: list[str]) -> str | None:
+    """The text after `#` on the line where the value ends, or None when no comment follows."""
+    row, col = value.end_mark.line, value.end_mark.column
+    if row >= len(lines):
+        return None
+    tail = lines[row][col:]
+    prefix, sep, after = tail.partition("#")
+    if not sep or (prefix and not prefix.isspace()):
+        return None
+    return after
+
+
+def _call(pairs: dict, workflow: bool, lines: list[str]) -> Call | None:
     if "uses" not in pairs or not isinstance(pairs["uses"][1], yaml.ScalarNode):
         return None
     key, value = pairs["uses"]
     given = _pairs(pairs["with"][1]) if "with" in pairs else {}
     keys = {name: nodes[0].start_mark.line + 1 for name, nodes in given.items()}
-    return Call(key.start_mark.line + 1, value.value, workflow, keys)
+    return Call(key.start_mark.line + 1, value.value, workflow, keys, _comment(value, lines))
 
 
 def _steps(pairs: dict) -> list[dict]:
@@ -323,13 +347,16 @@ def _composed(path: Path) -> dict[str, tuple[yaml.Node, yaml.Node]]:
 def _calls(path: Path, kind: str) -> list[Call]:
     """Every `uses` of a workflow or an action file, with the line of each `with` key."""
     root = _composed(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
     if kind == "action":
-        found = [_call(step, False) for step in _steps(_pairs(root.get("runs", (None, None))[1]))]
+        found = [
+            _call(step, False, lines) for step in _steps(_pairs(root.get("runs", (None, None))[1]))
+        ]
         return [call for call in found if call]
     found = []
     for _, node in _pairs(root.get("jobs", (None, None))[1]).values():
         job = _pairs(node)
-        found += [_call(job, True), *(_call(step, False) for step in _steps(job))]
+        found += [_call(job, True, lines), *(_call(step, False, lines) for step in _steps(job))]
     return [call for call in found if call]
 
 
@@ -475,6 +502,30 @@ def listing(root: Path, work: Path) -> int:
     return 0
 
 
+def _comments(root: Path, documents: list) -> tuple[list[Finding], int]:
+    """Findings on outside uses on a commit whose comment is not one bare ref, and count of them."""
+    findings, bare = [], 0
+    for path, kind, _ in documents:
+        for call in _calls(root / path, kind):
+            if call.uses.startswith(LOCAL):
+                continue
+            _, _, ref = call.uses.partition("@")
+            if not COMMIT.fullmatch(ref):
+                continue
+            stripped = call.comment.strip() if call.comment is not None else ""
+            if not stripped or not BARE_REF.fullmatch(stripped):
+                said = (
+                    "the comment must name one ref, such as `# main` or `# v1.2.3`, "
+                    "or the update bot skips the pin (ADR-0075)"
+                )
+                findings.append(
+                    Finding(path, call.line, f"{_written(str(root / path), call.line)}: {said}")
+                )
+            else:
+                bare += 1
+    return findings, bare
+
+
 def check(root: Path, work: Path, rewrite: bool) -> int:
     documents, named = _tree(root)
     token = _token()
@@ -484,15 +535,16 @@ def check(root: Path, work: Path, rewrite: bool) -> int:
         found = _scan(work, named, token)
     late, uses, keys = _inputs(root, documents)
     floating, jobs, _ = _labels(root, documents)
-    problems = sorted([*found[UNPINNED], *found[COMMENT], *late, *floating])
+    comments, bare = _comments(root, documents)
+    problems = sorted([*found[UNPINNED], *found[COMMENT], *late, *floating, *comments])
     for finding in problems:
         ciwf.complain(f"FAIL: {finding.path}:{finding.line}: {finding.text}")
     if problems:
         return 1
     ciwf.say(
-        f"PASS: {len(named)} file(s), {uses} outside use(s) on a commit, no comment refuted, "
-        f"{keys} `with` key(s) declared, {jobs} job(s) on no floating runner label; "
-        f"{_version()}, online"
+        f"PASS: {len(named)} file(s), {uses} outside use(s) on a commit, "
+        f"{bare} on a bare ref comment, no comment refuted, {keys} `with` key(s) declared, "
+        f"{jobs} job(s) on no floating runner label; {_version()}, online"
     )
     return 0
 

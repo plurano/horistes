@@ -80,7 +80,9 @@ files = [a for a in args if a.endswith((".yml", ".yaml")) and a != config]
 quiet = "--offline" in args or os.environ.get("ZIZMOR_OFFLINE") == "true"
 online = bool(os.environ.get("GH_TOKEN")) and not quiet
 fix = "--fix=all" in args
-USES = re.compile(r"^(\s*(?:- )?uses:\s*)([^\s@]+)@(\S+?)(?:\s+#\s*(.*))?$")
+USES = re.compile(
+    r'^(\s*(?:- )?uses:\s*)["\']?([^\s@"\']+?)@([^\s"\']+?)["\']?(?:\s+#\s*(.*))?$'
+)
 found = []
 
 
@@ -212,6 +214,10 @@ def test_tree_on_commits_with_right_comments_and_declared_keys_passes(tree):
     assert [call["token"] for call in engine_calls(tree)] == ["a-token-for-the-stand-in"]
 
 
+# The end of the finding on a commit pin whose comment is not one ref.
+ONE_REF = "or the update bot skips the pin (ADR-0075)"
+
+
 @pytest.mark.parametrize(
     ("old", "new", "line", "message"),
     [
@@ -239,9 +245,10 @@ def test_use_that_is_not_a_commit_under_its_release_fails(tree, old, new, line, 
     answers[at("plurano/shared", ".github/workflows/licence.yml", "v1")] = held(CALLED)
     done = run(tree, workflow=planted(old, new), answers=answers)
     assert done.returncode == 1, done.stdout
-    (failure,) = [text for text in done.stderr.splitlines() if text.startswith("FAIL")]
-    assert failure.startswith(f"FAIL: {WORKFLOW}:{line}: ")
-    assert message in failure
+    failures = [text for text in done.stderr.splitlines() if text.startswith("FAIL")]
+    assert all(text.startswith(f"FAIL: {WORKFLOW}:{line}: ") for text in failures), failures
+    (failure,) = [text for text in failures if message in text]
+    assert [text for text in failures if text != failure and ONE_REF not in text] == []
 
 
 @pytest.mark.parametrize("command", ["check", "pin"])
@@ -518,3 +525,90 @@ def test_engine_that_is_not_there_is_an_error(tree):
     done = real(tree, "list", GOOD, env={"ZIZMOR": str(tree.root / "no-such-zizmor")})
     assert done.returncode == 3, done.stdout
     assert done.stderr.startswith("ERROR: ")
+
+
+RED_COMMENTS = [
+    "# main 2026-11-02 (#96)",
+    "# v1.2.3 main",
+    "# tag=v1.2.3",
+    "",
+    "#",
+]
+
+
+@pytest.mark.parametrize(
+    "comment",
+    RED_COMMENTS,
+    ids=["dated", "words", "tag-equals", "none", "hash-only"],
+)
+@pytest.mark.parametrize(
+    ("target", "line", "lead"),
+    [
+        (USE, 10, f"        uses: actions/checkout@{CHECKOUT}"),
+        (CALL, 23, f"    uses: plurano/shared/.github/workflows/licence.yml@{SHARED}"),
+    ],
+    ids=["step-uses", "job-uses"],
+)
+def test_outside_commit_use_with_red_comment_fails(tree, comment, target, line, lead):
+    suffix = f" {comment}\n" if comment else "\n"
+    new = f"{lead}{suffix}"
+    done = run(tree, workflow=planted(target, new))
+    assert done.returncode == 1, done.stdout
+    assert f"FAIL: {WORKFLOW}:{line}: " in done.stderr
+    assert ONE_REF in done.stderr
+
+
+GREEN_COMMENTS = [
+    "# main",
+    "# v1.2.3",
+    "#v1.2.3",
+    "# release/v2",
+    "# v1.2.3   ",
+]
+
+
+@pytest.mark.parametrize(
+    "comment",
+    GREEN_COMMENTS,
+    ids=["main", "version", "no-space", "branch", "trailing-spaces"],
+)
+def test_outside_commit_use_with_green_comment_passes(tree, comment):
+    new = f"    uses: plurano/shared/.github/workflows/licence.yml@{SHARED} {comment}\n"
+    engine = {"releases": {f"actions/checkout@{CHECKOUT}": "v4.2.2"}}
+    done = run(tree, workflow=planted(CALL, new), engine=engine)
+    assert done.returncode == 0, done.stderr
+    assert "FAIL" not in done.stderr
+    assert "3 on a bare ref comment" in done.stdout
+
+
+def test_quoted_uses_holding_hash_inside_quotes_with_good_comment_passes(tree):
+    new = f'    uses: "plurano/shared/.github/workflows/licence.yml#part@{SHARED}" # main\n'
+    answers = {
+        **ANSWERS,
+        at("plurano/shared", ".github/workflows/licence.yml%23part", SHARED): held(CALLED),
+    }
+    engine = {"releases": {f"actions/checkout@{CHECKOUT}": "v4.2.2"}}
+    done = run(tree, workflow=planted(CALL, new), answers=answers, engine=engine)
+    assert done.returncode == 0, done.stderr
+    assert "FAIL" not in done.stderr
+    assert "3 on a bare ref comment" in done.stdout
+
+
+def test_use_on_tag_gets_no_comment_finding_from_this_check(tree):
+    new = "        uses: actions/checkout@v4.2.2 # main 2026-11-02 (#96)\n"
+    done = run(tree, workflow=planted(USE, new))
+    assert done.returncode == 1, done.stdout
+    assert "action is not pinned to a hash" in done.stderr
+    assert ONE_REF not in done.stderr
+
+
+def test_pin_on_red_comment_tree_fails_and_writes_no_comment_change(tree):
+    bad = planted(
+        CALL,
+        f"    uses: plurano/shared/.github/workflows/licence.yml@{SHARED}"
+        " # main 2026-11-02 (#96)\n",
+    )
+    done = run(tree, command="pin", workflow=bad)
+    assert done.returncode == 1, done.stdout
+    assert ONE_REF in done.stderr
+    assert (tree.root / WORKFLOW).read_text(encoding="utf-8") == bad

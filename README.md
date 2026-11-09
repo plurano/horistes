@@ -114,10 +114,14 @@ hyphen, the release is created with `--prerelease`
     needs: [build, verify]
     permissions:
       contents: write
-    uses: plurano/horistes/.github/workflows/draft-release.yml@<commit>
+    uses: plurano/horistes/.github/workflows/draft-release.yml@<commit> # main
     with:
       artifact: release-files
 ```
+
+The comment is one ref and nothing else (`# main` or a release tag), so the
+update bot moves the pin. `pins.py check` in the shared workflow check refuses
+any other comment (ADR-0075).
 
 The merge train runs from one caller in the fleet's operations repository
 and sweeps every repository the merge-train app is installed on; the
