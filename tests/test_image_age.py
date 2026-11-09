@@ -249,16 +249,17 @@ def test_fetch_hub_tags_parses_json(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_fetch_hub_tags_http_error(monkeypatch: pytest.MonkeyPatch):
-    """fetch_hub_tags wraps HTTPError in ReadError."""
+    """fetch_hub_tags wraps HTTPError in ReadError and closes the HTTPError."""
+    err = urllib.error.HTTPError("https://hub.docker.com", 404, "Not Found", {}, io.BytesIO(b""))
 
     def raise_http(req, timeout):
-        raise urllib.error.HTTPError(
-            "https://hub.docker.com", 404, "Not Found", {}, io.BytesIO(b"")
-        )
+        raise err
 
     monkeypatch.setattr(urllib.request, "urlopen", raise_http)
-    with pytest.raises(image_age.ReadError, match="Docker Hub HTTP 404"):
+    with pytest.raises(image_age.ReadError, match="Docker Hub HTTP 404") as caught:
         image_age.fetch_hub_tags("https://hub.example/tags")
+    assert caught.value.__cause__ is err
+    assert err.closed
 
 
 def test_main_cli(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):

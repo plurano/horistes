@@ -9,6 +9,14 @@ skips = ["B404", "B603", "B607"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
+# A resource left unclosed fails its test. Its ResourceWarning is raised in
+# __del__, where the error the first filter makes cannot propagate; pytest
+# 9.1.1 reports it as PytestUnraisableExceptionWarning, which the second
+# filter makes an error.
+filterwarnings = [
+    "error::ResourceWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 
 [tool.coverage.run]
 # Branch coverage counts both outcomes of every condition, not only the lines.

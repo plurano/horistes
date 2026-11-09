@@ -112,19 +112,27 @@ def test_body_over_the_limit_is_refused(tmp_path, monkeypatch, size, passes):
 
 
 def test_refused_request_names_its_status_and_the_limit_left(tmp_path, monkeypatch):
-    opener(monkeypatch, refusal(403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "17"}))
+    """A refused request reports its HTTP status and rate-limit headers, and closes the error."""
+    err = refusal(403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "17"})
+    opener(monkeypatch, err)
     with pytest.raises(stranger.FetchError) as caught:
         stranger.Stranger(tmp_path).fetch(URL, tmp_path / "file")
     assert caught.value.status == 403
     assert "HTTP 403 (x-ratelimit-remaining 0, x-ratelimit-reset 17)" in str(caught.value)
+    assert caught.value.__cause__ is err
+    assert err.closed
 
 
 def test_missing_file_names_its_status_and_no_limit(tmp_path, monkeypatch):
-    opener(monkeypatch, refusal(404, {"x-ratelimit-remaining": "41"}))
+    """A 404 response reports its status without rate-limit info, and closes the error."""
+    err = refusal(404, {"x-ratelimit-remaining": "41"})
+    opener(monkeypatch, err)
     with pytest.raises(stranger.FetchError) as caught:
         stranger.Stranger(tmp_path).fetch(URL, tmp_path / "file")
     assert caught.value.status == 404
     assert str(caught.value) == f"GET {URL}: HTTP 404"
+    assert caught.value.__cause__ is err
+    assert err.closed
 
 
 def test_request_without_an_answer_has_no_status(tmp_path, monkeypatch):
