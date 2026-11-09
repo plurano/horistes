@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shlex
 import sys
 
@@ -518,3 +519,23 @@ def test_engine_that_is_not_there_is_an_error(tree):
     done = real(tree, "list", GOOD, env={"ZIZMOR": str(tree.root / "no-such-zizmor")})
     assert done.returncode == 3, done.stdout
     assert done.stderr.startswith("ERROR: ")
+
+
+def test_offline_env_drops_every_token_name(monkeypatch):
+    for name in pins.TOKENS:
+        monkeypatch.setenv(name, "set-by-the-caller")
+    monkeypatch.setenv("HORISTES_UNRELATED", "kept")
+    env = pins.offline_env()
+    assert not set(pins.TOKENS) & set(env)
+    assert env["HORISTES_UNRELATED"] == "kept"
+
+
+def test_offline_env_drops_an_empty_token(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "")
+    assert "GH_TOKEN" not in pins.offline_env()
+
+
+def test_offline_env_without_a_token_is_the_whole_environment(monkeypatch):
+    for name in pins.TOKENS:
+        monkeypatch.delenv(name, raising=False)
+    assert pins.offline_env() == dict(os.environ)

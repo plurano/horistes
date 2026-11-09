@@ -198,6 +198,15 @@ def _version() -> str:
     return done.stdout.strip()
 
 
+def offline_env() -> dict[str, str]:
+    """This process's environment without the token names, for a zizmor run that stays offline.
+
+    zizmor takes GH_TOKEN or GITHUB_TOKEN as its token and exits 2 on an empty
+    one, even with --offline, so a caller's empty variable would stop the run.
+    """
+    return {key: value for key, value in os.environ.items() if key not in TOKENS}
+
+
 def _token() -> str:
     for name in TOKENS:
         if os.environ.get(name):
@@ -220,7 +229,7 @@ def _engine_run(work: Path, files: list[str], token: str | None, fix: bool):
     command += ["--no-progress", "--color", "never", "--format", "json"]
     command += ["--fix=all"] if fix else []
     command += [] if token else ["--offline"]
-    env = {key: value for key, value in os.environ.items() if key not in TOKENS}
+    env = offline_env()
     if token:
         env["GH_TOKEN"] = token
     done = _run([*command, *files], ENGINE_SECONDS, env)

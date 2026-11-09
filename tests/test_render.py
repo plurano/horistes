@@ -18,6 +18,7 @@ from conftest import REUSABLE, ROOT, external
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
+import pins
 import render
 
 CONTEXT = {
@@ -310,6 +311,7 @@ def test_rendered_caller_passes_both_linters(tree, template, name):
         text=True,
         check=False,
         timeout=30,
+        env=pins.offline_env(),
     )
     assert done.returncode == 0, done.stdout + done.stderr
 

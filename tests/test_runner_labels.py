@@ -217,8 +217,7 @@ def test_value_shared_by_many_aliases_is_read_once(tree):
 def test_check_starts_no_engine_and_asks_no_client(tree):
     marker = tree.root / "started"
     starts = shlex.join([sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"])
-    names = ("GH_TOKEN", "GITHUB_TOKEN", "ZIZMOR_GITHUB_TOKEN")
-    done = run(tree, env={"ZIZMOR": starts, "GH": starts, **dict.fromkeys(names, "")})
+    done = run(tree, env={"ZIZMOR": starts, "GH": starts, **dict.fromkeys(pins.TOKENS, "")})
     assert done.returncode == 0, done.stderr
     assert not marker.exists()
 

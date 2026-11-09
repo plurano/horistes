@@ -91,13 +91,16 @@ lint-python: tools
 	$(BIN)/ruff format --check --config ruff.toml tools tests fuzz
 
 # actionlint reads .github/workflows by itself; zizmor is given the workflow
-# and the action directories and must find at least the workflows.
+# and the action directories and must find at least the workflows. zizmor
+# takes GH_TOKEN or GITHUB_TOKEN as its token and exits 2 on an empty one even
+# offline, so it runs without the TOKENS names of tools/pins.py.
 lint-workflows: tools
 	@found="$$($(ACTIONLINT) -version | head -n 1)"; \
 	if [ "$$found" != "$(ACTIONLINT_VERSION)" ] && [ "$$found" != "v$(ACTIONLINT_VERSION)" ]; then \
 		printf '%s\n' "actionlint $(ACTIONLINT_VERSION) required, found: $$found" >&2; exit 1; fi
 	$(ACTIONLINT)
-	$(BIN)/zizmor --offline --strict-collection --persona pedantic .github/workflows $(wildcard actions)
+	env -u GH_TOKEN -u GITHUB_TOKEN -u ZIZMOR_GITHUB_TOKEN \
+		$(BIN)/zizmor --offline --strict-collection --persona pedantic .github/workflows $(wildcard actions)
 
 check-interface:
 	$(PYTHON) -B tools/interface.py check --base-ref $(BASE_REF)

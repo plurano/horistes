@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 import pytest
 from conftest import ACTION, CHECKOUT, REUSABLE, ROOT, external, rooted
+
+sys.path.insert(0, str(ROOT / "tools"))
+import pins
 
 WORKFLOW = ".github/workflows/licence.yml"
 UNPINNED = REUSABLE.replace(CHECKOUT, "actions/checkout@v7")
@@ -82,7 +86,9 @@ def zizmor(tree):
         str(tree.root),
     ]
     # nosemgrep: dangerous-subprocess-use-audit runs the Makefile zizmor offline on a planted tree
-    return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
+    return subprocess.run(
+        command, capture_output=True, text=True, check=False, timeout=60, env=pins.offline_env()
+    )
 
 
 def yamllint(tree, *args):
@@ -137,6 +143,24 @@ def test_image_named_by_digest_passes_both_linters(tree):
     done = zizmor(tree)
     assert done.returncode == 0, done.stdout
     assert "No findings to report" in done.stdout
+
+
+def test_zizmor_runs_offline_under_an_empty_token(tree, monkeypatch):
+    """An empty GH_TOKEN or GITHUB_TOKEN in the caller's shell does not stop the offline run."""
+    monkeypatch.setenv("GH_TOKEN", "")
+    monkeypatch.setenv("GITHUB_TOKEN", "")
+    done = zizmor(tree.write({WORKFLOW: REUSABLE}))
+    assert "cannot be empty" not in done.stderr, done.stderr
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "No findings to report" in done.stdout
+
+
+def test_zizmor_finding_survives_an_empty_token(tree, monkeypatch):
+    """The token names are dropped, not the check: a planted finding is still refused."""
+    monkeypatch.setenv("GH_TOKEN", "")
+    done = zizmor(tree.write({WORKFLOW: UNPINNED}))
+    assert done.returncode in pins.FINDING_CODES[1:], done.stderr
+    assert "[unpinned-uses]" in done.stdout
 
 
 @pytest.mark.parametrize(
@@ -278,6 +302,19 @@ def _recipe(makefile: str, target: str) -> list[str]:
             else:
                 break
     return recipe
+
+
+def test_makefile_runs_zizmor_without_the_token_names():
+    """The gate's zizmor line drops exactly the names tools/pins.py drops, in its order."""
+    recipe = _recipe((ROOT / "Makefile").read_text(encoding="utf-8"), "lint-workflows")
+    found = [at for at, line in enumerate(recipe) if "/zizmor --offline" in line]
+    assert len(found) == 1, recipe
+    at = found[0]
+    joined = recipe[at - 1] + recipe[at] if at and recipe[at - 1].endswith("\\") else recipe[at]
+    words = joined.replace("\\", " ").split()
+    assert words[0] == "env", words
+    dropped = tuple(words[n + 1] for n, word in enumerate(words[:-1]) if word == "-u")
+    assert dropped == pins.TOKENS, words
 
 
 def test_makefile_lint_python_recipe_passes_config_flag():
