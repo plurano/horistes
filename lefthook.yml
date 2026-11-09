@@ -10,6 +10,7 @@
 # REUSE.toml or LICENSES/ was present at adoption: the reuse-lint job runs
 # reuse lint at the release line fsfe/reuse-action@v6 runs in CI.
 # It skips where reuse is not installed and fails on another reuse major.
+# The pre-push tools-stamp check refuses a push when .venv/.stamp does not match requirements/tools.txt.
 ---
 agent-checkpoint-tool:
   commands:
@@ -50,7 +51,11 @@ post-commit:
 
 pre-push:
   parallel: false
+  piped: true
   commands:
+    tools-stamp:
+      priority: 1
+      run: make --no-print-directory check-tools-stamp
     flavor-audit:
       run: sh .config/lefthook/engine.sh flavor audit .
     audit:
