@@ -21,6 +21,7 @@ import hashlib
 import http.client
 import importlib.util
 import io
+import itertools
 import json
 import os
 import re
@@ -343,7 +344,10 @@ class Forge:
         self.commits: dict[int, list[tuple[str, int]]] = {}
         self.merge_states: dict[int, str] = {}
         self.commit_counts: dict[int, int] = {}
-        self.review_details: dict[int, dict] = {}
+        # One detail per number, or a list read in turn (the last repeats); None reads as
+        # a pull request the forge no longer returns.
+        self.review_details: dict[int, dict | list[dict | None] | None] = {}
+        self.review_refusals: dict[int, str] = {}
         self.review_body_calls: list[int] = []
         self.merged_pulls: dict[str, list[dict]] = {}
         self.issue_right = True
@@ -545,8 +549,14 @@ class Forge:
         number = variables["number"]
         assert variables == {"owner": owner, "name": name, "number": number}, variables
         self.review_body_calls.append(number)
+        if number in self.review_refusals:
+            return {"errors": [{"message": self.review_refusals[number]}]}
         empty = {"totalCount": 0, "nodes": []}
         detail = self.review_details.get(number, {})
+        if isinstance(detail, list):
+            detail = detail.pop(0) if len(detail) > 1 else detail[0]
+        if detail is None:
+            return {"data": {"repository": {"pullRequest": None}}}
         pr = {
             "reviews": detail.get("reviews", empty),
             "comments": detail.get("comments", empty),
@@ -6271,3 +6281,178 @@ def test_armed_pr_disarmed_when_review_settle_hides_red_scan(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert disarmed(1) in forge.writes
     assert "disarmed: code-scanning check failed" in summary
+
+
+def _finding(review_id: int) -> dict:
+    """A REVIEW_BODIES payload with one unanswered CodeRabbit nitpick body."""
+    return _detail(reviews=[_bot_review(review_id, "coderabbitai", "Nitpick comments: 1")])
+
+
+def test_security_update_held_by_review_body_still_holds_the_update(tmp_path):
+    """A security fix a review body holds is still the fix the update waits for (record 0062)."""
+    forge = Forge(repository(*held_pair(), rules=LINEAR))
+    forge.review_details[2] = _finding(1201)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, HOLD), ("draft", "PR_1")], forge.writes
+    assert "held as a draft: security update #2 is open" in summary, summary
+    assert "| #2 | BEHIND | review body: coderabbitai review 1201 has findings" in summary, summary
+
+
+def test_retitled_armed_pull_request_held_by_review_body_stays_disarmed(tmp_path):
+    """A drifted title does not re-arm a pull request a review body disarmed in this run."""
+    retitled = pull(
+        1,
+        "BLOCKED",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    forge.review_details[1] = _finding(1301)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)], forge.writes
+    assert forge.messages == [], forge.messages
+    assert "| #1 | BLOCKED | disarmed: review body: coderabbitai review 1301" in summary, summary
+
+
+def test_switched_off_reports_a_review_body_hold_with_a_read_token(tmp_path):
+    """Switched off, the train mints read rights only: it reports the hold and writes nothing."""
+    p = pull(1, "CLEAN", author={"login": "person"}, autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(p))
+    forge.review_details[1] = _finding(1401)
+    done, summary = train(tmp_path, forge, switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.minted[1] == (7, {"permissions": READ, "repositories": ["app"]})
+    assert forge.writes == [], forge.writes
+    assert "| #1 | CLEAN | review body: coderabbitai review 1401 has findings" in summary, summary
+
+
+def test_landing_reads_the_review_bodies_again(tmp_path):
+    """A pull request the train lands has its review bodies read twice: verdict and landing."""
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)], forge.writes
+    assert forge.review_body_calls == [1, 1], forge.review_body_calls
+
+
+@pytest.mark.parametrize(
+    ("auto_merge", "writes", "note"),
+    [
+        (None, [], "| #1 | CLEAN | review body: coderabbitai review 1501"),
+        ({"enabledAt": OLD}, [disarmed(1)], "| #1 | CLEAN | disarmed: review body: coderabbitai"),
+    ],
+    ids=["unarmed", "armed"],
+)
+def test_finding_posted_after_the_first_read_holds_at_landing(tmp_path, auto_merge, writes, note):
+    """A bot body posted between the verdict read and the landing holds the pull request."""
+    p = pull(1, "CLEAN", author={"login": "person"}, autoMergeRequest=auto_merge)
+    forge = Forge(repository(p))
+    forge.review_details[1] = [_detail(), _finding(1501)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == writes, forge.writes
+    assert forge.review_body_calls == [1, 1], forge.review_body_calls
+    assert note in summary, summary
+
+
+def _token_mixes(tokens: tuple[str, ...], longest: int) -> list[str]:
+    """Every string of up to longest tokens, in order."""
+    return [
+        "".join(mix)
+        for size in range(longest + 1)
+        for mix in itertools.product(tokens, repeat=size)
+    ]
+
+
+# The expressions the scans replaced; each scan must answer as its expression does.
+HTML_COMMENT_ORACLE = re.compile(r"<!--.*?-->", re.S)
+REVIEW_INFO_ORACLE = re.compile(
+    r"<summary>(?:(?!</summary>).)*?Review info.*?</summary>", re.S | re.I
+)
+
+
+def test_html_comment_strip_matches_its_expression(tmp_path, monkeypatch):
+    """Every mix of up to five comment fragments strips as re.sub with <!--.*?--> does."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    mixes = _token_mixes(("<!--", "-->", "<!-", "-", "a", "\n"), 5)
+    wrong = [
+        m for m in mixes if merge_train._strip_html_comments(m) != HTML_COMMENT_ORACLE.sub("", m)
+    ]
+    assert len(mixes) == 9331
+    assert wrong == []
+
+
+def test_review_info_scan_matches_its_expression(tmp_path, monkeypatch):
+    """Every mix of up to five summary fragments reads as the Review info expression reads it."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    tokens = ("<summary>", "</summary>", "Review info", "REVIEW INFO", "<SUMMARY>", "x")
+    mixes = _token_mixes(tokens, 5)
+    wrong = [
+        m for m in mixes if merge_train._has_review_info(m) != bool(REVIEW_INFO_ORACLE.search(m))
+    ]
+    assert len(mixes) == 9331
+    assert wrong == []
+
+
+@pytest.mark.parametrize(
+    ("scan", "body"),
+    [
+        ("_strip_html_comments", "<!--" * 16384),
+        ("_has_review_info", "<summary>" * 7281),
+        ("_sourcery_finding", "1" * 65536),
+    ],
+    ids=["comment-openers", "summary-openers", "met-digits"],
+)
+def test_bot_body_scans_stay_linear(tmp_path, monkeypatch, scan, body):
+    """Up to 64 KiB of unclosed openers or digits: the replaced expressions took 2 to 16 s."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    start = time.perf_counter()
+    getattr(merge_train, scan)(body)
+    assert time.perf_counter() - start < 0.25
+
+
+@pytest.mark.parametrize(
+    ("unreadable", "reason"),
+    [
+        ("refused", "review body: cannot read: GraphQL: "),
+        ("gone", "review body: cannot read: the forge returned no pull request"),
+        ("oversize", "review body: cannot read: POST "),
+    ],
+    ids=["refused", "gone", "oversize"],
+)
+def test_unreadable_review_bodies_hold_that_pull_request_alone(tmp_path, unreadable, reason):
+    """A refused, missing or oversize read holds its pull request; the run lands the next one."""
+    forge = Forge(
+        repository(
+            pull(1, "CLEAN", author={"login": "person"}),
+            pull(2, "CLEAN", author={"login": "person"}),
+        )
+    )
+    if unreadable == "refused":
+        forge.review_refusals[1] = "stand-in refuses the read"
+    elif unreadable == "gone":
+        forge.review_details[1] = None
+    else:
+        body = "x" * (16 * 1024 * 1024)  # MAX_ARTIFACT_BYTES of the whole answer
+        forge.review_details[1] = _detail(reviews=[_bot_review(1601, "coderabbitai", body)])
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)], forge.writes
+    assert f"| #1 | CLEAN | {reason}" in summary, summary
+
+
+def test_review_body_reads_stop_at_the_bound_security_update_first(tmp_path):
+    """Ten reads a run, security update first; the pull request past the bound is held unread."""
+    people = [pull(n, "CLEAN", author={"login": "person"}) for n in range(1, 11)]
+    fix = pull(11, "CLEAN", headRefName="renovate/x-net", title="fix(deps): x/net [security]")
+    forge = Forge(repository(*people, fix))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.review_body_calls == [11, *range(1, 10), 11], forge.review_body_calls
+    assert forge.writes == [landed(11)], forge.writes
+    expected = (
+        "| #10 | CLEAN | review body: not read: more than 10 pull requests to read in one run |"
+    )
+    assert expected in summary, summary

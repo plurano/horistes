@@ -54,20 +54,24 @@ new review-body parsing and GraphQL queries belong in `tools/merge_train.py`.
     - Inspect candidate reviews on any commit of the pull request where
       `author.__typename == "Bot"` and `state` is in `{"COMMENTED", "CHANGES_REQUESTED", "APPROVED"}`
       (`DISMISSED` and `PENDING` are ignored).
-    - Strip HTML comments (`<!--.*?-->`) and detect findings per bot login (after
-      stripping any `"[bot]"` suffix; shapes taken from live reviews 2026-11-09):
+    - Strip closed HTML comments in one pass over the body (`_strip_html_comments()`,
+      the same result as `<!--.*?-->` with `re.S`, which rescans the rest of the body at
+      every unclosed opener) and detect findings per bot login (after stripping any
+      `"[bot]"` suffix; shapes taken from live reviews 2026-11-09):
       - `coderabbitai`: finding when any count in
         `(Nitpick|Outside diff range|Duplicate|Additional) comments` (`: N` or ` (N)`)
         is greater than zero, or when `[!CAUTION]` appears in the body; empty body has no
         finding; clean when body holds `Actionable comments posted:` or a `Review info`
-        summary; otherwise fails closed as an unknown shape; the autofix checkbox is not
-        a finding.
+        summary (a `<summary>` element holding `Review info` in ASCII letters of any
+        case, found in one pass by `_has_review_info()`); otherwise fails closed as an
+        unknown shape; the autofix checkbox is not a finding.
       - `sourcery-ai`: finding when any marker appears (case-insensitive:
         `high level feedback`, `## Overall Comments`, `security issue`,
         `Needs a human reviewer`, `Approval pending`), or when any linked-issue line
-        `(\d+) of (\d+) met` has first < second; clean when body holds a known Sourcery
-        opener or assessment (`Hey - I've found`, `Hey - I've reviewed your changes`,
-        `### Sourcery assessment`); otherwise fails closed as an unknown shape.
+        `(\d{1,6}) of (\d{1,6}) met` (digit runs and spaces bounded) has first < second;
+        clean when body holds a known Sourcery opener or assessment (`Hey - I've found`,
+        `Hey - I've reviewed your changes`, `### Sourcery assessment`); otherwise fails
+        closed as an unknown shape.
       - `codacy-production`: finding when `No blocking issues noticed` is absent or any
         line matches `^- \[ \] `.
       - Any other bot: finding when the comment-stripped body is non-empty.
@@ -82,6 +86,25 @@ new review-body parsing and GraphQL queries belong in `tools/merge_train.py`.
     rows whose reason is in `("land", "behind", "red")` or that have `autoMergeRequest`
     set, and that are not `is_bot_dependency(pull, conf)`. Replace the row's reason with
     the hold reason when held; leave all other rows untouched without fetching.
+  - Read at most `REVIEW_READS` (10) pull requests per repository in one run, in serving
+    order, so security updates and the oldest pull requests are read first. An eligible
+    pull request past the bound is held with
+    `"review body: not read: more than 10 pull requests to read in one run"` and read in
+    a later run.
+  - A failed read holds that pull request alone (`read_review_hold()`): a refused GraphQL
+    answer (errors, no data, or a response over `MAX_ARTIFACT_BYTES`) holds it with
+    `"review body: cannot read: <error>"`, and a null `pullRequest` (deleted, or no
+    longer visible to the token) with
+    `"review body: cannot read: the forge returned no pull request"`. The run goes on
+    with the other pull requests.
+  - `land_clean()` reads the review bodies again (`late_review_hold()`) just before it
+    merges or enqueues a pull request that is not a bot dependency update. A hold stops
+    that landing; an armed pull request is disarmed with `"disarmed: <hold reason>"`.
+  - `re_arm_drifted()` skips a row a review body holds, so a pull request disarmed in
+    this run is not re-armed in the same run.
+  - `hold_for_security()` reads the verdicts from before the review-body holds, so a
+    security update a review body holds is still the fix the other dependency updates
+    wait for ([ADR-0062](0062-dependency-updates-wait-while-a-security-update-is-open.md)).
   - Extend `disarm_red_scanning()` in `tools/merge_train.py` so an armed pull request
     held by a review body is disarmed via `DISARM` with note `"disarmed: <hold reason>"`,
     preserving `"disarmed: code-scanning check failed"` when code scanning is red.
@@ -99,11 +122,21 @@ new review-body parsing and GraphQL queries belong in `tools/merge_train.py`.
     preserving GraphQL rate budget on held, draft, or bot-dependency pull requests.
   - Coverage in `tests/test_merge_train.py` verifies live bot exemption, per-bot body
     classification, author comment/review/commit answers, pagination bounds, disarming
-    of armed pull requests, and query field selection.
+    of armed pull requests, query field selection, the read bound in serving order, the
+    second read at landing, a security update held by a review body, no re-arm after a
+    review-body disarm, a hold per unreadable pull request, and the one-pass scans
+    against their regular expressions and on unclosed openers.
 - **Negative**:
   - Race window on armed pull requests: if a pull request is already armed for forge
     auto-merge when a bot posts a late review body, the forge may merge the pull request
-    before the next merge-train sweep runs and disarms it.
+    before the next merge-train sweep runs and disarms it. For a pull request the train
+    lands itself, the window is the time between the second read and the merge call.
+  - When the train is switched off, its token carries read rights only
+    ([ADR-0029](0029-a-forge-app-drives-the-merge-train.md)), so it cannot disarm; a
+    review-body hold shows in the summary, and an armed pull request stays armed until
+    the train is switched on again.
+  - With more than 10 eligible pull requests in one repository, the rest wait unread for
+    later runs, and landing them takes more sweeps.
   - Unrecognized bot review body formats fail closed and require an explicit author
     reply or parser update.
   - Twelve of the thirteen Sourcery `Hey - I've found N issues` reviews in PRs 138 to
