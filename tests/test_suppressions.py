@@ -13,6 +13,8 @@ import pytest
 from conftest import ROOT
 from exceptions import WORDS, codacy_problems, suppression_problems
 
+FIXED_TODAY = datetime.date(2026, 11, 9)
+
 PRUNE_DIRS = {
     ".claude",
     ".git",
@@ -128,7 +130,7 @@ def test_planted_refusals(payload: str, kind: str) -> None:
     if kind == "yaml":
         assert codacy_problems(payload) == ["engines.opengrep.exclude_paths is not permitted"]
         return
-    problems = suppression_problems(planted(payload), "test.py")
+    problems = suppression_problems(planted(payload), "test.py", today=FIXED_TODAY)
     assert len(problems) == 1
     assert problems[0].startswith("test.py:1: invalid ")
 
@@ -140,7 +142,7 @@ def test_planted_refusals(payload: str, kind: str) -> None:
 )
 def test_accepted_boundary_rows(payload: str) -> None:
     """Boundary conditions: valid suppressions, split words and nosec in strings pass."""
-    assert suppression_problems(planted(payload), "test.py") == []
+    assert suppression_problems(planted(payload), "test.py", today=FIXED_TODAY) == []
 
 
 def test_ignore_word_in_multiline_string_names_its_line() -> None:
@@ -148,7 +150,9 @@ def test_ignore_word_in_multiline_string_names_its_line() -> None:
 
     Opengrep reads that line as the line above the next statement's finding.
     """
-    problems = suppression_problems(planted('NOTE = """first\nsecond\n    {sg}"""\n'), "test.py")
+    problems = suppression_problems(
+        planted('NOTE = """first\nsecond\n    {sg}"""\n'), "test.py", today=FIXED_TODAY
+    )
     assert len(problems) == 1
     assert problems[0].startswith("test.py:3: invalid opengrep ignore word outside a comment: ")
 
@@ -432,10 +436,18 @@ def test_has_trailing_noqa_e501_cases(comment: str, expected: bool) -> None:
 )
 def test_suppression_problems_tokenize_error(text: str, name: str, expected_err_part: str) -> None:
     """suppression_problems catches TokenError on invalid Python syntax and reports line 1."""
-    probs = suppression_problems(text, name)
+    probs = suppression_problems(text, name, today=FIXED_TODAY)
     if expected_err_part:
         assert len(probs) == 1
         assert f"{name}:1: tokenize error: " in probs[0]
         assert expected_err_part in probs[0]
     else:
         assert probs == []
+
+
+def test_reader_needs_a_date() -> None:
+    """A reader without a fixed date would judge dated rows against the wall clock."""
+    with pytest.raises(TypeError):
+        suppression_problems("x = 1\n", "test.py")
+    with pytest.raises(TypeError):
+        exceptions.comment_problems("# x", False, "test.py:1")

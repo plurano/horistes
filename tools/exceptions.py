@@ -516,13 +516,12 @@ def comment_problems(
     comment: str,
     after_code: bool,
     where: str,
-    today: datetime.date | None = None,
+    today: datetime.date,
     valid_exceptions: set[tuple[str, str]] | None = None,
     path: str = "",
     counts: dict[str, int] | None = None,
 ) -> list[str]:
     """Read one comment as linters read it; verify fleet format or exception coverage."""
-    now = today or datetime.date.today()
     valid = valid_exceptions or set()
     problems: list[str] = []
     opengrep = OPENGREP_AFTER_CODE if after_code else OPENGREP_OWN_LINE
@@ -531,14 +530,14 @@ def comment_problems(
             counts[LONG_WORD] = counts.get(LONG_WORD, 0) + 1
         rule_pat = r"^#\s*" + LONG_WORD + r":\s*([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)"
         probs = _check_directive(
-            comment, NOSEMGREP_FLEET, "opengrep", where, now, valid, path, rule_pat
+            comment, NOSEMGREP_FLEET, "opengrep", where, today, valid, path, rule_pat
         )
         problems.extend(probs)
     if NOSEC_DIRECTIVE.search(comment):
         if counts is not None:
             counts["nosec"] = counts.get("nosec", 0) + 1
         rule_pat = r"^#\s*nosec(?::|\s+)\s*(B\d{3}(?:[ ,]+B\d{3})*)"
-        probs = _check_directive(comment, NOSEC_FLEET, "nosec", where, now, valid, path, rule_pat)
+        probs = _check_directive(comment, NOSEC_FLEET, "nosec", where, today, valid, path, rule_pat)
         problems.extend(probs)
     noqa_match = NOQA_DIRECTIVE.search(comment)
     if noqa_match:
@@ -550,7 +549,7 @@ def comment_problems(
             re.IGNORECASE,
         )
         probs = _check_directive(
-            noqa_comment, NOQA_FLEET, "noqa", where, now, valid, path, rule_pat
+            noqa_comment, NOQA_FLEET, "noqa", where, today, valid, path, rule_pat
         )
         problems.extend(probs)
     if TYPE_IGNORE_DIRECTIVE.search(comment):
@@ -558,7 +557,7 @@ def comment_problems(
             counts["type: ignore"] = counts.get("type: ignore", 0) + 1
         rule_pat = r"^#\s*type:\s*ignore(?:\[([^\]]+)\])?"
         probs = _check_directive(
-            comment, TYPE_IGNORE_FLEET, "type: ignore", where, now, valid, path, rule_pat
+            comment, TYPE_IGNORE_FLEET, "type: ignore", where, today, valid, path, rule_pat
         )
         problems.extend(probs)
     if PYLINT_DIRECTIVE.search(comment):
@@ -568,7 +567,9 @@ def comment_problems(
             r"^#\s*pylint:\s*disable(?:-next|-msg)?="
             r"([A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*)"
         )
-        probs = _check_directive(comment, PYLINT_FLEET, "pylint", where, now, valid, path, rule_pat)
+        probs = _check_directive(
+            comment, PYLINT_FLEET, "pylint", where, today, valid, path, rule_pat
+        )
         problems.extend(probs)
     return problems
 
@@ -585,7 +586,7 @@ def _has_trailing_noqa_e501(comment: str) -> bool:
 def suppression_problems(
     text: str,
     name: str,
-    today: datetime.date | None = None,
+    today: datetime.date,
     valid_exceptions: set[tuple[str, str]] | None = None,
     counts: dict[str, int] | None = None,
 ) -> list[str]:
