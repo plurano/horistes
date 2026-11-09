@@ -13,10 +13,10 @@ import atheris
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 with atheris.instrument_imports():
-    import results  # noqa: E402
+    import results  # noqa: E402 expires 2027-03-09 category D: import after sys.path insert
 
 
-def TestOneInput(data: bytes) -> None:  # noqa: N802
+def TestOneInput(data: bytes) -> None:  # noqa: N802 expires 2027-03-09 category D: atheris entry name
     """from_sarif returns a dict or raises ResultError; anything else is a crash."""
     with contextlib.suppress(results.ResultError):
         results.from_sarif(data)

@@ -208,7 +208,7 @@ def test_action_used_twice_is_reported_once(tree):
 
 
 LOG = "curl -fsSL https://rekor.sigstore.dev/api/v1/log"
-EXPIRES = "expires = 2026-12-31\n"
+EXPIRES = 'expires = 2026-12-31\ncategory = "D"\n'
 DATED = DECLARED.replace('input = "publish"\n', EXPIRES)
 
 
@@ -226,15 +226,15 @@ def test_expired_exception_fails(tree):
 
 
 def test_exception_that_ends_on_the_last_allowed_day_passes(tree):
-    done = scan(tree, planted(LOG), DATED, "--today", "2026-10-02")
+    done = scan(tree, planted(LOG), DATED, "--today", "2026-09-02")
     assert done.returncode == 0, done.stderr
 
 
 def test_exception_that_ends_later_than_the_longest_time_fails(tree):
-    done = scan(tree, planted(LOG), DATED, "--today", "2026-10-01")
+    done = scan(tree, planted(LOG), DATED, "--today", "2026-09-01")
     assert done.returncode == 1, done.stdout
     assert (
-        "host rekor.sigstore.dev is an exception that ends on 2026-12-31, more than 90 days ahead"
+        "host rekor.sigstore.dev is an exception that ends on 2026-12-31, more than 120 days ahead"
         in done.stderr
     )
 
@@ -242,12 +242,24 @@ def test_exception_that_ends_later_than_the_longest_time_fails(tree):
 @pytest.mark.parametrize(
     ("entry", "message"),
     [
-        ('expires = "2026-12-31"\n', "has an `expires` that is no date"),
-        ("expires = 2026-12-31T00:00:00\n", "has an `expires` that is no date"),
-        ("expires = true\n", "has an `expires` that is no date"),
+        ('expires = "2026-12-31"\ncategory = "D"\n', "has an `expires` that is no date"),
+        ('expires = 2026-12-31T00:00:00\ncategory = "D"\n', "has an `expires` that is no date"),
+        ('expires = true\ncategory = "D"\n', "has an `expires` that is no date"),
         (EXPIRES + 'input = "publish"\n', "names both `input` and `expires`"),
+        ("expires = 2026-12-31\n", "is an exception without `category` (one of A, B, C, D)"),
+        (
+            'expires = 2026-12-31\ncategory = "X"\n',
+            "is an exception with category `X`, not one of A, B, C, D",
+        ),
     ],
-    ids=["text", "date-with-time", "boolean", "switch-and-exception"],
+    ids=[
+        "text",
+        "date-with-time",
+        "boolean",
+        "switch-and-exception",
+        "missing-category",
+        "unknown-category",
+    ],
 )
 def test_malformed_exception_fails(tree, entry, message):
     done = scan(tree, planted(LOG), DATED.replace(EXPIRES, entry), "--today", "2026-10-11")

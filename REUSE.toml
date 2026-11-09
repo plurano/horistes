@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 #
-# Only files that cannot carry a header are named here, and the files the
-# Praetor engine writes, which it compares byte for byte and so cannot gain
-# one. There is deliberately no "**" table: a source file without its own
+# Only files that cannot carry a header are named here, the override table
+# for caller templates and their render test, and the files the Praetor
+# engine writes, which it compares byte for byte and so cannot gain one.
+# There is deliberately no "**" table: a source file without its own
 # header must fail `reuse lint`. release-please writes CHANGELOG.md in its
 # release pull request, so it is named here too.
 
@@ -24,6 +25,7 @@ path = [
     "requirements/fuzz.txt",
     "requirements/tools.txt",
     "settings-sync.json",
+    "suppression-baseline.json",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
@@ -81,6 +83,17 @@ SPDX-License-Identifier = "EUPL-1.2"
 # the fixture folder as root (tests/fixtures/unlicensed), it refuses it.
 [[annotations]]
 path = ["tests/fixtures/unlicensed/planted.py"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
+SPDX-License-Identifier = "EUPL-1.2"
+
+# Override ignores licensing information inside the covered files (REUSE spec 3.3),
+# so the rendered caller's SPDX field lines never count as this repository's tags.
+[[annotations]]
+path = [
+    "templates/callers/*.tmpl",
+    "tests/test_render.py",
+]
 precedence = "override"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
 SPDX-License-Identifier = "EUPL-1.2"

@@ -18,7 +18,7 @@ def _fake_gh(state: str):
     """Return a mock for subprocess.run that reports a merge state."""
 
     def _run(cmd, **kwargs):
-        # nosemgrep: dangerous-subprocess-use-audit builds a fake result and runs nothing
+        # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: mock run nothing
         return subprocess.CompletedProcess(cmd, 0, stdout=f"{state}\n", stderr="")
 
     return _run

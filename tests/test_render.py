@@ -39,10 +39,8 @@ GOOD = f"""\
 <%- /*
 Required check: the job `result` reports the calling job's name ({ISSUE}).
 */ -%>
-<%- /* REUSE-IgnoreStart */ -%>
 # SPDX-FileCopyrightText: <% .Licence.CopyrightText %>
 # SPDX-License-Identifier: <% .Licence.Identifier %>
-<%/* REUSE-IgnoreEnd */ -%>
 ---
 name: Licence check
 on:
@@ -135,14 +133,15 @@ jobs:
     timeout-minutes: 5
     permissions: {{}}
     steps:
-      # yamllint disable rule:line-length
       - name: Report the draft
         if: needs.licence.result == 'skipped'
         shell: bash
-        run: |
-          {DRAFT_ERROR}
+        run: >
+          echo "::error title=Gate not run on a draft::The gate did not run
+          because the pull request is a draft.
+          It runs when the pull request is marked ready for review."
+
           exit 1
-      # yamllint enable rule:line-length
       - name: Fail unless the licence check passed
         if: needs.licence.result != 'success'
         shell: bash
@@ -450,10 +449,8 @@ PLANTED = [
     ),
     pytest.param(
         GOOD.replace(
-            "<%- /* REUSE-IgnoreStart */ -%>\n"
             "# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>\n"
-            "# SPDX-License-Identifier: <% .Licence.Identifier %>\n"
-            "<%/* REUSE-IgnoreEnd */ -%>\n",
+            "# SPDX-License-Identifier: <% .Licence.Identifier %>\n",
             "",
         ),
         "the rendered caller does not start with the two SPDX header lines",
@@ -895,7 +892,7 @@ def test_unreadable_called_workflow_is_a_failure(tree):
 def test_refused_template_is_reported_with_its_line(tree):
     done = check(tree, GOOD.replace("on:\n  pull_request:\n", "on: <% hostedGateOn %>\n"))
     assert done.returncode == 1
-    assert done.stderr.startswith(f"FAIL: {TEMPLATE}:10: `<% hostedGateOn %>`")
+    assert done.stderr.startswith(f"FAIL: {TEMPLATE}:8: `<% hostedGateOn %>`")
 
 
 CONTEXT_FILE = f"""\

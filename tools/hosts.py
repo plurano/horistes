@@ -198,7 +198,12 @@ def _switch_problem(spec: dict, inputs: dict, today: datetime.date) -> str:
         return "names both `input` and `expires`: an exception has no switch"
     if type(expires) is not datetime.date:
         return "has an `expires` that is no date (unquoted YYYY-MM-DD)"
-    problem = exceptions.day_problem(expires, today)
+    if "category" not in spec:
+        return "is an exception without `category` (one of A, B, C, D)"
+    category = spec["category"]
+    if category not in ("A", "B", "C", "D"):
+        return f"is an exception with category `{category}`, not one of A, B, C, D"
+    problem = exceptions.category_problem(expires, category, str(spec.get("reason", "")), today)
     return f"is an exception that {problem}" if problem else ""
 
 

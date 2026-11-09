@@ -61,7 +61,7 @@ except ImportError:
 
 def actionlint(tree):
     """Run actionlint against the workflow file in the tree."""
-    # nosemgrep: dangerous-subprocess-use-audit runs the Makefile actionlint on a planted workflow
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs actionlint
     return subprocess.run(
         [*external("ACTIONLINT", "actionlint"), str(tree.root / WORKFLOW)],
         capture_output=True,
@@ -81,7 +81,7 @@ def zizmor(tree):
         "pedantic",
         str(tree.root),
     ]
-    # nosemgrep: dangerous-subprocess-use-audit runs the Makefile zizmor offline on a planted tree
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs zizmor on tree
     return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
 
 
@@ -89,7 +89,7 @@ def yamllint(tree, *args):
     """Run yamllint in strict mode against the given targets in the tree."""
     cmd = rooted(external("YAMLLINT", "yamllint"))
     target = list(args) if args else ["."]
-    # nosemgrep: dangerous-subprocess-use-audit runs the Makefile yamllint on a planted tree
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs yamllint on tree
     return subprocess.run(
         [*cmd, "--strict", *target],
         cwd=tree.root,
@@ -104,7 +104,7 @@ def ruff(tree, *args):
     """Run ruff against the planted tree."""
     cmd = rooted(external("RUFF", "ruff"))
     subcommand = list(args) if args else ["check", "."]
-    # nosemgrep: dangerous-subprocess-use-audit runs the Makefile ruff on a planted tree
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs ruff on tree
     return subprocess.run(
         [*cmd, *subcommand],
         cwd=tree.root,

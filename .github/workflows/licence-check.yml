@@ -47,14 +47,15 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     steps:
-      # yamllint disable rule:line-length
       - name: Report the draft
         if: needs.licence.result == 'skipped'
         shell: bash
-        run: |
-          echo "::error title=Gate not run on a draft::The gate did not run because the pull request is a draft. It runs when the pull request is marked ready for review."
+        run: >
+          echo "::error title=Gate not run on a draft::The gate did not run
+          because the pull request is a draft.
+          It runs when the pull request is marked ready for review."
+
           exit 1
-      # yamllint enable rule:line-length
       - name: Fail unless the licence check passed
         if: needs.licence.result != 'success'
         shell: bash

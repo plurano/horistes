@@ -229,7 +229,7 @@ def run_bash_cmd(
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     if env_extra:
         env.update(env_extra)
-    # nosemgrep: dangerous-subprocess-use-audit callers pass fixed argv with stubs on PATH
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: fixed argv with stubs
     return subprocess.run(
         cmd, env=env, capture_output=True, text=True, check=False, timeout=timeout
     )
@@ -717,7 +717,7 @@ def test_fetch_verified_fallback_missing_gh_fails(tmp_path: Path) -> None:
         "FETCH_TIMEOUT": "60",
         "FETCH_OUTPUT": str(tmp_path / "out.txt"),
     }
-    # nosemgrep: dangerous-subprocess-use-audit runs bash on a fixed script with stub tools on PATH
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs fixed script
     res = subprocess.run(
         ["bash", "-c", FETCH_SCRIPT],
         env=env,

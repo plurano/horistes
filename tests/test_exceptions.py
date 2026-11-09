@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import datetime
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from conftest import ROOT, Tree
@@ -15,7 +17,7 @@ CONFIG = ".github/zizmor.yml"
 RUFF = "ruff.toml"
 GOOD = (
     "---\nrules:\n  concurrency-limits:\n    ignore:\n"
-    "      - old.yml # expires 2026-12-31: written by another tool\n"
+    "      - old.yml # expires 2026-12-31 category D: written by another tool\n"
 )
 TODAY = "2026-10-11"
 
@@ -60,7 +62,7 @@ def test_root_that_is_no_git_repository_exits_3(tree):
     shutil.rmtree(tree.root / ".git")
     (tree.root / "hook.py").write_text("# hook\n")
     (tree.root / RUFF).write_text(
-        '[lint.per-file-ignores]\n"hook.py" = ["ISC001"] # expires 2026-12-31: test\n'
+        '[lint.per-file-ignores]\n"hook.py" = ["ISC001"] # expires 2026-12-31 category D: test\n'
     )
     done = tree.tool("exceptions.py", "check", "--today", TODAY)
     assert done.returncode == 3
@@ -81,13 +83,14 @@ def test_entry_passes_on_its_last_day_and_fails_the_day_after(tree):
 
 
 def test_entry_without_the_comment_fails(tree):
-    done = check(tree, GOOD.replace(" # expires 2026-12-31: written by another tool", ""))
+    replacement = " # expires 2026-12-31 category D: written by another tool"
+    done = check(tree, GOOD.replace(replacement, ""))
     assert done.returncode == 1
     assert "has no `# expires" in done.stderr
 
 
 def test_entry_without_a_reason_fails(tree):
-    done = check(tree, GOOD.replace(": written by another tool", ":"))
+    done = check(tree, GOOD.replace("written by another tool", ""))
     assert done.returncode == 1
 
 
@@ -120,7 +123,9 @@ ENTRY = (
     f"    path: {SUBJECT}\n"
     "    issue: owner/engine#1212\n"
     "    reason: the engine declares a name no run reports\n"
-    '    expires: "2026-12-31"\n'
+    '    category: "C"\n'
+    '    entered: "2026-10-01"\n'
+    '    expires: "2026-10-11"\n'
 )
 LIST = "---\nexceptions:\n" + ENTRY
 
@@ -138,20 +143,22 @@ def test_own_entry_with_every_field_passes(tree):
 
 
 def test_own_entry_passes_on_its_last_day_and_fails_the_day_after(tree):
-    assert own(tree, LIST, "2026-12-31").returncode == 0
-    done = own(tree, LIST, "2027-01-01")
+    assert own(tree, LIST, "2026-10-11").returncode == 0
+    done = own(tree, LIST, "2026-10-12")
     assert done.returncode == 1
-    assert f"{OWN}: entry 1 expired on 2026-12-31" in done.stderr
+    assert f"{OWN}: entry 1 expired on 2026-10-11" in done.stderr
 
 
-def test_own_entry_may_end_ninety_days_ahead_and_not_one_more(tree):
-    assert own(tree, LIST, "2026-10-02").returncode == 0
-    done = own(tree, LIST, "2026-10-01")
+def test_own_entry_may_end_ten_days_ahead_for_category_c_and_not_one_more(tree):
+    assert own(tree, LIST, "2026-10-01").returncode == 0
+    done = own(tree, LIST, "2026-09-30")
     assert done.returncode == 1
-    assert "more than 90 days ahead" in done.stderr
+    assert "more than 10 days ahead" in done.stderr
 
 
-@pytest.mark.parametrize("field", ["rule", "path", "issue", "reason", "expires"])
+@pytest.mark.parametrize(
+    "field", ["rule", "path", "issue", "reason", "expires", "category", "entered"]
+)
 def test_own_entry_without_a_field_fails(tree, field):
     lines = [line for line in LIST.splitlines() if not line.lstrip(" -").startswith(field + ":")]
     text = "\n".join(lines).replace("\n    rule:", "\n  - rule:", 1) + "\n"
@@ -166,13 +173,22 @@ def test_own_entry_without_a_field_fails(tree, field):
     ("old", "new", "said"),
     [
         ("the engine declares a name no run reports", '""', "has no `reason`"),
-        ('"2026-12-31"', "2026-12-31", "has no `expires`"),
+        ('"2026-10-11"', "2026-10-11", "has no `expires`"),
         ("owner/engine#1212", "the engine's issue 1212", "not as owner/name#number"),
         (SUBJECT, f".github/../{SUBJECT}", "is no file of the repository"),
         (SUBJECT, ".github/rulesets", "is no file of the repository"),
         ("    reason:", "    until: never\n    reason:", "has the unknown field `until`"),
+        ('category: "C"', 'category: "X"', "not one of A, B, C, D"),
     ],
-    ids=["empty reason", "day unquoted", "issue as prose", "path with ..", "folder", "field"],
+    ids=[
+        "empty reason",
+        "day unquoted",
+        "issue as prose",
+        "path with ..",
+        "folder",
+        "field",
+        "bad category",
+    ],
 )
 def test_own_entry_with_a_bad_field_fails(tree, old, new, said):
     done = own(tree, LIST.replace(old, new))
@@ -201,7 +217,9 @@ def test_own_entry_path_naming_untracked_file_fails(tree):
         "    path: untracked.json\n"
         "    issue: owner/engine#1212\n"
         "    reason: untracked file test\n"
-        '    expires: "2026-12-31"\n'
+        '    category: "C"\n'
+        '    entered: "2026-10-01"\n'
+        '    expires: "2026-10-11"\n'
     )
     done = own(tree, entry, subject=None)
     assert done.returncode == 1
@@ -325,7 +343,7 @@ def test_own_entry_named_twice_fails_and_another_path_does_not(tree):
         "---\nexceptions:\n  rule: one\n",
         LIST + "tiers:\n  - tests/**\n",
         "---\n- rule: one\n",
-        LIST.replace("2026-12-31", "2026-13-41"),
+        LIST.replace("2026-10-11", "2026-13-41"),
     ],
     ids=["unreadable", "no list", "second key", "no mapping", "no date"],
 )
@@ -333,11 +351,11 @@ def test_own_list_that_cannot_be_read_is_an_error(tree, text):
     assert own(tree, text).returncode == 3
 
 
-def test_accepted_finding_more_than_ninety_days_ahead_fails(tree):
-    assert check(tree, GOOD, "2026-10-02").returncode == 0
-    done = check(tree, GOOD, "2026-10-01")
+def test_accepted_finding_more_than_allowed_days_ahead_fails(tree):
+    assert check(tree, GOOD, "2026-09-02").returncode == 0
+    done = check(tree, GOOD, "2026-09-01")
     assert done.returncode == 1
-    assert "more than 90 days ahead" in done.stderr
+    assert "more than 120 days ahead" in done.stderr
 
 
 def test_both_places_are_counted_and_a_finding_in_either_fails(tree):
@@ -348,9 +366,25 @@ def test_both_places_are_counted_and_a_finding_in_either_fails(tree):
     assert tree.tool("exceptions.py", "check", "--today", "2027-01-01").stderr.count("expired") == 2
 
 
-def _with_category(cat: str, entered: str, expires: str) -> str:
-    replacement = f'    category: {cat}\n    entered: "{entered}"\n    expires: "{expires}"\n'
-    return "---\nexceptions:\n" + ENTRY.replace('    expires: "2026-12-31"\n', replacement)
+def _with_category(
+    cat: str,
+    entered: str,
+    expires: str,
+    reason: str = "the engine declares a name no run reports",
+) -> str:
+    replacement = (
+        f"    reason: {reason}\n"
+        f'    category: "{cat}"\n'
+        f'    entered: "{entered}"\n'
+        f'    expires: "{expires}"\n'
+    )
+    target = (
+        "    reason: the engine declares a name no run reports\n"
+        '    category: "C"\n'
+        '    entered: "2026-10-01"\n'
+        '    expires: "2026-10-11"\n'
+    )
+    return "---\nexceptions:\n" + ENTRY.replace(target, replacement)
 
 
 def test_category_c_plus_eleven_days_refused(tree):
@@ -365,9 +399,23 @@ def test_category_c_plus_ten_days_ok(tree):
     assert done.returncode == 0, done.stderr
 
 
-def test_category_a_skips_interval_check(tree):
-    done = own(tree, _with_category("A", "2026-10-11", "2026-12-31"))
+def test_category_a_with_stated_interval_ok(tree):
+    entry = _with_category("A", "2026-10-11", "2026-11-20", reason="interval 40 days test")
+    done = own(tree, entry)
     assert done.returncode == 0, done.stderr
+
+
+def test_category_a_missing_interval_fails(tree):
+    done = own(tree, _with_category("A", "2026-10-11", "2026-11-20", reason="no interval"))
+    assert done.returncode == 1, done.stdout
+    assert "category A needs 'interval N days' in reason" in done.stderr
+
+
+def test_category_a_interval_above_ninety_fails(tree):
+    entry = _with_category("A", "2026-10-11", "2027-01-10", reason="interval 91 days test")
+    done = own(tree, entry)
+    assert done.returncode == 1, done.stdout
+    assert "category A interval 91 must be between 1 and 90 days" in done.stderr
 
 
 def test_category_d_plus_120_days_ok(tree):
@@ -399,7 +447,7 @@ def test_mutation_empty_category_days_lets_wrong_interval_pass(tree):
         SUBJECT: "{}\n",
     }
     tree.write(files)
-    # nosemgrep: dangerous-subprocess-use-audit runs a mutant exceptions.py copy on a planted tree
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs mutant on tree
     done = subprocess.run(
         [sys.executable, "-B", str(mutant), "check", "--root", str(tree.root), "--today", TODAY],
         capture_output=True,
@@ -414,7 +462,7 @@ LINTED = ".github/actionlint.yaml"
 WORKFLOW = ".github/workflows/train.yml"
 IGNORE = (
     "---\npaths:\n  .github/workflows/train.yml:\n    ignore:\n"
-    "      - 'property \"x\" is not defined' # expires 2026-12-31: linter lacks x\n"
+    "      - 'property \"x\" is not defined' # expires 2026-12-31 category D: linter lacks x\n"
 )
 
 
@@ -439,9 +487,9 @@ def test_actionlint_ignore_fails_the_day_after_it_ends(tree):
 @pytest.mark.parametrize(
     "old, new, said",
     [
-        (" # expires 2026-12-31: linter lacks x", "", "has no `# expires"),
+        (" # expires 2026-12-31 category D: linter lacks x", "", "has no `# expires"),
         (": linter lacks x", ":", "has no `# expires"),
-        ("2026-12-31", "2027-03-01", "more than 90 days ahead"),
+        ("2026-12-31", "2027-03-01", "more than 120 days ahead"),
         ("workflows/train.yml", "workflows/*.yml", "is no one file"),
         ("    ignore:\n", "    other: 1\n    ignore:\n", "sets `other`"),
     ],
@@ -463,7 +511,7 @@ def test_actionlint_config_path_naming_untracked_file_fails(tree):
     (tree.root / "untracked.yml").write_text("# untracked\n")
     text = (
         "---\npaths:\n  untracked.yml:\n    ignore:\n"
-        "      - 'property \"x\" is not defined' # expires 2026-12-31: test\n"
+        "      - 'property \"x\" is not defined' # expires 2026-12-31 category D: test\n"
     )
     done = linted(tree, text)
     assert done.returncode == 1
@@ -474,7 +522,7 @@ RUFF = "ruff.toml"
 HOOK = ".config/agent/hooks/block_evasion.py"
 RUFF_IGNORE = (
     "[lint.per-file-ignores]\n"
-    f'"{HOOK}" = ["ISC001", "ISC004"] # expires 2026-12-31: praetor-managed hook\n'
+    f'"{HOOK}" = ["ISC001", "ISC004"] # expires 2026-12-31 category D: praetor-managed hook\n'
 )
 
 
@@ -524,7 +572,7 @@ def test_ruff_key_naming_untracked_file_fails(tree):
     (tree.root / "untracked.py").write_text("# untracked\n")
     text = (
         "[lint.per-file-ignores]\n"
-        '"untracked.py" = ["ISC001"] # expires 2026-12-31: untracked file\n'
+        '"untracked.py" = ["ISC001"] # expires 2026-12-31 category D: untracked file\n'
     )
     done = ruffed(tree, text)
     assert done.returncode == 1
@@ -536,7 +584,7 @@ def test_ruff_key_naming_untracked_file_passes_after_git_add(tree):
     (tree.root / "untracked.py").write_text("# untracked\n")
     text = (
         "[lint.per-file-ignores]\n"
-        '"untracked.py" = ["ISC001"] # expires 2026-12-31: untracked file\n'
+        '"untracked.py" = ["ISC001"] # expires 2026-12-31 category D: untracked file\n'
     )
     done_fail = ruffed(tree, text)
     assert done_fail.returncode == 1
@@ -601,7 +649,7 @@ def test_ruff_single_quoted_key_passes(tree):
     """A single-quoted key in per-file-ignores passes."""
     text = (
         "[lint.per-file-ignores]\n"
-        f'\'{HOOK}\' = ["ISC001", "ISC004"] # expires 2026-12-31: single-quoted key\n'
+        f'\'{HOOK}\' = ["ISC001", "ISC004"] # expires 2026-12-31 category D: single-quoted key\n'
     )
     done = ruffed(tree, text)
     assert done.returncode == 0, done.stderr
@@ -611,7 +659,10 @@ def test_ruff_single_quoted_key_passes(tree):
 def test_ruff_bare_key_passes(tree):
     """A bare key naming a tracked file in per-file-ignores passes."""
     tree.write({"hook_file": "# tracked\n"})
-    text = '[lint.per-file-ignores]\nhook_file = ["ISC001"] # expires 2026-12-31: bare key\n'
+    text = (
+        "[lint.per-file-ignores]\n"
+        'hook_file = ["ISC001"] # expires 2026-12-31 category D: bare key\n'
+    )
     done = ruffed(tree, text)
     assert done.returncode == 0, done.stderr
     assert "1 accepted" in done.stdout
@@ -621,7 +672,7 @@ def test_ruff_comment_counts_for_the_key_toml_decodes(tree):
     """A comment on the literal key '"<hook>"' does not count for the bare hook key."""
     text = (
         "[lint.per-file-ignores]\n"
-        f'\'"{HOOK}"\' = ["ISC001"] # expires 2026-12-31: key holds quote marks\n'
+        f'\'"{HOOK}"\' = ["ISC001"] # expires 2026-12-31 category D: key holds quote marks\n'
         f'"{HOOK}" = ["ISC001"]\n'
     )
     done = ruffed(tree, text)
@@ -634,7 +685,7 @@ def test_ruff_multiline_array_comment_on_opening_line_passes(tree):
     """A multiline array with the comment on the opening line passes."""
     text = (
         "[lint.per-file-ignores]\n"
-        f'"{HOOK}" = [ # expires 2026-12-31: multiline array\n'
+        f'"{HOOK}" = [ # expires 2026-12-31 category D: multiline array\n'
         '    "ISC001",\n'
         '    "ISC004",\n'
         "]\n"
@@ -651,7 +702,7 @@ def test_ruff_multiline_array_comment_on_closing_line_fails(tree):
         f'"{HOOK}" = [\n'
         '    "ISC001",\n'
         '    "ISC004",\n'
-        "] # expires 2026-12-31: closing line comment\n"
+        "] # expires 2026-12-31 category D: closing line comment\n"
     )
     done = ruffed(tree, text)
     assert done.returncode == 1
@@ -664,7 +715,7 @@ def test_ruff_entry_under_isort_instead_of_per_file_ignores_fails(tree):
         "[lint.per-file-ignores]\n"
         f'"{HOOK}" = ["ISC001"]\n'
         "[lint.isort]\n"
-        f'"{HOOK}" = ["ISC001"] # expires 2026-12-31: under isort\n'
+        f'"{HOOK}" = ["ISC001"] # expires 2026-12-31 category D: under isort\n'
     )
     done = ruffed(tree, text)
     assert done.returncode == 1
@@ -675,7 +726,7 @@ def test_ruff_header_with_spaces_fails(tree):
     """A header spelled `[ lint.per-file-ignores ]` fails to collect stated entries."""
     text = (
         "[ lint.per-file-ignores ]\n"
-        f'"{HOOK}" = ["ISC001", "ISC004"] # expires 2026-12-31: praetor-managed hook\n'
+        f'"{HOOK}" = ["ISC001", "ISC004"] # expires 2026-12-31 category D: praetor-managed hook\n'
     )
     done = ruffed(tree, text)
     assert done.returncode == 1
@@ -692,13 +743,13 @@ def real_check(day: str) -> subprocess.CompletedProcess:
     """Run exceptions.py check on the repository itself as if today were this day."""
     command = [sys.executable, "-B", str(ROOT / "tools" / "exceptions.py"), "check"]
     command += ["--root", str(ROOT), "--today", day]
-    # nosemgrep: dangerous-subprocess-use-audit runs tools/exceptions.py check on ROOT
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs check on ROOT
     return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
 
 
 def test_real_repository_ruff_toml_passes_today_and_fails_after_expiry():
-    """The real repository ruff.toml passes on 2026-11-08 and fails on 2026-11-19."""
-    done_pass = real_check("2026-11-08")
+    """The real repository passes today (2026-11-09) and ruff.toml fails on 2026-11-19."""
+    done_pass = real_check("2026-11-09")
     assert done_pass.returncode == 0, done_pass.stderr
     assert "accepted finding(s)" in done_pass.stdout
     done_fail = real_check("2026-11-19")
@@ -706,3 +757,229 @@ def test_real_repository_ruff_toml_passes_today_and_fails_after_expiry():
     assert (
         "ruff.toml: .config/agent/hooks/block_evasion.py expired on 2026-11-18" in done_fail.stderr
     )
+
+
+def test_category_problem_3d():
+    """3D unit tests for category_problem under fleet MEL rules."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+
+    # Missing / bad category -> refused
+    assert "not one of A, B, C, D" in exceptions.category_problem(today, "X", "reason", today)
+
+    # Expired -> refused
+    yesterday = today - datetime.timedelta(days=1)
+    assert exceptions.category_problem(yesterday, "B", "reason", today) == f"expired on {yesterday}"
+
+    # Category D: exactly 120 days -> ok; 121 days -> refused
+    d_120 = today + datetime.timedelta(days=120)
+    d_121 = today + datetime.timedelta(days=121)
+    assert exceptions.category_problem(d_120, "D", "reason", today) == ""
+    assert f"ends on {d_121}, more than 120 days ahead" in exceptions.category_problem(
+        d_121, "D", "reason", today
+    )
+
+    # Category B: exactly 3 days -> ok; 4 days -> refused
+    b_3 = today + datetime.timedelta(days=3)
+    b_4 = today + datetime.timedelta(days=4)
+    assert exceptions.category_problem(b_3, "B", "reason", today) == ""
+    assert f"ends on {b_4}, more than 3 days ahead" in exceptions.category_problem(
+        b_4, "B", "reason", today
+    )
+
+    # Category C: exactly 10 days -> ok; 11 days -> refused
+    c_10 = today + datetime.timedelta(days=10)
+    c_11 = today + datetime.timedelta(days=11)
+    assert exceptions.category_problem(c_10, "C", "reason", today) == ""
+    assert f"ends on {c_11}, more than 10 days ahead" in exceptions.category_problem(
+        c_11, "C", "reason", today
+    )
+
+    # Category A: without interval N days -> refused
+    assert "category A needs 'interval N days' in reason" in exceptions.category_problem(
+        today, "A", "no interval here", today
+    )
+    # Category A: interval 91 -> refused
+    assert "between 1 and 90 days" in exceptions.category_problem(
+        today, "A", "interval 91 days", today
+    )
+    # Category A: interval 90 -> exactly 90 days -> ok
+    a_90 = today + datetime.timedelta(days=90)
+    assert exceptions.category_problem(a_90, "A", "interval 90 days allowed", today) == ""
+    # Category A: interval 10 days, 11 days ahead -> refused
+    a_11 = today + datetime.timedelta(days=11)
+    assert f"ends on {a_11}, more than 10 days ahead" in exceptions.category_problem(
+        a_11, "A", "interval 10 days allowed", today
+    )
+
+
+def test_reason_problem_3d():
+    """3D unit tests for reason validation."""
+    import exceptions
+
+    assert exceptions._reason_problem("") == "reason is empty"
+    assert exceptions._reason_problem("   ") == "reason is empty"
+    assert exceptions._reason_problem("bad, reason with comma") == "reason contains a comma"
+    assert exceptions._reason_problem("1234567") == "reason has no letter"
+    assert exceptions._reason_problem("valid reason text") == ""
+
+
+def test_yaml_suppressions_3d(tree):
+    """3D tests for YAML file suppressions: yamllint/zizmor refused, opengrep fleet format."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+
+    # yamllint directive refused
+    yaml_yamllint = "steps:\n  # yamllint disable rule:line-length\n  - run: echo 1\n"
+    probs = exceptions.yaml_problems(yaml_yamllint, "test.yml", today, set(), {})
+    assert len(probs) == 1
+    assert "invalid yamllint suppression" in probs[0]
+
+    # zizmor directive refused
+    yaml_zizmor = "steps:\n  # zizmor: ignore[rule]\n  - run: echo 1\n"
+    probs = exceptions.yaml_problems(yaml_zizmor, "test.yml", today, set(), {})
+    assert len(probs) == 1
+    assert "invalid zizmor suppression" in probs[0]
+
+    # opengrep fleet format in YAML passes
+    sg = exceptions.LONG_WORD
+    yaml_sg_ok = f"steps:\n  # {sg}: some-rule expires 2026-11-12 category B: valid reason\n"
+    counts = {}
+    probs = exceptions.yaml_problems(yaml_sg_ok, "test.yml", today, set(), counts)
+    assert probs == []
+    assert counts.get(sg) == 1
+
+    # opengrep bad format in YAML fails
+    yaml_sg_bad = f"steps:\n  # {sg}: some-rule bad format\n"
+    probs = exceptions.yaml_problems(yaml_sg_bad, "test.yml", today, set(), {})
+    assert len(probs) == 1
+    assert "invalid opengrep suppression" in probs[0]
+
+
+def test_markdown_suppressions_3d(tree):
+    """3D tests for Markdown comment suppressions."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+
+    # Without format and without entry -> red
+    md_bad = "<!-- markdownlint-disable MD013 -->\n# Title\n"
+    probs = exceptions.md_problems(md_bad, "test.md", today, set(), {})
+    assert len(probs) == 1
+    assert "invalid markdownlint suppression" in probs[0]
+
+    # Valid fleet format -> green
+    md_fleet = (
+        "<!-- markdownlint-disable MD013 expires 2026-11-12 category B: line length issue -->\n"
+        "# Title\n"
+    )
+    counts = {}
+    probs = exceptions.md_problems(md_fleet, "test.md", today, set(), counts)
+    assert probs == []
+    assert counts.get("markdownlint") == 1
+
+    # Covered by valid exception -> green
+    valid_map = {("MD013", "test.md"): {"rule": "MD013", "path": "test.md"}}
+    probs = exceptions.md_problems(md_bad, "test.md", today, set(valid_map.keys()), {})
+    assert probs == []
+
+    # Covered by expired exception -> red (expired entries not in valid_map)
+    probs_expired = exceptions.md_problems(md_bad, "test.md", today, set(), {})
+    assert len(probs_expired) == 1
+
+
+def test_shell_suppressions_3d(tree):
+    """3D tests for Shell comment suppressions."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+
+    # Without fleet format -> red
+    sh_bad = "# shellcheck disable=SC2086\necho $var\n"
+    probs = exceptions.sh_problems(sh_bad, "test.sh", today, set(), {})
+    assert len(probs) == 1
+    assert "invalid shellcheck suppression" in probs[0]
+
+    # With valid fleet format -> green
+    sh_ok = "# shellcheck disable=SC2086 expires 2026-11-12 category B: word splitting\necho $var\n"
+    counts = {}
+    probs = exceptions.sh_problems(sh_ok, "test.sh", today, set(), counts)
+    assert probs == []
+    assert counts.get("shellcheck") == 1
+
+
+def test_reuse_marker_refused_3d(tree):
+    """3D test: leftover REUSE markers are refused in tracked text files."""
+    import exceptions
+
+    start_marker = exceptions.REUSE_START
+    end_marker = exceptions.REUSE_END
+
+    probs_start = exceptions._reuse_problems("file.txt", f"header\n<{start_marker}>\nbody\n")
+    assert len(probs_start) == 1
+    assert "invalid REUSE suppression" in probs_start[0]
+
+    probs_end = exceptions._reuse_problems("file.txt", f"body\n<{end_marker}>\nfooter\n")
+    assert len(probs_end) == 1
+    assert "invalid REUSE suppression" in probs_end[0]
+
+
+def test_ratchet_3d(tree):
+    """3D test: ratchet detects growth and shrinkages against suppression-baseline.json."""
+    import exceptions
+
+    sg = exceptions.LONG_WORD
+    # Baseline matches counts -> pass
+    tree.write({"suppression-baseline.json": f'{{"noqa": 2, "{sg}": 10}}\n'})
+    probs = exceptions._ratchet_problems(tree.root, {"noqa": 2, sg: 10})
+    assert probs == []
+
+    # Growth -> fail
+    probs_grow = exceptions._ratchet_problems(tree.root, {"noqa": 3, sg: 10})
+    assert len(probs_grow) == 1
+    assert "noqa grew from 2 to 3" in probs_grow[0]
+
+    # Shrinkage -> fail
+    probs_shrink = exceptions._ratchet_problems(tree.root, {"noqa": 1, sg: 10})
+    assert len(probs_shrink) == 1
+    assert "lower noqa in suppression-baseline.json to 1" in probs_shrink[0]
+
+
+def test_reuse_lint_override_3d(tmp_path):
+    """3D test: reuse lint passes with override table, fails without override table."""
+    import os
+
+    reuse_bin = (
+        os.environ.get("REUSE") or shutil.which("reuse") or str(ROOT / ".venv" / "bin" / "reuse")
+    )
+    if not Path(reuse_bin).exists() and not shutil.which(str(reuse_bin)):
+        pytest.skip("reuse binary not found")
+
+    dest = tmp_path / "repo"
+    dest.mkdir()
+    shutil.copy(ROOT / "REUSE.toml", dest / "REUSE.toml")
+    shutil.copytree(ROOT / "LICENSES", dest / "LICENSES")
+    shutil.copytree(ROOT / "templates", dest / "templates")
+    (dest / "tests").mkdir()
+    shutil.copy(ROOT / "tests" / "test_render.py", dest / "tests" / "test_render.py")
+
+    subprocess.run(["git", "init", "-b", "main"], cwd=dest, capture_output=True, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=dest, capture_output=True, check=True)
+
+    # 1. With override table -> rc 0
+    proc1 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
+    assert proc1.returncode == 0, proc1.stdout + proc1.stderr
+
+    # 2. Mutate REUSE.toml: remove the override table
+    toml_text = (dest / "REUSE.toml").read_text(encoding="utf-8")
+    assert 'precedence = "override"' in toml_text
+    blocks = toml_text.split("[[annotations]]")
+    kept_blocks = [b for b in blocks if 'precedence = "override"' not in b]
+    (dest / "REUSE.toml").write_text("[[annotations]]".join(kept_blocks), encoding="utf-8")
+
+    # Run reuse lint again -> must fail with invalid SPDX expressions
+    proc2 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
+    assert proc2.returncode != 0
+    assert "Invalid SPDX" in proc2.stdout or "invalid spdx" in proc2.stdout.lower()

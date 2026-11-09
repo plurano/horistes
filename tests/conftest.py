@@ -32,6 +32,10 @@ ROOT = Path(__file__).resolve().parent.parent
 # keeps a token-shaped literal out of the tests.
 STUB_GH_TOKEN = secrets.token_hex(8)
 
+for _token_var in ("GH_TOKEN", "GITHUB_TOKEN"):
+    if os.environ.get(_token_var) == "":
+        os.environ.pop(_token_var, None)
+
 # The commit address of the merge-train app's bot user (numeric user id, then the
 # app slug), read from GET /users/plurano-merge-train[bot]. Renovate compares an
 # entry for equality before it reads it as a glob, so the brackets stay literal.
