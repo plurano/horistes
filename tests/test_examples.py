@@ -20,6 +20,7 @@ def check(tree: Tree, files: dict[str, str], *args: str) -> subprocess.Completed
 
 def test_current_repository_examples_pass():
     """Every fenced YAML and TOML block in the repository Markdown files parses."""
+    # nosemgrep: dangerous-subprocess-use-audit runs tools/examples.py via sys.executable on ROOT
     done = subprocess.run(
         [sys.executable, "-B", str(ROOT / "tools" / "examples.py"), "--root", str(ROOT)],
         capture_output=True,
@@ -100,6 +101,7 @@ def test_mutation_without_tomllib_loads_planted_case_passes_proving_guard(tree: 
     tree.git("init", "-q", "-b", "main")
     tree.git("add", "-A")
     tree.git("commit", "-q", "-m", "fixture")
+    # nosemgrep: dangerous-subprocess-use-audit runs a mutant examples.py copy on a planted tree
     done = subprocess.run(
         [sys.executable, "-B", str(mutant_tool), "--root", str(tree.root)],
         capture_output=True,

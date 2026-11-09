@@ -399,6 +399,7 @@ def test_mutation_empty_category_days_lets_wrong_interval_pass(tree):
         SUBJECT: "{}\n",
     }
     tree.write(files)
+    # nosemgrep: dangerous-subprocess-use-audit runs a mutant exceptions.py copy on a planted tree
     done = subprocess.run(
         [sys.executable, "-B", str(mutant), "check", "--root", str(tree.root), "--today", TODAY],
         capture_output=True,
@@ -691,6 +692,7 @@ def real_check(day: str) -> subprocess.CompletedProcess:
     """Run exceptions.py check on the repository itself as if today were this day."""
     command = [sys.executable, "-B", str(ROOT / "tools" / "exceptions.py"), "check"]
     command += ["--root", str(ROOT), "--today", day]
+    # nosemgrep: dangerous-subprocess-use-audit runs tools/exceptions.py check on ROOT
     return subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
 
 
