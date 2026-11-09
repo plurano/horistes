@@ -5,7 +5,7 @@ SPDX-License-Identifier: EUPL-1.2
 
 # ADR-0016: Action pins are listed, written and checked by zizmor behind three guards, and `with` keys are read here
 
-- **Status**: Accepted
+- **Status**: Accepted; [ADR-0075](0075-caller-pins-name-one-ref.md) supersedes the clause that a commit no release names is not judged and the `# tag=v4.2.2` comment form
 - **Date**: 2026-10-11
 - **Authors**: Lusoris
 
