@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import ciwf
+import hosts
 import pytest
 from conftest import ACTION, CHECKOUT, HOSTS, REUSABLE, Tree
 
@@ -208,7 +210,7 @@ def test_action_used_twice_is_reported_once(tree):
 
 
 LOG = "curl -fsSL https://rekor.sigstore.dev/api/v1/log"
-EXPIRES = "expires = 2026-12-31\n"
+EXPIRES = 'expires = 2026-12-31\ncategory = "D"\n'
 DATED = DECLARED.replace('input = "publish"\n', EXPIRES)
 
 
@@ -226,28 +228,61 @@ def test_expired_exception_fails(tree):
 
 
 def test_exception_that_ends_on_the_last_allowed_day_passes(tree):
-    done = scan(tree, planted(LOG), DATED, "--today", "2026-10-02")
+    done = scan(tree, planted(LOG), DATED, "--today", "2026-09-02")
     assert done.returncode == 0, done.stderr
 
 
 def test_exception_that_ends_later_than_the_longest_time_fails(tree):
-    done = scan(tree, planted(LOG), DATED, "--today", "2026-10-01")
+    done = scan(tree, planted(LOG), DATED, "--today", "2026-09-01")
     assert done.returncode == 1, done.stdout
     assert (
-        "host rekor.sigstore.dev is an exception that ends on 2026-12-31, more than 90 days ahead"
+        "host rekor.sigstore.dev is an exception that ends on 2026-12-31, more than 120 days ahead"
         in done.stderr
     )
+
+
+def test_host_exception_with_comma_reason_refused(tree):
+    bad = DATED.replace('reason = "public transparency log"', 'reason = "bad, reason with comma"')
+    done = scan(tree, planted(LOG), bad, "--today", "2026-10-11")
+    assert done.returncode == 1
+    assert "reason contains a comma" in done.stderr
+
+
+def test_host_exception_with_empty_reason_refused(tree):
+    bad = DATED.replace('reason = "public transparency log"', 'reason = ""')
+    done = scan(tree, planted(LOG), bad, "--today", "2026-10-11")
+    assert done.returncode == 1
+    assert "host rekor.sigstore.dev is declared without a reason" in done.stderr
+
+
+def test_host_exception_with_missing_reason_refused(tree):
+    bad = DATED.replace('reason = "public transparency log"\n', "")
+    done = scan(tree, planted(LOG), bad, "--today", "2026-10-11")
+    assert done.returncode == 1
+    assert "host rekor.sigstore.dev is declared without a reason" in done.stderr
 
 
 @pytest.mark.parametrize(
     ("entry", "message"),
     [
-        ('expires = "2026-12-31"\n', "has an `expires` that is no date"),
-        ("expires = 2026-12-31T00:00:00\n", "has an `expires` that is no date"),
-        ("expires = true\n", "has an `expires` that is no date"),
+        ('expires = "2026-12-31"\ncategory = "D"\n', "has an `expires` that is no date"),
+        ('expires = 2026-12-31T00:00:00\ncategory = "D"\n', "has an `expires` that is no date"),
+        ('expires = true\ncategory = "D"\n', "has an `expires` that is no date"),
         (EXPIRES + 'input = "publish"\n', "names both `input` and `expires`"),
+        ("expires = 2026-12-31\n", "is an exception without `category` (one of A, B, C, D)"),
+        (
+            'expires = 2026-12-31\ncategory = "X"\n',
+            "is an exception with category `X`, not one of A, B, C, D",
+        ),
     ],
-    ids=["text", "date-with-time", "boolean", "switch-and-exception"],
+    ids=[
+        "text",
+        "date-with-time",
+        "boolean",
+        "switch-and-exception",
+        "missing-category",
+        "unknown-category",
+    ],
 )
 def test_malformed_exception_fails(tree, entry, message):
     done = scan(tree, planted(LOG), DATED.replace(EXPIRES, entry), "--today", "2026-10-11")
@@ -356,3 +391,63 @@ def test_list_subcommand_prints_host_rows_and_refuses_bad_input(tree):
     assert bad.returncode == 3
     assert "ERROR: " in bad.stderr
     assert "hosts.toml" in bad.stderr
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        ("registry.example.com/org/repo:1.0", "registry.example.com"),
+        ("ubuntu:24.04", "docker.io"),
+        ("", "<dynamic>"),
+        ("${{ matrix.image }}", "<dynamic>"),
+        ("$MY_IMAGE", "<dynamic>"),
+        ("prefix-$VAR", "<dynamic>"),
+    ],
+    ids=[
+        "explicit-registry",
+        "default-docker-io",
+        "empty-image",
+        "expression-only",
+        "shell-variable-only",
+        "variable-in-image",
+    ],
+)
+def test_image_host_cases(image: str, expected: str) -> None:
+    """_image_host extracts registry or resolves dynamic/empty expressions."""
+    assert hosts._image_host(image) == expected
+
+
+@pytest.mark.parametrize(
+    "job_value",
+    ["not-a-dict", 123, None, ["list", "step"]],
+    ids=["string", "number", "none", "list"],
+)
+def test_found_hosts_skips_non_dict_job(job_value: object) -> None:
+    """found_hosts skips workflow jobs whose value is not a mapping."""
+    doc = {"jobs": {"bad_job": job_value, "good_job": {"steps": []}}}
+    found, unknown = hosts.found_hosts(doc, {})
+    assert found == {}
+    assert unknown == []
+
+
+@pytest.mark.parametrize(
+    ("forge_content", "error_message"),
+    [
+        ("[files]\n", "`forge` must list the forge's hosts"),
+        ("forge = []\n", "`forge` must list the forge's hosts"),
+        ('forge = "github.com"\n', "`forge` must list the forge's hosts"),
+        ("forge = 42\n", "`forge` must list the forge's hosts"),
+    ],
+    ids=["missing-forge", "empty-list", "string-not-list", "number-not-list"],
+)
+def test_declaration_invalid_forge_fails(
+    tree: Tree, forge_content: str, error_message: str
+) -> None:
+    """declaration requires forge to be a non-empty list of hosts."""
+    tree.write({"hosts.toml": forge_content})
+    with pytest.raises(ciwf.ReadError) as err:
+        hosts.declaration(tree.root)
+    assert error_message in str(err.value)
+    done = tree.write({WORKFLOW: REUSABLE, "hosts.toml": forge_content}).tool("hosts.py", "check")
+    assert done.returncode == 3
+    assert error_message in done.stderr

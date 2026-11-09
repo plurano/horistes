@@ -61,7 +61,7 @@ def test_closes_the_http_error():
 
 def _child(command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     """Run one child process with fixed arguments and no shell, within DEADLINE."""
-    # nosemgrep: dangerous-subprocess-use-audit callers pass fixed python or make argv in tmp_path
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: fixed argv only
     return subprocess.run(
         command,
         cwd=cwd,

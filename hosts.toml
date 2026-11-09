@@ -102,10 +102,12 @@ reason = "files of those tools"
 # it ends (decision record 0005).
 [files.".github/workflows/workflow-check.yml"."pypi.org"]
 reason = "index of the hash-pinned zizmor and PyYAML wheels in requirements/tools.txt"
+category = "D"
 expires = 2027-01-20
 
 [files.".github/workflows/workflow-check.yml"."files.pythonhosted.org"]
 reason = "hash-pinned zizmor and PyYAML wheels in requirements/tools.txt"
+category = "D"
 expires = 2027-01-20
 
 # The shared licence workflow runs the licence tool's public image, named by
@@ -113,7 +115,8 @@ expires = 2027-01-20
 # with a day it ends (decision record 0005), and it leaves when a pinned image
 # of the licence tool is on the forge's registry.
 [files.".github/workflows/licence.yml"."docker.io"]
-reason = "image of the licence tool, named by digest; no pinned copy on the forge's registry yet"
+reason = "image of the licence tool named by digest; no pinned copy on the forge's registry yet"
+category = "D"
 expires = 2026-12-31
 
 # The age check of the licence tool's pinned image (decision record 0035). It

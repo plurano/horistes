@@ -106,7 +106,7 @@ check-hosts:
 	$(PYTHON) -B tools/hosts.py check
 
 # An accepted linter finding (zizmor, actionlint, ruff.toml) and an entry of
-# exceptions.yaml name one file, a reason and a day it ends, at most 90 days ahead.
+# exceptions.yaml name one file, a reason, a MEL category and a day it ends.
 check-exceptions:
 	$(PYTHON) -B tools/exceptions.py check
 

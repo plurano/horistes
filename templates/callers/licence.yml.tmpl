@@ -28,14 +28,12 @@ never collides with another caller's.
 
 Licence header: the rendered caller starts with the consumer's own header,
 written from .Licence (working names, as above), so the consumer's licence
-check accepts it (#3). The REUSE-IgnoreStart and REUSE-IgnoreEnd notes render
-as nothing and keep this repository's licence check from reading the field
-lines as tags.
+check accepts it (#3). The empty note inside each field line renders as
+nothing and keeps this repository's licence check from reading the line as a
+tag; no REUSE.toml table and no ignore marker covers the template.
 */ -%>
-<%- /* REUSE-IgnoreStart */ -%>
-# SPDX-FileCopyrightText: <% .Licence.CopyrightText %>
-# SPDX-License-Identifier: <% .Licence.Identifier %>
-<%/* REUSE-IgnoreEnd */ -%>
+# SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>
 ---
 # Licence check: every file carries its licence information. The job is the
 # shared workflow of <% .Shared.Repository %>, named by commit.
@@ -82,14 +80,15 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     steps:
-      # yamllint disable rule:line-length
       - name: Report the draft
         if: needs.licence.result == 'skipped'
         shell: bash
-        run: |
-          echo "::error title=Gate not run on a draft::The gate did not run because the pull request is a draft. It runs when the pull request is marked ready for review."
+        run: >
+          echo "::error title=Gate not run on a draft::The gate did not run
+          because the pull request is a draft.
+          It runs when the pull request is marked ready for review."
+
           exit 1
-      # yamllint enable rule:line-length
       - name: Fail unless the licence check passed
         if: needs.licence.result != 'success'
         shell: bash

@@ -24,6 +24,7 @@ path = [
     "requirements/fuzz.txt",
     "requirements/tools.txt",
     "settings-sync.json",
+    "suppression-baseline.json",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"

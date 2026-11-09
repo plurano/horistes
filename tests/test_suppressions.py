@@ -4,39 +4,17 @@
 
 from __future__ import annotations
 
-import io
+import datetime
+import inspect
 import os
-import re
-import tokenize
 from pathlib import Path
 
+import exceptions
 import pytest
-import yaml
 from conftest import ROOT
+from exceptions import WORDS, codacy_problems, suppression_problems
 
-# Opengrep reads raw source lines, strings and names included, so this file never
-# spells an ignore word whole outside a comment: it joins each from two halves.
-SHORT_WORD = "no" + "sem"
-LONG_WORD = SHORT_WORD + "grep"
-OPEN_WORD = "no" + "opengrep"
-WORDS = {"sem": SHORT_WORD, "sg": LONG_WORD, "SG": LONG_WORD.upper(), "og": OPEN_WORD}
-
-# Opengrep 1.30.0 (Nosemgrep.ml) takes nosem, nosemgrep and noopengrep, in any
-# case, as one ignore word. On a line with code it reads the word anywhere in the
-# line; on the line above a finding, only when no letter or digit comes first.
-OPENGREP_IGNORE_WORD = r"\b(?:" + "|".join((SHORT_WORD, LONG_WORD, OPEN_WORD)) + r")\b"
-OPENGREP_AFTER_CODE = re.compile(OPENGREP_IGNORE_WORD, re.IGNORECASE)
-OPENGREP_OWN_LINE = re.compile(r"^[^a-zA-Z0-9]*\s*" + OPENGREP_IGNORE_WORD, re.IGNORECASE)
-NOSEMGREP_VALID = re.compile(
-    r"^#\s*"
-    + LONG_WORD
-    + r":\s*[A-Za-z0-9_.-]+(?:\s*,\s*[A-Za-z0-9_.-]+)*\s+[^,\n]*[A-Za-z][^,\n]*$"
-)
-
-# Bandit 1.9.4 (NOSEC_COMMENT in bandit/core/manager.py) takes a `#`, optional
-# space and lower-case `nosec` anywhere in a comment, even inside a longer word.
-NOSEC_DIRECTIVE = re.compile(r"#\s*nosec")
-NOSEC_VALID = re.compile(r"^#\s*nosec\s+B\d{3}(?:[ ,]+B\d{3})*\s*#\s*[^#\n]*[A-Za-z][^#\n]*$")
+FIXED_TODAY = datetime.date(2026, 11, 9)
 
 PRUNE_DIRS = {
     ".claude",
@@ -52,13 +30,30 @@ PRUNE_DIRS = {
 PLANTED_REFUSALS: list[tuple[str, str, str]] = [
     ("bare-ignore-word", "# {sg}\n", "code"),
     ("ignore-word-no-reason", "# {sg}: rule-id\n", "code"),
-    ("ignore-word-comma-reason", "# {sg}: rule-id bad, reason\n", "code"),
+    (
+        "ignore-word-comma-reason",
+        "# {sg}: rule-id expires 2026-11-12 category B: bad, reason\n",
+        "code",
+    ),
     ("bare-nosec", "# nosec\n", "code"),
     ("nosec-no-reason", "# nosec B101\n", "code"),
     ("nosec-reason-no-id", "# nosec # reason without id\n", "code"),
+    (
+        "nosec-no-hash-before-expires",
+        "# nosec B101 expires 2026-11-12 category B: valid test reason\n",
+        "code",
+    ),
     ("short-alias", "# {sem}\n", "code"),
-    ("opengrep-alias", "# {og}: rule-id valid test reason\n", "code"),
-    ("upper-case-ignore-word", "# {SG}: rule-id valid test reason\n", "code"),
+    (
+        "opengrep-alias",
+        "# {og}: rule-id expires 2026-11-12 category B: valid test reason\n",
+        "code",
+    ),
+    (
+        "upper-case-ignore-word",
+        "# {SG}: rule-id expires 2026-11-12 category B: valid test reason\n",
+        "code",
+    ),
     ("word-first-prose", "# {sg} is not wanted here\n", "code"),
     ("prose-after-code", "run(cmd)  # we avoid {sg} here\n", "code"),
     ("string-on-code-line", 'run(cmd, env={{"NOTE": "{sg}"}})\n', "code"),
@@ -75,9 +70,13 @@ PLANTED_REFUSALS: list[tuple[str, str, str]] = [
 ]
 
 ACCEPTED_BOUNDARIES: list[tuple[str, str]] = [
-    ("ignore-word-one-id", "# {sg}: rule-id valid test reason\n"),
-    ("ignore-word-two-ids", "# {sg}: rule-one, rule-two valid test reason\n"),
-    ("nosec-two-ids", "# nosec B101, B102 # valid test reason\n"),
+    ("ignore-word-one-id", "# {sg}: rule-id expires 2026-11-12 category B: valid test reason\n"),
+    (
+        "ignore-word-two-ids",
+        "# {sg}: rule-one, rule-two expires 2026-11-12 category B: valid test reason\n",
+    ),
+    ("nosec-two-ids", "# nosec B101, B102 # expires 2026-11-12 category B: valid test reason\n"),
+    ("nosec-hash-expiry", "# nosec B602 # expires 2026-11-12 category B: valid test reason\n"),
     ("split-word-string", 'TEXT = "no" + "semgrep"\n'),
     ("nosec-in-string", 'TEXT = "# nosec"\n'),
     ("own-line-prose", "# This helper explains why {sg} is not used here.\n"),
@@ -91,63 +90,11 @@ def planted(payload: str) -> str:
     return payload.format(**WORDS)
 
 
-def comment_problems(comment: str, after_code: bool, where: str) -> list[str]:
-    """Read one comment as opengrep and Bandit read it; refuse a suppression without a reason."""
-    problems: list[str] = []
-    opengrep = OPENGREP_AFTER_CODE if after_code else OPENGREP_OWN_LINE
-    if opengrep.search(comment) and not NOSEMGREP_VALID.match(comment):
-        problems.append(f"{where}: invalid opengrep suppression: {comment}")
-    if NOSEC_DIRECTIVE.search(comment) and not NOSEC_VALID.match(comment):
-        problems.append(f"{where}: invalid nosec suppression: {comment}")
-    return problems
-
-
-def token_problems(tok: tokenize.TokenInfo, name: str) -> list[str]:
-    """Refuse an opengrep ignore word outside a comment: in a string or a name it suppresses too.
-
-    Bandit reads nosec in comment tokens only, so only the opengrep words count here.
-    """
-    found = OPENGREP_AFTER_CODE.search(tok.string)
-    if not found:
-        return []
-    line = tok.start[0] + tok.string.count("\n", 0, found.start())
-    return [f"{name}:{line}: invalid opengrep ignore word outside a comment: {tok.string.strip()}"]
-
-
-def suppression_problems(text: str, name: str) -> list[str]:
-    """Tokenize text and verify that all suppression comments meet requirements."""
-    problems: list[str] = []
-    try:
-        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
-        for tok in tokens:
-            if tok.type != tokenize.COMMENT:
-                problems.extend(token_problems(tok, name))
-                continue
-            after_code = bool(tok.line[: tok.start[1]].strip())
-            where = f"{name}:{tok.start[0]}"
-            problems.extend(comment_problems(tok.string.strip(), after_code, where))
-    except tokenize.TokenError as err:
-        problems.append(f"{name}:1: tokenize error: {err}")
-    return problems
-
-
-def codacy_problems(text: str) -> list[str]:
-    """Check .codacy.yml: engines must not define exclude_paths."""
-    data = yaml.safe_load(text)
-    if not isinstance(data, dict):
-        return []
-    engines = data.get("engines")
-    if not isinstance(engines, dict):
-        return []
-    problems: list[str] = []
-    for engine, config in sorted(engines.items()):
-        if isinstance(config, dict) and "exclude_paths" in config:
-            problems.append(f"engines.{engine}.exclude_paths is not permitted")
-    return problems
-
-
 def tree_problems(root: Path) -> list[str]:
     """Walk root finding problems in all Python files, pruning ignored directories."""
+    today = datetime.date(2026, 11, 9)
+    _, _, valid_map = exceptions._own(root, today)
+    valid_exceptions = set(valid_map.keys())
     problems: list[str] = []
     py_files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -158,7 +105,8 @@ def tree_problems(root: Path) -> list[str]:
     for py_file in sorted(py_files):
         rel = py_file.relative_to(root).as_posix()
         text = py_file.read_text(encoding="utf-8")
-        problems.extend(suppression_problems(text, rel))
+        probs = suppression_problems(text, rel, today=today, valid_exceptions=valid_exceptions)
+        problems.extend(probs)
     return problems
 
 
@@ -183,7 +131,7 @@ def test_planted_refusals(payload: str, kind: str) -> None:
     if kind == "yaml":
         assert codacy_problems(payload) == ["engines.opengrep.exclude_paths is not permitted"]
         return
-    problems = suppression_problems(planted(payload), "test.py")
+    problems = suppression_problems(planted(payload), "test.py", today=FIXED_TODAY)
     assert len(problems) == 1
     assert problems[0].startswith("test.py:1: invalid ")
 
@@ -195,7 +143,7 @@ def test_planted_refusals(payload: str, kind: str) -> None:
 )
 def test_accepted_boundary_rows(payload: str) -> None:
     """Boundary conditions: valid suppressions, split words and nosec in strings pass."""
-    assert suppression_problems(planted(payload), "test.py") == []
+    assert suppression_problems(planted(payload), "test.py", today=FIXED_TODAY) == []
 
 
 def test_ignore_word_in_multiline_string_names_its_line() -> None:
@@ -203,6 +151,305 @@ def test_ignore_word_in_multiline_string_names_its_line() -> None:
 
     Opengrep reads that line as the line above the next statement's finding.
     """
-    problems = suppression_problems(planted('NOTE = """first\nsecond\n    {sg}"""\n'), "test.py")
+    problems = suppression_problems(
+        planted('NOTE = """first\nsecond\n    {sg}"""\n'), "test.py", today=FIXED_TODAY
+    )
     assert len(problems) == 1
     assert problems[0].startswith("test.py:3: invalid opengrep ignore word outside a comment: ")
+
+
+LONG_NOSEMGREP_E501 = (
+    f"# {exceptions.LONG_WORD}: dangerous-subprocess-use-audit expires 2026-11-12 "
+    "category B: long reason that easily exceeds one hundred columns  # noqa: E501\n"
+)
+
+
+def test_trailing_noqa_e501_positive() -> None:
+    """Positive: own-line fleet rule over 100 cols with trailing noqa E501 and entry passes."""
+    today = datetime.date(2026, 11, 9)
+    valid = {("E501", "test.py")}
+    probs = suppression_problems(
+        LONG_NOSEMGREP_E501, "test.py", today=today, valid_exceptions=valid
+    )
+    assert probs == []
+
+
+def test_trailing_noqa_e501_negative_without_entry() -> None:
+    """Negative: same line without register entry raises invalid noqa and exceeds 100 columns."""
+    today = datetime.date(2026, 11, 9)
+    probs = suppression_problems(
+        LONG_NOSEMGREP_E501, "test.py", today=today, valid_exceptions=set()
+    )
+    assert len(probs) == 2
+    assert "invalid noqa suppression: # noqa: E501" in probs[0]
+    assert f"{exceptions.LONG_WORD} line exceeds 100 columns" in probs[1]
+
+
+@pytest.mark.parametrize(
+    ("payload", "valid", "expected_probs"),
+    [
+        (
+            LONG_NOSEMGREP_E501,
+            {("E501", "other.py")},
+            [
+                "test.py:1: invalid noqa suppression: # noqa: E501",
+                f"test.py:1: {exceptions.LONG_WORD} line exceeds 100 columns",
+            ],
+        ),
+        (
+            LONG_NOSEMGREP_E501.replace("E501", "E731"),
+            {("E501", "test.py")},
+            [
+                "test.py:1: invalid noqa suppression: # noqa: E731",
+                f"test.py:1: {exceptions.LONG_WORD} line exceeds 100 columns",
+            ],
+        ),
+        (
+            "# noqa: E501\n",
+            set(),
+            ["test.py:1: invalid noqa suppression: # noqa: E501"],
+        ),
+    ],
+    ids=["entry-other-path", "trailing-e731", "standalone-noqa"],
+)
+def test_trailing_noqa_e501_boundaries(
+    payload: str,
+    valid: set[tuple[str, str]],
+    expected_probs: list[str],
+) -> None:
+    """Boundary conditions: wrong path, wrong code and standalone noqa are refused."""
+    today = datetime.date(2026, 11, 9)
+    probs = suppression_problems(payload, "test.py", today=today, valid_exceptions=valid)
+    assert probs == expected_probs
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_problems"),
+    [
+        (
+            "engines:\n  opengrep:\n    exclude_paths:\n      - 'tests/a.py'\n",
+            ["engines.opengrep.exclude_paths is not permitted"],
+        ),
+        ("not: valid: yaml: [", []),
+        ("- list\n- item\n", []),
+        ("just a plain string\n", []),
+        ("engines: 'not-a-dict'\n", []),
+        (
+            "engines:\n  tool1: 'not-a-dict'\n  tool2:\n    enabled: true\n",
+            [],
+        ),
+        (
+            "engines:\n  tool1: 'not-a-dict'\n  tool2:\n    exclude_paths:\n      - 'a.py'\n",
+            ["engines.tool2.exclude_paths is not permitted"],
+        ),
+    ],
+    ids=[
+        "permitted-check-failure",
+        "invalid-yaml-syntax",
+        "doc-is-list",
+        "doc-is-string",
+        "engines-not-dict",
+        "engine-configs-without-exclude",
+        "mixed-engine-configs",
+    ],
+)
+def test_codacy_problems_branches(content: str, expected_problems: list[str]) -> None:
+    """codacy_problems handles invalid YAML, non-dict roots, and non-dict engine configs."""
+    assert codacy_problems(content) == expected_problems
+
+
+@pytest.mark.parametrize(
+    ("comment", "valid_exceptions", "expected_probs", "expected_count"),
+    [
+        (
+            "# " + "type: ignore[arg-type] # expires 2026-11-12 category B: valid reason",
+            set(),
+            [],
+            1,
+        ),
+        (
+            "# " + "type: ignore[arg-type]",
+            set(),
+            ["test.py:1: invalid type: ignore suppression: # type: ignore[arg-type]"],
+            1,
+        ),
+        (
+            "# " + "type: ignore[arg-type]",
+            {("arg-type", "test.py")},
+            [],
+            1,
+        ),
+        (
+            "# " + "type: ignore[arg-type, name-defined]",
+            set(),
+            ["test.py:1: invalid type: ignore suppression: # type: ignore[arg-type, name-defined]"],
+            1,
+        ),
+        (
+            "# " + "type: ignore # expires 2026-11-12 category B: valid reason",
+            set(),
+            [],
+            1,
+        ),
+        (
+            "# " + "type: ignore[arg-type]",
+            set(),
+            ["test.py:1: invalid type: ignore suppression: # type: ignore[arg-type]"],
+            None,
+        ),
+    ],
+    ids=[
+        "fleet-with-rule-code",
+        "plain-uncovered",
+        "plain-covered-by-exception",
+        "plain-uncovered-multi",
+        "fleet-bare-directive",
+        "plain-without-counts",
+    ],
+)
+def test_type_ignore_directive_lifecycle(
+    comment: str,
+    valid_exceptions: set[tuple[str, str]],
+    expected_probs: list[str],
+    expected_count: int | None,
+) -> None:
+    """type: ignore directives support fleet format, plain format with exceptions, and counts."""
+    counts: dict[str, int] | None = None if expected_count is None else {}
+    probs = exceptions.comment_problems(
+        comment,
+        after_code=True,
+        where="test.py:1",
+        today=datetime.date(2026, 11, 9),
+        valid_exceptions=valid_exceptions,
+        path="test.py",
+        counts=counts,
+    )
+    assert probs == expected_probs
+    if counts is not None:
+        assert counts.get("type: ignore") == expected_count
+
+
+@pytest.mark.parametrize(
+    ("comment", "valid_exceptions", "expected_probs", "expected_count"),
+    [
+        (
+            "# " + "pylint: disable=broad-except expires 2026-11-12 category B: valid reason",
+            set(),
+            [],
+            1,
+        ),
+        (
+            "# " + "pylint: disable=broad-except",
+            set(),
+            ["test.py:1: invalid pylint suppression: # pylint: disable=broad-except"],
+            1,
+        ),
+        (
+            "# " + "pylint: disable=broad-except",
+            {("broad-except", "test.py")},
+            [],
+            1,
+        ),
+        (
+            "# " + "pylint: disable-next=broad-except expires 2026-11-12 category B: valid reason",
+            set(),
+            [],
+            1,
+        ),
+        (
+            "# " + "pylint: disable=broad-except,no-member",
+            {("broad-except", "test.py"), ("no-member", "test.py")},
+            [],
+            1,
+        ),
+        (
+            "# " + "pylint: disable=broad-except",
+            set(),
+            ["test.py:1: invalid pylint suppression: # pylint: disable=broad-except"],
+            None,
+        ),
+    ],
+    ids=[
+        "fleet-valid",
+        "plain-uncovered",
+        "plain-covered-by-exception",
+        "disable-next-fleet",
+        "multiple-rules-covered",
+        "plain-without-counts",
+    ],
+)
+def test_pylint_directive_lifecycle(
+    comment: str,
+    valid_exceptions: set[tuple[str, str]],
+    expected_probs: list[str],
+    expected_count: int | None,
+) -> None:
+    """pylint directives support fleet format, plain format with exceptions, and counts."""
+    counts: dict[str, int] | None = None if expected_count is None else {}
+    probs = exceptions.comment_problems(
+        comment,
+        after_code=False,
+        where="test.py:1",
+        today=datetime.date(2026, 11, 9),
+        valid_exceptions=valid_exceptions,
+        path="test.py",
+        counts=counts,
+    )
+    assert probs == expected_probs
+    if counts is not None:
+        assert counts.get("pylint") == expected_count
+
+
+@pytest.mark.parametrize(
+    ("comment", "expected"),
+    [
+        ("# ordinary comment with no noqa", False),
+        ("# noqa: E501", True),
+        ("# noqa: E501, W291", True),
+        ("# noqa: W291, E501", True),
+        ("# noqa: W291", False),
+        ("# noqa: E501 (not trailing)", False),
+        ("", False),
+    ],
+    ids=[
+        "no-noqa-at-all",
+        "exact-e501",
+        "e501-first",
+        "e501-second",
+        "different-code",
+        "noqa-not-trailing",
+        "empty-comment",
+    ],
+)
+def test_has_trailing_noqa_e501_cases(comment: str, expected: bool) -> None:
+    """_has_trailing_noqa_e501 detects trailing E501 and refuses comments without noqa."""
+    assert exceptions._has_trailing_noqa_e501(comment) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "name", "expected_err_part"),
+    [
+        ("(\n", "unclosed_paren.py", "EOF in multi-line statement"),
+        ('"""unclosed docstring', "unclosed_doc.py", "EOF in multi-line string"),
+        ("x = 1\n", "valid.py", ""),
+    ],
+    ids=["unclosed-parenthesis", "unclosed-docstring", "valid-syntax"],
+)
+def test_suppression_problems_tokenize_error(text: str, name: str, expected_err_part: str) -> None:
+    """suppression_problems catches TokenError on invalid Python syntax and reports line 1."""
+    probs = suppression_problems(text, name, today=FIXED_TODAY)
+    if expected_err_part:
+        assert len(probs) == 1
+        assert f"{name}:1: tokenize error: " in probs[0]
+        assert expected_err_part in probs[0]
+    else:
+        assert probs == []
+
+
+def test_reader_needs_a_date() -> None:
+    """A reader without a fixed date would judge dated rows against the wall clock,
+    so `today` has no default.
+    """
+    for reader in (suppression_problems, exceptions.comment_problems):
+        param = inspect.signature(reader).parameters["today"]
+        assert param.default is inspect.Parameter.empty

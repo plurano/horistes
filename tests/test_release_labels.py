@@ -20,6 +20,7 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -185,11 +186,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data if short is None else data[:short])
 
+    @property
+    def forge(self) -> Forge:
+        return cast(ForgeServer, self.server).forge
+
     def do_GET(self) -> None:
-        self.answer(*self.server.forge.get(urlsplit(self.path).path))  # type: ignore[attr-defined]
+        self.answer(*self.forge.get(urlsplit(self.path).path))
 
     def do_POST(self) -> None:
-        forge: Forge = self.server.forge  # type: ignore[attr-defined]
+        forge: Forge = self.forge
         path = urlsplit(self.path).path
         length = int(self.headers.get("Content-Length", 0))
         if path == "/graphql":
@@ -206,18 +211,22 @@ class Handler(BaseHTTPRequestHandler):
         self.answer(200, [{"name": name} for name in labels])
 
     def do_DELETE(self) -> None:
-        forge: Forge = self.server.forge  # type: ignore[attr-defined]
+        forge: Forge = self.forge
         head, _, label = urlsplit(self.path).path.partition("/labels/")
         forge.writes.append(("delete_label", int(head.split("/issues/")[1]), unquote(label)))
         self.answer(200, [])
+
+
+class ForgeServer(ThreadingHTTPServer):
+    forge: Forge
 
 
 @pytest.fixture
 def forge() -> Iterator[Forge]:
     """A stand-in forge on a free local port."""
     stand_in = Forge()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.forge = stand_in  # type: ignore[attr-defined]
+    server = ForgeServer(("127.0.0.1", 0), Handler)
+    server.forge = stand_in
     threading.Thread(target=server.serve_forever, daemon=True).start()
     stand_in.url = f"http://127.0.0.1:{server.server_port}"
     yield stand_in
