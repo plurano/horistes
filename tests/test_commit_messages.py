@@ -32,28 +32,15 @@ Two credit rules, on one message each:
 The base is `BASE_REF` as the gate receives it, or `origin/main`. A base that
 does not name a commit fails the test; it is never skipped.
 
-One-message mode: with `MESSAGE_FILE` set, `test_message_file_passes_the_judge`
-judges that file by the same rules, as the message of the commit git is about to
-make in the repository the hook runs in (the working directory). Its author is
-git's author identity (`git var GIT_AUTHOR_IDENT`), which `git commit` sets to
-the effective author for its hooks, `--author` and `--amend` included. Its
-parents are `HEAD` and, while a merge is in progress, the heads in `MERGE_HEAD`;
-its tree is the index git commits (`git write-tree`). The commit-msg hook runs
-it through `make check-message`, and the squash helper runs that hook on the
-message it is about to send, so a squash message is judged before it lands
-(ADR-0072). Without `MESSAGE_FILE` the test is skipped; the range test above
-still runs. The file is read as git hands it to the hook, before git strips
-comment lines or the diff of `git commit -v`, so a line there that breaks a rule
-is refused too. It must be a regular file: it is opened without blocking, so a
-FIFO is refused instead of waited on, and at most `MESSAGE_BYTES` bytes are read.
+The judge functions and constants live in `tools/commit_message.py` (ADR-0074),
+which provides the standalone stdlib-only judge and CLI used by `make check-message`
+and the commit-msg hook. This module runs the range test on gate runs and tests
+the judge rules.
 """
 
 from __future__ import annotations
 
 import os
-import re
-import stat
-import subprocess
 import sys
 import threading
 import time
@@ -61,29 +48,28 @@ import tracemalloc
 from pathlib import Path
 
 import pytest
+from commit_message import (
+    ALONE,
+    MAX_MESSAGE,
+    MERGE_HEAD_BYTES,
+    MESSAGE_BYTES,
+    JudgeError,
+    author_email,
+    credited,
+    foreign_sign_off,
+    git,
+    judged,
+    message_text,
+    oversize,
+    pending,
+    refused,
+    run_git,
+    unsigned,
+)
 from conftest import ROOT
 
-DEADLINE = 20  # seconds for one git call
-MAX_COMMITS = 500
-MAX_MESSAGE = 65536
-MESSAGE_BYTES = 4 * MAX_MESSAGE  # UTF-8 takes at most 4 bytes per character
-# The message file of one-message mode, as the commit-msg hook names it.
-MESSAGE_FILE = os.environ.get("MESSAGE_FILE", "")
-TRAILERS = {"signed-off-by", "migration"}
-FOOTER = re.compile(r"^\W*(generated with\b|co-authored-by\s*:)", re.IGNORECASE)
-FORGE_BOT = re.compile(r"\d+\+[a-z0-9-]+\[bot\]@users\.noreply\.github\.com", re.IGNORECASE)
-SIGN_OFF_VALUE = re.compile(r"[^<>\n]*[^<>\s] <([^<>\s@]+@[^<>\s@]+)>")
 SIGN_OFF = "Signed-off-by: A Person <person@example.org>"
 GOOD = f"feat(x): add a thing\n\nThe header is generated with its own command.\n\n{SIGN_OFF}\n"
-# Outside this repository git reads no configuration of the machine it runs on.
-ALONE = {
-    "GIT_CONFIG_GLOBAL": os.devnull,
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_AUTHOR_NAME": "A Person",
-    "GIT_AUTHOR_EMAIL": "person@example.org",
-    "GIT_COMMITTER_NAME": "A Person",
-    "GIT_COMMITTER_EMAIL": "person@example.org",
-}
 BOT = {
     **ALONE,
     "GIT_AUTHOR_NAME": "renovate[bot]",
@@ -91,194 +77,9 @@ BOT = {
 }
 
 
-def run_git(
-    repo: Path, *arguments: str, text: str | None = None, env: dict | None = None
-) -> subprocess.CompletedProcess[str]:
-    """One git call in repo; the caller judges its exit status."""
-    return subprocess.run(
-        ["git", "-C", str(repo), *arguments],
-        input=text,
-        capture_output=True,
-        text=True,
-        timeout=DEADLINE,
-        check=False,
-        env=None if env is None else {**os.environ, **env},
-    )
-
-
-def git(repo: Path, *arguments: str, text: str | None = None, env: dict | None = None) -> str:
-    done = run_git(repo, *arguments, text=text, env=env)
-    assert done.returncode == 0, f"git {' '.join(arguments)}: {done.stderr.strip()}"
-    return done.stdout
-
-
-def merged_tree(repo: Path, ours: str, theirs: str) -> str | None:
-    """Tree of the clean merge of ours and theirs, or None when they conflict."""
-    done = run_git(repo, "merge-tree", "--write-tree", ours, theirs, env=ALONE)
-    if done.returncode == 0 and done.stdout:
-        return done.stdout.splitlines()[0].strip()
-    return None
-
-
-def trailers(message: str) -> list[tuple[str, str]]:
-    """Trailers of one message as (key, value) pairs, as git reads them."""
-    parsed = git(ROOT, "interpret-trailers", "--parse", text=message, env=ALONE)
-    return [
-        (line.split(":", 1)[0].strip(), line.split(":", 1)[1].strip())
-        for line in parsed.splitlines()
-        if ":" in line
-    ]
-
-
-def trailer_keys(message: str) -> list[str]:
-    """Keys of the trailer block of one message, as git reads it."""
-    return [key for key, _ in trailers(message)]
-
-
-def foreign_sign_off(author: str, message: str) -> list[str]:
-    """Findings on malformed sign-offs, and when none names the author (a bot's: or a person)."""
-    values = [v for k, v in trailers(message) if k.lower() == "signed-off-by"]
-    if not values:
-        return []
-    findings: list[str] = []
-    emails: list[str] = []
-    for value in values:
-        match = SIGN_OFF_VALUE.fullmatch(value)
-        if match:
-            emails.append(match.group(1))
-        else:
-            findings.append(f"malformed sign-off {value!r}")
-    if not emails:
-        return findings
-    if any(email.lower() == author.lower() for email in emails):
-        return findings
-    if FORGE_BOT.fullmatch(author) and any(not FORGE_BOT.fullmatch(e) for e in emails):
-        return findings
-    findings.append(f"sign-off {', '.join(emails)} is not the author {author}")
-    return findings
-
-
-def credited(message: str) -> list[str]:
-    """What one message holds that credits a tool: trailer keys, then footer lines."""
-    keys = trailer_keys(message)
-    lines = [line.strip() for line in message.splitlines() if FOOTER.match(line)]
-    loose = [line for line in lines if line.split(":", 1)[0] not in keys]
-    return [f"trailer {key}" for key in keys if key.lower() not in TRAILERS] + [
-        f"line {line}" for line in loose
-    ]
-
-
-def unsigned(message: str) -> list[str]:
-    """The finding of a message that has no `Signed-off-by` trailer."""
-    keys = {key.lower() for key in trailer_keys(message)}
-    return [] if "signed-off-by" in keys else ["no trailer Signed-off-by"]
-
-
-def oversize(message: str) -> list[str]:
-    """Finding when a message is longer than MAX_MESSAGE characters."""
-    if len(message) > MAX_MESSAGE:
-        return [f"message of {len(message)} characters, over {MAX_MESSAGE}"]
-    return []
-
-
-def signed_off(repo: Path, tree: str, author: str, parents: str, message: str) -> list[str]:
-    """Sign-off findings of one commit; a clean 2-parent merge without a trailer is exempt.
-
-    `tree` names the commit's tree: the commit itself, or the tree written from the
-    index git is about to commit. Only a 2-parent message without a sign-off reads it.
-    """
-    parent_list = parents.split()
-    if len(parent_list) == 2 and unsigned(message):
-        p1, p2 = parent_list
-        merged = merged_tree(repo, p1, p2)
-        target = git(repo, "rev-parse", "--verify", f"{tree}^{{tree}}", env=ALONE).strip()
-        if merged is not None and merged == target:
-            return []
-    return unsigned(message) + foreign_sign_off(author, message)
-
-
-def judged(repo: Path, tree: str, author: str, parents: str, message: str) -> list[str]:
-    """Findings on one message: its length first, then sign-off and credit."""
-    return oversize(message) or signed_off(repo, tree, author, parents, message) + credited(message)
-
-
-def author_email(repo: Path) -> str:
-    """The email of git's author identity, as git hands it to a commit hook."""
-    ident = git(repo, "var", "GIT_AUTHOR_IDENT")
-    match = re.search(r"<([^<>\s]+)>", ident)
-    assert match, f"git var GIT_AUTHOR_IDENT names no email: {ident.strip()!r}"
-    return match.group(1)
-
-
-def pending(repo: Path) -> tuple[str, str]:
-    """Parents and tree of the commit git is about to make in repo.
-
-    The parents are `HEAD` and, while a merge is in progress, each head in
-    `MERGE_HEAD`. The tree is written from the index git commits, which git names
-    to its hooks in `GIT_INDEX_FILE`; it is read only for a merge.
-    """
-    head = run_git(repo, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", env=ALONE)
-    if head.returncode != 0:
-        return "", ""
-    merging = run_git(repo, "rev-parse", "--verify", "--quiet", "MERGE_HEAD", env=ALONE)
-    if merging.returncode != 0:
-        return head.stdout.strip(), ""
-    path = Path(repo, git(repo, "rev-parse", "--git-path", "MERGE_HEAD", env=ALONE).strip())
-    heads = path.read_text(encoding="ascii").split()
-    tree = git(repo, "write-tree", env=ALONE).strip()
-    return " ".join([head.stdout.strip(), *heads]), tree
-
-
-def message_text(path: str) -> str:
-    """The message file as text: a regular file of at most MESSAGE_BYTES bytes.
-
-    It is opened without blocking, so a FIFO with no writer is refused at once
-    instead of holding the commit.
-    """
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-    try:
-        mode = os.fstat(descriptor).st_mode
-        assert stat.S_ISREG(mode), f"{path}: not a regular file"
-    except BaseException:
-        os.close(descriptor)
-        raise
-    with os.fdopen(descriptor, "rb") as handle:
-        data = handle.read(MESSAGE_BYTES + 1)
-    assert len(data) <= MESSAGE_BYTES, f"{path}: over {MESSAGE_BYTES} bytes"
-    return data.decode("utf-8")
-
-
-def refused(repo: Path, base: str) -> dict[str, list[str]]:
-    """Commits between the base and HEAD, merges included, that break a sign-off or credit rule."""
-    git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
-    listed = git(repo, "rev-list", f"--max-count={MAX_COMMITS + 1}", f"{base}..HEAD")
-    commits = listed.split()
-    assert len(commits) <= MAX_COMMITS, f"more than {MAX_COMMITS} commits since {base}"
-    found: dict[str, list[str]] = {}
-    for sha in commits:
-        read = git(repo, "log", "-1", "--format=format:%ae%x00%P%x00%B", sha)
-        author, parents, message = read.split("\x00", 2)
-        lines = judged(repo, sha, author, parents, message)
-        if lines:
-            found[sha] = lines
-    return found
-
-
 def test_commits_of_this_change_credit_no_tool():
     base = os.environ.get("BASE_REF", "origin/main")
     assert refused(ROOT, base) == {}
-
-
-@pytest.mark.skipif(
-    not MESSAGE_FILE, reason="one-message mode: the commit-msg hook sets MESSAGE_FILE"
-)
-def test_message_file_passes_the_judge():
-    """The message file given to the judge produces no findings for the pending commit."""
-    message = message_text(MESSAGE_FILE)
-    repo = Path.cwd()
-    parents, tree = pending(repo)
-    findings = judged(repo, tree, author_email(repo), parents, message)
-    assert findings == [], f"{MESSAGE_FILE}: " + "; ".join(findings)
 
 
 CO_AUTHOR = "Co-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>"
@@ -344,7 +145,7 @@ def test_message_text_reads_up_to_the_byte_bound(tmp_path, size, passes):
     if passes:
         assert message_text(str(path)) == "x" * size
         return
-    with pytest.raises(AssertionError, match=f"over {MESSAGE_BYTES} bytes"):
+    with pytest.raises(JudgeError, match=f"over {MESSAGE_BYTES} bytes"):
         message_text(str(path))
 
 
@@ -360,7 +161,7 @@ def test_message_text_holds_at_most_the_bound_of_a_large_file(tmp_path):
         handle.truncate(64 * MESSAGE_BYTES)
     tracemalloc.start()
     try:
-        with pytest.raises(AssertionError, match=f"over {MESSAGE_BYTES} bytes"):
+        with pytest.raises(JudgeError, match=f"over {MESSAGE_BYTES} bytes"):
             message_text(str(path))
         peak = tracemalloc.get_traced_memory()[1]
     finally:
@@ -393,7 +194,7 @@ def test_message_text_refuses_a_fifo_without_waiting(tmp_path):
     helper.start()
     started = time.monotonic()
     try:
-        with pytest.raises(AssertionError, match="not a regular file"):
+        with pytest.raises(JudgeError, match="not a regular file"):
             message_text(str(path))
     finally:
         done.set()
@@ -404,7 +205,7 @@ def test_message_text_refuses_a_fifo_without_waiting(tmp_path):
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows refuses to open a directory")
 def test_message_text_refuses_a_directory(tmp_path):
     """A directory passed to message_text is refused as not a regular file."""
-    with pytest.raises(AssertionError, match="not a regular file"):
+    with pytest.raises(JudgeError, match="not a regular file"):
         message_text(str(tmp_path))
 
 
@@ -531,9 +332,9 @@ def test_planted_commit_without_sign_off_is_refused(tmp_path):
 def test_base_that_names_no_commit_fails(tmp_path):
     git(tmp_path, "init", "--quiet", "--initial-branch=main", env=ALONE)
     commit(tmp_path, GOOD)
-    with pytest.raises(AssertionError, match="rev-parse"):
+    with pytest.raises(JudgeError, match="rev-parse"):
         refused(tmp_path, "0000000000000000000000000000000000000000")
-    with pytest.raises(AssertionError, match="rev-parse"):
+    with pytest.raises(JudgeError, match="rev-parse"):
         refused(tmp_path, "origin/absent")
 
 
@@ -799,3 +600,20 @@ def test_boundary_octopus_merge_without_trailer_is_refused(tmp_path):
     merged = git(tmp_path, "rev-parse", "HEAD").strip()
     assert len(git(tmp_path, "log", "-1", "--format=%P", merged).split()) == 3
     assert refused(tmp_path, base) == {merged: ["no trailer Signed-off-by"]}
+
+
+@pytest.mark.parametrize(("extra", "passes"), [(0, True), (1, False)], ids=["at-bound", "over"])
+def test_pending_reads_merge_head_up_to_the_byte_bound(tmp_path, extra, passes):
+    """Boundary: a MERGE_HEAD of MERGE_HEAD_BYTES bytes is read; one byte more is refused."""
+    branches(tmp_path)
+    git(tmp_path, "merge", "--no-ff", "--no-commit", "--quiet", "feature", env=ALONE)
+    path = Path(tmp_path, git(tmp_path, "rev-parse", "--git-path", "MERGE_HEAD").strip())
+    head = path.read_text(encoding="ascii")
+    path.write_text(head + " " * (MERGE_HEAD_BYTES + extra - len(head)), encoding="ascii")
+    if passes:
+        parents, tree = pending(tmp_path)
+        assert parents.split()[1] == head.strip()
+        assert tree
+        return
+    with pytest.raises(JudgeError, match=f"over {MERGE_HEAD_BYTES} bytes"):
+        pending(tmp_path)
