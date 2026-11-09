@@ -8,10 +8,9 @@ import datetime
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
-from conftest import ROOT, Tree
+from conftest import ROOT, Tree, external, rooted
 
 CONFIG = ".github/zizmor.yml"
 RUFF = "ruff.toml"
@@ -949,13 +948,7 @@ def test_ratchet_3d(tree):
 
 def test_reuse_lint_template_empty_note_3d(tmp_path):
     """3D test: template SPDX empty notes pass reuse lint; fails without them on identifier."""
-    import os
-
-    reuse_bin = (
-        os.environ.get("REUSE") or shutil.which("reuse") or str(ROOT / ".venv" / "bin" / "reuse")
-    )
-    if not Path(reuse_bin).exists() and not shutil.which(str(reuse_bin)):
-        pytest.skip("reuse binary not found")
+    reuse = [*rooted(external("REUSE", "reuse")), "lint"]
 
     dest = tmp_path / "repo"
     dest.mkdir()
@@ -965,11 +958,13 @@ def test_reuse_lint_template_empty_note_3d(tmp_path):
     (dest / "tests").mkdir()
     shutil.copy(ROOT / "tests" / "test_render.py", dest / "tests" / "test_render.py")
 
-    subprocess.run(["git", "init", "-b", "main"], cwd=dest, capture_output=True, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=dest, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=dest, capture_output=True, check=True, timeout=60
+    )
+    subprocess.run(["git", "add", "-A"], cwd=dest, capture_output=True, check=True, timeout=60)
 
     # 1. Positive: template empty notes pass reuse lint without an override table -> rc 0
-    proc1 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
+    proc1 = subprocess.run(reuse, cwd=dest, capture_output=True, text=True, timeout=300)
     assert proc1.returncode == 0, proc1.stdout + proc1.stderr
 
     # 2. Negative: plain License-Identifier without empty note fails naming invalid SPDX expression
@@ -981,7 +976,7 @@ def test_reuse_lint_template_empty_note_3d(tmp_path):
         "# SPDX-" + "License-Identifier:",
     )
     tmpl.write_text(plain_identifier, encoding="utf-8")
-    proc2 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
+    proc2 = subprocess.run(reuse, cwd=dest, capture_output=True, text=True, timeout=300)
     assert proc2.returncode != 0
     assert "invalid spdx" in (proc2.stdout + proc2.stderr).lower()
 
@@ -992,7 +987,7 @@ def test_reuse_lint_template_empty_note_3d(tmp_path):
         "# SPDX-" + "FileCopyrightText:",
     )
     tmpl.write_text(plain_copyright, encoding="utf-8")
-    proc3 = subprocess.run([str(reuse_bin), "lint"], cwd=dest, capture_output=True, text=True)
+    proc3 = subprocess.run(reuse, cwd=dest, capture_output=True, text=True, timeout=300)
     assert proc3.returncode == 0, proc3.stdout + proc3.stderr
 
 
