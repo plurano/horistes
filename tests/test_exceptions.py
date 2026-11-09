@@ -400,6 +400,20 @@ def test_category_c_plus_ten_days_ok(tree):
     assert done.returncode == 0, done.stderr
 
 
+def test_category_c_shorter_than_ten_days_refused(tree):
+    """An entry ends one interval after its entered day, not earlier."""
+    done = own(tree, _with_category("C", "2026-10-11", "2026-10-16"))
+    assert done.returncode == 1, done.stdout
+    assert "gives 2026-10-21" in done.stderr
+
+
+def test_category_c_entered_after_today_refused(tree):
+    """An entry entered after the check day ends more than one interval ahead."""
+    done = own(tree, _with_category("C", "2026-10-12", "2026-10-22"))
+    assert done.returncode == 1, done.stdout
+    assert "more than 10 days ahead" in done.stderr
+
+
 def test_category_a_with_stated_interval_ok(tree):
     entry = _with_category("A", "2026-10-11", "2026-11-20", reason="interval 40 days test")
     done = own(tree, entry)

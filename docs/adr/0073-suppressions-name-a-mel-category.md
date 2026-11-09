@@ -22,14 +22,17 @@ hook files cannot be modified directly in this repository without causing contex
 - Every suppression in this repository, whether an inline comment directive or configuration
   exception, states an expiry date, a fleet MEL category (`A`, `B`, `C`, or `D`), and a
   non-empty reason containing at least one letter and no commas.
-- Fleet MEL category intervals govern duration caps:
-  - `A`: stated in reason as `interval N days` (1 <= N <= 90).
-  - `B`: 3 days.
-  - `C`: 10 days.
-  - `D`: 120 days.
+- Each category fixes an interval: `A` states it in the reason as `interval N days` (1 <= N <= 90),
+  `B` is 3 days, `C` 10 days and `D` 120 days.
+- An `exceptions.yaml` entry expires exactly one interval after its `entered` day, since the fleet
+  MEL rule sets the expiry from the entry date; a shorter time takes category `A` with its own
+  interval, and a fix before the expiry removes the entry. Every other suppression (inline
+  directives, accepted findings in `.github/zizmor.yml`, `.github/actionlint.yaml` and `ruff.toml`,
+  and dated hosts in `hosts.toml`) names no entered day, so its expiry lies at most one interval
+  after the day of the check.
 - One reader, `tools/exceptions.py check` (`make check-exceptions`), judges all suppressions across
   all tracked files, while dated host exceptions in `hosts.toml` are checked by `tools/hosts.py check`.
-- Per-category caps replace the flat 90-day cap of ADR-0010, superseding it.
+- Per-category intervals replace the flat 90-day cap of ADR-0010, superseding it.
 - A bandit suppression requires a second `#` before the expiry
   (`# nosec B602 # expires 2027-03-09 category D: reason`): bandit reads test ids only up to
   the next `#`, so the words after it raise no warning; bandit prints one warning per word
