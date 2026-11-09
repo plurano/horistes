@@ -106,8 +106,9 @@ new review-body parsing and GraphQL queries belong in `tools/merge_train.py`.
     before the next merge-train sweep runs and disarms it.
   - Unrecognized bot review body formats fail closed and require an explicit author
     reply or parser update.
-  - Every Sourcery `Hey - I've found N issues` review in PRs 138 to 153 ends with
-    `**Approval pending.**` and a `Blocking findings:` list, so each such review holds
-    until the author names it, even when the same findings sit in inline threads the
-    thread gate already covers. The body is Sourcery's own blocking verdict, so it counts
-    as a finding; one author comment naming the review clears it.
+  - Twelve of the thirteen Sourcery `Hey - I've found N issues` reviews in PRs 138 to
+    153 end with `**Approval pending.**` and a `Blocking findings:` list; the thirteenth
+    (review 5818404249 on PR 138) has the blocking list and a security-issue list. Each
+    of the thirteen holds until the author names it, even when the same findings sit in
+    inline threads the thread gate already covers. The body is Sourcery's own blocking
+    verdict, so it counts as a finding; one author comment naming the review clears it.
