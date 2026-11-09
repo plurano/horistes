@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import ciwf
+import hosts
 import pytest
 from conftest import ACTION, CHECKOUT, HOSTS, REUSABLE, Tree
 
@@ -368,3 +370,63 @@ def test_list_subcommand_prints_host_rows_and_refuses_bad_input(tree):
     assert bad.returncode == 3
     assert "ERROR: " in bad.stderr
     assert "hosts.toml" in bad.stderr
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        ("registry.example.com/org/repo:1.0", "registry.example.com"),
+        ("ubuntu:24.04", "docker.io"),
+        ("", "<dynamic>"),
+        ("${{ matrix.image }}", "<dynamic>"),
+        ("$MY_IMAGE", "<dynamic>"),
+        ("prefix-$VAR", "<dynamic>"),
+    ],
+    ids=[
+        "explicit-registry",
+        "default-docker-io",
+        "empty-image",
+        "expression-only",
+        "shell-variable-only",
+        "variable-in-image",
+    ],
+)
+def test_image_host_cases(image: str, expected: str) -> None:
+    """_image_host extracts registry or resolves dynamic/empty expressions."""
+    assert hosts._image_host(image) == expected
+
+
+@pytest.mark.parametrize(
+    "job_value",
+    ["not-a-dict", 123, None, ["list", "step"]],
+    ids=["string", "number", "none", "list"],
+)
+def test_found_hosts_skips_non_dict_job(job_value: object) -> None:
+    """found_hosts skips workflow jobs whose value is not a mapping."""
+    doc = {"jobs": {"bad_job": job_value, "good_job": {"steps": []}}}
+    found, unknown = hosts.found_hosts(doc, {})
+    assert found == {}
+    assert unknown == []
+
+
+@pytest.mark.parametrize(
+    ("forge_content", "error_message"),
+    [
+        ("[files]\n", "`forge` must list the forge's hosts"),
+        ("forge = []\n", "`forge` must list the forge's hosts"),
+        ('forge = "github.com"\n', "`forge` must list the forge's hosts"),
+        ("forge = 42\n", "`forge` must list the forge's hosts"),
+    ],
+    ids=["missing-forge", "empty-list", "string-not-list", "number-not-list"],
+)
+def test_declaration_invalid_forge_fails(
+    tree: Tree, forge_content: str, error_message: str
+) -> None:
+    """declaration requires forge to be a non-empty list of hosts."""
+    tree.write({"hosts.toml": forge_content})
+    with pytest.raises(ciwf.ReadError) as err:
+        hosts.declaration(tree.root)
+    assert error_message in str(err.value)
+    done = tree.write({WORKFLOW: REUSABLE, "hosts.toml": forge_content}).tool("hosts.py", "check")
+    assert done.returncode == 3
+    assert error_message in done.stderr

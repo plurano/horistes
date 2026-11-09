@@ -211,3 +211,226 @@ def test_trailing_noqa_e501_boundaries(
     today = datetime.date(2026, 11, 9)
     probs = suppression_problems(payload, "test.py", today=today, valid_exceptions=valid)
     assert probs == expected_probs
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_problems"),
+    [
+        (
+            "engines:\n  opengrep:\n    exclude_paths:\n      - 'tests/a.py'\n",
+            ["engines.opengrep.exclude_paths is not permitted"],
+        ),
+        ("not: valid: yaml: [", []),
+        ("- list\n- item\n", []),
+        ("just a plain string\n", []),
+        ("engines: 'not-a-dict'\n", []),
+        (
+            "engines:\n  tool1: 'not-a-dict'\n  tool2:\n    enabled: true\n",
+            [],
+        ),
+        (
+            "engines:\n  tool1: 'not-a-dict'\n  tool2:\n    exclude_paths:\n      - 'a.py'\n",
+            ["engines.tool2.exclude_paths is not permitted"],
+        ),
+    ],
+    ids=[
+        "permitted-check-failure",
+        "invalid-yaml-syntax",
+        "doc-is-list",
+        "doc-is-string",
+        "engines-not-dict",
+        "engine-configs-without-exclude",
+        "mixed-engine-configs",
+    ],
+)
+def test_codacy_problems_branches(content: str, expected_problems: list[str]) -> None:
+    """codacy_problems handles invalid YAML, non-dict roots, and non-dict engine configs."""
+    assert codacy_problems(content) == expected_problems
+
+
+@pytest.mark.parametrize(
+    ("comment", "valid_exceptions", "expected_probs", "expected_count"),
+    [
+        (
+            "# " + "type: ignore[arg-type] # expires 2026-11-12 category B: valid reason",
+            set(),
+            [],
+            1,
+        ),
+        (
+            "# " + "type: ignore[arg-type]",
+            set(),
+            ["test.py:1: invalid type: ignore suppression: # type: ignore[arg-type]"],
+            1,
+        ),
+        (
+            "# " + "type: ignore[arg-type]",
+            {("arg-type", "test.py")},
+            [],
+            1,
+        ),
+        (
+            "# " + "type: ignore[arg-type, name-defined]",
+            set(),
+            ["test.py:1: invalid type: ignore suppression: # type: ignore[arg-type, name-defined]"],
+            1,
+        ),
+        (
+            "# " + "type: ignore # expires 2026-11-12 category B: valid reason",
+            set(),
+            [],
+            1,
+        ),
+        (
+            "# " + "type: ignore[arg-type]",
+            set(),
+            ["test.py:1: invalid type: ignore suppression: # type: ignore[arg-type]"],
+            None,
+        ),
+    ],
+    ids=[
+        "fleet-with-rule-code",
+        "plain-uncovered",
+        "plain-covered-by-exception",
+        "plain-uncovered-multi",
+        "fleet-bare-directive",
+        "plain-without-counts",
+    ],
+)
+def test_type_ignore_directive_lifecycle(
+    comment: str,
+    valid_exceptions: set[tuple[str, str]],
+    expected_probs: list[str],
+    expected_count: int | None,
+) -> None:
+    """type: ignore directives support fleet format, plain format with exceptions, and counts."""
+    counts: dict[str, int] | None = None if expected_count is None else {}
+    probs = exceptions.comment_problems(
+        comment,
+        after_code=True,
+        where="test.py:1",
+        today=datetime.date(2026, 11, 9),
+        valid_exceptions=valid_exceptions,
+        path="test.py",
+        counts=counts,
+    )
+    assert probs == expected_probs
+    if counts is not None:
+        assert counts.get("type: ignore") == expected_count
+
+
+@pytest.mark.parametrize(
+    ("comment", "valid_exceptions", "expected_probs", "expected_count"),
+    [
+        (
+            "# " + "pylint: disable=broad-except expires 2026-11-12 category B: valid reason",
+            set(),
+            [],
+            1,
+        ),
+        (
+            "# " + "pylint: disable=broad-except",
+            set(),
+            ["test.py:1: invalid pylint suppression: # pylint: disable=broad-except"],
+            1,
+        ),
+        (
+            "# " + "pylint: disable=broad-except",
+            {("broad-except", "test.py")},
+            [],
+            1,
+        ),
+        (
+            "# " + "pylint: disable-next=broad-except expires 2026-11-12 category B: valid reason",
+            set(),
+            [],
+            1,
+        ),
+        (
+            "# " + "pylint: disable=broad-except,no-member",
+            {("broad-except", "test.py"), ("no-member", "test.py")},
+            [],
+            1,
+        ),
+        (
+            "# " + "pylint: disable=broad-except",
+            set(),
+            ["test.py:1: invalid pylint suppression: # pylint: disable=broad-except"],
+            None,
+        ),
+    ],
+    ids=[
+        "fleet-valid",
+        "plain-uncovered",
+        "plain-covered-by-exception",
+        "disable-next-fleet",
+        "multiple-rules-covered",
+        "plain-without-counts",
+    ],
+)
+def test_pylint_directive_lifecycle(
+    comment: str,
+    valid_exceptions: set[tuple[str, str]],
+    expected_probs: list[str],
+    expected_count: int | None,
+) -> None:
+    """pylint directives support fleet format, plain format with exceptions, and counts."""
+    counts: dict[str, int] | None = None if expected_count is None else {}
+    probs = exceptions.comment_problems(
+        comment,
+        after_code=False,
+        where="test.py:1",
+        today=datetime.date(2026, 11, 9),
+        valid_exceptions=valid_exceptions,
+        path="test.py",
+        counts=counts,
+    )
+    assert probs == expected_probs
+    if counts is not None:
+        assert counts.get("pylint") == expected_count
+
+
+@pytest.mark.parametrize(
+    ("comment", "expected"),
+    [
+        ("# ordinary comment with no noqa", False),
+        ("# noqa: E501", True),
+        ("# noqa: E501, W291", True),
+        ("# noqa: W291, E501", True),
+        ("# noqa: W291", False),
+        ("# noqa: E501 (not trailing)", False),
+        ("", False),
+    ],
+    ids=[
+        "no-noqa-at-all",
+        "exact-e501",
+        "e501-first",
+        "e501-second",
+        "different-code",
+        "noqa-not-trailing",
+        "empty-comment",
+    ],
+)
+def test_has_trailing_noqa_e501_cases(comment: str, expected: bool) -> None:
+    """_has_trailing_noqa_e501 detects trailing E501 and refuses comments without noqa."""
+    assert exceptions._has_trailing_noqa_e501(comment) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "name", "expected_err_part"),
+    [
+        ("(\n", "unclosed_paren.py", "EOF in multi-line statement"),
+        ('"""unclosed docstring', "unclosed_doc.py", "EOF in multi-line string"),
+        ("x = 1\n", "valid.py", ""),
+    ],
+    ids=["unclosed-parenthesis", "unclosed-docstring", "valid-syntax"],
+)
+def test_suppression_problems_tokenize_error(text: str, name: str, expected_err_part: str) -> None:
+    """suppression_problems catches TokenError on invalid Python syntax and reports line 1."""
+    probs = suppression_problems(text, name)
+    if expected_err_part:
+        assert len(probs) == 1
+        assert f"{name}:1: tokenize error: " in probs[0]
+        assert expected_err_part in probs[0]
+    else:
+        assert probs == []

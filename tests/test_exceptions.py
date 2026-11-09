@@ -8,6 +8,7 @@ import datetime
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from conftest import ROOT, Tree, external, rooted
@@ -1072,3 +1073,350 @@ def test_ratchet_baseline_value_not_count_fails(tree, bad_value):
     tree.write({"suppression-baseline.json": f'{{"noqa": {bad_value}}}\n'})
     probs = exceptions._ratchet_problems(tree.root, {"noqa": 0})
     assert probs == ["suppression-baseline.json: noqa is not a count"]
+
+
+@pytest.mark.parametrize(
+    ("directive", "expected_prob"),
+    [
+        (
+            "# noqa: E501 expires 2026-11-12 category X: valid test reason",
+            "category `X` is not one of A, B, C, D",
+        ),
+        (
+            "# noqa: E501 expires 2026-11-12 category B: valid test reason",
+            "",
+        ),
+        (
+            "# noqa: E501 expires 2026-11-12 category B: comma, not allowed",
+            "reason contains a comma",
+        ),
+    ],
+    ids=["unknown-category", "valid-category-b", "invalid-reason-comma"],
+)
+def test_check_fleet_match_cases(directive: str, expected_prob: str) -> None:
+    """_check_fleet_match validates reason, category in A-D, and expiration."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+    match = exceptions.NOQA_FLEET.match(directive)
+    assert match is not None
+    prob = exceptions._check_fleet_match(match, today)
+    assert prob == expected_prob
+
+
+@pytest.mark.parametrize(
+    ("rules_str", "path", "valid_exceptions", "expected"),
+    [
+        ("[E501]", "test.py", {("E501", "test.py")}, True),
+        ("[ E501 ]", "test.py", {("E501", "test.py")}, True),
+        ("[E501, W291]", "test.py", {("E501", "test.py"), ("W291", "test.py")}, True),
+        ("[E501]", "test.py", set(), False),
+        ("", "test.py", {("E501", "test.py")}, False),
+        ("[]", "test.py", {("E501", "test.py")}, False),
+        ("[   ]", "test.py", {("E501", "test.py")}, False),
+        ("E501", "test.py", {("E501", "test.py")}, True),
+    ],
+    ids=[
+        "bracketed-single-covered",
+        "bracketed-spaces-covered",
+        "bracketed-multi-covered",
+        "bracketed-uncovered",
+        "empty-rules-string",
+        "empty-brackets",
+        "whitespace-brackets",
+        "unbracketed-covered",
+    ],
+)
+def test_is_covered_cases(
+    rules_str: str,
+    path: str,
+    valid_exceptions: set[tuple[str, str]],
+    expected: bool,
+) -> None:
+    """_is_covered strips brackets, checks against empty rules, and validates coverage."""
+    import exceptions
+
+    assert exceptions._is_covered(rules_str, path, valid_exceptions) is expected
+
+
+@pytest.mark.parametrize(
+    ("val", "field", "expected_date", "expected_err"),
+    [
+        (12345, "entered", None, "names `12345` as entered, not YYYY-MM-DD"),
+        ("not-a-date", "entered", None, "names `not-a-date` as entered, not YYYY-MM-DD"),
+        ("2026/11/09", "entered", None, "names `2026/11/09` as entered, not YYYY-MM-DD"),
+        (None, "expires", None, "names `None` as expires, not YYYY-MM-DD"),
+        ("2026-11-09", "entered", datetime.date(2026, 11, 9), ""),
+    ],
+    ids=[
+        "integer-val",
+        "non-date-string",
+        "slash-separated-date",
+        "none-val",
+        "valid-iso-date",
+    ],
+)
+def test_parse_entry_date_cases(
+    val: object,
+    field: str,
+    expected_date: datetime.date | None,
+    expected_err: str,
+) -> None:
+    """_parse_entry_date refuses non-string or non-YYYY-MM-DD values and parses ISO dates."""
+    import exceptions
+
+    found: list[str] = []
+    parsed = exceptions._parse_entry_date(val, field, found)
+    assert parsed == expected_date
+    if expected_err:
+        assert expected_err in found
+    else:
+        assert found == []
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["not-a-mapping", 1234, None, ["entry", "list"]],
+    ids=["string", "number", "none", "list"],
+)
+def test_entry_problems_not_mapping(entry: object) -> None:
+    """_entry_problems returns 'is no mapping' when entry is not a dict."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+    probs = exceptions._entry_problems(entry, Path("."), today)
+    assert probs == ["is no mapping"]
+
+
+@pytest.mark.parametrize(
+    ("helper_name", "simulated_error", "expected_msg_part"),
+    [
+        (
+            "_tracked_file",
+            FileNotFoundError("git binary not found"),
+            "git binary not found",
+        ),
+        (
+            "_tracked_file",
+            subprocess.TimeoutExpired(cmd=["git"], timeout=30),
+            "timed out after 30 seconds",
+        ),
+        (
+            "_tracked_files",
+            FileNotFoundError("git binary not found"),
+            "git binary not found",
+        ),
+        (
+            "_tracked_files",
+            subprocess.TimeoutExpired(cmd=["git"], timeout=30),
+            "timed out after 30 seconds",
+        ),
+        (
+            "_tracked_files",
+            subprocess.CompletedProcess(
+                args=["git"], returncode=128, stdout=b"", stderr=b"fatal: corrupted git tree\n"
+            ),
+            "fatal: corrupted git tree",
+        ),
+        (
+            "_tracked_files",
+            subprocess.CompletedProcess(args=["git"], returncode=2, stdout=b"", stderr=b""),
+            "git exited with 2",
+        ),
+    ],
+    ids=[
+        "tracked-file-not-found",
+        "tracked-file-timeout",
+        "tracked-files-not-found",
+        "tracked-files-timeout",
+        "tracked-files-nonzero-stderr",
+        "tracked-files-nonzero-empty-stderr",
+    ],
+)
+def test_git_helpers_failure_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    helper_name: str,
+    simulated_error: object,
+    expected_msg_part: str,
+) -> None:
+    """_tracked_file and _tracked_files raise ciwf.ReadError on git errors or non-zero rc."""
+    import ciwf
+    import exceptions
+
+    def mock_run(*args: object, **kwargs: object) -> object:
+        cmd = args[0] if args else kwargs.get("args", [])
+        if isinstance(cmd, list) and "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        if isinstance(simulated_error, Exception):
+            raise simulated_error
+        return simulated_error
+
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    (tmp_path / "file.py").write_text("test\n")
+
+    with pytest.raises(ciwf.ReadError) as err:
+        if helper_name == "_tracked_file":
+            exceptions._tracked_file(tmp_path, "file.py")
+        else:
+            exceptions._tracked_files(tmp_path)
+    assert expected_msg_part in str(err.value)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected_prob"),
+    [
+        (
+            "<!-- markdownlint-disable MD013 expires 2026-11-01 category B: expired reason -->",
+            "expired on 2026-11-01",
+        ),
+        (
+            "<!-- markdownlint-disable MD013 expires 2026-11-12 category X: bad category -->",
+            "category `X` is not one of A, B, C, D",
+        ),
+        (
+            "<!-- markdownlint-disable MD013 expires 2026-11-12 category B: reason, comma -->",
+            "reason contains a comma",
+        ),
+        (
+            "<!-- markdownlint-disable MD013 expires 2026-11-12 category B: valid reason -->",
+            "",
+        ),
+    ],
+    ids=[
+        "expired-date",
+        "invalid-category",
+        "comma-in-reason",
+        "valid-fleet-format",
+    ],
+)
+def test_markdownlint_fleet_invalid_part(line: str, expected_prob: str) -> None:
+    """md_problems reports invalid parts in markdownlint fleet format directives."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+    counts: dict[str, int] = {}
+    probs = exceptions.md_problems(f"{line}\n# Title\n", "doc.md", today, set(), counts)
+    if expected_prob:
+        assert len(probs) == 1
+        assert f"doc.md:1: invalid markdownlint suppression: {expected_prob}" == probs[0]
+    else:
+        assert probs == []
+
+
+@pytest.mark.parametrize(
+    ("line", "valid", "expected_prob"),
+    [
+        (
+            "# shellcheck disable=SC2086 expires 2026-11-01 category B: expired reason",
+            set(),
+            "invalid shellcheck suppression: expired on 2026-11-01",
+        ),
+        (
+            "# shellcheck disable=SC2086 expires 2026-11-12 category Z: unknown category",
+            set(),
+            "invalid shellcheck suppression: category `Z` is not one of A, B, C, D",
+        ),
+        (
+            "# shellcheck disable=SC2086",
+            {("SC2086", "script.sh")},
+            "",
+        ),
+        (
+            "# shellcheck disable=SC2086",
+            set(),
+            (
+                "invalid shellcheck suppression: not in fleet format "
+                "and not covered by exceptions.yaml"
+            ),
+        ),
+    ],
+    ids=[
+        "fleet-expired",
+        "fleet-invalid-category",
+        "plain-covered-by-exceptions-yaml",
+        "plain-uncovered",
+    ],
+)
+def test_shellcheck_fleet_and_coverage(
+    line: str, valid: set[tuple[str, str]], expected_prob: str
+) -> None:
+    """sh_problems checks fleet format validation errors and exceptions.yaml coverage."""
+    import exceptions
+
+    today = datetime.date(2026, 11, 9)
+    counts: dict[str, int] = {}
+    probs = exceptions.sh_problems(f"{line}\necho 1\n", "script.sh", today, valid, counts)
+    if expected_prob:
+        assert len(probs) == 1
+        assert f"script.sh:1: {expected_prob}" == probs[0]
+    else:
+        assert probs == []
+
+
+@pytest.mark.parametrize(
+    "rel_path",
+    ["deleted_from_worktree.py", "subdir_not_a_file"],
+    ids=["deleted-file", "directory-path"],
+)
+def test_scan_tracked_file_non_file(tmp_path: Path, rel_path: str) -> None:
+    """_scan_tracked_file returns empty problems and 0 skipped when path is not a file."""
+    import exceptions
+
+    (tmp_path / "subdir_not_a_file").mkdir(exist_ok=True)
+    today = datetime.date(2026, 11, 9)
+    probs, skipped = exceptions._scan_tracked_file(rel_path, tmp_path, today, set(), {})
+    assert probs == []
+    assert skipped == 0
+
+
+@pytest.mark.parametrize(
+    ("raw_content", "counts", "expected_prob", "expect_read_error"),
+    [
+        (None, {"noqa": 1}, "suppression-baseline.json: does not exist", False),
+        (None, {}, "", False),
+        ("not valid json {{", {}, "Expecting value", True),
+        (b"\xff\xfe\x00\x00", {}, "codec can't decode", True),
+        ("[1, 2, 3]", {}, "suppression-baseline.json: must be a JSON object", False),
+        ('"string-json"', {}, "suppression-baseline.json: must be a JSON object", False),
+    ],
+    ids=[
+        "missing-baseline-with-counts",
+        "missing-baseline-zero-counts",
+        "invalid-json",
+        "non-utf8-bytes",
+        "json-array-not-object",
+        "json-string-not-object",
+    ],
+)
+def test_ratchet_baseline_error_cases(
+    tree: Tree,
+    raw_content: str | bytes | None,
+    counts: dict[str, int],
+    expected_prob: str,
+    expect_read_error: bool,
+) -> None:
+    """_ratchet_problems handles missing baseline, non-UTF8/non-JSON data, and non-object JSON."""
+    import ciwf
+    import exceptions
+
+    baseline_path = tree.root / "suppression-baseline.json"
+    if raw_content is None:
+        if baseline_path.exists():
+            baseline_path.unlink()
+    elif isinstance(raw_content, bytes):
+        baseline_path.write_bytes(raw_content)
+    else:
+        baseline_path.write_text(raw_content, encoding="utf-8")
+
+    if expect_read_error:
+        with pytest.raises(ciwf.ReadError) as err:
+            exceptions._ratchet_problems(tree.root, counts)
+        assert expected_prob in str(err.value)
+    else:
+        probs = exceptions._ratchet_problems(tree.root, counts)
+        if expected_prob:
+            assert len(probs) == 1
+            assert expected_prob in probs[0]
+        else:
+            assert probs == []
