@@ -81,13 +81,19 @@ class ForgeError(Exception):
     """A request the forge did not answer with readable data."""
 
 
-def download(path: str) -> bytes:
+def download(path: str, *, token: str | None = None) -> bytes:
     """The body of one GET as it came; a rate limit is waited out a few times."""
     command = [*shlex.split(os.environ.get("GH", "gh")), "api", *HEADERS, path]
+    env = {**os.environ, "GH_TOKEN": token} if token is not None else None
     for attempt in range(RETRIES):
         try:
             done = subprocess.run(
-                command, capture_output=True, check=False, timeout=DEADLINE_SECONDS
+                # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args expires 2027-03-09 category D: the GH variable picks the gh binary so tests run a stand-in  # noqa: E501
+                command,
+                capture_output=True,
+                check=False,
+                timeout=DEADLINE_SECONDS,
+                env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as err:
             raise ForgeError(f"GET {path}: {err}") from err
@@ -101,10 +107,10 @@ def download(path: str) -> bytes:
     raise ForgeError(f"GET {path}: rate limit, {RETRIES} attempts used")
 
 
-def api(path: str) -> object:
+def api(path: str, *, token: str | None = None) -> object:
     """The decoded answer of one GET."""
     try:
-        return json.loads(download(path))
+        return json.loads(download(path, token=token))
     except ValueError as err:
         raise ForgeError(f"GET {path}: answer is not JSON ({err})") from err
 

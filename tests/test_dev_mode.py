@@ -143,7 +143,10 @@ line = json.dumps(
 with (Path(__file__).resolve().parent / "probe.jsonl").open("a", encoding="utf-8") as log:
     log.write(line + "\\n")
 """
-CLEARED = "PYTHONOPTIMIZE= PYTEST_ADDOPTS= "
+# The coverage run step of `make test`; check-message clears the same two
+# (tests/test_message_hook.py), so the anchor takes the next assignment too.
+CLEARED = "PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="
+UNCLEARED = "ACTIONLINT="
 
 
 def _setup_probe_tree(tmp_path: Path) -> None:
@@ -174,7 +177,7 @@ def _probe_coverage_run(tmp_path: Path, cleared: bool, inherited: dict[str, str]
         text = makefile.read_text(encoding="utf-8")
         assert text.count(CLEARED) == 1
         makefile = tmp_path / "Makefile.uncleared"
-        makefile.write_text(text.replace(CLEARED, ""), encoding="utf-8")
+        makefile.write_text(text.replace(CLEARED, UNCLEARED), encoding="utf-8")
     env = {name: os.environ[name] for name in KEEP if name in os.environ} | inherited
     command = [
         "make",

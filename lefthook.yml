@@ -11,6 +11,10 @@
 # reuse lint at the release line fsfe/reuse-action@v6 runs in CI.
 # It skips where reuse is not installed and fails on another reuse major.
 # The pre-push tools-stamp check refuses a push when .venv/.stamp does not match requirements/tools.txt.
+# The commit-msg job judges the message with tools/commit_message.py
+# (ADR-0074). Lefthook pastes {1} into the shell line as it is, so the job reads
+# it from a here-document with a quoted delimiter: the shell expands nothing
+# there, and a space, quote or $ stays part of the path.
 ---
 agent-checkpoint-tool:
   commands:
@@ -40,6 +44,15 @@ pre-commit:
       run: sh .config/lefthook/engine.sh compile-context --verify
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit --offline
+
+commit-msg:
+  commands:
+    message-judge:
+      run: |
+        MESSAGE_FILE=$(cat <<'GIT_ARGUMENT'
+        {1}
+        GIT_ARGUMENT
+        ) make --no-print-directory check-message
 
 post-commit:
   commands:

@@ -114,10 +114,15 @@ hyphen, the release is created with `--prerelease`
     needs: [build, verify]
     permissions:
       contents: write
-    uses: plurano/horistes/.github/workflows/draft-release.yml@<commit>
+    uses: plurano/horistes/.github/workflows/draft-release.yml@<commit> # main
     with:
       artifact: release-files
 ```
+
+The comment is one ref and nothing else (`# main` or a release tag), so the
+update bot moves the pin. `pins.py check` in the shared workflow check refuses
+any other comment (ADR-0075). A pin behind main's head passes while its commit
+is on main's history (ADR-0075).
 
 The merge train runs from one caller in the fleet's operations repository
 and sweeps every repository the merge-train app is installed on; the
@@ -207,8 +212,13 @@ hashes.
   a tool or a model: a trailer whose key is not `Signed-off-by` or `Migration`,
   a co-author line, or a line that opens with "generated with". The engine's
   own message check passes such a message; this test retires when the pinned
-  engine refuses it. The message of a squash merge is written on the forge, so
-  it is read only afterwards, on the run of `main`.
+  engine refuses it. The commit-msg hook judges each message by the same rules
+  when it is written (`make check-message`, `tools/commit_message.py`), and the
+  squash helper runs that hook on the squash message before it sends it
+  ([ADR-0072](docs/adr/0072-the-commit-msg-hook-judges-each-message.md),
+  [ADR-0074](docs/adr/0074-the-commit-message-judge-runs-on-the-host-python.md)). A
+  squash message written on the forge by hand is read only afterwards, on the
+  run of `main`.
 - No tracked file holds the address this repository had under its working name
   (`tests/test_name.py`): the forge does not redirect a call to it. Two
   accepted records keep it and are named in the test

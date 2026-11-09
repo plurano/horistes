@@ -175,8 +175,10 @@ jobs:
           python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
           make tools
 
-      - name: Test the read-back and stranger tools on Python 3.12
-        run: .venv/bin/python -B -m pytest tests/test_readback.py tests/test_stranger.py -q -p no:cacheprovider
+      - name: Test the read-back and stranger tools and the commit-message judge on Python 3.12
+        run: >-
+          .venv/bin/python -B -m pytest -q -p no:cacheprovider
+          tests/test_readback.py tests/test_stranger.py tests/test_commit_message_tool.py
 
   fuzz:
     name: Fuzz the result reader

@@ -115,3 +115,27 @@ exceptions:
     reason: >-
       written by the engine (praetorctl compile-context or adopt) without
       the fleet inline format; ends when the engine release emits it
+  - rule: zizmor ref-version-mismatch on branch comments
+    path: tools/pins.py
+    issue: zizmorcore/zizmor#2378
+    category: D
+    entered: "2026-11-09"
+    reason: >-
+      pins.py drops zizmor's branch-points-to-commit finding only when the
+      forge compare puts the pinned commit on the named branch's history;
+      error refuses; MEL category D; revisit when horistes ships release
+      tags or zizmor judges branch history itself (the upstream issue)
+    expires: "2027-03-09"
+  - rule: ruff E501 on the opengrep suppression of the gh call
+    path: tools/forge.py
+    issue: plurano/horistes#161
+    category: D
+    entered: "2026-11-09"
+    reason: >-
+      the nosemgrep line above the gh call in download() names the full
+      rule id, its expiry, its category and its reason on one line, which
+      runs past 100 columns at that nesting; ruff exempts no nosemgrep
+      comment, so a trailing noqa E501 binds that line alone; MEL category
+      D; revisit when issue 161 settles the suppression form or the GH
+      override leaves download()
+    expires: "2027-03-09"
