@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: EUPL-1.2
 ---
 name: Verified download
-description: Bounded, digest-verified release download over HTTPS.
+description: Bounded, digest-verified release download over HTTPS with GitHub CLI release fallback.
 
 inputs:
   url:
@@ -22,13 +22,18 @@ inputs:
     required: false
     default: "33554432"
   timeout-seconds:
-    description: Maximum download time in seconds.
+    description: >-
+      Maximum time in seconds for curl with its retries, and again for the gh release download fallback;
+      a command still running 5 seconds after its deadline is killed,
+      so one call takes at most twice this plus 10 seconds.
     required: false
     default: "120"
 
 outputs:
   lib:
-    description: Absolute path of verified-download.sh so callers can source it directly.
+    description: >-
+      Absolute path of verified-download.sh so callers can source it directly;
+      a step that sources it sets GH_TOKEN for the gh release download fallback.
     value: ${{ steps.download.outputs.lib }}
 
 runs:
@@ -37,6 +42,7 @@ runs:
     - id: download
       shell: bash
       env:
+        GH_TOKEN: ${{ github.token }}
         DOWNLOAD_URL: ${{ inputs.url }}
         DOWNLOAD_SHA256: ${{ inputs.sha256 }}
         DOWNLOAD_OUTPUT: ${{ inputs.output }}

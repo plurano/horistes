@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import sys
@@ -26,6 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import ciwf
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# The stub gh programs check only that GH_TOKEN is set; a random value per run
+# keeps a token-shaped literal out of the tests.
+STUB_GH_TOKEN = secrets.token_hex(8)
 
 # The commit address of the merge-train app's bot user (numeric user id, then the
 # app slug), read from GET /users/plurano-merge-train[bot]. Renovate compares an

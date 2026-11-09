@@ -78,4 +78,5 @@ record that supersedes it.
 | [0068](0068-the-train-holds-on-failed-code-scanning.md) | 2026-11-08 | The train holds on failed code scanning | Accepted |
 | [0069](0069-the-first-release-is-0-1-0-from-release-please.md) | 2026-11-08 | The first release is 0.1.0 from release-please | Accepted |
 | [0070](0070-the-train-holds-on-unanswered-review-bodies.md) | 2026-11-09 | The train holds on unanswered review bodies | Accepted |
+| [0071](0071-a-failed-release-download-falls-back-to-the-forge-api.md) | 2026-11-09 | A failed release download falls back to the forge API | Accepted |
 | [0072](0072-the-commit-msg-hook-judges-each-message.md) | 2026-11-09 | The commit-msg hook judges each message | Accepted |
