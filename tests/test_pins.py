@@ -13,11 +13,13 @@ from the stand-in client of conftest.py.
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import shlex
 import sys
 
 import pytest
+import yaml
 from conftest import ROOT, external
 
 sys.path.insert(0, str(ROOT / "tools"))
@@ -56,7 +58,8 @@ jobs:
 """
 # A stand-in for zizmor. It reports a use on a tag or a branch always, and a
 # commit under a comment that is not its release only when it has a token and
-# was not told to stay offline; a commit no release names is never reported.
+# was not told to stay offline; a branch comment is judged against that branch's
+# head commit; a commit no release names is never reported.
 # With --fix=all it rewrites what it knows. Every call is recorded.
 STAND_IN = r"""
 import json
@@ -102,6 +105,13 @@ def judge(path, lines, row):
             lines[row] = f"{head}{action}@{known[0]} # {known[1]}"
         else:
             report("unpinned-uses", path, row, "action is not pinned to a hash")
+        return
+    branches = told.get("branches", {}).get(action, {}) if online else {}
+    if note and note in branches:
+        head_commit = branches[note]
+        if ref == head_commit:
+            return
+        report("ref-version-mismatch", path, row, f"branch points to commit {head_commit[:12]}")
         return
     release = told["releases"].get(f"{action}@{ref}") if online else None
     if release is None or note == release:
@@ -612,3 +622,121 @@ def test_pin_on_red_comment_tree_fails_and_writes_no_comment_change(tree):
     assert done.returncode == 1, done.stdout
     assert ONE_REF in done.stderr
     assert (tree.root / WORKFLOW).read_text(encoding="utf-8") == bad
+
+
+ACTION_LICENCE = "plurano/shared/.github/workflows/licence.yml"
+MAIN_HEAD = "5e08088c776c1234567890abcdef1234567890ab"
+CALL_MAIN = f"    uses: {ACTION_LICENCE}@{SHARED} # main\n"
+WORKFLOW_MAIN = planted(CALL, CALL_MAIN)
+COMPARE_PATH = f"repos/plurano/shared/compare/{SHARED}...main"
+ENGINE_BRANCH = {
+    "releases": {k: v for k, v in RELEASES.items() if SHARED not in k},
+    "branches": {ACTION_LICENCE: {"main": MAIN_HEAD}},
+}
+
+
+@pytest.mark.parametrize("status", ["ahead", "identical"])
+def test_branch_comment_on_commit_in_branch_history_passes(tree, status):
+    answers = {**ANSWERS, COMPARE_PATH: {"status": status}}
+    done = run(tree, workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
+    assert done.returncode == 0, done.stderr
+    if status == "ahead":
+        assert "1 behind its branch head on its history" in done.stdout
+    assert COMPARE_PATH in tree.forge_calls()
+
+
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (
+            {"status": "behind"},
+            "; the forge compare puts the commit off the history of `main` (behind)",
+        ),
+        (
+            {"status": "diverged"},
+            "; the forge compare puts the commit off the history of `main` (diverged)",
+        ),
+        (
+            {"status": "unknown"},
+            "; the forge compare puts the commit off the history of `main` (unknown)",
+        ),
+        ({}, "; the forge compare could not be read: no status in answer"),
+        (
+            {"fail": "gh: Server Error (HTTP 500)"},
+            (
+                "; the forge compare could not be read: GET "
+                f"repos/plurano/shared/compare/{SHARED}...main: gh: Server Error (HTTP 500)"
+            ),
+        ),
+        (
+            None,
+            (
+                "; the forge compare could not be read: GET "
+                f"repos/plurano/shared/compare/{SHARED}...main: gh: Not Found (HTTP 404)"
+            ),
+        ),
+    ],
+    ids=["behind", "diverged", "unknown", "no-status", "error-500", "not-found"],
+)
+def test_branch_comment_off_history_or_failing_compare_fails(tree, answer, reason):
+    answers = dict(ANSWERS) if answer is None else {**ANSWERS, COMPARE_PATH: answer}
+    done = run(tree, workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
+    assert done.returncode == 1, done.stdout
+    failures = [text for text in done.stderr.splitlines() if text.startswith("FAIL")]
+    assert len(failures) == 1, failures
+    (failure,) = failures
+    assert failure.startswith(f"FAIL: {WORKFLOW}:23: ")
+    assert "branch points to commit 5e08088c776c" in failure
+    assert reason in failure
+
+
+def test_branch_comment_at_branch_head_passes_without_compare(tree):
+    engine = {
+        "releases": {k: v for k, v in RELEASES.items() if SHARED not in k},
+        "branches": {ACTION_LICENCE: {"main": SHARED}},
+    }
+    done = run(tree, workflow=WORKFLOW_MAIN, engine=engine)
+    assert done.returncode == 0, done.stderr
+    assert not any("/compare/" in call for call in tree.forge_calls())
+
+
+def test_tag_mismatch_asks_no_compare(tree):
+    done = run(
+        tree,
+        workflow=planted(CALL, CALL.replace(f"{SHARED} # v1.2.0", f"{SHARED} # v1.1.9")),
+    )
+    assert done.returncode == 1
+    assert not any("/compare/" in call for call in tree.forge_calls())
+
+    done = run(
+        tree,
+        workflow=planted(
+            USE,
+            USE.replace(f"{CHECKOUT} # v4.2.2", f"{CHECKOUT} # v4.2.1"),
+        ),
+    )
+    assert done.returncode == 1
+    assert not any("/compare/" in call for call in tree.forge_calls())
+
+
+def test_pin_on_diverged_branch_fails_and_leaves_file_unchanged(tree):
+    answers = {**ANSWERS, COMPARE_PATH: {"status": "diverged"}}
+    done = run(tree, command="pin", workflow=WORKFLOW_MAIN, answers=answers, engine=ENGINE_BRANCH)
+    assert done.returncode == 1, done.stdout
+    assert (tree.root / WORKFLOW).read_text(encoding="utf-8") == WORKFLOW_MAIN
+
+
+def test_branch_rule_exception_in_exceptions_yaml():
+    exceptions_data = yaml.safe_load((ROOT / "exceptions.yaml").read_text(encoding="utf-8"))
+    entries = [
+        e
+        for e in exceptions_data.get("exceptions", [])
+        if e.get("rule") == pins.BRANCH_RULE and e.get("path") == "tools/pins.py"
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.get("category") == "D"
+    assert entry.get("issue") == "zizmorcore/zizmor#2378"
+    entered = datetime.date.fromisoformat(entry["entered"])
+    expires = datetime.date.fromisoformat(entry["expires"])
+    assert expires == entered + datetime.timedelta(days=120)

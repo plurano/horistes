@@ -13,14 +13,16 @@ comment names another release, no release or nothing, and on a `with:` key
 the action or the called workflow does not declare at the ref that is
 written. `pin` rewrites a tag or a branch to the commit it names today, puts
 the comment right where the commit is known, and then checks. It moves no
-pin to a newer release. A commit that no release names is not judged: zizmor
-reports nothing for it, whatever its comment says (ADR-0016).
+pin to a newer release. zizmor judges a branch comment against the branch head;
+check accepts a commit behind the head only when the forge compare puts it on
+the branch's history; the compare runs only for that finding; error = refused.
 
 `check` (and `pin`, which runs `check`) also refuses an outside use pinned on a
 commit whose line comment is not exactly one bare ref: Renovate's builtin
 `github-actions` manager skips a pin whose comment is missing or names more than
-one ref (`skipReason: unversioned-reference`), and zizmor does not judge a commit
-that no release names (ADR-0075).
+one ref (`skipReason: unversioned-reference`); zizmor judges a branch comment
+against the branch head, and check accepts a commit behind the head only when the
+forge compare puts it on the branch's history (ADR-0075).
 
 The first two findings are zizmor's (`unpinned-uses`, `ref-version-mismatch`,
 persona pedantic); this tool runs it with every other audit switched off and
@@ -86,6 +88,10 @@ import forge
 
 UNPINNED = "unpinned-uses"
 COMMENT = "ref-version-mismatch"
+# Exceptions.yaml entry and ADR-0075: forge compare accepts a commit on branch history.
+BRANCH_RULE = "zizmor ref-version-mismatch on branch comments"
+BRANCH_ANNOTATION = re.compile(r"^branch points to commit [0-9a-f]+$")
+ALLOW_STATUSES = frozenset({"ahead", "identical"})
 # Every other audit of zizmor 1.30.1 (docs.zizmor.sh/audits, read 2026-10-11).
 OTHER_AUDITS = (
     "adhoc-packages",
@@ -169,6 +175,7 @@ class Finding(NamedTuple):
     path: str
     line: int
     text: str
+    note: str = ""
 
 
 class Call(NamedTuple):
@@ -242,8 +249,8 @@ def _engine_run(work: Path, files: list[str], token: str | None, fix: bool):
     return done
 
 
-def _place(finding: dict) -> tuple[str, int, str]:
-    """Path and line of the use a finding is about, and what zizmor says of it."""
+def _place(finding: dict) -> tuple[str, int, str, str]:
+    """Path and line of the use a finding is about, what zizmor says of it, and its note."""
     try:
         spots = finding["locations"]
         on_uses = [s for s in spots if s["symbolic"]["route"]["route"][-1:] == [{"Key": "uses"}]]
@@ -255,7 +262,8 @@ def _place(finding: dict) -> tuple[str, int, str]:
         ]
     except (KeyError, IndexError, TypeError) as err:
         raise PinError(f"zizmor: a finding in a shape this tool does not read ({err!r})") from err
-    return path, line, "; ".join(note for note in notes if note) or str(finding.get("desc"))
+    note = "; ".join(n for n in notes if n)
+    return path, line, note or str(finding.get("desc")), note
 
 
 def _written(path: str, line: int) -> str:
@@ -288,11 +296,11 @@ def _scan(work: Path, named: dict[str, str], token: str | None) -> dict[str, lis
                 f"zizmor reports `{audit}`: it has an audit this tool does not switch off; "
                 "no file was written"
             )
-        path, line, said = _place(finding)
+        path, line, said, note = _place(finding)
         if path == str(planted):
             seen.add(audit)
         elif path in named:
-            found[audit].append(Finding(named[path], line, f"{_written(path, line)}: {said}"))
+            found[audit].append(Finding(named[path], line, f"{_written(path, line)}: {said}", note))
         else:
             raise PinError(f"zizmor reports a file it was not given: {path}")
     for audit in (UNPINNED, *((COMMENT,) if token else ())):
@@ -526,6 +534,66 @@ def _comments(root: Path, documents: list) -> tuple[list[Finding], int]:
     return findings, bare
 
 
+def _branch_status(call: Call) -> tuple[bool, str]:
+    """Drop status and appended reason for one outside commit use under a branch comment."""
+    name, _, commit = call.uses.partition("@")
+    parts = name.split("/")
+    if len(parts) < 2 or not COMMIT.fullmatch(commit):
+        return False, "; the forge compare could not be read: target is not owner/repo@commit"
+    ref = call.comment.strip() if call.comment else ""
+    if not ref:
+        return False, "; the forge compare could not be read: no ref in comment"
+    asked = f"repos/{parts[0]}/{parts[1]}/compare/{commit}...{ref}"
+    try:
+        answer = forge.api(asked)
+    except forge.ForgeError as err:
+        return False, f"; the forge compare could not be read: {str(err)[:200]}"
+    if not isinstance(answer, dict):
+        return False, "; the forge compare could not be read: answer is not a mapping"
+    if "status" not in answer:
+        return False, "; the forge compare could not be read: no status in answer"
+    status = answer["status"]
+    if not isinstance(status, str):
+        return False, "; the forge compare could not be read: status is not text"
+    if status in ALLOW_STATUSES:
+        return True, ""
+    return False, f"; the forge compare puts the commit off the history of `{ref}` ({status})"
+
+
+def _judge_branches(
+    root: Path, documents: list, findings: list[Finding]
+) -> tuple[list[Finding], int]:
+    """Filter branch-points-to-commit findings against forge compare; drop those on history."""
+    calls = {
+        (path, call.line): call for path, kind, _ in documents for call in _calls(root / path, kind)
+    }
+    kept: list[Finding] = []
+    lagging = 0
+    for finding in findings:
+        if not BRANCH_ANNOTATION.fullmatch(finding.note):
+            kept.append(finding)
+            continue
+        call = calls.get((finding.path, finding.line))
+        if call is None:
+            kept.append(
+                Finding(
+                    finding.path,
+                    finding.line,
+                    f"{finding.text}; the forge compare could not be read: no call found",
+                    finding.note,
+                )
+            )
+            continue
+        drop, reason = _branch_status(call)
+        if drop:
+            lagging += 1
+        else:
+            kept.append(
+                Finding(finding.path, finding.line, f"{finding.text}{reason}", finding.note)
+            )
+    return kept, lagging
+
+
 def check(root: Path, work: Path, rewrite: bool) -> int:
     documents, named = _tree(root)
     token = _token()
@@ -533,17 +601,19 @@ def check(root: Path, work: Path, rewrite: bool) -> int:
     if rewrite:
         _engine_run(work, list(named), token, fix=True)
         found = _scan(work, named, token)
+    comment_findings, lagging = _judge_branches(root, documents, found[COMMENT])
     late, uses, keys = _inputs(root, documents)
     floating, jobs, _ = _labels(root, documents)
     comments, bare = _comments(root, documents)
-    problems = sorted([*found[UNPINNED], *found[COMMENT], *late, *floating, *comments])
+    problems = sorted([*found[UNPINNED], *comment_findings, *late, *floating, *comments])
     for finding in problems:
         ciwf.complain(f"FAIL: {finding.path}:{finding.line}: {finding.text}")
     if problems:
         return 1
     ciwf.say(
         f"PASS: {len(named)} file(s), {uses} outside use(s) on a commit, "
-        f"{bare} on a bare ref comment, no comment refuted, {keys} `with` key(s) declared, "
+        f"{bare} on a bare ref comment, {lagging} behind its branch head on its history, "
+        f"no comment refuted, {keys} `with` key(s) declared, "
         f"{jobs} job(s) on no floating runner label; {_version()}, online"
     )
     return 0

@@ -29,9 +29,14 @@ the same line:
 
 A caller in the fleet's operations repository carried the dated form and
 stayed a week behind `main` with no bot pull request. `pins.py check` passed
-it: the only comment rule it ran was zizmor's `ref-version-mismatch`, and
-zizmor reports nothing for a commit that no release names, whatever its
-comment says (ADR-0016).
+it: the only comment rule it ran was zizmor's `ref-version-mismatch`. Real
+zizmor on `uses: plurano/horistes/.github/workflows/merge-train.yml@<commit> # main`,
+with the commit behind main's head, reports `ref-version-mismatch` with the
+annotation `branch points to commit <12 hex of the branch head>`. The forge
+compare API `repos/<owner>/<name>/compare/<commit>...<ref>` gives status
+`ahead` or `identical` for a commit on the branch's history, and `behind` or
+`diverged` for a commit off it. Zizmor upstream issue 2378 reports this exact
+case: a pin on a commit behind a branch head is flagged by ref-version-mismatch.
 
 `default.json` already lets these updates through: its rule for own GitHub
 releases sets `minimumReleaseAge` to `null` for `github-digest` on packages of
@@ -61,6 +66,23 @@ matches its digest updates
 (`test_preset_permits_horistes_digest_updates`,
 `test_planted_presets_refuse_disabled_or_aged_horistes_digest`).
 
+A comment on a branch is judged against that branch's history. When zizmor
+reports `ref-version-mismatch` with the annotation
+`branch points to commit <hex>`, `tools/pins.py check` asks the forge compare
+API `repos/<owner>/<name>/compare/<commit>...<ref>`, with the forge client's
+60-second deadline (`tools/forge.py`, `DEADLINE_SECONDS`). Only status `ahead`
+or `identical` drops the finding. Any other status (`behind`, `diverged`, an
+unknown one), a missing status or a failed call keeps the finding and appends
+the reason, so the check fails closed (`tests/test_pins.py`,
+`test_branch_comment_off_history_or_failing_compare_fails`). A tag mismatch
+asks no compare.
+
+Dropping that zizmor finding is a declared exception in `exceptions.yaml`
+(file `tools/pins.py`, MEL category D, 120 days), tracked by zizmor upstream
+issue 2378. It is revisited when this repository ships release tags or zizmor
+judges branch history itself. This decision supersedes the clause of
+ADR-0016 that a commit no release names is not judged.
+
 ## Consequences
 
 - A caller with a dated or missing comment on a commit pin fails its workflow
@@ -73,4 +95,5 @@ matches its digest updates
   stays valid; this repository's own pins all carry `# vX.Y.Z`.
 - A commit that a release names still answers to zizmor's
   `ref-version-mismatch`, which wants that release's tag as the comment
-  (ADR-0016); `# main` fits a commit that no release names.
+  (ADR-0016); a commit behind a branch head passes under that branch's comment
+  while forge compare puts it on the branch's history.

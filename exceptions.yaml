@@ -16,3 +16,14 @@ exceptions:
       project answers are in .bestpractices.json; registration on
       bestpractices.dev approved, waiting for completion
     expires: "2026-11-17"
+  - rule: zizmor ref-version-mismatch on branch comments
+    path: tools/pins.py
+    issue: zizmorcore/zizmor#2378
+    category: D
+    entered: "2026-11-09"
+    reason: >-
+      pins.py drops zizmor's branch-points-to-commit finding only when the
+      forge compare puts the pinned commit on the named branch's history;
+      error refuses; MEL category D; revisit when horistes ships release
+      tags or zizmor judges branch history itself (the upstream issue)
+    expires: "2027-03-09"
