@@ -273,6 +273,7 @@ def test_commits_of_this_change_credit_no_tool():
     not MESSAGE_FILE, reason="one-message mode: the commit-msg hook sets MESSAGE_FILE"
 )
 def test_message_file_passes_the_judge():
+    """The message file given to the judge produces no findings for the pending commit."""
     message = message_text(MESSAGE_FILE)
     repo = Path.cwd()
     parents, tree = pending(repo)
@@ -284,20 +285,24 @@ CO_AUTHOR = "Co-authored-by: renovate[bot] <29139614+renovate[bot]@users.noreply
 
 
 def test_judged_clean_message_has_no_finding():
+    """A clean commit message signed off by its author produces no findings."""
     assert judged(ROOT, "", "person@example.org", "", GOOD) == []
 
 
 def test_judged_planted_bot_co_author_is_refused():
+    """A commit message with a planted bot Co-authored-by trailer is refused."""
     planted = GOOD + CO_AUTHOR + "\n"
     assert judged(ROOT, "", "person@example.org", "", planted) == ["trailer Co-authored-by"]
 
 
 def test_judged_message_of_another_author_is_refused():
+    """A commit message signed off by a different author is refused."""
     found = judged(ROOT, "", "other@example.org", "", GOOD)
     assert found == ["sign-off person@example.org is not the author other@example.org"]
 
 
 def test_judged_unsigned_message_is_refused():
+    """A commit message without a Signed-off-by trailer is refused."""
     assert judged(ROOT, "", "person@example.org", "", "feat(x): add a thing\n") == [
         "no trailer Signed-off-by"
     ]
@@ -312,6 +317,7 @@ def test_judged_unsigned_message_is_refused():
     ids=["exact", "one over"],
 )
 def test_judged_length_comes_first(length, found):
+    """At the bound a message is judged on its trailers; one over gets the length finding alone."""
     head, tail = "feat(x): add a thing\n\n", f"\n\n{SIGN_OFF}\n{CO_AUTHOR}\n"
     message = head + "x" * (length - len(head) - len(tail)) + tail
     assert len(message) == length
@@ -320,6 +326,7 @@ def test_judged_length_comes_first(length, found):
 
 @pytest.mark.parametrize("email", ["person@example.org", "other@example.net"])
 def test_author_email_reads_the_author_git_hands_the_hook(monkeypatch, email):
+    """author_email returns the email git var names for the GIT_AUTHOR_EMAIL the hook gets."""
     monkeypatch.setenv("GIT_AUTHOR_NAME", "A Person")
     monkeypatch.setenv("GIT_AUTHOR_EMAIL", email)
     assert author_email(ROOT) == email
@@ -331,6 +338,7 @@ def test_author_email_reads_the_author_git_hands_the_hook(monkeypatch, email):
     ids=["at the bound", "one byte over"],
 )
 def test_message_text_reads_up_to_the_byte_bound(tmp_path, size, passes):
+    """A message file up to the byte bound is read, while one byte over is refused."""
     path = tmp_path / "message.txt"
     path.write_bytes(b"x" * size)
     if passes:
@@ -372,6 +380,7 @@ def test_message_text_refuses_a_fifo_without_waiting(tmp_path):
     done = threading.Event()
 
     def release() -> None:
+        """Open the FIFO as a writer after five seconds if the read open blocked."""
         if done.wait(5):
             return
         try:
@@ -394,6 +403,7 @@ def test_message_text_refuses_a_fifo_without_waiting(tmp_path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows refuses to open a directory")
 def test_message_text_refuses_a_directory(tmp_path):
+    """A directory passed to message_text is refused as not a regular file."""
     with pytest.raises(AssertionError, match="not a regular file"):
         message_text(str(tmp_path))
 
