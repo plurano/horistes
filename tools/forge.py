@@ -88,6 +88,7 @@ def download(path: str, *, token: str | None = None) -> bytes:
     for attempt in range(RETRIES):
         try:
             done = subprocess.run(
+                # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args expires 2027-03-09 category D: the GH variable picks the gh binary so tests run a stand-in  # noqa: E501
                 command,
                 capture_output=True,
                 check=False,
