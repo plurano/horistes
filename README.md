@@ -212,9 +212,10 @@ hashes.
   a co-author line, or a line that opens with "generated with". The engine's
   own message check passes such a message; this test retires when the pinned
   engine refuses it. The commit-msg hook judges each message by the same rules
-  when it is written (`make check-message`), and the squash helper runs that
-  hook on the squash message before it sends it
-  ([ADR-0072](docs/adr/0072-the-commit-msg-hook-judges-each-message.md)). A
+  when it is written (`make check-message`, `tools/commit_message.py`), and the
+  squash helper runs that hook on the squash message before it sends it
+  ([ADR-0072](docs/adr/0072-the-commit-msg-hook-judges-each-message.md),
+  [ADR-0074](docs/adr/0074-the-commit-message-judge-runs-on-the-host-python.md)). A
   squash message written on the forge by hand is read only afterwards, on the
   run of `main`.
 - No tracked file holds the address this repository had under its working name

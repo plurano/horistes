@@ -80,4 +80,5 @@ record that supersedes it.
 | [0070](0070-the-train-holds-on-unanswered-review-bodies.md) | 2026-11-09 | The train holds on unanswered review bodies | Accepted |
 | [0071](0071-a-failed-release-download-falls-back-to-the-forge-api.md) | 2026-11-09 | A failed release download falls back to the forge API | Accepted |
 | [0072](0072-the-commit-msg-hook-judges-each-message.md) | 2026-11-09 | The commit-msg hook judges each message | Accepted |
+| [0074](0074-the-commit-message-judge-runs-on-the-host-python.md) | 2026-11-09 | The commit-message judge runs on the host Python | Accepted |
 | [0075](0075-caller-pins-name-one-ref.md) | 2026-11-09 | Caller pins name one ref | Accepted |

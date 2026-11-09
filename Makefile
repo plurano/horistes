@@ -59,17 +59,15 @@ check-tools-stamp:
 		exit 1; \
 	fi
 
-# The commit-msg hook judges one message by the rules of
-# tests/test_commit_messages.py (ADR-0072): lefthook names the message file in
-# MESSAGE_FILE. Without it the test would be skipped and pass, so the target
-# refuses to run. It installs nothing: a stale .venv fails as in pre-push.
-check-message: check-tools-stamp
+# The commit-msg hook judges one message with tools/commit_message.py
+# (ADR-0074): lefthook names the message file in MESSAGE_FILE. Without it the
+# target refuses to run. It runs on the host python3 alone without .venv.
+check-message:
 	@if [ -z "$$MESSAGE_FILE" ]; then \
 		printf '%s\n' 'check-message needs MESSAGE_FILE, the commit message file to judge' >&2; \
 		exit 2; \
 	fi
-	@PYTHONOPTIMIZE= PYTEST_ADDOPTS= $(BIN)/python -B -m pytest \
-		tests/test_commit_messages.py::test_message_file_passes_the_judge
+	@python3 -I -B tools/commit_message.py check -- "$$MESSAGE_FILE"
 
 # Recompile the pins; a release younger than three days is left out. The
 # header of the output records this command and Renovate reruns it from there,
