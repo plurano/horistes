@@ -256,6 +256,24 @@ hashes.
   change. A change that breaks a caller also raises the recorded version:
   `interface_minor` while `interface_major` is 0, `interface_major` from 1 on
   ([ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)).
+- Each line anchor that `.bestpractices.json` links as evidence is derived
+  from a pin in `tools/anchors.py`: the source text that opens and closes the
+  range, and the answers that must link it. `tests/test_bestpractices.py`
+  fails when an anchor matches no pin of its answer or a pin's answer does not
+  link it. `make fix-anchors` moves anchors through `ANCHORS_BASE`, a revision
+  whose files hold the source at the lines the current anchors record (for a
+  committed change, usually `git merge-base HEAD main`); `main` works only
+  while it still holds those lines, and nothing is written if mapping fails.
+  `fix` rechecks the answers and pinned sources just before it replaces the
+  file and refuses if they changed; the recheck is best effort. Between the
+  recheck and replacement, an edit to `.bestpractices.json` is overwritten;
+  an edit to a pinned source stays on disk but may leave the written anchors
+  pointing at moved lines, so `tests/test_bestpractices.py` fails. A second
+  `make fix-anchors` through the same base then refuses, because the base
+  does not hold the lines the first run wrote. Put back the anchors from
+  before the first run (`git restore .bestpractices.json` when that run made
+  its only uncommitted change), or set each anchor that `check` names to the
+  pin lines it reports, then run `make fix-anchors` again.
 - The floor job runs the read-back and stranger tests on Python 3.12
   ([ADR-0048](docs/adr/0048-the-python-floor-is-tested-in-ci.md)).
 
