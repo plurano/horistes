@@ -6,25 +6,14 @@ from __future__ import annotations
 
 import datetime
 import inspect
-import os
 from pathlib import Path
 
 import exceptions
 import pytest
-from conftest import ROOT
+from conftest import ROOT, Tree
 from exceptions import WORDS, codacy_problems, suppression_problems
 
 FIXED_TODAY = datetime.date(2026, 11, 9)
-
-PRUNE_DIRS = {
-    ".claude",
-    ".git",
-    ".lane-input",
-    ".venv",
-    ".workingdir",
-    "__pycache__",
-    "node_modules",
-}
 
 # Payloads name the ignore words as {sem}, {sg}, {SG} and {og}; planted() fills them in.
 PLANTED_REFUSALS: list[tuple[str, str, str]] = [
@@ -91,19 +80,17 @@ def planted(payload: str) -> str:
 
 
 def tree_problems(root: Path) -> list[str]:
-    """Walk root finding problems in all Python files, pruning ignored directories."""
+    """Find problems in tracked Python files only, from git ls-files."""
     today = datetime.date(2026, 11, 9)
     _, _, valid_map = exceptions._own(root, today)
     valid_exceptions = set(valid_map.keys())
     problems: list[str] = []
-    py_files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in PRUNE_DIRS)
-        for filename in sorted(filenames):
-            if filename.endswith(".py"):
-                py_files.append(Path(dirpath) / filename)
-    for py_file in sorted(py_files):
-        rel = py_file.relative_to(root).as_posix()
+    for rel in sorted(exceptions._tracked_files(root)):
+        if not rel.endswith(".py"):
+            continue
+        py_file = root / rel
+        if not py_file.is_file():
+            continue
         text = py_file.read_text(encoding="utf-8")
         probs = suppression_problems(text, rel, today=today, valid_exceptions=valid_exceptions)
         problems.extend(probs)
@@ -113,6 +100,60 @@ def tree_problems(root: Path) -> list[str]:
 def test_committed_tree_has_no_problems() -> None:
     """The committed Python source tree contains no suppression problems."""
     assert tree_problems(ROOT) == []
+
+
+def test_tree_problems_ignores_untracked_copy(tree: Tree) -> None:
+    """Planted case: an untracked repository copy cannot add suppression problems."""
+    tree.write(
+        {
+            "tools/a.py": "x = 1\n",
+            ".standards/worktrees/gate-1/tools/a.py": planted("# {sg}\n"),
+        }
+    )
+    tree.git("init", "-b", "main")
+    tree.git("add", "--", "tools/a.py")
+    assert tree_problems(tree.root) == []
+
+
+def test_tree_problems_reports_only_tracked_violation(tree: Tree) -> None:
+    """Planted case: only the tracked violation is reported beside an untracked copy."""
+    tree.write(
+        {
+            "tools/a.py": planted("# {sg}\n"),
+            ".standards/worktrees/gate-1/tools/a.py": planted("# {sg}\n"),
+        }
+    )
+    tree.git("init", "-b", "main")
+    tree.git("add", "--", "tools/a.py")
+    problems = tree_problems(tree.root)
+    assert len(problems) == 1
+    assert problems[0].startswith("tools/a.py:1: invalid ")
+    assert all(".standards/" not in problem for problem in problems)
+
+
+def test_tree_problems_ignores_untracked_root_python_file(tree: Tree) -> None:
+    """Boundary: an untracked root Python file cannot add suppression problems."""
+    tree.write({"tools/a.py": "x = 1\n", "b.py": planted("# {sg}\n")})
+    tree.git("init", "-b", "main")
+    tree.git("add", "--", "tools/a.py")
+    assert tree_problems(tree.root) == []
+
+
+def test_tree_problems_ignores_tracked_non_python_file(tree: Tree) -> None:
+    """Boundary: a tracked non-Python file cannot add suppression problems."""
+    tree.write({"notes.txt": planted("# {sg}\n")})
+    tree.git("init", "-b", "main")
+    tree.git("add", "--", "notes.txt")
+    assert tree_problems(tree.root) == []
+
+
+def test_tree_problems_ignores_deleted_tracked_python_file(tree: Tree) -> None:
+    """Boundary: a deleted tracked Python file is skipped without a read error."""
+    tree.write({"tools/a.py": planted("# {sg}\n")})
+    tree.git("init", "-b", "main")
+    tree.git("add", "--", "tools/a.py")
+    (tree.root / "tools/a.py").unlink()
+    assert tree_problems(tree.root) == []
 
 
 def test_committed_codacy_yml_has_no_problems() -> None:
