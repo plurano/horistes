@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Draft pull request stop: the step halts runs on draft PRs and passes otherwise.
+"""Run every copy of the draft stop step in every job: halt on drafts, pass otherwise.
 
 The run scripts and conditions are extracted from workflows with tools/ciwf.py
 and executed with bash in a temporary directory, verifying step summaries and
@@ -9,6 +9,7 @@ error annotations.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -22,39 +23,51 @@ sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
 
 DRAFT_STEP = "Stop on a draft pull request"
-WORKFLOWS = [
-    ".github/workflows/ci.yml",
-    ".github/workflows/codeql.yml",
-    ".github/workflows/hook-copy.yml",
-    ".github/workflows/image-age.yml",
-    ".github/workflows/licence.yml",
-    ".github/workflows/pins.yml",
-    ".github/workflows/secret-scan.yml",
-    ".github/workflows/workflow-check.yml",
+COPIES = [
+    (".github/workflows/ci.yml", "floor"),
+    (".github/workflows/ci.yml", "fuzz"),
+    (".github/workflows/ci.yml", "verify"),
+    (".github/workflows/codeql.yml", "analyze"),
+    (".github/workflows/hook-copy.yml", "check"),
+    (".github/workflows/image-age.yml", "image-age"),
+    (".github/workflows/licence.yml", "reuse"),
+    (".github/workflows/pins.yml", "pins"),
+    (".github/workflows/secret-scan.yml", "scan"),
+    (".github/workflows/workflow-check.yml", "check"),
 ]
 
 
-def workflows_with_draft_step(root: Path = ROOT) -> list[str]:
-    """Every workflow file declaring the draft stop step."""
+def _draft_steps(job: object) -> list[dict]:
+    """Every draft stop step in a job, preserving duplicate copies."""
+    if not isinstance(job, dict):
+        return []
+    return [
+        step
+        for step in job.get("steps") or []
+        if isinstance(step, dict) and step.get("name") == DRAFT_STEP
+    ]
+
+
+def draft_copies(root: Path = ROOT) -> list[tuple[str, str]]:
+    """Every path and job declaring a draft stop step, including duplicates."""
     return sorted(
-        {
-            path
-            for path, _, doc in ciwf.files(root)
-            for job in doc.get("jobs", {}).values()
-            if isinstance(job, dict)
-            for step in job.get("steps", [])
-            if isinstance(step, dict) and step.get("name") == DRAFT_STEP
-        }
+        (path, job_id)
+        for path, _, doc in ciwf.files(root)
+        for job_id, job in doc.get("jobs", {}).items()
+        for _ in _draft_steps(job)
     )
 
 
-def extract_step(rel_path: str) -> dict:
-    """The draft stop step dictionary from the workflow."""
-    for job in ciwf.load(ROOT / rel_path).get("jobs", {}).values():
-        for step in (job.get("steps") or []) if isinstance(job, dict) else []:
-            if isinstance(step, dict) and step.get("name") == DRAFT_STEP:
-                return step
-    raise ValueError(f"no draft stop step in {rel_path}")
+def extract_step(rel_path: str, job_id: str, root: Path = ROOT) -> dict:
+    """The named job's draft stop step; name the path and job if absent."""
+    try:
+        job = ciwf.load(root / rel_path)["jobs"][job_id]
+    except KeyError as err:
+        raise ValueError(f"no job {job_id} in {rel_path}") from err
+    steps = _draft_steps(job)
+    if not steps:
+        raise ValueError(f"no draft stop step in {rel_path} job {job_id}")
+    return steps[0]
 
 
 def _condition_holds(condition: str, draft: object) -> bool:
@@ -88,28 +101,105 @@ def run_step(step: dict, draft: object, tmp_path: Path) -> tuple[subprocess.Comp
     return done, summary.read_text(encoding="utf-8")
 
 
-def test_every_workflow_with_the_step_is_covered(tmp_path: Path) -> None:
-    """The declared workflow list covers every workflow with the draft stop step."""
-    assert workflows_with_draft_step() == WORKFLOWS
+def test_every_draft_copy_is_covered(tmp_path: Path) -> None:
+    """The declared copies catch renamed workflows and extra jobs in a covered file."""
+    assert draft_copies() == COPIES
 
     planted = tmp_path / ".github/workflows"
     planted.mkdir(parents=True)
-    for rel_path in WORKFLOWS[:-1]:
+    workflows = list(dict.fromkeys(path for path, _ in COPIES))
+    for rel_path in workflows[:-1]:
         shutil.copy(ROOT / rel_path, planted)
-    shutil.copy(ROOT / WORKFLOWS[-1], planted / "new.yml")
-    assert workflows_with_draft_step(tmp_path) != WORKFLOWS
+    shutil.copy(ROOT / workflows[-1], planted / "new.yml")
+    assert draft_copies(tmp_path) != COPIES
+
+    extra_root = tmp_path / "extra-job"
+    rel_path = ".github/workflows/ci.yml"
+    copied = extra_root / rel_path
+    copied.parent.mkdir(parents=True)
+    shutil.copy(ROOT / rel_path, copied)
+    doc = ciwf.load(copied)
+    doc["jobs"]["extra-floor"] = doc["jobs"]["floor"]
+    copied.write_text(json.dumps(doc), encoding="utf-8")
+    found = draft_copies(extra_root)
+    assert (rel_path, "extra-floor") in found
+    assert found != [copy for copy in COPIES if copy[0] == rel_path]
+
+
+def test_draft_copies_preserves_duplicate_steps(tmp_path: Path) -> None:
+    """Two draft stop steps in one job yield two entries and fail single-copy coverage."""
+    rel_path = ".github/workflows/ci.yml"
+    step = extract_step(rel_path, "verify")
+    planted = tmp_path / rel_path
+    planted.parent.mkdir(parents=True)
+    doc = {"jobs": {"a": {"steps": [step, step]}}}
+    planted.write_text(json.dumps(doc), encoding="utf-8")
+    assert draft_copies(tmp_path) == [(rel_path, "a"), (rel_path, "a")]
+    assert draft_copies(tmp_path) != [(rel_path, "a")]
+
+
+def test_planted_second_job_copy_is_run(tmp_path: Path) -> None:
+    """Job-specific extraction exposes a second job mutated to pass on a draft."""
+    rel_path = ".github/workflows/ci.yml"
+    step = extract_step(rel_path, "verify")
+    mutated = {**step, "run": step["run"].replace("exit 1", "exit 0")}
+    planted = tmp_path / rel_path
+    planted.parent.mkdir(parents=True)
+    doc = {"jobs": {"a": {"steps": [step]}, "b": {"steps": [mutated]}}}
+    planted.write_text(json.dumps(doc), encoding="utf-8")
+    assert draft_copies(tmp_path) == [(rel_path, "a"), (rel_path, "b")]
+    first = extract_step(rel_path, "a", root=tmp_path)
+    second = extract_step(rel_path, "b", root=tmp_path)
+    assert second == mutated
+    assert second["run"] != first["run"]
+    second_done, _ = run_step(second, True, tmp_path)
+    first_done, _ = run_step(first, True, tmp_path)
+    assert second_done.returncode == 0
+    assert first_done.returncode == 1
+
+
+def test_extract_step_names_missing_job() -> None:
+    """An absent job raises ValueError naming both the workflow and the job."""
+    rel_path = ".github/workflows/ci.yml"
+    job_id = "no-such-job"
+    with pytest.raises(ValueError) as caught:
+        extract_step(rel_path, job_id)
+    assert rel_path in str(caught.value)
+    assert job_id in str(caught.value)
+
+
+def test_extract_step_names_missing_step(tmp_path: Path) -> None:
+    """A job without a draft stop step raises ValueError naming its path and job."""
+    rel_path = ".github/workflows/ci.yml"
+    job_id = "no-stop"
+    planted = tmp_path / rel_path
+    planted.parent.mkdir(parents=True)
+    planted.write_text(json.dumps({"jobs": {job_id: {"steps": []}}}), encoding="utf-8")
+    with pytest.raises(ValueError) as caught:
+        extract_step(rel_path, job_id, root=tmp_path)
+    assert rel_path in str(caught.value)
+    assert job_id in str(caught.value)
 
 
 @pytest.mark.parametrize("draft", [True, "true"])
-@pytest.mark.parametrize("rel_path", WORKFLOWS)
+@pytest.mark.parametrize(
+    ("rel_path", "job_id"),
+    COPIES,
+    ids=[f"{Path(path).name}:{job_id}" for path, job_id in COPIES],
+)
 def test_draft_stop_halts_on_a_draft_pull_request(
-    rel_path: str, draft: object, tmp_path: Path
+    rel_path: str, job_id: str, draft: object, tmp_path: Path
 ) -> None:
     """A draft pull request triggers the stop step, exiting non-zero with an error annotation."""
-    step = extract_step(rel_path)
+    step = extract_step(rel_path, job_id)
     done, summary = run_step(step, draft, tmp_path)
     assert done.returncode == 1, done.stderr
     assert "::error title=Gate not run on a draft::" in done.stdout
+    assert step["env"]["TITLE"] == "Gate not run on a draft"
+    assert (
+        f"::error title={step['env']['TITLE']}::{step['env']['MESSAGE']}"
+        in done.stdout.splitlines()
+    )
     assert summary.strip() == step["env"]["MESSAGE"].strip()
 
     mutated = {**step, "run": step["run"].replace("exit 1", "exit 0")}
@@ -118,12 +208,16 @@ def test_draft_stop_halts_on_a_draft_pull_request(
 
 
 @pytest.mark.parametrize("draft", [False, "false"])
-@pytest.mark.parametrize("rel_path", WORKFLOWS)
+@pytest.mark.parametrize(
+    ("rel_path", "job_id"),
+    COPIES,
+    ids=[f"{Path(path).name}:{job_id}" for path, job_id in COPIES],
+)
 def test_draft_stop_passes_on_a_ready_pull_request(
-    rel_path: str, draft: object, tmp_path: Path
+    rel_path: str, job_id: str, draft: object, tmp_path: Path
 ) -> None:
     """A ready pull request skips the stop step, exiting zero without annotations."""
-    step = extract_step(rel_path)
+    step = extract_step(rel_path, job_id)
     done, summary = run_step(step, draft, tmp_path)
     assert done.returncode == 0, done.stderr
     assert "::error" not in done.stdout and "::notice" not in done.stdout
@@ -138,12 +232,16 @@ def test_draft_stop_passes_on_a_ready_pull_request(
 
 
 @pytest.mark.parametrize("draft", ["", None])
-@pytest.mark.parametrize("rel_path", WORKFLOWS)
+@pytest.mark.parametrize(
+    ("rel_path", "job_id"),
+    COPIES,
+    ids=[f"{Path(path).name}:{job_id}" for path, job_id in COPIES],
+)
 def test_draft_stop_passes_when_draft_state_is_empty_or_missing(
-    rel_path: str, draft: object, tmp_path: Path
+    rel_path: str, job_id: str, draft: object, tmp_path: Path
 ) -> None:
     """An empty or missing draft state skips the stop step, exiting zero without annotations."""
-    step = extract_step(rel_path)
+    step = extract_step(rel_path, job_id)
     done, summary = run_step(step, draft, tmp_path)
     assert done.returncode == 0, done.stderr
     assert "::error" not in done.stdout and "::notice" not in done.stdout
