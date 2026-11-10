@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,34 @@ HASH_FAILED = "cannot hash requirements/tools.txt"
 POSIX_SHELL = pytest.mark.skipif(
     sys.platform == "win32", reason="planted lefthook commands need a POSIX shell"
 )
+
+
+def _real_python3() -> str | None:
+    """Resolve the running interpreter; PATH shims may need HOME dropped by bare-PATH tests."""
+    return os.path.realpath(sys.executable) if sys.executable else None
+
+
+def _plant_home_shim(shim_dir: Path, py_path: str) -> Path:
+    """Plant a python3 shim that needs HOME before executing the real interpreter."""
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim = shim_dir / "python3"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "${HOME+x}" != x ]; then exit 1; fi\n'
+        f'exec {shlex.quote(py_path)} "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def _plant_path_python3(path_dir: Path) -> Path:
+    """Plant an executable python3 shell script that exits successfully."""
+    path_dir.mkdir(parents=True, exist_ok=True)
+    path_python = path_dir / "python3"
+    path_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path_python.chmod(0o755)
+    return path_python
 
 
 def _run_make(
@@ -313,12 +342,23 @@ def test_lefthook_pre_push_mutation_proof_without_piped(tmp_path: Path) -> None:
     assert len(ran_files) >= 1, "expected at least one *.ran file when piped is false"
 
 
-def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
+@pytest.mark.skipif(sys.platform == "win32", reason="planted python3 shim needs a POSIX shell")
+def test_check_tools_stamp_without_sha256sum_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Plant without sha256sum on PATH: passes with valid stamp, fails when stale."""
-    py_path = shutil.which("python3")
+    if not sys.executable:
+        pytest.skip("running interpreter path unknown")
+    shim_dir = tmp_path / "shim"
+    shim = _plant_home_shim(shim_dir, os.path.realpath(sys.executable))
+    monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
+    assert shutil.which("python3") == str(shim)
+    py_path = _real_python3()
     cat_path = shutil.which("cat")
-    if py_path is None or cat_path is None:
-        pytest.skip("python3 or cat not found on PATH")
+    if py_path is None:
+        pytest.skip("running interpreter path unknown")
+    if cat_path is None:
+        pytest.skip("cat not found on PATH")
     make_bin = shutil.which("make")
     if make_bin is None:
         pytest.skip("make not found on PATH")
@@ -346,6 +386,90 @@ def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
     assert "make tools" in proc_stale.stderr
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="planted python3 shim needs a POSIX shell")
+def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plant a HOME-dependent PATH shim; the real interpreter works with only PATH set."""
+    py_path = _real_python3()
+    if py_path is None:
+        pytest.skip("running interpreter path unknown")
+
+    shim_dir = tmp_path / "shim"
+    shim = _plant_home_shim(shim_dir, py_path)
+    monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
+    assert shutil.which("python3") == str(shim)
+    real_python = _real_python3()
+    assert real_python is not None
+    assert real_python != str(shim)
+    assert real_python == os.path.realpath(sys.executable)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    linked_python = bin_dir / "python3"
+    linked_python.symlink_to(real_python)
+    proc = subprocess.run(
+        ["./python3", "-c", "pass"],
+        cwd=bin_dir,
+        env={"PATH": str(bin_dir)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    shim_proc = subprocess.run(
+        ["./python3", "-c", "pass"],
+        cwd=shim_dir,
+        env={"PATH": str(bin_dir)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert shim_proc.returncode != 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="planted python3 needs a POSIX shell")
+def test_real_python3_none_without_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Return None without an executable path even when PATH contains python3."""
+    pathbin = tmp_path / "pathbin"
+    path_python = _plant_path_python3(pathbin)
+    monkeypatch.setenv("PATH", str(pathbin))
+    assert shutil.which("python3") == str(path_python)
+    monkeypatch.setattr(sys, "executable", "")
+    assert _real_python3() is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="planted python3 needs a POSIX shell")
+def test_real_python3_follows_sys_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve a linked sys.executable instead of the planted PATH interpreter."""
+    if not sys.executable:
+        pytest.skip("running interpreter path unknown")
+    original_python = os.path.realpath(sys.executable)
+
+    pathbin = tmp_path / "pathbin"
+    path_python = _plant_path_python3(pathbin)
+    monkeypatch.setenv("PATH", str(pathbin))
+    assert shutil.which("python3") == str(path_python)
+
+    exe_dir = tmp_path / "exe"
+    exe_dir.mkdir()
+    linked_python = exe_dir / "python3"
+    try:
+        linked_python.symlink_to(original_python)
+    except OSError:
+        if sys.platform == "win32":
+            pytest.skip("interpreter symlink creation unsupported")
+        raise
+    monkeypatch.setattr(sys, "executable", str(linked_python))
+    real_python = _real_python3()
+    assert real_python == original_python
+    assert real_python != str(path_python)
+
+
 def test_makefile_shares_hashlib_command() -> None:
     """Assert Makefile text holds the hashlib hash command exactly once."""
     makefile_text = (ROOT / "Makefile").read_text(encoding="utf-8")
@@ -369,7 +493,7 @@ def test_tools_negative_hash_command_fails(tmp_path: Path) -> None:
     nopython.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     nopython.chmod(0o755)
 
-    proc = _run_make(tmp_path, "tools", f"PYTHON={nopython}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(nopython))}")
     assert proc.returncode != 0
     assert stamp.read_bytes() == old_stamp
     assert HASH_FAILED in proc.stderr
@@ -384,7 +508,7 @@ def test_tools_negative_python_nonexistent(tmp_path: Path) -> None:
     stamp.write_bytes(old_stamp)
 
     nonexistent = tmp_path / "bin" / "does-not-exist"
-    proc = _run_make(tmp_path, "tools", f"PYTHON={nonexistent}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(nonexistent))}")
     assert proc.returncode != 0
     assert stamp.read_bytes() == old_stamp
     assert HASH_FAILED in proc.stderr
@@ -392,16 +516,16 @@ def test_tools_negative_python_nonexistent(tmp_path: Path) -> None:
 
 def test_tools_boundary_missing_requirements(tmp_path: Path) -> None:
     """Boundary: missing tools.txt, stub venv -> rc != 0, stamp unchanged, hash failure named."""
-    py_path = shutil.which("python3")
+    py_path = _real_python3()
     if py_path is None:
-        pytest.skip("python3 not found on PATH")
+        pytest.skip("running interpreter path unknown")
 
     _setup_stub_venv(tmp_path)
     stamp = tmp_path / ".venv" / ".stamp"
     old_stamp = b"old-stamp-bytes\n"
     stamp.write_bytes(old_stamp)
 
-    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(py_path))}")
     assert proc.returncode != 0
     assert stamp.read_bytes() == old_stamp
     assert HASH_FAILED in proc.stderr
@@ -409,16 +533,16 @@ def test_tools_boundary_missing_requirements(tmp_path: Path) -> None:
 
 def test_tools_positive_stale_stamp(tmp_path: Path) -> None:
     """Positive: real python3, stub venv python, stale stamp -> rc 0, stamp updated."""
-    py_path = shutil.which("python3")
+    py_path = _real_python3()
     if py_path is None:
-        pytest.skip("python3 not found on PATH")
+        pytest.skip("running interpreter path unknown")
 
     tools_txt, stamp = _setup_tree(tmp_path)
     _setup_stub_venv(tmp_path)
     stale_stamp = b"stale-stamp-bytes\n"
     stamp.write_bytes(stale_stamp)
 
-    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(py_path))}")
     assert proc.returncode == 0
     expected_hash = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
     assert stamp.read_text(encoding="utf-8") == f"{expected_hash}\n"
@@ -426,9 +550,9 @@ def test_tools_positive_stale_stamp(tmp_path: Path) -> None:
 
 def test_tools_positive_matching_stamp(tmp_path: Path) -> None:
     """Positive: matching stamp -> rc 0, stamp unchanged."""
-    py_path = shutil.which("python3")
+    py_path = _real_python3()
     if py_path is None:
-        pytest.skip("python3 not found on PATH")
+        pytest.skip("running interpreter path unknown")
 
     tools_txt, stamp = _setup_tree(tmp_path)
     _setup_stub_venv(tmp_path)
@@ -436,6 +560,33 @@ def test_tools_positive_matching_stamp(tmp_path: Path) -> None:
     matching_stamp = f"{expected_hash}\n"
     stamp.write_text(matching_stamp, encoding="utf-8")
 
-    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(py_path))}")
     assert proc.returncode == 0
     assert stamp.read_text(encoding="utf-8") == matching_stamp
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="quoted interpreter needs a POSIX shell")
+def test_tools_python_path_with_space(tmp_path: Path) -> None:
+    """Quoted spaced interpreter updates the stamp; an unquoted path leaves it stale."""
+    py_path = _real_python3()
+    if py_path is None:
+        pytest.skip("running interpreter path unknown")
+
+    spaced_dir = tmp_path / "dir with space"
+    spaced_dir.mkdir()
+    linked_python = spaced_dir / "python3"
+    linked_python.symlink_to(py_path)
+    tools_txt, stamp = _setup_tree(tmp_path)
+    _setup_stub_venv(tmp_path)
+    stale_stamp = b"stale-stamp-bytes\n"
+    stamp.write_bytes(stale_stamp)
+
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(linked_python))}")
+    assert proc.returncode == 0
+    expected_hash = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
+    assert stamp.read_bytes() == f"{expected_hash}\n".encode()
+
+    stamp.write_bytes(stale_stamp)
+    unquoted_proc = _run_make(tmp_path, "tools", f"PYTHON={linked_python}")
+    assert unquoted_proc.returncode != 0
+    assert stamp.read_bytes() == stale_stamp
