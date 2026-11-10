@@ -427,8 +427,10 @@ def _updated_raw(raw: str, answers: dict[str, str], moves: dict[str, str]) -> st
 def _changed_inputs(path: Path, raw: bytes, snapshot: dict[str, str | None]) -> list[str]:
     """Best-effort recheck: report answers or pinned sources changed since capture.
 
-    This narrows, but does not close, the window for concurrent edits: an edit
-    landing between this recheck and replacement is overwritten.
+    This narrows, but does not close, the window for concurrent edits. Between
+    recheck and replacement, edits to .bestpractices.json are overwritten; edits
+    to pinned sources stay on disk but may leave written anchors pointing at
+    moved lines, so tests/test_bestpractices.py fails until make fix-anchors runs again.
     """
     problems = []
     if path.read_bytes() != raw:
@@ -446,8 +448,10 @@ def _write_atomic(
 ) -> list[str]:
     """Flush a same-directory temporary file and recheck inputs before replacement.
 
-    The recheck is best effort: it narrows, but does not close, the window for
-    concurrent edits; an edit between the recheck and replacement is overwritten.
+    The recheck is best effort. Between recheck and replacement, edits to
+    .bestpractices.json are overwritten; edits to pinned sources stay on disk but
+    may leave written anchors pointing at moved lines, so tests/test_bestpractices.py
+    fails until make fix-anchors runs again.
     """
     temporary = None
     failure: BaseException | None = None
