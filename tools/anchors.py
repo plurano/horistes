@@ -430,7 +430,8 @@ def _changed_inputs(path: Path, raw: bytes, snapshot: dict[str, str | None]) -> 
     This narrows, but does not close, the window for concurrent edits. Between
     recheck and replacement, edits to .bestpractices.json are overwritten; edits
     to pinned sources stay on disk but may leave written anchors pointing at
-    moved lines, so tests/test_bestpractices.py fails until make fix-anchors runs again.
+    moved lines, so tests/test_bestpractices.py fails. A second fix through the
+    same base then refuses; the README names the recovery.
     """
     problems = []
     if path.read_bytes() != raw:
@@ -451,7 +452,8 @@ def _write_atomic(
     The recheck is best effort. Between recheck and replacement, edits to
     .bestpractices.json are overwritten; edits to pinned sources stay on disk but
     may leave written anchors pointing at moved lines, so tests/test_bestpractices.py
-    fails until make fix-anchors runs again.
+    fails. A second fix through the same base then refuses; the README names the
+    recovery.
     """
     temporary = None
     failure: BaseException | None = None
