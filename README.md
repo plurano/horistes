@@ -72,7 +72,7 @@ pins a full commit of the default branch
 | `.github/workflows/draft-release.yml` | creates a draft release for a pushed tag from an artifact holding the release files | `runner` (label, default `ubuntu-26.04`); `artifact` (name of the artifact holding the files, default `release-files`) | `<calling job> / Store the files in a draft release` | none |
 | `.github/workflows/release-please.yml` | proposes release pull requests and creates forge releases from Conventional Commits through a GitHub App token ([ADR-0056](docs/adr/0056-release-please-and-the-commit-hook-are-shared.md)); the release commit is written by the app, so the caller's config sets a top-level `signoff` to the app bot's commit address (`<app-slug>[bot] <<user id>+<app-slug>[bot]@users.noreply.github.com>`), else a commit-message check that requires `Signed-off-by` refuses the release pull request | `runner` (label, default `ubuntu-26.04`); `app_client_id` (required); `config_file` (default `release-please-config.json`); `manifest_file` (default `.release-please-manifest.json`); secret `app_private_key` (required) | `<calling job> / Release please`, never a check of a pull request | none |
 | `.github/workflows/hook-copy.yml` | verifies that the caller's copy of the commit-msg hook files matches the repository source at the pinned commit and passes its test suite ([ADR-0056](docs/adr/0056-release-please-and-the-commit-hook-are-shared.md)) | `runner` (label, default `ubuntu-26.04`); `hooks_path` (default `.config/hooks`) | `<calling job> / Hook copy` | none |
-| `.github/workflows/merge-train.yml` | in every repository the merge-train app is installed on, lands one clean pull request (through the merge queue where the default branch has one) or updates the next one by merge ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md), [ADR-0034](docs/adr/0034-the-merge-train-queues-where-the-branch-has-a-merge-queue.md), [ADR-0037](docs/adr/0037-the-merge-train-writes-the-squash-message.md), [ADR-0039](docs/adr/0039-the-merge-train-closes-the-issues-its-merges-name.md), [ADR-0040](docs/adr/0040-the-merge-train-leaves-a-release-to-its-writer.md), [ADR-0041](docs/adr/0041-the-merge-train-refreshes-a-draft-stopped-pull-request.md), [ADR-0062](docs/adr/0062-dependency-updates-wait-while-a-security-update-is-open.md), [ADR-0067](docs/adr/0067-the-train-settles-reviews-before-landing.md), [ADR-0068](docs/adr/0068-the-train-holds-on-failed-code-scanning.md), [ADR-0070](docs/adr/0070-the-train-holds-on-unanswered-review-bodies.md)) | `app_client_id` (required); `runner` (required, needs python3 and openssl); `switch` (`on` or `off`); `merge_method` (`SQUASH` or `MERGE`); `accept_states` (`UNSTABLE`, `HAS_HOOKS`; default none); `min_age_days` (default 3); `hold_labels`, `dependency_branches`, `person_branches`, `security_labels`; secret `app_private_key` | `<calling job> / Merge train`, never a check of a pull request | none |
+| `.github/workflows/merge-train.yml` | in every repository the merge-train app is installed on, lands one clean pull request (through the merge queue where the default branch has one) or updates the next one by merge ([ADR-0029](docs/adr/0029-a-forge-app-drives-the-merge-train.md), [ADR-0034](docs/adr/0034-the-merge-train-queues-where-the-branch-has-a-merge-queue.md), [ADR-0037](docs/adr/0037-the-merge-train-writes-the-squash-message.md), [ADR-0039](docs/adr/0039-the-merge-train-closes-the-issues-its-merges-name.md), [ADR-0040](docs/adr/0040-the-merge-train-leaves-a-release-to-its-writer.md), [ADR-0041](docs/adr/0041-the-merge-train-refreshes-a-draft-stopped-pull-request.md), [ADR-0062](docs/adr/0062-dependency-updates-wait-while-a-security-update-is-open.md), [ADR-0067](docs/adr/0067-the-train-settles-reviews-before-landing.md), [ADR-0068](docs/adr/0068-the-train-holds-on-failed-code-scanning.md), [ADR-0070](docs/adr/0070-the-train-holds-on-unanswered-review-bodies.md), [ADR-0076](docs/adr/0076-train-holds-on-a-required-status.md)) | `app_client_id` (required); `runner` (required, needs python3 and openssl); `switch` (`on` or `off`); `merge_method` (`SQUASH` or `MERGE`); `accept_states` (`UNSTABLE`, `HAS_HOOKS`; default none); `min_age_days` (default 3); `hold_labels`, `dependency_branches`, `person_branches`, `security_labels`, `required_status`; secret `app_private_key` | `<calling job> / Merge train`, never a check of a pull request | none |
 
 The licence job reads the contents and takes no secret; the caller grants
 `contents: read` and nothing else. On a draft pull request the job stops with
@@ -142,15 +142,20 @@ the head commit it read, so a red or blocked pull request is refused by the
 forge itself and the app has no bypass. With none CLEAN and no armed one in
 flight, it arms auto-merge on the oldest BEHIND pull request whose checks are
 not red and merges the default branch into it; an armed pull request that is
-BEHIND is updated first. It updates no pull request it has not armed, and none
-where a ruleset on the default branch demands linear history (decision record
-0044). A red pull request whose red runs failed only at
-the draft step gets a fresh event instead, a label added and removed (a
-re-run would replay the draft payload). It then closes the open issues that
-its recent merges name as closed, which the forge leaves open when the app merges. It
-leaves alone drafts, forks, other bases, the hold labels, release branches
-(`release-please--`, a release is a person's act), dependency updates younger
-than the minimum age and archived repositories. After the sweep, a second job
+BEHIND is updated first. Without `required_status` it updates no pull request
+it has not armed. With it, the train arms none: it updates a BEHIND pull request
+whose status is SUCCESS without arming it, disarming an armed one first, and
+lands it itself once it is CLEAN (decision record 0076). Where the repository
+allows no auto-merge, the train leaves an unarmed BEHIND pull request as it is,
+even when its status is SUCCESS. It updates none where a ruleset on the default
+branch demands linear history (decision record 0044). A red pull request whose red
+runs failed only at the draft step gets a fresh event instead, a label added
+and removed (a re-run would replay the draft payload). It then closes the open
+issues that its recent merges name as closed, which the forge leaves open when
+the app merges. It leaves alone drafts, forks, other bases, the hold labels,
+release branches (`release-please--`, a release is a person's act), dependency
+updates younger than the minimum age and archived repositories. After the
+sweep, a second job
 runs release-please with release creation and release pull request updates
 split into separate steps: a repository that writes its own release skips
 release creation and has its labels moved once the tag is on the merge commit,
@@ -160,6 +165,25 @@ while a pre-existing release is verified
 The app is one public app installed on every account
 of the fleet; its rights are in `apps/merge-train.json`, and a test holds them
 equal to what the train asks the forge for.
+
+When `required_status` names a commit status context, the train requires that
+context in state SUCCESS before it lands a pull request. Only then does the
+query select `status { context(name: $status) { state } }` and the token carry
+Commit statuses read; unset, both stay as before. While it is set the train
+arms no pull request for auto-merge, disarms an armed one the status holds and
+takes a held one out of the merge queue. A held dependency pull request still
+gets its generated files. Opting in needs `statuses: read` in
+`apps/merge-train.json` accepted by each installation, and a hard gate also
+needs the context required, with the writer's app as its expected source, by a
+ruleset or branch protection, and the writer reporting the context only as a
+commit status on the head commit and, with a merge queue, on each merge-group
+commit: the train's merge guards only the head commit, so
+neither a status that changes after the train reads it nor auto-merge armed by
+hand waits for the train. With a merge queue the forge judges the merge-group
+commit, so a head status that changes after that commit passes may not stop
+the landing, and the queue holds each pull request on its own only with its
+"Only merge non-failing pull requests" setting on
+([ADR-0076](docs/adr/0076-train-holds-on-a-required-status.md)).
 
 ## Actions
 

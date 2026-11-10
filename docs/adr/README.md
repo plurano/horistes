@@ -83,3 +83,4 @@ record that supersedes it.
 | [0073](0073-suppressions-name-a-mel-category.md) | 2026-11-09 | Suppressions name a MEL category and expiry | Accepted |
 | [0074](0074-the-commit-message-judge-runs-on-the-host-python.md) | 2026-11-09 | The commit-message judge runs on the host Python | Accepted |
 | [0075](0075-caller-pins-name-one-ref.md) | 2026-11-09 | Caller pins name one ref | Accepted |
+| [0076](0076-train-holds-on-a-required-status.md) | 2026-11-10 | Train holds on a required status | Accepted |

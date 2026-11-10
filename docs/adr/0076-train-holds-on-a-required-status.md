@@ -1,0 +1,119 @@
+<!--
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+-->
+
+# ADR-0076: Train holds on a required status
+
+- **Status**: Accepted
+- **Date**: 2026-11-10
+- **Authors**: Lusoris
+
+## Context
+
+The merge train lands a clean pull request and updates a behind one once its
+own rules pass: merge state, check suites, draft state, labels, minimum age,
+review settling, code scanning and review bodies. A fleet can need one more
+precondition the train cannot judge itself, for example that another system has
+accepted the change. Such a system can report its verdict as a commit status
+on the head commit; the train had no way to require one.
+
+## Decision
+
+The merge-train reusable workflow (`.github/workflows/merge-train.yml`) takes an
+opt-in input `required_status` (string, default empty, which turns the check
+off).
+
+When `required_status` names a commit status context:
+
+- The name must match the pattern below: at most 100 characters, a letter or
+  digit first, then letters, digits, `._/:-` and spaces, with no space last.
+  Any other value stops the run with a setting error before the first forge
+  call (`check_required_status` in the train rules module).
+
+  ```text
+  ^[A-Za-z0-9](?:[A-Za-z0-9._/: -]{0,98}[A-Za-z0-9._/:-])?$
+  ```
+
+- The query declares `$status: String!` and reads
+  `status { context(name: $status) { state } }` on the head commit of every
+  open pull request (`pull_query` in the train rules module). The token the
+  train mints then also carries Commit statuses read (`STATUS_RIGHTS` in
+  `tools/merge_train.py`).
+- A head commit without that context holds the pull request with the reason
+  `status <name> absent: held`; a context in any state other than `SUCCESS`
+  (`PENDING`, `FAILURE`, `ERROR`, `EXPECTED`) holds it with
+  `status <name> <state>: held` (`required_status_hold`).
+- The hold comes after the code-scanning hold and before the land and behind
+  verdicts, so a held pull request is neither landed nor updated.
+- Write hold, security hold and refresh read the merge state under a status
+  hold (`unheld_reason`), so a regenerate head without the status still holds
+  the order, a held security fix still holds other dependency updates, and a
+  held pull request stopped at the draft step still gets its fresh event.
+- The train arms no pull request for auto-merge. `updatable` picks the BEHIND
+  pull requests decision record 0044 allows and arms none of them; the train
+  lands each one itself once it is CLEAN. An armed BEHIND pull request is
+  disarmed before its update (`advance`), so auto-merge cannot land the new
+  head before the train reads its status. Where the repository allows no
+  auto-merge, an unarmed BEHIND pull request is still left as it is.
+- Each run reads every open pull request's own status rather than its verdict
+  reason, so an earlier hold cannot hide a missing status. An armed pull
+  request the status holds is disarmed, and an armed pull request whose title
+  changed is disarmed and not armed again (`disarm_red_scanning`,
+  `re_arm_drifted` in `tools/merge_train.py`).
+- A pull request in the merge queue that the status holds is taken out of the
+  queue with the `dequeuePullRequest` mutation in the same step.
+- A dependency pull request the status holds still gets its generated files
+  committed (`is_candidate`): that commit is part of the head the status writer
+  judges, so skipping it would need a second status round.
+
+When `required_status` is empty, neither the query nor the token rights carry
+the status, and every verdict is the one it was before.
+
+## Consequences
+
+- A caller opts in by setting `required_status`; callers that leave it unset
+  keep their behaviour.
+- A caller sets it only once a writer reports that status for every pull
+  request the train serves, bot and person ones alike; otherwise every pull
+  request without the status waits forever.
+- Opting in needs `statuses: read` in the app manifest
+  (`apps/merge-train.json`) and each installation accepting it. An
+  installation token cannot carry a right the app was not granted, so until
+  then the run fails for that repository.
+- The train's merge is not atomic with its status read: `mergePullRequest`
+  guards only the head commit through `expectedHeadOid`, so a status that
+  changes after the read is not seen. Auto-merge that a person arms between
+  train runs does not wait for the train either. A ruleset or branch protection
+  rule that requires the context closes both gaps only when it names the
+  writer's app as the expected source of the context, so a status from another
+  author does not satisfy it, and when the writer reports the context only as
+  a commit status on the pull request head commit: the rule may also accept a
+  check run of that name from the writer's app, which the train does not read,
+  and the forge judges the test merge commit instead once that commit carries
+  a status. Where the default branch has a merge queue, the rule also requires
+  the context on each merge-group commit the queue builds, so the writer
+  reports it there too; without it the queue fails the entry and the pull
+  request does not land when "Only merge non-failing pull requests" is on.
+  Only with that setting on does the queue hold each pull request on its
+  own; with it off, a pull request whose own merge-group commit fails the
+  context can still land when a later merge-group commit in its group
+  passes. With a merge queue, the forge judges the context on the merge-group
+  commit; its documentation names no recheck of the head commit status after
+  the merge-group status passes, so a head status that changes after that
+  may not stop the landing. For a direct merge without a merge queue, the
+  forge checks the context when the merge happens and refuses the merge, the
+  train's included, while the context does not pass, unless the merging
+  actor may bypass the rule.
+- Tests in `tests/test_merge_train.py` hold the planted cases: absent and
+  non-success held, success landed, unset unchanged; the status selected only
+  when set and only on the head commit; Commit statuses read minted only when
+  set, and a status read refused without it; a BEHIND pull request updated
+  without arming; an armed BEHIND pull request disarmed before its update; a
+  retitled armed pull request disarmed and not armed again;
+  an armed or queued pull request with an earlier hold and no status disarmed
+  or dequeued; a held dependency pull request given its generated files; a
+  regenerate head without the status write-holding other landings, and
+  releasing them when behind; a held security fix holding other dependency
+  updates; a held pull request stopped at the draft step refreshed; status
+  names with internal spaces accepted and pipe or tab refused.

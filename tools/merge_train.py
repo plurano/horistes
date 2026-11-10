@@ -32,13 +32,13 @@ from train_rules import (
     ARM,
     COMMIT_MUTATION,
     COMMITS,
+    DEQUEUE,
     DISARM,
     DRAFT,
     ENQUEUE,
     MERGE,
     MERGE_STATE,
     MERGED,
-    QUERY,
     READY,
     REFRESH_LABEL,
     REGENERATE_HEADLINE,
@@ -46,6 +46,7 @@ from train_rules import (
     NoSignOffError,
     check_release_off,
     check_release_parallel,
+    check_required_status,
     drifted,
     has_red_code_scanning,
     head_since,
@@ -55,7 +56,9 @@ from train_rules import (
     is_security,
     issues_to_close,
     lease_until,
+    pull_query,
     refresh,
+    required_status_hold,
     security_hold,
     serving_order,
     squash_message,
@@ -93,6 +96,7 @@ WRITE_RIGHTS = {
     "checks": "read",
 }
 READ_RIGHTS = {"contents": "read", "pull_requests": "read", "checks": "read"}
+STATUS_RIGHTS = {"statuses": "read"}
 ISSUE_RIGHTS = {"issues": "write"}
 CLOSE_DAYS = 7
 LIST_RIGHTS = {"metadata": "read"}
@@ -308,6 +312,9 @@ def settings(env):
     check_app_key(env.get("TRAIN_APP_KEY", ""))
     release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
     parallel = check_release_parallel(env["TRAIN_RELEASE_MAX_PARALLEL"], InvalidSettingError)
+    required_status = check_required_status(
+        env.get("TRAIN_REQUIRED_STATUS", ""), InvalidSettingError
+    )
     return {
         "switch": switch,
         "method": method,
@@ -320,6 +327,7 @@ def settings(env):
         "release_max_parallel": parallel,
         "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
         "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
+        "required_status": required_status,
     }
 
 
@@ -394,23 +402,27 @@ def graphql(env, query, variables):
     return answer["data"]
 
 
-def read_page(env, variables):
+def read_page(env, variables, query):
     """One page of the read; a forge gateway error (502, 504) is tried again."""
     for attempt in range(1, READ_ATTEMPTS + 1):
         try:
-            return graphql(env, QUERY, variables)["repository"]
+            return graphql(env, query, variables)["repository"]
         except RefusedError as err:
             if getattr(err.__cause__, "code", 0) not in (502, 504) or attempt == READ_ATTEMPTS:
                 raise
             time.sleep(READ_BACKOFF_SECONDS)
 
 
-def pull_pages(env):
+def pull_pages(env, conf):
     """The oldest open pull requests, at most PULL_PAGES pages."""
     owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
-    variables, pulls, repo = {"owner": owner, "name": name, "after": None}, [], {}
+    variables = {"owner": owner, "name": name, "after": None}
+    if conf.get("required_status"):
+        variables["status"] = conf["required_status"]
+    query = pull_query(conf)
+    pulls, repo = [], {}
     for _ in range(PULL_PAGES):
-        repo = read_page(env, variables)
+        repo = read_page(env, variables, query)
         pulls += repo["pullRequests"]["nodes"]
         page = repo["pullRequests"]["pageInfo"]
         if not page["hasNextPage"]:
@@ -420,11 +432,11 @@ def pull_pages(env):
     return repo
 
 
-def fetch(env):
+def fetch(env, conf):
     """The repository and its open pull requests, re-read while a merge state is UNKNOWN."""
     repo = {}
     for attempt in range(SETTLE_ROUNDS):
-        repo = pull_pages(env)
+        repo = pull_pages(env, conf)
         pulls = repo["pullRequests"]["nodes"]
         if all(pull["mergeStateStatus"] != "UNKNOWN" or pull["isDraft"] for pull in pulls):
             break
@@ -530,7 +542,12 @@ def update(env, pull):
 
 
 def advance(env, conf, repo, rows, notes):
-    """Update the first pull request `updatable` names, arming it first where it says."""
+    """Update the first pull request `updatable` names, arming it first where it says.
+
+    While `required_status` is set an armed pull request is disarmed before its update:
+    auto-merge would otherwise land the new head before the train reads its status
+    (decision record 0076).
+    """
     for pull, arming in updatable(repo, rows, notes, conf):
         if arming:
             scanning = has_red_code_scanning(pull)
@@ -543,6 +560,9 @@ def advance(env, conf, repo, rows, notes):
                 notes[pull["number"]] = err.note
                 continue
             notes[pull["number"]] = "armed, updated from the default branch"
+        elif conf.get("required_status") and pull["autoMergeRequest"]:
+            graphql(env, DISARM, {"id": pull["id"]})
+            notes[pull["number"]] = "disarmed, updated from the default branch"
         else:
             notes[pull["number"]] = "updated from the default branch"
         if update(env, pull):
@@ -838,6 +858,8 @@ def is_candidate(pull, reason, default_branch, conf):
         return False
     if reason.startswith("labelled "):
         return False
+    # A dependency pull the required status holds stays a candidate: its generated files
+    # commit first, so the status writer judges the head that lands (record 0076).
     return reason != "release or reserved branch: a person lands it"
 
 
@@ -906,13 +928,18 @@ def re_arm_drifted(env, conf, served, held, notes):
     do not read it as armed.
     """
     for pull, reason in served:
-        if reason.startswith(REVIEW_BODY):
+        if reason.startswith(REVIEW_BODY) or required_status_hold(pull, conf):
             continue
         if pull["number"] not in held and drifted(pull, conf):
             if has_red_code_scanning(pull):
                 notes[pull["number"]] = "not re-armed: code-scanning check failed"
                 continue
             graphql(env, DISARM, {"id": pull["id"]})
+            if conf.get("required_status"):
+                notes[pull["number"]] = (
+                    "disarmed: title changed after arming, the train lands it directly"
+                )
+                return f"disarmed #{pull['number']}"
             try:
                 arm(env, conf, pull)
             except UnsignedBotError as err:
@@ -923,12 +950,26 @@ def re_arm_drifted(env, conf, served, held, notes):
     return None
 
 
-def disarm_red_scanning(env, rows, notes):
-    """Disarm auto-merge on any pull request held by red code scanning or a review body."""
+def disarm_red_scanning(env, rows, notes, conf):
+    """Disarm or dequeue a pull request a hold covers.
+
+    Auto-merge comes off where red code scanning, a review body or the required status
+    holds the pull request; a queued one the required status holds leaves the merge
+    queue (decision record 0076).
+    """
     for pull, reason in rows:
+        if pull.get("isInMergeQueue"):
+            status_hold = required_status_hold(pull, conf)
+            if status_hold:
+                graphql(env, DEQUEUE, {"id": pull["id"]})
+                notes[pull["number"]] = f"dequeued: {status_hold}"
         if not pull.get("autoMergeRequest"):
             continue
-        cause = has_red_code_scanning(pull) or (reason if reason.startswith(REVIEW_BODY) else None)
+        cause = (
+            has_red_code_scanning(pull)
+            or (reason if reason.startswith(REVIEW_BODY) else None)
+            or required_status_hold(pull, conf)
+        )
         if cause:
             graphql(env, DISARM, {"id": pull["id"]})
             notes[pull["number"]] = f"disarmed: {cause}"
@@ -1159,7 +1200,7 @@ def run(env, conf, repo, now, notes=None):
     notes.update({pull["number"]: reason for pull, reason in rows})
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
-    disarm_red_scanning(env, rows, notes)
+    disarm_red_scanning(env, rows, notes, conf)
     lease = lander_lease(repo, now)
     served = serving_order(rows, conf)
     # A security update a review body holds is still the fix the others wait for (record 0062).
@@ -1186,7 +1227,7 @@ def run(env, conf, repo, now, notes=None):
     if holding:
         return rows, notes, f"#{holding[0]} is armed and in flight"
     outcome = refresh(
-        served, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull)
+        served, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull), conf
     )
     if outcome:
         return rows, notes, outcome
@@ -1339,12 +1380,14 @@ def unsigned_bot_entries(target, notes):
 def one(env, conf, installation, target, now):
     """The train in one repository, with a token for that repository alone."""
     rights = WRITE_RIGHTS if conf["switch"] == "on" else READ_RIGHTS
+    if conf["required_status"]:
+        rights = {**rights, **STATUS_RIGHTS}
     token = mint(env, conf, installation, rights, [target["name"]])
     local = {**env, "GITHUB_REPOSITORY": target["full_name"], "TRAIN_TOKEN": token}
     closed = []
     notes = {}
     try:
-        repo = fetch(local)
+        repo = fetch(local, conf)
         rows, notes, outcome = run(local, conf, repo, now, notes)
         if conf["switch"] == "on":
             closed = close_issues(local, conf, installation, target, now)
@@ -1354,7 +1397,18 @@ def one(env, conf, installation, target, now):
     finally:
         revoke(env, token)
     moved = any(
-        note.startswith(("armed", "re-armed", "updated", "queued", "refreshed", "held", "released"))
+        note.startswith(
+            (
+                "armed",
+                "re-armed",
+                "updated",
+                "queued",
+                "dequeued",
+                "refreshed",
+                "held",
+                "released",
+            )
+        )
         or note == "generated files committed"
         for note in notes.values()
     )

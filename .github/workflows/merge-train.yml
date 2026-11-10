@@ -56,6 +56,11 @@
 #   Once no such security update is open, the train marks the held pull
 #   requests ready again and removes the label. A held pull request a person
 #   marks ready keeps the label and is not held again (decision record 0062).
+# - When `required_status` names a commit status context, a pull request whose
+#   head commit lacks that context or reports a state other than SUCCESS is
+#   held from landing, an armed pull request held by it is disarmed and a
+#   queued one is dequeued (decision record 0076). While the check is active,
+#   the train never arms auto-merge. An empty input turns the check off.
 # - After that write, it closes the open issues that the pull requests it
 #   merged in the last 7 days name as closed (`Closes #N` and the forge's
 #   other closing forms): the forge leaves them open when the app merges, and
@@ -102,8 +107,9 @@
 # secret as `app_private_key` and the client id as `app_client_id`. The key
 # signs a JWT of the app (openssl, the key through a pipe, never a file).
 # For every repository the job mints a token limited to that repository, with
-# contents, pull requests and workflows write, checks and actions read (read
-# rights only when `switch` is off), and revokes it when the repository is done.
+# contents, pull requests and workflows write, checks and actions read, commit
+# statuses read when required_status is set (read rights only when `switch` is off),
+# and revokes it when the repository is done.
 # Only when an issue is to be closed, a second token for that repository
 # carries issues write alone, for the comment and the close.
 # Workflows write is there because the forge refuses a merge or an
@@ -184,6 +190,14 @@ on:
         type: string
         required: false
         default: security
+      required_status:
+        description: >-
+          Commit status context the head commit must report as success before
+          the train updates or lands a pull request; while it is set the train
+          arms none. Empty turns the check off.
+        type: string
+        required: false
+        default: ""
     secrets:
       app_private_key:
         description: >-
@@ -234,6 +248,9 @@ jobs:
           RELEASE_LABEL = "autorelease:"
           REFRESH_LIMIT = 3
           STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
+          REQUIRED_STATUS_NAME = re.compile(
+              r"^[A-Za-z0-9](?:[A-Za-z0-9._/: -]{0,98}[A-Za-z0-9._/:-])?$"
+          )
 
 
           class NoSignOffError(ValueError):
@@ -309,9 +326,11 @@ jobs:
               fix behind (decision record 0062). A draft cannot be merged by either.
               """
               served = ("land", "behind", "red")
+              # A security update the required status holds is still the fix (decision record 0076).
+              reasons = [(pull, unheld_reason(pull, reason, conf)) for pull, reason in rows]
               fixes = [
                   pull
-                  for pull, reason in rows
+                  for pull, reason in reasons
                   if is_security(pull, conf) and (reason in served or reason.startswith("merge state"))
               ]
               marked = [pull for pull, _ in rows if SECURITY_HOLD_LABEL in label_names(pull)]
@@ -433,10 +452,52 @@ jobs:
               return False
 
 
+          def required_status_hold(pull, conf):
+              """Why the required commit status holds the pull request, or None (decision record 0076).
+
+              Absent status, absent context or a state other than SUCCESS holds.
+              """
+              name = conf.get("required_status") or ""
+              if not name:
+                  return None
+              nodes = pull.get("latest", {}).get("nodes", [])
+              commit = nodes[-1].get("commit", {}) if nodes else {}
+              status = commit.get("status") or {}
+              ctx = status.get("context")
+              if not ctx or not ctx.get("state"):
+                  return f"status {name} absent: held"
+              state = ctx["state"]
+              if state != "SUCCESS":
+                  return f"status {name} {state.lower()}: held"
+              return None
+
+
+          def merge_reason(pull, conf):
+              """land, red, behind or merge state <state>: the verdict from the merge state alone."""
+              state = pull["mergeStateStatus"]
+              if state in conf["accept"]:
+                  return "land"
+              if state == "BEHIND":
+                  return "red" if is_red(pull) else "behind"
+              return f"merge state {state}"
+
+
+          def unheld_reason(pull, reason, conf):
+              """The verdict reason, a required status hold replaced by the merge state verdict under it.
+
+              The steps that guard the landing order read it: security hold, write hold and
+              refresh. Landing, updating, arming and review bodies keep the hold (decision
+              record 0076).
+              """
+              hold = required_status_hold(pull, conf)
+              if hold is not None and reason == hold:
+                  return merge_reason(pull, conf)
+              return reason
+
+
           def verdict(pull, repo, conf, now, replaced=frozenset()):
               """land, behind, or the reason the train leaves the pull request alone."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
-              state = pull["mergeStateStatus"]
               held = sorted(labels & conf["hold"])
               if pull["baseRefName"] != repo["defaultBranchRef"]["name"]:
                   return "not for the default branch"
@@ -463,11 +524,10 @@ jobs:
               scanning = has_red_code_scanning(pull)
               if scanning:
                   return scanning
-              if state in conf["accept"]:
-                  return "land"
-              if state == "BEHIND":
-                  return "red" if is_red(pull) else "behind"
-              return f"merge state {state}"
+              status_hold = required_status_hold(pull, conf)
+              if status_hold:
+                  return status_hold
+              return merge_reason(pull, conf)
 
 
           def linear_history(repo):
@@ -485,6 +545,9 @@ jobs:
               request goes first: it already waits for the forge to merge it.
               Only an armed pull request is updated, and none where the default branch
               demands linear history (decision record 0044); `notes` says why one is skipped.
+              While `required_status` is set none is armed: `advance` disarms an armed one
+              before its update, and the train lands it directly once it is CLEAN
+              (decision record 0076).
               """
               behind = [pull for pull, reason in rows if reason == "behind"]
               if linear_history(repo):
@@ -493,9 +556,10 @@ jobs:
                   return []
               behind.sort(key=lambda pull: (not is_security(pull, conf), not pull["autoMergeRequest"]))
               picked = []
+              arms = not conf.get("required_status")
               for pull in behind:
                   if pull["autoMergeRequest"] or repo["autoMergeAllowed"]:
-                      picked.append((pull, not pull["autoMergeRequest"]))
+                      picked.append((pull, arms and not pull["autoMergeRequest"]))
                   else:
                       notes[pull["number"]] = "behind: auto-merge off, not armed, not updated"
               return picked
@@ -521,10 +585,14 @@ jobs:
               ]
 
 
-          def refresh_candidates(rows):
+          def refresh_candidates(rows, conf):
               """Red pull requests a fresh event could unblock, oldest first, at most REFRESH_LIMIT."""
               waiting = ("red", "merge state BLOCKED", "merge state UNSTABLE")
-              found = [pull for pull, reason in rows if reason in waiting and red_runs(pull)]
+              found = [
+                  pull
+                  for pull, reason in rows
+                  if unheld_reason(pull, reason, conf) in waiting and red_runs(pull)
+              ]
               return found[:REFRESH_LIMIT]
 
 
@@ -549,14 +617,14 @@ jobs:
               )
 
 
-          def refresh(rows, notes, jobs, toggle):
+          def refresh(rows, notes, jobs, toggle, conf):
               """Give the oldest pull request whose red runs stopped at the draft step a fresh event.
 
               A re-run replays the draft payload; a label event carries the current one
               (decision record 0041). Once per failed run: a refresh that started no run
               is left to a person. jobs reads a run's jobs; toggle adds and removes REFRESH_LABEL.
               """
-              for pull in refresh_candidates(rows):
+              for pull in refresh_candidates(rows, conf):
                   runs = red_runs(pull)
                   if not all(run and stopped_at_draft_step(jobs(run)) for run, _ in runs):
                       continue
@@ -677,7 +745,8 @@ jobs:
               email = f"{conf['bot_id']}+{conf['bot_login']}@users.noreply.github.com"
               held = []
               for pull, reason in served:
-                  if reason != "land" and not reason.startswith("merge state "):
+                  unheld = unheld_reason(pull, reason, conf)
+                  if unheld != "land" and not unheld.startswith("merge state "):
                       continue
                   nodes = pull["latest"]["nodes"]
                   commit = nodes[-1]["commit"] if nodes else {}
@@ -742,6 +811,16 @@ jobs:
               return int(raw)
 
 
+          def check_required_status(raw, error_cls=ValueError):
+              """Status context required on the head commit, or empty string when off."""
+              name = (raw or "").strip()
+              if not name:
+                  return ""
+              if not REQUIRED_STATUS_NAME.match(name):
+                  raise error_cls(f"required_status {raw!r} is not a status context name")
+              return name
+
+
           QUERY = """
           query($owner: String!, $name: String!, $after: String) {
             repository(owner: $owner, name: $name) {
@@ -795,6 +874,23 @@ jobs:
             }
           }
           """
+          # The pull query with the required status context on the head commit (record 0076):
+          # one more variable and one more field, so the unset query stays QUERY itself.
+          STATUS_QUERY = QUERY.replace(
+              "$after: String)", "$after: String, $status: String!)", 1
+          ).replace(
+              "signature { wasSignedByGitHub }",
+              "signature { wasSignedByGitHub }\n"
+              "                        status { context(name: $status) { state } }",
+              1,
+          )
+
+
+          def pull_query(conf):
+              """The open pull request query; it selects the required status only when one is set."""
+              return STATUS_QUERY if conf.get("required_status") else QUERY
+
+
           MERGE_STATE = """
           query($owner: String!, $name: String!, $number: Int!) {
             repository(owner: $owner, name: $name) {
@@ -855,6 +951,14 @@ jobs:
           mutation($id: ID!, $oid: GitObjectID!) {
             enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
               mergeQueueEntry { state }
+            }
+          }
+          """
+          # Dequeue a pull request from the merge queue.
+          DEQUEUE = """
+          mutation($id: ID!) {
+            dequeuePullRequest(input: {id: $id}) {
+              mergeQueueEntry { id }
             }
           }
           """
@@ -942,6 +1046,7 @@ jobs:
           TRAIN_RELEASE_OFF: ${{ inputs.release_off }}
           TRAIN_RELEASE_MAX_PARALLEL: ${{ inputs.release_max_parallel }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
+          TRAIN_REQUIRED_STATUS: ${{ inputs.required_status }}
         run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/merge_train.py"
 
   release:
