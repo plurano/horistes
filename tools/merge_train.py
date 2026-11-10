@@ -111,6 +111,8 @@ SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its produc
 REVIEW_BODY = "review body: "
 # Pull requests whose review bodies one run reads in one repository (ADR-0070).
 REVIEW_READS = 10
+# Distinct maintainer logins whose rights one pull request checks (ADR-0077).
+ANSWER_RIGHTS = 5
 REVIEW_BODIES = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -121,7 +123,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       }
       comments(first: 100) {
         totalCount
-        nodes { body author { login } }
+        nodes { body author { login __typename } }
       }
       commits(first: 100) {
         totalCount
@@ -1077,7 +1079,44 @@ def _is_review_answered(review_id, texts):
     return any(pattern.search(text) for text in texts)
 
 
-def review_body_hold(pull, detail):
+def _answer_candidates(pr_author, detail, review_id):
+    """Non-bot, non-author logins whose comments or reviews name this review."""
+    nodes = [
+        node
+        for kind in ("comments", "reviews")
+        for node in (detail.get(kind) or {}).get("nodes") or []
+    ]
+    return [
+        author["login"]
+        for node in nodes
+        if (author := node.get("author") or {}).get("login")
+        and author.get("__typename") != "Bot"
+        and author["login"] != pr_author
+        and _is_review_answered(review_id, [node.get("body") or ""])
+    ]
+
+
+def _maintainer_unanswered(pr_author, detail, unanswered, right):
+    """Remaining findings after at most ANSWER_RIGHTS distinct permission reads."""
+    rights = {}
+    remaining = []
+    for login, review_id in unanswered:
+        for candidate in _answer_candidates(pr_author, detail, review_id):
+            if candidate not in rights:
+                if len(rights) >= ANSWER_RIGHTS:
+                    continue
+                try:
+                    rights[candidate] = right(candidate)
+                except RefusedError as err:
+                    raise RefusedError(f"cannot read the right of {candidate}: {err}") from err
+            if rights[candidate]:
+                break
+        else:
+            remaining.append((login, review_id))
+    return remaining
+
+
+def review_body_hold(pull, detail, right=None):
     """Why a pull request waits for an unanswered bot review body finding, or None."""
     for kind in ("reviews", "comments", "commits"):
         if ((detail.get(kind) or {}).get("totalCount") or 0) > 100:
@@ -1096,6 +1135,11 @@ def review_body_hold(pull, detail):
             review_id, texts
         ):
             unanswered.append((login, review_id))
+    if unanswered and is_bot(pull) and right is not None:
+        try:
+            unanswered = _maintainer_unanswered(pr_author, detail, unanswered, right)
+        except RefusedError as err:
+            return f"{REVIEW_BODY}{err}"[:200]
     if not unanswered:
         return None
     login, review_id = unanswered[0]
@@ -1115,6 +1159,21 @@ def pull_review_bodies(env, number):
     return (data.get("repository") or {}).get("pullRequest")
 
 
+def collaborator_right(env, login):
+    """Whether the collaborator has write or admin permission; a missing user does not."""
+    user = urllib.parse.quote(login, safe="")
+    url = (
+        f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/collaborators/{user}/permission"
+    )
+    try:
+        answer = call(url, env["TRAIN_TOKEN"], "GET")
+    except RefusedError as err:
+        if "HTTP 404" in str(err):
+            return False
+        raise
+    return answer.get("permission") in ("admin", "write")
+
+
 def read_review_hold(env, pull):
     """The review-body hold of one pull request, or None; a failed read holds it."""
     try:
@@ -1123,7 +1182,7 @@ def read_review_hold(env, pull):
         return f"{REVIEW_BODY}cannot read: {err}"[:200]
     if not detail:
         return f"{REVIEW_BODY}cannot read: the forge returned no pull request"
-    return review_body_hold(pull, detail)
+    return review_body_hold(pull, detail, right=lambda login: collaborator_right(env, login))
 
 
 def review_body_eligible(pull, reason, conf):

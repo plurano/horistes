@@ -354,6 +354,9 @@ class Forge:
         self.review_details: dict[int, dict | list[dict | None] | None] = {}
         self.review_refusals: dict[int, str] = {}
         self.review_body_calls: list[int] = []
+        self.rights: dict[str, str] = {}
+        self.right_refusals: dict[str, int] = {}
+        self.right_calls: list[str] = []
         self.merged_pulls: dict[str, list[dict]] = {}
         self.issue_right = True
         self.ungranted: set[int] = set()
@@ -882,7 +885,20 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if self._dispatch_app(path):
             return
-        if "/contents/" in path and path.startswith("/repos/"):
+        if re.fullmatch(r"/repos/[^/]+/[^/]+/collaborators/[^/]+/permission", path):
+            forge = self.server.forge
+            full, _, tail = path.removeprefix("/repos/").partition("/collaborators/")
+            assert forge.repo_of(self.headers["Authorization"])[0] == full
+            login = unquote(tail.removesuffix("/permission"))
+            forge.right_calls.append(login)
+            if login in forge.right_refusals:
+                self.answer(forge.right_refusals[login], {"message": "Permission read refused"})
+            elif login in forge.rights:
+                permission = forge.rights[login]
+                self.answer(200, {"permission": permission, "role_name": permission})
+            else:
+                self.answer(404, {"message": "Not Found"})
+        elif "/contents/" in path and path.startswith("/repos/"):
             self._get_contents(path)
         elif path.startswith("/repos/") and path.endswith("/actions/artifacts"):
             self._get_artifacts(path)
@@ -6512,7 +6528,7 @@ def test_review_bodies_query_fields(tmp_path, monkeypatch):
         "body",
         "author { login __typename }",
         "comments(first: 100)",
-        "author { login }",
+        "nodes { body author { login __typename } }",
         "commits(first: 100)",
         "commit { message }",
     ):
@@ -6931,6 +6947,222 @@ def test_review_body_reads_stop_at_the_bound_security_update_first(tmp_path):
         "| #10 | CLEAN | review body: not read: more than 10 pull requests to read in one run |"
     )
     assert expected in summary, summary
+
+
+def _maintainer_answer(login="maintainer", typename="User", review_id=1701):
+    """One comment or review body naming the review it answers."""
+    return {
+        "body": f"Addressed pullrequestreview-{review_id}.",
+        "author": {"login": login, "__typename": typename},
+    }
+
+
+def _maintainer_forge(comments=(), reviews=(), **fields):
+    """A signed app-authored non-dependency pull request with a review-body finding."""
+    fields.setdefault("author", {"login": "vmafx-release-bot", "__typename": "Bot"})
+    p = pull(1, "CLEAN", headRefName="docs/render", **fields)
+    forge = Forge(repository(p))
+    forge.commits[1] = [("docs: render\n\nSigned-off-by: Producer <producer@example.org>", 1)]
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(1701, "coderabbitai", "Nitpick comments: 1"), *reviews],
+        comments=comments,
+    )
+    return forge
+
+
+def _assert_maintainer_hold(tmp_path, forge):
+    """The original unanswered-review reason remains visible without a write."""
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    expected = (
+        "review body: coderabbitai review 1701 has findings "
+        "without a reply naming pullrequestreview-1701"
+    )
+    assert f"| #1 | CLEAN | {expected} |" in summary
+
+
+def test_maintainer_write_answer_lands_bot_pull_request(tmp_path):
+    """A human collaborator with write permission can answer an app's review-body finding."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.rights = {"maintainer": "write"}
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+    assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_maintainer_admin_answer_lands_bot_pull_request(tmp_path):
+    """Admin permission also lets a human collaborator answer an app's review-body finding."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.rights = {"maintainer": "admin"}
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_maintainer_read_right_cannot_answer_bot_review(tmp_path):
+    """A reader's comment naming the review cannot release an app-authored pull request."""
+    forge = _maintainer_forge(comments=[_maintainer_answer("outsider")])
+    forge.rights = {"outsider": "read"}
+    _assert_maintainer_hold(tmp_path, forge)
+    assert forge.right_calls == ["outsider"]
+
+
+def test_maintainer_missing_right_cannot_answer_bot_review(tmp_path):
+    """A permission lookup returning 404 leaves the review body unanswered."""
+    forge = _maintainer_forge(comments=[_maintainer_answer("outsider")])
+    _assert_maintainer_hold(tmp_path, forge)
+    assert forge.right_calls == ["outsider"]
+
+
+def test_maintainer_right_refusal_holds_bot_pull_request(tmp_path):
+    """A refused permission read holds the pull request and names the candidate."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_refusals = {"maintainer": 500}
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | CLEAN | review body: cannot read the right of maintainer:" in summary
+    assert forge.right_calls == ["maintainer"]
+
+
+def test_maintainer_answer_does_not_release_human_pull_request(tmp_path):
+    """Human-authored pull requests still require the author's own review-body answer."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()], author={"login": "person"})
+    forge.rights = {"maintainer": "write"}
+    _assert_maintainer_hold(tmp_path, forge)
+    assert forge.right_calls == []
+
+
+def test_bot_maintainer_answer_does_not_count(tmp_path):
+    """Bot comments never qualify as maintainer answers even with write permission."""
+    forge = _maintainer_forge(comments=[_maintainer_answer("coderabbitai", "Bot")])
+    forge.rights = {"coderabbitai": "write"}
+    _assert_maintainer_hold(tmp_path, forge)
+    assert forge.right_calls == []
+
+
+def test_maintainer_right_lookups_stop_at_five(tmp_path):
+    """A sixth candidate with write permission cannot exceed the five-login bound."""
+    forge = _maintainer_forge(comments=[_maintainer_answer(f"candidate-{n}") for n in range(6)])
+    forge.rights = {"candidate-5": "write"}
+    _assert_maintainer_hold(tmp_path, forge)
+    assert forge.right_calls == [f"candidate-{n}" for n in range(5)]
+
+
+def test_maintainer_review_answer_lands_bot_pull_request(tmp_path):
+    """A human maintainer can answer in a submitted review body instead of a comment."""
+    answer = _bot_review(1702, "maintainer", "Addressed review 1701.", typename="User")
+    forge = _maintainer_forge(reviews=[answer])
+    forge.rights = {"maintainer": "write"}
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_maintainer_answer_for_different_review_is_not_a_candidate(tmp_path):
+    """A comment naming another review triggers no permission lookup."""
+    forge = _maintainer_forge(comments=[_maintainer_answer(review_id=1702)])
+    forge.rights = {"maintainer": "write"}
+    _assert_maintainer_hold(tmp_path, forge)
+    assert forge.right_calls == []
+
+
+def test_maintainer_answer_keeps_armed_bot_pull_request_armed(tmp_path):
+    """An armed app-authored pull request with a maintainer answer lands without disarming."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()], autoMergeRequest={"enabledAt": OLD})
+    forge.rights = {"maintainer": "write"}
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_bot_review_body_without_right_callback_keeps_old_behaviour(tmp_path, monkeypatch):
+    """Without a permission callback the pure core still ignores maintainer answers."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    p = pull(1, "CLEAN", author={"login": "vmafx-release-bot", "__typename": "Bot"})
+    hold = merge_train.review_body_hold(p, forge.review_details[1])
+    assert hold == (
+        "review body: coderabbitai review 1701 has findings "
+        "without a reply naming pullrequestreview-1701"
+    )
+
+
+def test_maintainer_right_cache_spans_reviews_and_reuses_fifth_login(tmp_path, monkeypatch):
+    """The fifth candidate's cached write right answers several findings without another read."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    comments = [_maintainer_answer(f"candidate-{n}") for n in range(5)]
+    comments[-1]["body"] += " Also addressed review 1702."
+    forge = _maintainer_forge(comments=comments)
+    detail = forge.review_details[1]
+    detail["reviews"]["nodes"].append(_bot_review(1702, "coderabbitai", "Nitpick comments: 1"))
+    detail["reviews"]["totalCount"] = 2
+    calls = []
+
+    def right(login):
+        calls.append(login)
+        return login == "candidate-4"
+
+    p = pull(1, "CLEAN", author={"login": "vmafx-release-bot", "__typename": "Bot"})
+    assert merge_train.review_body_hold(p, detail, right=right) is None
+    assert calls == [f"candidate-{n}" for n in range(5)]
+
+
+def test_maintainer_false_right_is_cached_and_remaining_count_recomputed(tmp_path, monkeypatch):
+    """Duplicate denied candidates are read once and only unanswered findings remain counted."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    answer = _maintainer_answer("outsider")
+    answer["body"] += " Also review 1702 and review 1703."
+    forge = _maintainer_forge(comments=[answer, answer, _maintainer_answer()])
+    detail = forge.review_details[1]
+    detail["reviews"]["nodes"] += [
+        _bot_review(n, "coderabbitai", "Nitpick comments: 1") for n in (1702, 1703)
+    ]
+    detail["reviews"]["totalCount"] = 3
+    calls = []
+
+    def right(login):
+        calls.append(login)
+        return login == "maintainer"
+
+    p = pull(1, "CLEAN", author={"login": "vmafx-release-bot", "__typename": "Bot"})
+    assert merge_train.review_body_hold(p, detail, right=right) == (
+        "review body: coderabbitai review 1702 has findings "
+        "without a reply naming pullrequestreview-1702 (and 1 more)"
+    )
+    assert calls == ["outsider", "maintainer"]
+
+
+def test_bot_maintainer_review_answer_does_not_count(tmp_path):
+    """A bot's submitted review is excluded from maintainer permission lookups."""
+    answer = _bot_review(
+        1702, "coderabbitai", "Actionable comments posted: 0\nAddressed review 1701."
+    )
+    forge = _maintainer_forge(reviews=[answer])
+    forge.rights = {"coderabbitai": "write"}
+    _assert_maintainer_hold(tmp_path, forge)
+    assert forge.right_calls == []
+
+
+def test_maintainer_right_refusal_reason_stays_bounded(tmp_path, monkeypatch):
+    """Long permission failures retain the candidate's name within the 200-character limit."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+
+    def right(login):
+        raise merge_train.RefusedError("permission refused " + "x" * 300)
+
+    p = pull(1, "CLEAN", author={"login": "vmafx-release-bot", "__typename": "Bot"})
+    reason = merge_train.review_body_hold(p, forge.review_details[1], right=right)
+    prefix = "review body: cannot read the right of maintainer: permission refused "
+    assert reason.startswith(prefix)
+    assert len(reason) == 200
 
 
 def test_planted_required_status_absent_holds_clean_pull(tmp_path):
