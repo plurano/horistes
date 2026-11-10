@@ -23,6 +23,12 @@ sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
 
 DRAFT_STEP = "Stop on a draft pull request"
+# Maximum number of workflow and composite action files inspected per root.
+MAX_WORKFLOW_FILES = 64
+# Maximum number of jobs inspected per file.
+MAX_JOBS = 32
+# Maximum number of steps inspected per job.
+MAX_STEPS = 64
 COPIES = [
     (".github/workflows/ci.yml", "floor"),
     (".github/workflows/ci.yml", "fuzz"),
@@ -37,25 +43,39 @@ COPIES = [
 ]
 
 
-def _draft_steps(job: object) -> list[dict]:
+def _draft_steps(job: object, where: str) -> list[dict]:
     """Every draft stop step in a job, preserving duplicate copies."""
     if not isinstance(job, dict):
         return []
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return []
+    if len(steps) > MAX_STEPS:
+        raise ValueError(f"{where} has {len(steps)} steps, at most {MAX_STEPS} supported")
     return [
         step
-        for step in job.get("steps") or []
+        for step in steps[:MAX_STEPS]
         if isinstance(step, dict) and step.get("name") == DRAFT_STEP
     ]
 
 
 def draft_copies(root: Path = ROOT) -> list[tuple[str, str]]:
     """Every path and job declaring a draft stop step, including duplicates."""
-    return sorted(
-        (path, job_id)
-        for path, _, doc in ciwf.files(root)
-        for job_id, job in doc.get("jobs", {}).items()
-        for _ in _draft_steps(job)
-    )
+    docs = ciwf.files(root)
+    if len(docs) > MAX_WORKFLOW_FILES:
+        raise ValueError(
+            f"{root} has {len(docs)} workflow/action files, at most {MAX_WORKFLOW_FILES} supported"
+        )
+    copies = []
+    for path, _, doc in docs[:MAX_WORKFLOW_FILES]:
+        jobs = doc.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        if len(jobs) > MAX_JOBS:
+            raise ValueError(f"{path} has {len(jobs)} jobs, at most {MAX_JOBS} supported")
+        for job_id, job in list(jobs.items())[:MAX_JOBS]:
+            copies.extend((path, job_id) for _ in _draft_steps(job, f"{path} job {job_id}"))
+    return sorted(copies)
 
 
 def extract_step(rel_path: str, job_id: str, root: Path = ROOT) -> dict:
@@ -64,7 +84,7 @@ def extract_step(rel_path: str, job_id: str, root: Path = ROOT) -> dict:
         job = ciwf.load(root / rel_path)["jobs"][job_id]
     except KeyError as err:
         raise ValueError(f"no job {job_id} in {rel_path}") from err
-    steps = _draft_steps(job)
+    steps = _draft_steps(job, f"{rel_path} job {job_id}")
     if not steps:
         raise ValueError(f"no draft stop step in {rel_path} job {job_id}")
     return steps[0]
@@ -136,6 +156,103 @@ def test_draft_copies_preserves_duplicate_steps(tmp_path: Path) -> None:
     planted.write_text(json.dumps(doc), encoding="utf-8")
     assert draft_copies(tmp_path) == [(rel_path, "a"), (rel_path, "a")]
     assert draft_copies(tmp_path) != [(rel_path, "a")]
+
+
+@pytest.mark.parametrize("jobs", [None, [], "jobs"], ids=["null", "list", "text"])
+def test_draft_copies_skips_jobs_that_are_not_a_mapping(tmp_path: Path, jobs: object) -> None:
+    """A non-mapping jobs value contributes no draft stop copies."""
+    planted = tmp_path / ".github/workflows/ci.yml"
+    planted.parent.mkdir(parents=True)
+    planted.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+    assert draft_copies(tmp_path) == []
+
+
+@pytest.mark.parametrize("steps", [None, {"a": 1}, "steps"], ids=["null", "mapping", "text"])
+def test_draft_copies_skips_steps_that_are_not_a_list(tmp_path: Path, steps: object) -> None:
+    """A non-list steps value contributes no draft stop copies."""
+    planted = tmp_path / ".github/workflows/ci.yml"
+    planted.parent.mkdir(parents=True)
+    planted.write_text(json.dumps({"jobs": {"verify": {"steps": steps}}}), encoding="utf-8")
+    assert draft_copies(tmp_path) == []
+
+
+def test_draft_copies_accepts_maximum_steps(tmp_path: Path) -> None:
+    """Exactly MAX_STEPS draft stops in one job preserve every copy."""
+    rel_path = ".github/workflows/ci.yml"
+    step = extract_step(rel_path, "verify")
+    planted = tmp_path / rel_path
+    planted.parent.mkdir(parents=True)
+    doc = {"jobs": {"verify": {"steps": [step] * MAX_STEPS}}}
+    planted.write_text(json.dumps(doc), encoding="utf-8")
+    assert draft_copies(tmp_path) == [(rel_path, "verify")] * MAX_STEPS
+
+
+def test_draft_copies_rejects_too_many_steps(tmp_path: Path) -> None:
+    """An over-limit step list raises ValueError naming its path, job, count and bound."""
+    rel_path = ".github/workflows/ci.yml"
+    step = extract_step(rel_path, "verify")
+    planted = tmp_path / rel_path
+    planted.parent.mkdir(parents=True)
+    doc = {"jobs": {"verify": {"steps": [step] * (MAX_STEPS + 1)}}}
+    planted.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError) as caught:
+        draft_copies(tmp_path)
+    assert rel_path in str(caught.value)
+    assert "job verify" in str(caught.value)
+    assert f"has {MAX_STEPS + 1} steps, at most {MAX_STEPS}" in str(caught.value)
+
+
+def test_draft_copies_accepts_maximum_jobs(tmp_path: Path) -> None:
+    """Exactly MAX_JOBS jobs in one file preserve every draft stop copy."""
+    rel_path = ".github/workflows/ci.yml"
+    step = extract_step(rel_path, "verify")
+    planted = tmp_path / rel_path
+    planted.parent.mkdir(parents=True)
+    doc = {"jobs": {f"job{i}": {"steps": [step]} for i in range(MAX_JOBS)}}
+    planted.write_text(json.dumps(doc), encoding="utf-8")
+    assert len(draft_copies(tmp_path)) == MAX_JOBS
+
+
+def test_draft_copies_rejects_too_many_jobs(tmp_path: Path) -> None:
+    """An over-limit jobs mapping raises ValueError naming its path, count and bound."""
+    rel_path = ".github/workflows/ci.yml"
+    step = extract_step(rel_path, "verify")
+    planted = tmp_path / rel_path
+    planted.parent.mkdir(parents=True)
+    doc = {"jobs": {f"job{i}": {"steps": [step]} for i in range(MAX_JOBS + 1)}}
+    planted.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError) as caught:
+        draft_copies(tmp_path)
+    assert rel_path in str(caught.value)
+    assert f"has {MAX_JOBS + 1} jobs, at most {MAX_JOBS}" in str(caught.value)
+
+
+def test_draft_copies_accepts_maximum_files(tmp_path: Path) -> None:
+    """Exactly MAX_WORKFLOW_FILES files preserve every draft stop copy."""
+    step = extract_step(".github/workflows/ci.yml", "verify")
+    planted = tmp_path / ".github/workflows"
+    planted.mkdir(parents=True)
+    doc = {"jobs": {"verify": {"steps": [step]}}}
+    for i in range(MAX_WORKFLOW_FILES):
+        (planted / f"w{i}.yml").write_text(json.dumps(doc), encoding="utf-8")
+    assert len(draft_copies(tmp_path)) == MAX_WORKFLOW_FILES
+
+
+def test_draft_copies_rejects_too_many_files(tmp_path: Path) -> None:
+    """An over-limit file list raises ValueError naming its root, count and bound."""
+    step = extract_step(".github/workflows/ci.yml", "verify")
+    planted = tmp_path / ".github/workflows"
+    planted.mkdir(parents=True)
+    doc = {"jobs": {"verify": {"steps": [step]}}}
+    for i in range(MAX_WORKFLOW_FILES + 1):
+        (planted / f"w{i}.yml").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError) as caught:
+        draft_copies(tmp_path)
+    assert str(tmp_path) in str(caught.value)
+    assert (
+        f"has {MAX_WORKFLOW_FILES + 1} workflow/action files, at most {MAX_WORKFLOW_FILES}"
+        in str(caught.value)
+    )
 
 
 def test_planted_second_job_copy_is_run(tmp_path: Path) -> None:
