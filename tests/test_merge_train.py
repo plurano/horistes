@@ -169,6 +169,7 @@ def build_commit_node(number: int, suites: list, **fields) -> dict:
     commit_date = fields.pop("committedDate", created_at)
     signature = fields.pop("signature", _ABSENT)
     user = fields.pop("user", _ABSENT)
+    status = fields.pop("status", None)
     suite_nodes = []
     base_time = datetime(2026, 10, 18, 0, 0, 0, tzinfo=UTC)
     for i, item in enumerate(suites):
@@ -204,6 +205,7 @@ def build_commit_node(number: int, suites: list, **fields) -> dict:
         "messageHeadline": headline,
         "author": author_node,
         "signature": sig_node,
+        "status": status,
         "checkSuites": {"nodes": suite_nodes},
     }
 
@@ -224,7 +226,8 @@ def pull(number: int, state: str, **fields) -> dict:
         pr_author = {"login": f"author-{number}"}
     reviews = fields.pop("reviews", [])
     review_nodes = reviews if isinstance(reviews, dict) else {"nodes": reviews}
-    commit_node = build_commit_node(number, suites, **fields)
+    status = fields.pop("status", None)
+    commit_node = build_commit_node(number, suites, status=status, **fields)
     node = {
         "number": number,
         "id": f"PR_{number}",
@@ -897,8 +900,7 @@ def train(
         path = tmp_path / "train.py"
         path.write_text(source, encoding="utf-8")
         command = [sys.executable, "-I", "-B", str(path)]
-    summary = tmp_path / "summary.md"
-    output = tmp_path / "output"
+    summary, output = tmp_path / "summary.md", tmp_path / "output"
     forge.workdir = tmp_path
     server = serve(forge)
     url = f"http://127.0.0.1:{server.server_address[1]}"
@@ -922,6 +924,7 @@ def train(
             "TRAIN_RELEASE_OFF": "",
             "TRAIN_RELEASE_MAX_PARALLEL": "3",
             "TRAIN_SECURITY_LABELS": "security",
+            "TRAIN_REQUIRED_STATUS": "",
             **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
         }
     )
@@ -968,6 +971,10 @@ def queued(number: int) -> tuple:
 
 def updated(number: int) -> tuple:
     return ("update", number, f"{number:040x}")
+
+
+def ctx(name, state):
+    return {"contexts": [{"context": name, "state": state}]}
 
 
 CHECKOUT = {
@@ -1672,6 +1679,9 @@ def test_switched_off_writes_nothing(tmp_path):
         ("release_max_parallel", "0"),
         ("release_max_parallel", "4"),
         ("release_max_parallel", "two"),
+        ("required_status", "has space"),
+        ("required_status", "-lead"),
+        ("required_status", "x" * 101),
     ],
 )
 def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
@@ -6760,3 +6770,240 @@ def test_review_body_reads_stop_at_the_bound_security_update_first(tmp_path):
         "| #10 | CLEAN | review body: not read: more than 10 pull requests to read in one run |"
     )
     assert expected in summary, summary
+
+
+def test_planted_required_status_absent_holds_clean_pull(tmp_path):
+    """A clean pull request without the required commit status context does not land."""
+    p = pull(1, "CLEAN")
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "status lanes/booked absent: held" in summary
+    assert "| #1 | CLEAN | status lanes/booked absent: held |" in summary
+
+
+def test_planted_required_status_other_context_holds_clean_pull(tmp_path):
+    """A clean pull request with a different status context does not satisfy the required status."""
+    p = pull(1, "CLEAN", status=ctx("ci/other", "SUCCESS"))
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "status lanes/booked absent: held" in summary
+    assert "| #1 | CLEAN | status lanes/booked absent: held |" in summary
+
+
+@pytest.mark.parametrize("state", ["PENDING", "FAILURE", "ERROR", "EXPECTED"])
+def test_required_status_non_success_holds_clean_pull(tmp_path, state):
+    """A required status context in any non-SUCCESS state holds the pull request."""
+    p = pull(1, "CLEAN", status=ctx("lanes/booked", state))
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    expected = f"status lanes/booked {state.lower()}: held"
+    assert expected in summary
+    assert f"| #1 | CLEAN | {expected} |" in summary
+
+
+def test_required_status_success_lands(tmp_path):
+    """A pull request whose required commit status is SUCCESS lands."""
+    p = pull(1, "CLEAN", status=ctx("lanes/booked", "SUCCESS"))
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_unset_required_status_lands_unchanged(tmp_path):
+    """When required_status is unset or empty, landing behavior is unchanged."""
+    p1 = pull(1, "CLEAN")
+    forge1 = Forge(repository(p1))
+    done1, summary1 = train(tmp_path, forge1)
+    assert done1.returncode == 0, done1.stdout + done1.stderr
+    assert forge1.writes == [landed(1)]
+
+    p2 = pull(1, "CLEAN", status=ctx("lanes/booked", "FAILURE"))
+    forge2 = Forge(repository(p2))
+    done2, summary2 = train(tmp_path, forge2)
+    assert done2.returncode == 0, done2.stdout + done2.stderr
+    assert forge2.writes == [landed(1)]
+
+
+def test_planted_armed_pr_held_by_required_status_is_disarmed(tmp_path):
+    """An armed PR held by an absent required status context is disarmed."""
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "person"},
+        autoMergeRequest={"enabledAt": OLD},
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)]
+    assert "disarmed: status lanes/booked absent: held" in summary
+
+
+def test_behind_pr_not_armed_or_updated_when_required_status_absent(tmp_path):
+    """A BEHIND PR without the required commit status context is not armed or updated."""
+    p = pull(1, "BEHIND")
+    forge = Forge(repository(p, rules=()))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "status lanes/booked absent: held" in summary
+    assert "| #1 | BEHIND | status lanes/booked absent: held |" in summary
+
+
+def test_check_required_status_validates_and_strips(tmp_path):
+    """The check_required_status helper strips whitespace and validates context names."""
+    rules = load_rules(tmp_path)
+    assert rules.check_required_status("") == ""
+    assert rules.check_required_status("   ") == ""
+    assert rules.check_required_status("lanes/booked") == "lanes/booked"
+    assert rules.check_required_status("  lanes/booked  ") == "lanes/booked"
+    with pytest.raises(ValueError, match="not a status context name"):
+        rules.check_required_status("has space")
+    with pytest.raises(ValueError, match="not a status context name"):
+        rules.check_required_status("-lead")
+    with pytest.raises(ValueError, match="not a status context name"):
+        rules.check_required_status("x" * 101)
+
+
+def test_required_status_hold_with_empty_nodes_reports_absent(tmp_path):
+    """A pull request with no latest commit nodes reports absent."""
+    rules = load_rules(tmp_path)
+    p = pull(1, "CLEAN", latest={"nodes": []})
+    conf = {"required_status": "lanes/booked"}
+    assert rules.required_status_hold(p, conf) == "status lanes/booked absent: held"
+
+
+def test_query_includes_status_contexts(tmp_path):
+    """The GraphQL pull query requests commit status contexts."""
+    rules = load_rules(tmp_path)
+    assert "status { contexts { context state } }" in rules.QUERY
+
+
+def test_without_the_required_status_hold_a_held_pull_request_lands(tmp_path):
+    """Planted: without the required status hold, a pull request lacking the status lands."""
+    mutant = module().replace(
+        "    status_hold = required_status_hold(pull, conf)\n"
+        "    if status_hold:\n"
+        "        return status_hold",
+        "    pass",
+    )
+    assert mutant != module()
+    p = pull(1, "CLEAN")
+    forge = Forge(repository(p))
+    done, _ = train(tmp_path, forge, helper=mutant, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+
+
+def test_planted_retitled_armed_pr_held_by_required_status_is_not_re_armed(tmp_path):
+    """A retitled armed pull request held by the required status is disarmed and stays disarmed."""
+    retitled = pull(
+        1,
+        "BLOCKED",
+        title="chore(deps): update tool to v2",
+        autoMergeRequest=armed_squash("chore(deps): update tool to v1 (#1)"),
+    )
+    forge = Forge(repository(retitled))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)], forge.writes
+    assert "re-armed" not in summary, summary
+    assert "disarmed: status lanes/booked absent: held" in summary, summary
+
+
+def test_is_required_status_hold_reads_only_its_own_reasons(tmp_path):
+    """Only a reason the required status check wrote counts as its hold."""
+    rules = load_rules(tmp_path)
+    assert rules.is_required_status_hold("status lanes/booked absent: held")
+    assert rules.is_required_status_hold("status lanes/booked pending: held")
+    assert not rules.is_required_status_hold("")
+    assert not rules.is_required_status_hold("merge state BLOCKED")
+    assert not rules.is_required_status_hold("status lanes/booked absent")
+
+
+@pytest.mark.parametrize(
+    ("others", "expected"), [(99, None), (100, "status lanes/booked absent: held")]
+)
+def test_required_status_contexts_past_the_bound_count_as_absent(tmp_path, others, expected):
+    """The context read stops at MAX_STATUS_CONTEXTS; one past it is absent, so the bound holds."""
+    rules = load_rules(tmp_path)
+    assert rules.MAX_STATUS_CONTEXTS == 100
+    contexts = [{"context": f"ci/{i}", "state": "SUCCESS"} for i in range(others)]
+    contexts.append({"context": "lanes/booked", "state": "SUCCESS"})
+    p = pull(1, "CLEAN", status={"contexts": contexts})
+    assert rules.required_status_hold(p, {"required_status": "lanes/booked"}) == expected
+
+
+# workflow_call inputs the job reads itself, not the train script.
+INPUTS_OFF_TRAIN = frozenset({"runner"})
+
+
+def input_wiring_findings(doc: dict, source: str) -> list[str]:
+    """Inputs missing from the train step env as TRAIN_<NAME>, or set there but never read."""
+    inputs = doc["on"]["workflow_call"]["inputs"]
+    steps = [s for s in doc["jobs"]["train"]["steps"] if s.get("name") == STEP]
+    env = (steps[0].get("env") if steps else None) or {}
+    read = set(re.findall(r'"(TRAIN_[A-Z0-9_]+)"', source))
+    found = []
+    for name in sorted(set(inputs) - INPUTS_OFF_TRAIN):
+        key = f"TRAIN_{name.upper()}"
+        if env.get(key) != f"${{{{ inputs.{name} }}}}":
+            found.append(f"input {name} does not reach {key}")
+        elif key not in read:
+            found.append(f"{key} is set but the train never reads it")
+    return found
+
+
+def test_every_train_input_reaches_the_train_env():
+    """Each workflow_call input but the runner is passed to the train step and read by the train."""
+    doc = ciwf.load(TRAIN)
+    assert INPUTS_OFF_TRAIN.issubset(doc["on"]["workflow_call"]["inputs"])
+    assert input_wiring_findings(doc, SCRIPT.read_text(encoding="utf-8")) == []
+
+
+def _train_env(doc: dict) -> dict:
+    """The env mapping of the train step in doc."""
+    return next(s for s in doc["jobs"]["train"]["steps"] if s.get("name") == STEP)["env"]
+
+
+@pytest.mark.parametrize(
+    ("mutator", "drop", "finding"),
+    [
+        (
+            lambda doc: _train_env(doc).pop("TRAIN_REQUIRED_STATUS"),
+            None,
+            "input required_status does not reach TRAIN_REQUIRED_STATUS",
+        ),
+        (
+            lambda doc: _train_env(doc).update(TRAIN_REQUIRED_STATUS="${{ inputs.switch }}"),
+            None,
+            "input required_status does not reach TRAIN_REQUIRED_STATUS",
+        ),
+        (
+            lambda doc: doc["on"]["workflow_call"]["inputs"].update(extra={"type": "string"}),
+            None,
+            "input extra does not reach TRAIN_EXTRA",
+        ),
+        (
+            lambda doc: None,
+            '"TRAIN_REQUIRED_STATUS"',
+            "TRAIN_REQUIRED_STATUS is set but the train never reads it",
+        ),
+    ],
+)
+def test_planted_input_wiring_mutants_are_found(mutator, drop, finding):
+    """A dropped, rewired or new input, or an env name the train stops reading, is named."""
+    doc = ciwf.load(TRAIN)
+    mutator(doc)
+    source = SCRIPT.read_text(encoding="utf-8")
+    if drop:
+        source = source.replace(drop, '"GONE"')
+    assert input_wiring_findings(doc, source) == [finding]

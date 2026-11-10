@@ -56,6 +56,10 @@
 #   Once no such security update is open, the train marks the held pull
 #   requests ready again and removes the label. A held pull request a person
 #   marks ready keeps the label and is not held again (decision record 0062).
+# - When `required_status` names a commit status context, a pull request whose
+#   head commit lacks that context or reports a state other than SUCCESS is
+#   held from landing and arming, and an armed pull request held by it is
+#   disarmed (decision record 0076). An empty input turns the check off.
 # - After that write, it closes the open issues that the pull requests it
 #   merged in the last 7 days name as closed (`Closes #N` and the forge's
 #   other closing forms): the forge leaves them open when the app merges, and
@@ -184,6 +188,13 @@ on:
         type: string
         required: false
         default: security
+      required_status:
+        description: >-
+          Commit status context the head commit must report as success before
+          the train arms or lands a pull request; empty turns the check off.
+        type: string
+        required: false
+        default: ""
     secrets:
       app_private_key:
         description: >-
@@ -234,6 +245,14 @@ jobs:
           RELEASE_LABEL = "autorelease:"
           REFRESH_LIMIT = 3
           STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
+          REQUIRED_STATUS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}$")
+          REQUIRED_STATUS_PREFIX = "status "
+          MAX_STATUS_CONTEXTS = 100
+
+
+          def is_required_status_hold(reason):
+              """Whether a hold reason came from the required status check."""
+              return reason.startswith(REQUIRED_STATUS_PREFIX) and reason.endswith(": held")
 
 
           class NoSignOffError(ValueError):
@@ -433,6 +452,26 @@ jobs:
               return False
 
 
+          def required_status_hold(pull, conf):
+              """Why the required commit status holds the pull request, or None (decision record 0076).
+
+              Absent context or a state other than SUCCESS holds; contexts past MAX_STATUS_CONTEXTS
+              count as absent, so the bound fails closed.
+              """
+              name = conf.get("required_status") or ""
+              if not name:
+                  return None
+              nodes = pull["latest"]["nodes"]
+              status = (nodes[-1]["commit"].get("status") if nodes else None) or {}
+              contexts = status.get("contexts") or []
+              states = [ctx["state"] for ctx in contexts[:MAX_STATUS_CONTEXTS] if ctx["context"] == name]
+              if not states:
+                  return f"status {name} absent: held"
+              if states[0] != "SUCCESS":
+                  return f"status {name} {states[0].lower()}: held"
+              return None
+
+
           def verdict(pull, repo, conf, now, replaced=frozenset()):
               """land, behind, or the reason the train leaves the pull request alone."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
@@ -463,6 +502,9 @@ jobs:
               scanning = has_red_code_scanning(pull)
               if scanning:
                   return scanning
+              status_hold = required_status_hold(pull, conf)
+              if status_hold:
+                  return status_hold
               if state in conf["accept"]:
                   return "land"
               if state == "BEHIND":
@@ -742,6 +784,16 @@ jobs:
               return int(raw)
 
 
+          def check_required_status(raw, error_cls=ValueError):
+              """Status context required on the head commit, or empty string when off."""
+              name = (raw or "").strip()
+              if not name:
+                  return ""
+              if not REQUIRED_STATUS_NAME.match(name):
+                  raise error_cls(f"required_status {raw!r} is not a status context name")
+              return name
+
+
           QUERY = """
           query($owner: String!, $name: String!, $after: String) {
             repository(owner: $owner, name: $name) {
@@ -778,6 +830,7 @@ jobs:
                         messageHeadline
                         author { email user { login } }
                         signature { wasSignedByGitHub }
+                        status { contexts { context state } }
                         checkSuites(first: 30) {
                           nodes {
                             databaseId
@@ -942,6 +995,7 @@ jobs:
           TRAIN_RELEASE_OFF: ${{ inputs.release_off }}
           TRAIN_RELEASE_MAX_PARALLEL: ${{ inputs.release_max_parallel }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
+          TRAIN_REQUIRED_STATUS: ${{ inputs.required_status }}
         run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/merge_train.py"
 
   release:

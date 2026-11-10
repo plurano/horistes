@@ -46,12 +46,14 @@ from train_rules import (
     NoSignOffError,
     check_release_off,
     check_release_parallel,
+    check_required_status,
     drifted,
     has_red_code_scanning,
     head_since,
     in_flight,
     is_bot_dependency,
     is_red,
+    is_required_status_hold,
     is_security,
     issues_to_close,
     lease_until,
@@ -308,6 +310,9 @@ def settings(env):
     check_app_key(env.get("TRAIN_APP_KEY", ""))
     release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
     parallel = check_release_parallel(env["TRAIN_RELEASE_MAX_PARALLEL"], InvalidSettingError)
+    required_status = check_required_status(
+        env.get("TRAIN_REQUIRED_STATUS", ""), InvalidSettingError
+    )
     return {
         "switch": switch,
         "method": method,
@@ -320,6 +325,7 @@ def settings(env):
         "release_max_parallel": parallel,
         "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
         "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
+        "required_status": required_status,
     }
 
 
@@ -906,7 +912,7 @@ def re_arm_drifted(env, conf, served, held, notes):
     do not read it as armed.
     """
     for pull, reason in served:
-        if reason.startswith(REVIEW_BODY):
+        if reason.startswith(REVIEW_BODY) or is_required_status_hold(reason):
             continue
         if pull["number"] not in held and drifted(pull, conf):
             if has_red_code_scanning(pull):
@@ -928,7 +934,11 @@ def disarm_red_scanning(env, rows, notes):
     for pull, reason in rows:
         if not pull.get("autoMergeRequest"):
             continue
-        cause = has_red_code_scanning(pull) or (reason if reason.startswith(REVIEW_BODY) else None)
+        cause = (
+            has_red_code_scanning(pull)
+            or (reason if reason.startswith(REVIEW_BODY) else None)
+            or (reason if is_required_status_hold(reason) else None)
+        )
         if cause:
             graphql(env, DISARM, {"id": pull["id"]})
             notes[pull["number"]] = f"disarmed: {cause}"
