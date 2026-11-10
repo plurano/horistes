@@ -88,16 +88,23 @@ the status, and every verdict is the one it was before.
   rule that requires the context closes both gaps only when it names the
   writer's app as the expected source of the context, so a status from another
   author does not satisfy it, and when the writer reports the context only as
-  a commit status on the pull request head commit: the rule also accepts a
+  a commit status on the pull request head commit: the rule may also accept a
   check run of that name from the writer's app, which the train does not read,
   and the forge judges the test merge commit instead once that commit carries
   a status. Where the default branch has a merge queue, the rule also requires
   the context on each merge-group commit the queue builds, so the writer
   reports it there too; without it the queue fails the entry and the pull
-  request does not land, while nothing merges without the context. The forge
-  checks the context when the merge happens and refuses the merge, the train's
-  included, while the context does not pass, unless the merging actor may bypass
-  the rule.
+  request does not land when "Only merge non-failing pull requests" is on.
+  Only with that setting on does the queue hold each pull request on its
+  own; with it off, a pull request whose own merge-group commit fails the
+  context can still land when a later merge-group commit in its group
+  passes. With a merge queue, the forge judges the context on the merge-group
+  commit; its documentation names no recheck of the head commit status after
+  the merge-group status passes, so a head status that changes after that
+  may not stop the landing. For a direct merge without a merge queue, the
+  forge checks the context when the merge happens and refuses the merge, the
+  train's included, while the context does not pass, unless the merging
+  actor may bypass the rule.
 - Tests in `tests/test_merge_train.py` hold the planted cases: absent and
   non-success held, success landed, unset unchanged; the status selected only
   when set and only on the head commit; Commit statuses read minted only when

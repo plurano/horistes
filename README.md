@@ -179,7 +179,10 @@ ruleset or branch protection, and the writer reporting the context only as a
 commit status on the head commit and, with a merge queue, on each merge-group
 commit: the train's merge guards only the head commit, so
 neither a status that changes after the train reads it nor auto-merge armed by
-hand waits for the train
+hand waits for the train. With a merge queue the forge judges the merge-group
+commit, so a head status that changes after that commit passes may not stop
+the landing, and the queue holds each pull request on its own only with its
+"Only merge non-failing pull requests" setting on
 ([ADR-0076](docs/adr/0076-train-holds-on-a-required-status.md)).
 
 ## Actions
