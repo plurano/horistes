@@ -68,7 +68,7 @@ CRYPTO_USE = (
     "crypto_weaknesses",
 )
 CRYPTO_CALL = re.compile(r"\bhashlib\.|\bopenssl\b|\bhmac\.|\bcryptography\b")
-LINK = re.compile(r"blob/main/([^\s#)]+)")
+LINK = re.compile(r"blob/main/([^\s#)]+)(#L)?")
 
 
 def findings(
@@ -93,8 +93,8 @@ def findings(
     for key, text in answers.items():
         found += [
             f"{key}: links missing {path}"
-            for path in LINK.findall(text)
-            if not (root / path.rstrip(".,")).exists()
+            for path, anchored in LINK.findall(text)
+            if not anchored and not (root / path.rstrip(".,")).exists()
         ]
     found += anchors.findings(answers, root, pins)
     return found
@@ -142,11 +142,13 @@ def test_missing_link_refused(tmp_path: Path) -> None:
     assert findings({"x_justification": text}, root) == ["x_justification: links missing GONE.md"]
 
 
-def test_missing_linked_file_with_anchor_gets_no_anchor_finding(tmp_path: Path) -> None:
-    """A missing file with an anchor reports only links missing, no anchor finding."""
+def test_missing_linked_file_with_anchor_gets_one_finding(tmp_path: Path) -> None:
+    """A missing file with an anchor gets one finding, from the anchor check alone."""
     root = _tree(tmp_path, "")
     text = "Evidence: https://github.com/plurano/horistes/blob/main/GONE.md#L10"
-    assert findings({"x_justification": text}, root) == ["x_justification: links missing GONE.md"]
+    assert findings({"x_justification": text}, root) == [
+        "x_justification: anchor GONE.md#L10 links missing GONE.md"
+    ]
 
 
 def test_planted_stale_first_line(tmp_path: Path) -> None:

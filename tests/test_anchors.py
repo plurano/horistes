@@ -227,6 +227,27 @@ def test_planted_missing_current_file_writes_nothing(tree: Tree, capsys) -> None
     assert (root / ".bestpractices.json").read_bytes() == before
 
 
+def test_planted_check_refuses_anchor_into_missing_file(tree: Tree, capsys) -> None:
+    """Planted: the check alone fails an anchor whose linked file is gone."""
+    raw = f'{{"one": "{URL}tools/a.py#L2-L3 {URL}tools/gone.py#L4"}}\n'
+    root = repository(tree, "header\nfirst\nlast\n", raw)
+    assert invoke(root, "check", (PIN,)) == 1
+    errors = capsys.readouterr().err
+    assert errors == "FAIL: one: anchor tools/gone.py#L4 links missing tools/gone.py\n"
+
+
+def test_planted_check_refuses_pinned_anchor_once_its_file_is_deleted(
+    tree: Tree, capsys
+) -> None:
+    """Planted: deleting a pinned file fails the check on the answer's anchor."""
+    raw = f'{{"one": "{URL}tools/a.py#L2-L3"}}\n'
+    root = repository(tree, "header\nfirst\nlast\n", raw)
+    (root / "tools/a.py").unlink()
+    assert invoke(root, "check", (PIN,)) == 1
+    errors = capsys.readouterr().err
+    assert "FAIL: one: anchor tools/a.py#L2-L3 links missing tools/a.py\n" in errors
+
+
 @pytest.mark.parametrize("source", ["{", "\xff"])
 def test_planted_bad_answers_are_file_errors(tree: Tree, source: str, capsys) -> None:
     """Planted: malformed JSON and invalid UTF-8 report the CLI error code."""

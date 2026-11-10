@@ -184,10 +184,10 @@ def findings(answers: dict[str, str], root: Path, pins: tuple[Pin, ...] = PINS) 
     }
     for key, text in answers.items():
         for match in ANCHOR.finditer(text):
-            if not (root / match.group(1)).exists():
-                continue
             anchor = match.group(0).removeprefix("blob/main/")
-            if (key, anchor) not in valid:
+            if not (root / match.group(1)).exists():
+                found.append(f"{key}: anchor {anchor} links missing {match.group(1)}")
+            elif (key, anchor) not in valid:
                 found.append(
                     f"{key}: anchor {anchor} matches no pin for this answer; "
                     "run tools/anchors.py fix"
