@@ -376,11 +376,13 @@ def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.Mo
     real_python = _real_python3()
     assert real_python is not None
     assert real_python != str(shim)
+    assert real_python == os.path.realpath(sys.executable)
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     linked_python = bin_dir / "python3"
     linked_python.symlink_to(real_python)
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-10 category D: runs linked python
     proc = subprocess.run(
         [str(linked_python), "-c", "pass"],
         env={"PATH": str(bin_dir)},
@@ -390,6 +392,7 @@ def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.Mo
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-10 category D: runs planted shim
     shim_proc = subprocess.run(
         [str(shim), "-c", "pass"],
         env={"PATH": str(bin_dir)},
@@ -401,10 +404,50 @@ def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.Mo
     assert shim_proc.returncode != 0
 
 
-def test_real_python3_none_without_executable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Return None when the running interpreter exposes no executable path."""
+def test_real_python3_none_without_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Return None without an executable path even when PATH contains python3."""
+    pathbin = tmp_path / "pathbin"
+    pathbin.mkdir()
+    path_python = pathbin / "python3"
+    path_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path_python.chmod(0o755)
+    monkeypatch.setenv("PATH", str(pathbin))
+    assert shutil.which("python3") == str(path_python)
     monkeypatch.setattr(sys, "executable", "")
     assert _real_python3() is None
+
+
+def test_real_python3_follows_sys_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve a linked sys.executable instead of the planted PATH interpreter."""
+    if not sys.executable:
+        pytest.skip("running interpreter path unknown")
+    original_python = os.path.realpath(sys.executable)
+
+    pathbin = tmp_path / "pathbin"
+    pathbin.mkdir()
+    path_python = pathbin / "python3"
+    path_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path_python.chmod(0o755)
+    monkeypatch.setenv("PATH", str(pathbin))
+    assert shutil.which("python3") == str(path_python)
+
+    exe_dir = tmp_path / "exe"
+    exe_dir.mkdir()
+    linked_python = exe_dir / "python3"
+    try:
+        linked_python.symlink_to(original_python)
+    except OSError:
+        if sys.platform == "win32":
+            pytest.skip("interpreter symlink creation unsupported")
+        raise
+    monkeypatch.setattr(sys, "executable", str(linked_python))
+    real_python = _real_python3()
+    assert real_python == original_python
+    assert real_python != str(path_python)
 
 
 def test_makefile_shares_hashlib_command() -> None:
@@ -430,7 +473,7 @@ def test_tools_negative_hash_command_fails(tmp_path: Path) -> None:
     nopython.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     nopython.chmod(0o755)
 
-    proc = _run_make(tmp_path, "tools", f"PYTHON={nopython}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(nopython))}")
     assert proc.returncode != 0
     assert stamp.read_bytes() == old_stamp
     assert HASH_FAILED in proc.stderr
@@ -445,7 +488,7 @@ def test_tools_negative_python_nonexistent(tmp_path: Path) -> None:
     stamp.write_bytes(old_stamp)
 
     nonexistent = tmp_path / "bin" / "does-not-exist"
-    proc = _run_make(tmp_path, "tools", f"PYTHON={nonexistent}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(nonexistent))}")
     assert proc.returncode != 0
     assert stamp.read_bytes() == old_stamp
     assert HASH_FAILED in proc.stderr
@@ -462,7 +505,7 @@ def test_tools_boundary_missing_requirements(tmp_path: Path) -> None:
     old_stamp = b"old-stamp-bytes\n"
     stamp.write_bytes(old_stamp)
 
-    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(py_path))}")
     assert proc.returncode != 0
     assert stamp.read_bytes() == old_stamp
     assert HASH_FAILED in proc.stderr
@@ -479,7 +522,7 @@ def test_tools_positive_stale_stamp(tmp_path: Path) -> None:
     stale_stamp = b"stale-stamp-bytes\n"
     stamp.write_bytes(stale_stamp)
 
-    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(py_path))}")
     assert proc.returncode == 0
     expected_hash = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
     assert stamp.read_text(encoding="utf-8") == f"{expected_hash}\n"
@@ -497,6 +540,33 @@ def test_tools_positive_matching_stamp(tmp_path: Path) -> None:
     matching_stamp = f"{expected_hash}\n"
     stamp.write_text(matching_stamp, encoding="utf-8")
 
-    proc = _run_make(tmp_path, "tools", f"PYTHON={py_path}")
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(py_path))}")
     assert proc.returncode == 0
     assert stamp.read_text(encoding="utf-8") == matching_stamp
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="quoted interpreter needs a POSIX shell")
+def test_tools_python_path_with_space(tmp_path: Path) -> None:
+    """Quoted spaced interpreter updates the stamp; an unquoted path leaves it stale."""
+    py_path = _real_python3()
+    if py_path is None:
+        pytest.skip("running interpreter path unknown")
+
+    spaced_dir = tmp_path / "dir with space"
+    spaced_dir.mkdir()
+    linked_python = spaced_dir / "python3"
+    linked_python.symlink_to(py_path)
+    tools_txt, stamp = _setup_tree(tmp_path)
+    _setup_stub_venv(tmp_path)
+    stale_stamp = b"stale-stamp-bytes\n"
+    stamp.write_bytes(stale_stamp)
+
+    proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(linked_python))}")
+    assert proc.returncode == 0
+    expected_hash = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
+    assert stamp.read_bytes() == f"{expected_hash}\n".encode("utf-8")
+
+    stamp.write_bytes(stale_stamp)
+    unquoted_proc = _run_make(tmp_path, "tools", f"PYTHON={linked_python}")
+    assert unquoted_proc.returncode != 0
+    assert stamp.read_bytes() == stale_stamp
