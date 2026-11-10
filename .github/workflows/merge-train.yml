@@ -193,7 +193,8 @@ on:
       required_status:
         description: >-
           Commit status context the head commit must report as success before
-          the train arms or lands a pull request; empty turns the check off.
+          the train updates or lands a pull request; while it is set the train
+          arms none. Empty turns the check off.
         type: string
         required: false
         default: ""
@@ -247,7 +248,9 @@ jobs:
           RELEASE_LABEL = "autorelease:"
           REFRESH_LIMIT = 3
           STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
-          REQUIRED_STATUS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}$")
+          REQUIRED_STATUS_NAME = re.compile(
+              r"^[A-Za-z0-9](?:[A-Za-z0-9._/: -]{0,98}[A-Za-z0-9._/:-])?$"
+          )
 
 
           class NoSignOffError(ValueError):
@@ -323,9 +326,11 @@ jobs:
               fix behind (decision record 0062). A draft cannot be merged by either.
               """
               served = ("land", "behind", "red")
+              # A security update the required status holds is still the fix (decision record 0076).
+              reasons = [(pull, unheld_reason(pull, reason, conf)) for pull, reason in rows]
               fixes = [
                   pull
-                  for pull, reason in rows
+                  for pull, reason in reasons
                   if is_security(pull, conf) and (reason in served or reason.startswith("merge state"))
               ]
               marked = [pull for pull, _ in rows if SECURITY_HOLD_LABEL in label_names(pull)]
@@ -467,10 +472,32 @@ jobs:
               return None
 
 
+          def merge_reason(pull, conf):
+              """land, red, behind or merge state <state>: the verdict from the merge state alone."""
+              state = pull["mergeStateStatus"]
+              if state in conf["accept"]:
+                  return "land"
+              if state == "BEHIND":
+                  return "red" if is_red(pull) else "behind"
+              return f"merge state {state}"
+
+
+          def unheld_reason(pull, reason, conf):
+              """The verdict reason, a required status hold replaced by the merge state verdict under it.
+
+              The steps that guard the landing order read it: security hold, write hold and
+              refresh. Landing, updating, arming and review bodies keep the hold (decision
+              record 0076).
+              """
+              hold = required_status_hold(pull, conf)
+              if hold is not None and reason == hold:
+                  return merge_reason(pull, conf)
+              return reason
+
+
           def verdict(pull, repo, conf, now, replaced=frozenset()):
               """land, behind, or the reason the train leaves the pull request alone."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
-              state = pull["mergeStateStatus"]
               held = sorted(labels & conf["hold"])
               if pull["baseRefName"] != repo["defaultBranchRef"]["name"]:
                   return "not for the default branch"
@@ -500,11 +527,7 @@ jobs:
               status_hold = required_status_hold(pull, conf)
               if status_hold:
                   return status_hold
-              if state in conf["accept"]:
-                  return "land"
-              if state == "BEHIND":
-                  return "red" if is_red(pull) else "behind"
-              return f"merge state {state}"
+              return merge_reason(pull, conf)
 
 
           def linear_history(repo):
@@ -561,10 +584,14 @@ jobs:
               ]
 
 
-          def refresh_candidates(rows):
+          def refresh_candidates(rows, conf):
               """Red pull requests a fresh event could unblock, oldest first, at most REFRESH_LIMIT."""
               waiting = ("red", "merge state BLOCKED", "merge state UNSTABLE")
-              found = [pull for pull, reason in rows if reason in waiting and red_runs(pull)]
+              found = [
+                  pull
+                  for pull, reason in rows
+                  if unheld_reason(pull, reason, conf) in waiting and red_runs(pull)
+              ]
               return found[:REFRESH_LIMIT]
 
 
@@ -589,14 +616,14 @@ jobs:
               )
 
 
-          def refresh(rows, notes, jobs, toggle):
+          def refresh(rows, notes, jobs, toggle, conf):
               """Give the oldest pull request whose red runs stopped at the draft step a fresh event.
 
               A re-run replays the draft payload; a label event carries the current one
               (decision record 0041). Once per failed run: a refresh that started no run
               is left to a person. jobs reads a run's jobs; toggle adds and removes REFRESH_LABEL.
               """
-              for pull in refresh_candidates(rows):
+              for pull in refresh_candidates(rows, conf):
                   runs = red_runs(pull)
                   if not all(run and stopped_at_draft_step(jobs(run)) for run, _ in runs):
                       continue
@@ -717,7 +744,8 @@ jobs:
               email = f"{conf['bot_id']}+{conf['bot_login']}@users.noreply.github.com"
               held = []
               for pull, reason in served:
-                  if reason != "land" and not reason.startswith("merge state "):
+                  unheld = unheld_reason(pull, reason, conf)
+                  if unheld != "land" and not unheld.startswith("merge state "):
                       continue
                   nodes = pull["latest"]["nodes"]
                   commit = nodes[-1]["commit"] if nodes else {}

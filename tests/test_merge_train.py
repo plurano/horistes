@@ -1749,7 +1749,8 @@ def test_switched_off_writes_nothing(tmp_path):
         ("release_max_parallel", "0"),
         ("release_max_parallel", "4"),
         ("release_max_parallel", "two"),
-        ("required_status", "has space"),
+        ("required_status", "pipe|inside"),
+        ("required_status", "tab\tinside"),
         ("required_status", "-lead"),
         ("required_status", "x" * 101),
     ],
@@ -4196,7 +4197,7 @@ STOPPED = [
 REFRESH_CALL = (
     "outcome = refresh(\n"
     "        served, notes, lambda run: run_jobs(env, run),"
-    " lambda pull: toggle_refresh(env, pull)\n"
+    " lambda pull: toggle_refresh(env, pull), conf\n"
     "    )"
 )
 GUARD = "if refreshed_since(pull, max(created for _, created in runs)):"
@@ -4367,6 +4368,24 @@ def test_each_refresh_rule_is_needed(tmp_path, where, original, mutant, fields):
         second, _ = train(tmp_path, mutated, helper=changed)
     assert first.returncode == second.returncode == 0, second.stdout + second.stderr
     assert bool(kept.writes) != bool(mutated.writes), (kept.writes, mutated.writes)
+
+
+def test_stopped_pull_held_by_required_status_is_refreshed(tmp_path):
+    """A pull request the required status holds still gets its fresh event at the draft step."""
+    forge = stopped_forge("BLOCKED")
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "### fleet/app: refreshed #1" in summary
+    assert forge.writes == refreshed(1)
+
+
+def test_stopped_pull_with_other_failed_step_not_refreshed_under_required_status(tmp_path):
+    """With required_status set, a pull request red at another step gets no fresh event."""
+    forge = stopped_forge("BLOCKED", jobs=("x",))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "refreshed" not in summary
 
 
 def test_check_release_off_parses_and_lowercases(tmp_path):
@@ -4581,6 +4600,17 @@ def test_release_of_an_update_already_ready_only_removes_the_label(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [("unlabel", 1, HOLD)], forge.writes
+
+
+def test_security_hold_held_by_required_status_holds_dependency_updates(tmp_path):
+    """A security update held by required status still drafts other dependency updates."""
+    update = pull(1, "BLOCKED", headRefName="renovate/go-snaps")
+    fix = pull(2, "BLOCKED", headRefName="renovate/x-net", labels=("security",))
+    forge = Forge(repository(update, fix, rules=LINEAR))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, HOLD), ("draft", "PR_1")], forge.writes
+    assert "held as a draft: security update #2 is open" in summary, summary
 
 
 @pytest.mark.parametrize(
@@ -5028,6 +5058,59 @@ def test_the_written_head_itself_lands_under_the_hold(tmp_path):
     assert forge.writes == [landed(1)]
     assert "### fleet/app: landed #1" in summary
     assert "held for the generated files of #1 until" in summary
+
+
+def test_fresh_train_write_holds_other_landings_under_required_status(tmp_path):
+    """A fresh regenerate head without the required status still holds other landings."""
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = (datetime.fromisoformat(recent) + timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    written = pull(
+        1,
+        "BLOCKED",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+    )
+    other = pull(
+        2,
+        "CLEAN",
+        headRefName="feat/clean-feature",
+        status=ctx("lanes/booked", "SUCCESS"),
+    )
+    forge = Forge(repository(written, other))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #2 | CLEAN | held for the generated files of #1 until {until} |" in summary
+
+
+def test_behind_regenerate_commit_does_not_write_hold_under_required_status(tmp_path):
+    """A BEHIND regenerate head the status holds holds nothing: the update tool rebases it."""
+    rules = load_rules(tmp_path)
+    bot_email = f"123456+{BOT}[bot]@users.noreply.github.com"
+    recent = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    written = pull(
+        1,
+        "BEHIND",
+        headRefName="renovate/demo-dep",
+        messageHeadline=rules.REGENERATE_HEADLINE,
+        author=bot_email,
+        committedDate=recent,
+    )
+    other = pull(
+        2,
+        "CLEAN",
+        headRefName="feat/clean-feature",
+        status=ctx("lanes/booked", "SUCCESS"),
+    )
+    forge = Forge(repository(written, other))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert "### fleet/app: landed #2" in summary
 
 
 def test_a_security_update_lands_first_while_a_train_write_is_open(tmp_path):
@@ -6935,12 +7018,34 @@ def test_check_required_status_validates_and_strips(tmp_path):
     assert rules.check_required_status("   ") == ""
     assert rules.check_required_status("lanes/booked") == "lanes/booked"
     assert rules.check_required_status("  lanes/booked  ") == "lanes/booked"
+    assert rules.check_required_status("ci/circleci: build") == "ci/circleci: build"
+    assert rules.check_required_status("has space") == "has space"
+    assert rules.check_required_status("x" * 100) == "x" * 100
     with pytest.raises(ValueError, match="not a status context name"):
-        rules.check_required_status("has space")
+        rules.check_required_status("pipe|inside")
     with pytest.raises(ValueError, match="not a status context name"):
         rules.check_required_status("-lead")
     with pytest.raises(ValueError, match="not a status context name"):
         rules.check_required_status("x" * 101)
+
+
+def test_required_status_with_spaces_end_to_end(tmp_path):
+    """A status name with internal spaces holds while absent and lands on SUCCESS."""
+    status_name = "ci/circleci: build"
+    p_absent = pull(1, "CLEAN")
+    forge_absent = Forge(repository(p_absent))
+    done_absent, summary_absent = train(tmp_path, forge_absent, required_status=status_name)
+    assert done_absent.returncode == 0, done_absent.stdout + done_absent.stderr
+    assert forge_absent.writes == []
+    assert f"status {status_name} absent: held" in summary_absent
+    assert f"| #1 | CLEAN | status {status_name} absent: held |" in summary_absent
+
+    p_success = pull(1, "CLEAN", status=ctx(status_name, "SUCCESS"))
+    forge_success = Forge(repository(p_success))
+    done_success, summary_success = train(tmp_path, forge_success, required_status=status_name)
+    assert done_success.returncode == 0, done_success.stdout + done_success.stderr
+    assert forge_success.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary_success
 
 
 def test_required_status_hold_with_empty_nodes_reports_absent(tmp_path):

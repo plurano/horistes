@@ -26,9 +26,15 @@ off).
 
 When `required_status` names a commit status context:
 
-- The name must match `^[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}$`; any other value
-  stops the run with a setting error before the first forge call
-  (`check_required_status` in the train rules module).
+- The name must match the pattern below: at most 100 characters, a letter or
+  digit first, then letters, digits, `._/:-` and spaces, with no space last.
+  Any other value stops the run with a setting error before the first forge
+  call (`check_required_status` in the train rules module).
+
+  ```text
+  ^[A-Za-z0-9](?:[A-Za-z0-9._/: -]{0,98}[A-Za-z0-9._/:-])?$
+  ```
+
 - The query declares `$status: String!` and reads
   `status { context(name: $status) { state } }` on the head commit of every
   open pull request (`pull_query` in the train rules module). The token the
@@ -40,6 +46,10 @@ When `required_status` names a commit status context:
   `status <name> <state>: held` (`required_status_hold`).
 - The hold comes after the code-scanning hold and before the land and behind
   verdicts, so a held pull request is neither landed nor updated.
+- Write hold, security hold and refresh read the merge state under a status
+  hold (`unheld_reason`), so a regenerate head without the status still holds
+  the order, a held security fix still holds other dependency updates, and a
+  held pull request stopped at the draft step still gets its fresh event.
 - The train arms no pull request for auto-merge. `updatable` picks the BEHIND
   pull requests decision record 0044 allows and arms none of them; the train
   lands each one itself once it is CLEAN. Where the repository allows no
@@ -78,4 +88,8 @@ the status, and every verdict is the one it was before.
   set, and a status read refused without it; a BEHIND pull request updated
   without arming; a retitled armed pull request disarmed and not armed again;
   an armed or queued pull request with an earlier hold and no status disarmed
-  or dequeued; a held dependency pull request given its generated files.
+  or dequeued; a held dependency pull request given its generated files; a
+  regenerate head without the status write-holding other landings, and
+  releasing them when behind; a held security fix holding other dependency
+  updates; a held pull request stopped at the draft step refreshed; status
+  names with internal spaces accepted and pipe or tab refused.

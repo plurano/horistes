@@ -1219,7 +1219,7 @@ def run(env, conf, repo, now, notes=None):
     if holding:
         return rows, notes, f"#{holding[0]} is armed and in flight"
     outcome = refresh(
-        served, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull)
+        served, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull), conf
     )
     if outcome:
         return rows, notes, outcome
