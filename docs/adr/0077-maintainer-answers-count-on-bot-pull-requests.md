@@ -36,8 +36,9 @@ the train disarms it again on each sweep (`review_body_hold` and
 - Order candidate logins by their best `authorAssociation` across all answers:
   OWNER, MEMBER and COLLABORATOR first, CONTRIBUTOR next, everything else or a
   missing association last. Preserve first-seen order within each rank
-  (`ANSWER_ASSOCIATION_RANK` and `_ranked_logins`). Association only orders reads;
-  the permission read decides whether an answer counts. Association can understate
+  (`ANSWER_ASSOCIATION_RANK`, `ANSWER_UNRANKED` and `_ranked_logins`). Association
+  only orders reads; the permission read decides whether an answer counts.
+  Association can understate
   a maintainer: an organisation member whose membership is private shows as
   CONTRIBUTOR to a reader outside the organisation. Measured on 2026-11-10 on
   comment 6767657578 of this repository, whose author is a member: the author's own

@@ -7177,7 +7177,7 @@ def test_maintainer_right_read_needs_metadata_on_the_repository_token(tmp_path):
     """A repository token without metadata read cannot confirm a maintainer's right."""
     source = script()
     mutant = source.replace('WRITE_RIGHTS = {\n    "metadata": "read",', "WRITE_RIGHTS = {")
-    assert mutant != source
+    assert mutant != source, "WRITE_RIGHTS no longer opens with metadata read; update the plant"
     forge = _maintainer_forge(comments=[_maintainer_answer()])
     forge.rights = {"maintainer": "write"}
     done, summary = train(tmp_path, forge, text=mutant)

@@ -128,6 +128,8 @@ ANSWER_ASSOCIATION_RANK = {
     "COLLABORATOR": 0,
     "CONTRIBUTOR": 1,
 }
+# Any other or missing association ranks after every listed one.
+ANSWER_UNRANKED = max(ANSWER_ASSOCIATION_RANK.values()) + 1
 REVIEW_BODIES = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -1116,8 +1118,8 @@ def _ranked_logins(candidates):
     ranks = {}
     for answers in candidates:
         for login, association in answers:
-            rank = ANSWER_ASSOCIATION_RANK.get(association, 2)
-            ranks[login] = min(ranks.get(login, 2), rank)
+            rank = ANSWER_ASSOCIATION_RANK.get(association, ANSWER_UNRANKED)
+            ranks[login] = min(ranks.get(login, ANSWER_UNRANKED), rank)
     return sorted(ranks, key=ranks.get)
 
 
