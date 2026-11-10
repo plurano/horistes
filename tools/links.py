@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Check relative links and heading anchors in tracked Markdown files.
 
+Inline code spans are not read as links.
+
     links.py [check] [--root DIR]
 
 Exit codes: 0 pass, 1 broken link or anchor, 3 file or git error.
@@ -18,6 +20,7 @@ import urllib.parse
 from pathlib import Path
 
 INLINE_LINK = re.compile(r"\[[^\]]*\]\((?:<([^>]+)>|([^)\s]+))(?:\s+[^)]*)?\)")
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
 REF_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))")
 FENCE_START = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)(?:\s+#+)?$")
@@ -69,10 +72,15 @@ def heading_slugs(text: str) -> set[str]:
     return slugs
 
 
+def without_code_spans(line: str) -> str:
+    """Blank inline code spans with spaces; spans across lines are out of scope."""
+    return CODE_SPAN.sub(lambda match: " " * len(match.group(0)), line)
+
+
 def extract_links(text: str) -> list[str]:
     targets = []
     for line in unfenced_lines(text):
-        for m in INLINE_LINK.finditer(line):
+        for m in INLINE_LINK.finditer(without_code_spans(line)):
             t = (m.group(1) or m.group(2)).strip("<>'\"")
             if t and not is_skipped(t):
                 targets.append(t)

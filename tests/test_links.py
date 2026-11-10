@@ -7,6 +7,8 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import links
+import pytest
 from conftest import ROOT, Tree
 
 
@@ -63,6 +65,61 @@ def test_external_url_and_pure_anchor_and_fenced_link_ignored(tree):
     assert "PASS:" in done.stdout
     broken = content.replace("```markdown\n", "").replace("```\n", "")
     assert check(tree, {"README.md": broken, "doc.md": "# Intro\n"}).returncode == 1
+
+
+def test_planted_inline_code_links_ignored(tree):
+    """Planted links in code pass; removing the first span's backticks exposes its defect."""
+    content = (
+        "`[a](missing.md)`\n"
+        "`^[A-Za-z0-9](?:[A-Za-z0-9._/: -]{0,98}[A-Za-z0-9._/:-])?$`\n"
+        "`` [b](gone.md) ``\n"
+    )
+    done = check(tree, {"README.md": content})
+    assert done.returncode == 0, done.stderr
+    assert "PASS:" in done.stdout
+    planted = content.replace("`[a](missing.md)`", "[a](missing.md)")
+    done = check(tree, {"README.md": planted})
+    assert done.returncode == 1, done.stdout
+    assert "README.md: target `missing.md` does not exist" in done.stderr
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[`code`](missing.md)\n",
+        "`x` [a](missing.md)\n",
+        "a ` b [a](missing.md)\n",
+        "``x` [a](missing.md)\n",
+    ],
+)
+def test_boundary_links_outside_code_spans_still_read(tree, content):
+    """Boundary links outside closed spans or after unmatched backticks still fail."""
+    done = check(tree, {"README.md": content})
+    assert done.returncode == 1, done.stdout
+    assert "README.md: target `missing.md` does not exist" in done.stderr
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("", ""),
+        ("plain text", "plain text"),
+        ("`[a](missing.md)`", " " * 17),
+        ("`` [b](gone.md) ``", " " * 18),
+        ("[`code`](doc.md)", "[" + " " * 6 + "](doc.md)"),
+        ("`x` [a](missing.md)", " " * 3 + " [a](missing.md)"),
+        ("a ` b [a](missing.md)", "a ` b [a](missing.md)"),
+        ("``x` [a](missing.md)", "``x` [a](missing.md)"),
+        ("``x`y``", " " * 7),
+        ("`x``y`", " " * 6),
+        ("`x` a `y`", " " * 3 + " a " + " " * 3),
+        ("``x`y`", "``x" + " " * 3),
+        ("`x\ny`", "`x\ny`"),
+    ],
+)
+def test_boundary_without_code_spans_preserves_spacing(line, expected):
+    """Boundary masking preserves length and requires complete matching backtick runs."""
+    assert links.without_code_spans(line) == expected
 
 
 def test_root_absolute_link_reads_from_the_repository_root(tree):
