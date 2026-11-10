@@ -81,9 +81,13 @@ the status, and every verdict is the one it was before.
   (`apps/merge-train.json`) and each installation accepting it. An
   installation token cannot carry a right the app was not granted, so until
   then the run fails for that repository.
-- Auto-merge that a person arms between train runs does not wait for the
-  train, so a hard gate also needs the context required in the repository's
-  branch protection.
+- The train's merge is not atomic with its status read: `mergePullRequest`
+  guards only the head commit through `expectedHeadOid`, so a status that
+  changes after the read is not seen. Auto-merge that a person arms between
+  train runs does not wait for the train either. A ruleset or branch protection
+  rule that requires the context closes both gaps: the forge checks the context
+  when the merge happens and refuses the merge, the train's included, while the
+  context does not pass, unless the merging actor may bypass the rule.
 - Tests in `tests/test_merge_train.py` hold the planted cases: absent and
   non-success held, success landed, unset unchanged; the status selected only
   when set and only on the head commit; Commit statuses read minted only when

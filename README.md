@@ -173,8 +173,10 @@ Commit statuses read; unset, both stay as before. While it is set the train
 arms no pull request for auto-merge, disarms an armed one the status holds and
 takes a held one out of the merge queue. A held dependency pull request still
 gets its generated files. Opting in needs `statuses: read` in
-`apps/merge-train.json` accepted by each installation, and a hard gate against
-auto-merge armed by hand also needs the context required in branch protection
+`apps/merge-train.json` accepted by each installation, and a hard gate also
+needs the context required by a ruleset or branch protection: the train's merge
+guards only the head commit, so neither a status that changes after the train
+reads it nor auto-merge armed by hand waits for the train
 ([ADR-0076](docs/adr/0076-train-holds-on-a-required-status.md)).
 
 ## Actions
