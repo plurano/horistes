@@ -35,6 +35,29 @@ def _real_python3() -> str | None:
     return os.path.realpath(sys.executable) if sys.executable else None
 
 
+def _plant_home_shim(shim_dir: Path, py_path: str) -> Path:
+    """Plant a python3 shim that needs HOME before executing the real interpreter."""
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim = shim_dir / "python3"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "${HOME+x}" != x ]; then exit 1; fi\n'
+        f'exec {shlex.quote(py_path)} "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def _plant_path_python3(path_dir: Path) -> Path:
+    """Plant an executable python3 shell script that exits successfully."""
+    path_dir.mkdir(parents=True, exist_ok=True)
+    path_python = path_dir / "python3"
+    path_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path_python.chmod(0o755)
+    return path_python
+
+
 def _run_make(
     tmp_dir: Path,
     target: str = "check-tools-stamp",
@@ -319,8 +342,17 @@ def test_lefthook_pre_push_mutation_proof_without_piped(tmp_path: Path) -> None:
     assert len(ran_files) >= 1, "expected at least one *.ran file when piped is false"
 
 
-def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
+@pytest.mark.skipif(sys.platform == "win32", reason="planted python3 shim needs a POSIX shell")
+def test_check_tools_stamp_without_sha256sum_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Plant without sha256sum on PATH: passes with valid stamp, fails when stale."""
+    if not sys.executable:
+        pytest.skip("running interpreter path unknown")
+    shim_dir = tmp_path / "shim"
+    shim = _plant_home_shim(shim_dir, os.path.realpath(sys.executable))
+    monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
+    assert shutil.which("python3") == str(shim)
     py_path = _real_python3()
     cat_path = shutil.which("cat")
     if py_path is None:
@@ -362,15 +394,7 @@ def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.Mo
         pytest.skip("running interpreter path unknown")
 
     shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    shim = shim_dir / "python3"
-    shim.write_text(
-        "#!/bin/sh\n"
-        'if [ "${HOME+x}" != x ]; then exit 1; fi\n'
-        f'exec {shlex.quote(py_path)} "$@"\n',
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
+    shim = _plant_home_shim(shim_dir, py_path)
     monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
     assert shutil.which("python3") == str(shim)
     real_python = _real_python3()
@@ -382,9 +406,9 @@ def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.Mo
     bin_dir.mkdir()
     linked_python = bin_dir / "python3"
     linked_python.symlink_to(real_python)
-    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-10 category D: runs linked python
     proc = subprocess.run(
-        [str(linked_python), "-c", "pass"],
+        ["./python3", "-c", "pass"],
+        cwd=bin_dir,
         env={"PATH": str(bin_dir)},
         capture_output=True,
         text=True,
@@ -392,9 +416,9 @@ def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.Mo
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-10 category D: runs planted shim
     shim_proc = subprocess.run(
-        [str(shim), "-c", "pass"],
+        ["./python3", "-c", "pass"],
+        cwd=shim_dir,
         env={"PATH": str(bin_dir)},
         capture_output=True,
         text=True,
@@ -404,21 +428,20 @@ def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.Mo
     assert shim_proc.returncode != 0
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="planted python3 needs a POSIX shell")
 def test_real_python3_none_without_executable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Return None without an executable path even when PATH contains python3."""
     pathbin = tmp_path / "pathbin"
-    pathbin.mkdir()
-    path_python = pathbin / "python3"
-    path_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    path_python.chmod(0o755)
+    path_python = _plant_path_python3(pathbin)
     monkeypatch.setenv("PATH", str(pathbin))
     assert shutil.which("python3") == str(path_python)
     monkeypatch.setattr(sys, "executable", "")
     assert _real_python3() is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="planted python3 needs a POSIX shell")
 def test_real_python3_follows_sys_executable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -428,10 +451,7 @@ def test_real_python3_follows_sys_executable(
     original_python = os.path.realpath(sys.executable)
 
     pathbin = tmp_path / "pathbin"
-    pathbin.mkdir()
-    path_python = pathbin / "python3"
-    path_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    path_python.chmod(0o755)
+    path_python = _plant_path_python3(pathbin)
     monkeypatch.setenv("PATH", str(pathbin))
     assert shutil.which("python3") == str(path_python)
 
@@ -564,7 +584,7 @@ def test_tools_python_path_with_space(tmp_path: Path) -> None:
     proc = _run_make(tmp_path, "tools", f"PYTHON={shlex.quote(str(linked_python))}")
     assert proc.returncode == 0
     expected_hash = hashlib.sha256(tools_txt.read_bytes()).hexdigest()
-    assert stamp.read_bytes() == f"{expected_hash}\n".encode("utf-8")
+    assert stamp.read_bytes() == f"{expected_hash}\n".encode()
 
     stamp.write_bytes(stale_stamp)
     unquoted_proc = _run_make(tmp_path, "tools", f"PYTHON={linked_python}")
