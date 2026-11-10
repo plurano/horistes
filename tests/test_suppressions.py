@@ -8,6 +8,7 @@ import datetime
 import inspect
 from pathlib import Path
 
+import ciwf
 import exceptions
 import pytest
 from conftest import ROOT, Tree
@@ -80,16 +81,28 @@ def planted(payload: str) -> str:
 
 
 def tree_problems(root: Path) -> list[str]:
-    """Find problems in tracked Python files only, from git ls-files."""
+    """Find problems in tracked Python files as the working tree holds them.
+
+    The file list comes from git ls-files, capped at
+    exceptions.MAX_TRACKED_FILES like the scanner's own. A tracked
+    symlink is skipped: its committed content is the link path, and
+    reading through it would read a file the tree does not hold. A
+    tracked file deleted from the working tree is skipped; any other
+    path that cannot be read, such as a directory, raises OSError.
+    """
     today = datetime.date(2026, 11, 9)
     _, _, valid_map = exceptions._own(root, today)
     valid_exceptions = set(valid_map.keys())
+    tracked = exceptions._tracked_files(root)
+    if len(tracked) > exceptions.MAX_TRACKED_FILES:
+        cap = exceptions.MAX_TRACKED_FILES
+        raise ciwf.ReadError(f"{len(tracked)} tracked files exceeds cap of {cap}")
     problems: list[str] = []
-    for rel in sorted(exceptions._tracked_files(root)):
+    for rel in sorted(tracked):
         if not rel.endswith(".py"):
             continue
         py_file = root / rel
-        if not py_file.is_file():
+        if py_file.is_symlink() or not py_file.exists():
             continue
         text = py_file.read_text(encoding="utf-8")
         probs = suppression_problems(text, rel, today=today, valid_exceptions=valid_exceptions)
@@ -97,8 +110,8 @@ def tree_problems(root: Path) -> list[str]:
     return problems
 
 
-def test_committed_tree_has_no_problems() -> None:
-    """The committed Python source tree contains no suppression problems."""
+def test_tracked_tree_has_no_problems() -> None:
+    """The tracked Python files in the working tree contain no suppression problems."""
     assert tree_problems(ROOT) == []
 
 
@@ -147,6 +160,21 @@ def test_tree_problems_ignores_tracked_non_python_file(tree: Tree) -> None:
     assert tree_problems(tree.root) == []
 
 
+def test_tree_problems_skips_tracked_symlink(tree: Tree) -> None:
+    """Planted case: a tracked symlink cannot pull in an untracked file's problems."""
+    tree.write(
+        {
+            "tools/a.py": "x = 1\n",
+            ".standards/worktrees/gate-1/bad.py": planted("# {sg}\n"),
+        }
+    )
+    (tree.root / "tools/link.py").symlink_to("../.standards/worktrees/gate-1/bad.py")
+    tree.git("init", "-b", "main")
+    tree.git("add", "--", "tools/a.py", "tools/link.py")
+    assert sorted(exceptions._tracked_files(tree.root)) == ["tools/a.py", "tools/link.py"]
+    assert tree_problems(tree.root) == []
+
+
 def test_tree_problems_ignores_deleted_tracked_python_file(tree: Tree) -> None:
     """Boundary: a deleted tracked Python file is skipped without a read error."""
     tree.write({"tools/a.py": planted("# {sg}\n")})
@@ -154,6 +182,32 @@ def test_tree_problems_ignores_deleted_tracked_python_file(tree: Tree) -> None:
     tree.git("add", "--", "tools/a.py")
     (tree.root / "tools/a.py").unlink()
     assert tree_problems(tree.root) == []
+
+
+def test_tree_problems_refuses_tracked_path_replaced_by_directory(tree: Tree) -> None:
+    """Negative: a tracked Python path that is now a directory raises, never skips."""
+    tree.write({"tools/a.py": planted("# {sg}\n")})
+    tree.git("init", "-b", "main")
+    tree.git("add", "--", "tools/a.py")
+    (tree.root / "tools/a.py").unlink()
+    (tree.root / "tools/a.py").mkdir()
+    with pytest.raises(OSError):
+        tree_problems(tree.root)
+
+
+def test_tree_problems_refuses_more_tracked_files_than_the_cap(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boundary: one tracked file over the cap raises; exactly at the cap is read."""
+    tree.write({"tools/a.py": "x = 1\n", "tools/b.py": "x = 2\n"})
+    tree.git("init", "-b", "main")
+    tree.git("add", "--", "tools/a.py", "tools/b.py")
+    count = len(exceptions._tracked_files(tree.root))
+    monkeypatch.setattr(exceptions, "MAX_TRACKED_FILES", count)
+    assert tree_problems(tree.root) == []
+    monkeypatch.setattr(exceptions, "MAX_TRACKED_FILES", count - 1)
+    with pytest.raises(ciwf.ReadError, match=f"{count} tracked files exceeds cap of {count - 1}"):
+        tree_problems(tree.root)
 
 
 def test_committed_codacy_yml_has_no_problems() -> None:
