@@ -105,8 +105,7 @@ def test_planted_historical_read_failure_is_not_absence(
     def fail_read(root, *args):
         """Return an opaque read failure with no absence-related stderr keywords."""
         if args[0] == operation:
-            # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: mock only
-            return subprocess.CompletedProcess(args, 128, "", "opaque historical failure")
+            return subprocess.CompletedProcess(["git"], 128, "", "opaque historical failure")
         return original(root, *args)
 
     monkeypatch.setattr(anchors, "_git", fail_read)
@@ -412,8 +411,7 @@ def test_planted_git_read_explicitly_uses_utf8(tree: Tree, monkeypatch) -> None:
     def record(args, **kwargs):
         """Capture subprocess options without launching git or reading configuration."""
         calls.append(kwargs)
-        # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: mock only
-        return subprocess.CompletedProcess(args, 0, "π\n", "")
+        return subprocess.CompletedProcess(["git"], 0, "π\n", "")
 
     monkeypatch.setattr(anchors.ciwf, "git_env", dict)
     monkeypatch.setattr(anchors.subprocess, "run", record)
