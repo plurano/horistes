@@ -425,7 +425,11 @@ def _updated_raw(raw: str, answers: dict[str, str], moves: dict[str, str]) -> st
 
 
 def _changed_inputs(path: Path, raw: bytes, snapshot: dict[str, str | None]) -> list[str]:
-    """Refuse replacement if the answers or any pinned source changed since capture."""
+    """Best-effort recheck: report answers or pinned sources changed since capture.
+
+    This narrows, but does not close, the window for concurrent edits: an edit
+    landing between this recheck and replacement is overwritten.
+    """
     problems = []
     if path.read_bytes() != raw:
         problems.append(".bestpractices.json changed while fixing")
@@ -440,8 +444,13 @@ def _changed_inputs(path: Path, raw: bytes, snapshot: dict[str, str | None]) -> 
 def _write_atomic(
     path: Path, raw: bytes, updated: bytes, snapshot: dict[str, str | None]
 ) -> list[str]:
-    """Flush a same-directory temporary file and replace only unchanged inputs."""
+    """Flush a same-directory temporary file and recheck inputs before replacement.
+
+    The recheck is best effort: it narrows, but does not close, the window for
+    concurrent edits; an edit between the recheck and replacement is overwritten.
+    """
     temporary = None
+    failure: BaseException | None = None
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
@@ -456,15 +465,21 @@ def _write_atomic(
         os.replace(temporary, path)
         return []
     except OSError as err:
+        failure = err
         raise OSError(f"cannot atomically update {path}: {err}") from err
+    except BaseException as err:
+        failure = err
+        raise
     finally:
         if temporary is not None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError as err:
-                raise OSError(
-                    f"cannot remove temporary file {temporary} for {path}: {err}"
-                ) from err
+                message = f"cannot remove temporary file {temporary} for {path}: {err}"
+                if failure is not None:
+                    complain(f"ERROR: {message}")
+                else:
+                    raise OSError(message) from err
 
 
 def _report(problems: list[str]) -> bool:

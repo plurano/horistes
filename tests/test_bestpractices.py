@@ -68,7 +68,7 @@ CRYPTO_USE = (
     "crypto_weaknesses",
 )
 CRYPTO_CALL = re.compile(r"\bhashlib\.|\bopenssl\b|\bhmac\.|\bcryptography\b")
-LINK = re.compile(r"blob/main/([^\s#)]+)(#L)?")
+LINK = re.compile(r"blob/main/([^\s#)]+)(#L\d)?")
 
 
 def findings(
@@ -141,6 +141,16 @@ def test_missing_link_refused(tmp_path: Path) -> None:
     """Planted: an answer links a file that does not exist."""
     root = _tree(tmp_path, "")
     text = "Evidence: https://github.com/plurano/horistes/blob/main/GONE.md"
+    assert findings({"x_justification": text}, root, pins=()) == [
+        "x_justification: links missing GONE.md"
+    ]
+
+
+@pytest.mark.parametrize("case", ["GONE.md#L", "GONE.md#Lintro"])
+def test_planted_missing_file_with_digitless_line_fragment(tmp_path: Path, case: str) -> None:
+    """Planted: a digitless line fragment cannot hide a missing linked file."""
+    root = _tree(tmp_path, "")
+    text = f"Evidence: https://github.com/plurano/horistes/blob/main/{case}"
     assert findings({"x_justification": text}, root, pins=()) == [
         "x_justification: links missing GONE.md"
     ]

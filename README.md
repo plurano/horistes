@@ -264,6 +264,9 @@ hashes.
   whose files hold the source at the lines the current anchors record (for a
   committed change, usually `git merge-base HEAD main`); `main` works only
   while it still holds those lines, and nothing is written if mapping fails.
+  `fix` rechecks the answers and pinned sources just before it replaces the
+  file and refuses if they changed; the recheck is best effort, and an edit
+  made between the recheck and the replacement is overwritten.
 - The floor job runs the read-back and stranger tests on Python 3.12
   ([ADR-0048](docs/adr/0048-the-python-floor-is-tested-in-ci.md)).
 

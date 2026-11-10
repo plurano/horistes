@@ -551,6 +551,45 @@ def test_planted_atomic_write_failure_preserves_original(
     assert set(root.iterdir()) == entries
 
 
+def test_planted_cleanup_failure_keeps_replace_error(tree: Tree, monkeypatch, capsys) -> None:
+    """Planted: failed cleanup reports itself without hiding the replacement error."""
+    root, path, before = drifted_tree(tree)
+
+    def fail_replace(*args, **kwargs):
+        """Plant a replacement failure before the answer bytes change."""
+        raise OSError("planted replace failure")
+
+    def fail_unlink(*args, **kwargs):
+        """Plant a cleanup failure while the replacement error propagates."""
+        raise OSError("planted unlink failure")
+
+    monkeypatch.setattr(anchors.os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    assert invoke(root, "fix", (PIN,)) == 3
+    stderr = capsys.readouterr().err
+    assert "planted replace failure" in stderr
+    assert "cannot remove temporary file" in stderr
+    assert "planted unlink failure" in stderr
+    assert path.read_bytes() == before
+
+
+def test_boundary_cleanup_failure_alone_is_reported(tree: Tree, monkeypatch, capsys) -> None:
+    """Boundary: cleanup failure after successful replacement still reports an error."""
+    root, path, before = drifted_tree(tree)
+
+    def fail_unlink(*args, **kwargs):
+        """Plant cleanup failure even though replacement already renamed the temporary."""
+        raise OSError("planted unlink failure")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    assert invoke(root, "fix", (PIN,)) == 3
+    stderr = capsys.readouterr().err
+    assert "cannot remove temporary file" in stderr
+    assert "planted unlink failure" in stderr
+    # Replacement succeeds before cleanup fails, so the moved anchors remain on disk.
+    assert path.read_bytes() == before.replace(b"#L2-L3", b"#L3-L4")
+
+
 def test_boundary_atomic_write_preserves_mode_and_cleans_temp(tree: Tree) -> None:
     """Boundary: a successful replacement preserves the original permission bits."""
     root, path, before = drifted_tree(tree)
