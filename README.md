@@ -161,6 +161,17 @@ The app is one public app installed on every account
 of the fleet; its rights are in `apps/merge-train.json`, and a test holds them
 equal to what the train asks the forge for.
 
+When `required_status` names a commit status context, the train requires that
+context in state SUCCESS before it lands a pull request. Only then does the
+query select `status { context(name: $status) { state } }` and the token carry
+Commit statuses read; unset, both stay as before. While it is set the train
+arms no pull request for auto-merge, disarms an armed one the status holds and
+takes a held one out of the merge queue. A held dependency pull request still
+gets its generated files. Opting in needs `statuses: read` in
+`apps/merge-train.json` accepted by each installation, and a hard gate against
+auto-merge armed by hand also needs the context required in branch protection
+([ADR-0076](docs/adr/0076-train-holds-on-a-required-status.md)).
+
 ## Actions
 
 | File | Purpose | Inputs | Outputs | Hosts beyond the forge |

@@ -70,27 +70,27 @@ LINK = re.compile(r"blob/main/([^\s#)]+)")
 ANCHOR = re.compile(r"blob/main/([^\s#)]+)#L(\d+)(?:-L(\d+))?")
 
 EVIDENCE: dict[str, tuple[str, str]] = {
-    "tools/merge_train.py#L1233-L1262": (
+    "tools/merge_train.py#L1256-L1285": (
         "def app_jwt(",
         'return f"{signing_input}.{b64url(done.stdout)}"',
     ),
-    "tools/merge_train.py#L752": (
+    "tools/merge_train.py#L758": (
         "if hashlib.sha256(content).hexdigest() != sha:",
         "if hashlib.sha256(content).hexdigest() != sha:",
     ),
-    "tools/merge_train.py#L793": (
+    "tools/merge_train.py#L799": (
         "blob_sha = hashlib.sha1(",
         "blob_sha = hashlib.sha1(",
     ),
-    "tools/merge_train.py#L230-L268": (
+    "tools/merge_train.py#L232-L270": (
         "def key_bits(",
         "return int(match.group(1)) if match else None",
     ),
-    "tools/merge_train.py#L230-L290": (
+    "tools/merge_train.py#L232-L292": (
         "def key_bits(",
         'f"the app key has {bits} bits; at least {MIN_KEY_BITS} are required"',
     ),
-    "tests/test_merge_train.py#L1973-L2158": (
+    "tests/test_merge_train.py#L2043-L2228": (
         "@pytest.mark.parametrize(",
         'assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]',
     ),

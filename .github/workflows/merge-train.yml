@@ -58,8 +58,9 @@
 #   marks ready keeps the label and is not held again (decision record 0062).
 # - When `required_status` names a commit status context, a pull request whose
 #   head commit lacks that context or reports a state other than SUCCESS is
-#   held from landing and arming, and an armed pull request held by it is
-#   disarmed (decision record 0076). An empty input turns the check off.
+#   held from landing, an armed pull request held by it is disarmed and a
+#   queued one is dequeued (decision record 0076). While the check is active,
+#   the train never arms auto-merge. An empty input turns the check off.
 # - After that write, it closes the open issues that the pull requests it
 #   merged in the last 7 days name as closed (`Closes #N` and the forge's
 #   other closing forms): the forge leaves them open when the app merges, and
@@ -106,8 +107,9 @@
 # secret as `app_private_key` and the client id as `app_client_id`. The key
 # signs a JWT of the app (openssl, the key through a pipe, never a file).
 # For every repository the job mints a token limited to that repository, with
-# contents, pull requests and workflows write, checks and actions read (read
-# rights only when `switch` is off), and revokes it when the repository is done.
+# contents, pull requests and workflows write, checks and actions read, commit
+# statuses read when required_status is set (read rights only when `switch` is off),
+# and revokes it when the repository is done.
 # Only when an issue is to be closed, a second token for that repository
 # carries issues write alone, for the comment and the close.
 # Workflows write is there because the forge refuses a merge or an
@@ -246,13 +248,6 @@ jobs:
           REFRESH_LIMIT = 3
           STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
           REQUIRED_STATUS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]{0,99}$")
-          REQUIRED_STATUS_PREFIX = "status "
-          MAX_STATUS_CONTEXTS = 100
-
-
-          def is_required_status_hold(reason):
-              """Whether a hold reason came from the required status check."""
-              return reason.startswith(REQUIRED_STATUS_PREFIX) and reason.endswith(": held")
 
 
           class NoSignOffError(ValueError):
@@ -455,20 +450,20 @@ jobs:
           def required_status_hold(pull, conf):
               """Why the required commit status holds the pull request, or None (decision record 0076).
 
-              Absent context or a state other than SUCCESS holds; contexts past MAX_STATUS_CONTEXTS
-              count as absent, so the bound fails closed.
+              Absent status, absent context or a state other than SUCCESS holds.
               """
               name = conf.get("required_status") or ""
               if not name:
                   return None
-              nodes = pull["latest"]["nodes"]
-              status = (nodes[-1]["commit"].get("status") if nodes else None) or {}
-              contexts = status.get("contexts") or []
-              states = [ctx["state"] for ctx in contexts[:MAX_STATUS_CONTEXTS] if ctx["context"] == name]
-              if not states:
+              nodes = pull.get("latest", {}).get("nodes", [])
+              commit = nodes[-1].get("commit", {}) if nodes else {}
+              status = commit.get("status") or {}
+              ctx = status.get("context")
+              if not ctx or not ctx.get("state"):
                   return f"status {name} absent: held"
-              if states[0] != "SUCCESS":
-                  return f"status {name} {states[0].lower()}: held"
+              state = ctx["state"]
+              if state != "SUCCESS":
+                  return f"status {name} {state.lower()}: held"
               return None
 
 
@@ -527,6 +522,8 @@ jobs:
               request goes first: it already waits for the forge to merge it.
               Only an armed pull request is updated, and none where the default branch
               demands linear history (decision record 0044); `notes` says why one is skipped.
+              While `required_status` is set none is armed: the train lands it directly
+              once it is CLEAN (decision record 0076).
               """
               behind = [pull for pull, reason in rows if reason == "behind"]
               if linear_history(repo):
@@ -535,9 +532,10 @@ jobs:
                   return []
               behind.sort(key=lambda pull: (not is_security(pull, conf), not pull["autoMergeRequest"]))
               picked = []
+              arms = not conf.get("required_status")
               for pull in behind:
                   if pull["autoMergeRequest"] or repo["autoMergeAllowed"]:
-                      picked.append((pull, not pull["autoMergeRequest"]))
+                      picked.append((pull, arms and not pull["autoMergeRequest"]))
                   else:
                       notes[pull["number"]] = "behind: auto-merge off, not armed, not updated"
               return picked
@@ -830,7 +828,6 @@ jobs:
                         messageHeadline
                         author { email user { login } }
                         signature { wasSignedByGitHub }
-                        status { contexts { context state } }
                         checkSuites(first: 30) {
                           nodes {
                             databaseId
@@ -848,6 +845,23 @@ jobs:
             }
           }
           """
+          # The pull query with the required status context on the head commit (record 0076):
+          # one more variable and one more field, so the unset query stays QUERY itself.
+          STATUS_QUERY = QUERY.replace(
+              "$after: String)", "$after: String, $status: String!)", 1
+          ).replace(
+              "signature { wasSignedByGitHub }",
+              "signature { wasSignedByGitHub }\n"
+              "                        status { context(name: $status) { state } }",
+              1,
+          )
+
+
+          def pull_query(conf):
+              """The open pull request query; it selects the required status only when one is set."""
+              return STATUS_QUERY if conf.get("required_status") else QUERY
+
+
           MERGE_STATE = """
           query($owner: String!, $name: String!, $number: Int!) {
             repository(owner: $owner, name: $name) {
@@ -908,6 +922,14 @@ jobs:
           mutation($id: ID!, $oid: GitObjectID!) {
             enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
               mergeQueueEntry { state }
+            }
+          }
+          """
+          # Dequeue a pull request from the merge queue.
+          DEQUEUE = """
+          mutation($id: ID!) {
+            dequeuePullRequest(input: {id: $id}) {
+              mergeQueueEntry { id }
             }
           }
           """
