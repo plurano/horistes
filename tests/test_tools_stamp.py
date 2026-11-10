@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,11 @@ HASH_FAILED = "cannot hash requirements/tools.txt"
 POSIX_SHELL = pytest.mark.skipif(
     sys.platform == "win32", reason="planted lefthook commands need a POSIX shell"
 )
+
+
+def _real_python3() -> str | None:
+    """Resolve the running interpreter; PATH shims may need HOME dropped by bare-PATH tests."""
+    return os.path.realpath(sys.executable) if sys.executable else None
 
 
 def _run_make(
@@ -315,10 +321,12 @@ def test_lefthook_pre_push_mutation_proof_without_piped(tmp_path: Path) -> None:
 
 def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
     """Plant without sha256sum on PATH: passes with valid stamp, fails when stale."""
-    py_path = shutil.which("python3")
+    py_path = _real_python3()
     cat_path = shutil.which("cat")
-    if py_path is None or cat_path is None:
-        pytest.skip("python3 or cat not found on PATH")
+    if py_path is None:
+        pytest.skip("running interpreter path unknown")
+    if cat_path is None:
+        pytest.skip("cat not found on PATH")
     make_bin = shutil.which("make")
     if make_bin is None:
         pytest.skip("make not found on PATH")
@@ -344,6 +352,59 @@ def test_check_tools_stamp_without_sha256sum_on_path(tmp_path: Path) -> None:
     proc_stale = _run_make(tmp_path, env=restricted_env)
     assert proc_stale.returncode != 0
     assert "make tools" in proc_stale.stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="planted python3 shim needs a POSIX shell")
+def test_real_python3_ignores_a_path_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plant a HOME-dependent PATH shim; the real interpreter works with only PATH set."""
+    py_path = _real_python3()
+    if py_path is None:
+        pytest.skip("running interpreter path unknown")
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "python3"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "${HOME+x}" != x ]; then exit 1; fi\n'
+        f'exec {shlex.quote(py_path)} "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
+    assert shutil.which("python3") == str(shim)
+    real_python = _real_python3()
+    assert real_python is not None
+    assert real_python != str(shim)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    linked_python = bin_dir / "python3"
+    linked_python.symlink_to(real_python)
+    proc = subprocess.run(
+        [str(linked_python), "-c", "pass"],
+        env={"PATH": str(bin_dir)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    shim_proc = subprocess.run(
+        [str(shim), "-c", "pass"],
+        env={"PATH": str(bin_dir)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert shim_proc.returncode != 0
+
+
+def test_real_python3_none_without_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Return None when the running interpreter exposes no executable path."""
+    monkeypatch.setattr(sys, "executable", "")
+    assert _real_python3() is None
 
 
 def test_makefile_shares_hashlib_command() -> None:
@@ -392,9 +453,9 @@ def test_tools_negative_python_nonexistent(tmp_path: Path) -> None:
 
 def test_tools_boundary_missing_requirements(tmp_path: Path) -> None:
     """Boundary: missing tools.txt, stub venv -> rc != 0, stamp unchanged, hash failure named."""
-    py_path = shutil.which("python3")
+    py_path = _real_python3()
     if py_path is None:
-        pytest.skip("python3 not found on PATH")
+        pytest.skip("running interpreter path unknown")
 
     _setup_stub_venv(tmp_path)
     stamp = tmp_path / ".venv" / ".stamp"
@@ -409,9 +470,9 @@ def test_tools_boundary_missing_requirements(tmp_path: Path) -> None:
 
 def test_tools_positive_stale_stamp(tmp_path: Path) -> None:
     """Positive: real python3, stub venv python, stale stamp -> rc 0, stamp updated."""
-    py_path = shutil.which("python3")
+    py_path = _real_python3()
     if py_path is None:
-        pytest.skip("python3 not found on PATH")
+        pytest.skip("running interpreter path unknown")
 
     tools_txt, stamp = _setup_tree(tmp_path)
     _setup_stub_venv(tmp_path)
@@ -426,9 +487,9 @@ def test_tools_positive_stale_stamp(tmp_path: Path) -> None:
 
 def test_tools_positive_matching_stamp(tmp_path: Path) -> None:
     """Positive: matching stamp -> rc 0, stamp unchanged."""
-    py_path = shutil.which("python3")
+    py_path = _real_python3()
     if py_path is None:
-        pytest.skip("python3 not found on PATH")
+        pytest.skip("running interpreter path unknown")
 
     tools_txt, stamp = _setup_tree(tmp_path)
     _setup_stub_venv(tmp_path)
