@@ -116,7 +116,7 @@ def test_committed_answers_match_the_tree() -> None:
 def test_crypto_na_refused_when_code_hashes(tmp_path: Path) -> None:
     """Planted: crypto answered N/A while a tool calls hashlib."""
     root = _tree(tmp_path, "import hashlib\nhashlib.sha256(b'')\n")
-    assert findings({"crypto_call_status": "N/A"}, root) == [
+    assert findings({"crypto_call_status": "N/A"}, root, pins=()) == [
         "crypto_call: N/A while tools/ calls cryptography"
     ]
 
@@ -124,7 +124,7 @@ def test_crypto_na_refused_when_code_hashes(tmp_path: Path) -> None:
 def test_na_refused_where_not_offered(tmp_path: Path) -> None:
     """Planted: N/A on a criterion whose definition has no N/A answer."""
     root = _tree(tmp_path, "")
-    assert findings({"report_responses_status": "N/A"}, root) == [
+    assert findings({"report_responses_status": "N/A"}, root, pins=()) == [
         "report_responses: N/A is not offered"
     ]
 
@@ -132,21 +132,25 @@ def test_na_refused_where_not_offered(tmp_path: Path) -> None:
 def test_crypto_na_allowed_without_crypto(tmp_path: Path) -> None:
     """Boundary: with no cryptographic call, crypto N/A stands."""
     root = _tree(tmp_path, "print('no crypto here')\n")
-    assert findings({"crypto_call_status": "N/A", "crypto_random_status": "N/A"}, root) == []
+    assert (
+        findings({"crypto_call_status": "N/A", "crypto_random_status": "N/A"}, root, pins=()) == []
+    )
 
 
 def test_missing_link_refused(tmp_path: Path) -> None:
     """Planted: an answer links a file that does not exist."""
     root = _tree(tmp_path, "")
     text = "Evidence: https://github.com/plurano/horistes/blob/main/GONE.md"
-    assert findings({"x_justification": text}, root) == ["x_justification: links missing GONE.md"]
+    assert findings({"x_justification": text}, root, pins=()) == [
+        "x_justification: links missing GONE.md"
+    ]
 
 
 def test_missing_linked_file_with_anchor_gets_one_finding(tmp_path: Path) -> None:
     """A missing file with an anchor gets one finding, from the anchor check alone."""
     root = _tree(tmp_path, "")
     text = "Evidence: https://github.com/plurano/horistes/blob/main/GONE.md#L10"
-    assert findings({"x_justification": text}, root) == [
+    assert findings({"x_justification": text}, root, pins=()) == [
         "x_justification: anchor GONE.md#L10 links missing GONE.md"
     ]
 

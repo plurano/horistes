@@ -139,9 +139,10 @@ check-runners: tools
 check-links: tools
 	$(BIN)/python -B tools/links.py
 
-# Best-practices anchors: `fix-anchors` maps each line anchor of
-# .bestpractices.json through ANCHORS_BASE and moves those whose pinned lines
-# changed. It asks no host and writes nothing when one cannot be mapped.
+# Best-practices anchors: ANCHORS_BASE must be a revision whose files hold the
+# source at the lines the current anchors record (for a committed change,
+# usually `git merge-base HEAD main`); main works only while it holds those lines.
+# `fix-anchors` asks no host and writes nothing when an anchor cannot be mapped.
 ANCHORS_BASE ?= HEAD
 fix-anchors: tools
 	$(BIN)/python -B tools/anchors.py fix --base "$(ANCHORS_BASE)"

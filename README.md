@@ -260,10 +260,10 @@ hashes.
   from a pin in `tools/anchors.py`: the source text that opens and closes the
   range, and the answers that must link it. `tests/test_bestpractices.py`
   fails when an anchor matches no pin of its answer or a pin's answer does not
-  link it. `make fix-anchors` maps each old range through `HEAD`, or through
-  `ANCHORS_BASE` once the change is committed
-  (`make fix-anchors ANCHORS_BASE=main`), and moves the anchors whose lines
-  changed; it writes nothing when one cannot be mapped.
+  link it. `make fix-anchors` moves anchors through `ANCHORS_BASE`, a revision
+  whose files hold the source at the lines the current anchors record (for a
+  committed change, usually `git merge-base HEAD main`); `main` works only
+  while it still holds those lines, and nothing is written if mapping fails.
 - The floor job runs the read-back and stranger tests on Python 3.12
   ([ADR-0048](docs/adr/0048-the-python-floor-is-tested-in-ci.md)).
 

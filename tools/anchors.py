@@ -13,15 +13,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import ciwf
 
-ANCHOR = re.compile(r"blob/main/([^\s#)]+)#L(\d+)(?:-L(\d+))?")
+ANCHOR_BOUNDARY = r"(?=$|\s|\)|[.,](?:\s|$))"
+ANCHOR = re.compile(r"blob/main/([^\s#)]+)#L(\d+)(?:-L(\d+))?" + ANCHOR_BOUNDARY)
+ANCHOR_FRAGMENT = re.compile(r"blob/main/[^\s#)]+#L\d[^\s)]*")
+JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
 @dataclass(frozen=True)
@@ -126,7 +132,7 @@ def derive(pin: Pin, lines: list[str]) -> tuple[int, int] | str:
     if len(starts) != 1:
         return f"pin {pin.path} first text {pin.first[0]!r} matches {len(starts)} places"
     start = starts[0]
-    for end in range(start + len(pin.last) - 1, len(lines) + 1):
+    for end in range(start + max(len(pin.first), len(pin.last)) - 1, len(lines) + 1):
         if _block_at(lines, pin.last, end - len(pin.last)):
             return start, end
     return f"pin {pin.path} last text {pin.last[-1]!r} matches no place at or after line {start}"
@@ -137,19 +143,44 @@ def anchor_text(path: str, start: int, end: int) -> str:
     return f"{path}#L{start}" if start == end else f"{path}#L{start}-L{end}"
 
 
-def _ranges(root: Path, pins: tuple[Pin, ...]) -> dict[Pin, tuple[int, int] | str]:
-    """Derive pins for files present in this tree."""
+def _source_text(path: Path) -> str | None:
+    """Read UTF-8 source once, distinguishing absence from other read failures."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as err:
+        raise OSError(f"cannot read source {path}: {err}") from err
+
+
+def _snapshot(root: Path, pins: tuple[Pin, ...]) -> dict[str, str | None]:
+    """Capture each distinct pinned source, including missing files."""
+    return {path: _source_text(root / path) for path in dict.fromkeys(pin.path for pin in pins)}
+
+
+def _ranges(
+    root: Path, pins: tuple[Pin, ...], snapshot: dict[str, str | None] | None = None
+) -> dict[Pin, tuple[int, int] | str]:
+    """Derive every pin from one snapshot, reporting absent source files."""
+    if snapshot is None:
+        snapshot = _snapshot(root, pins)
     return {
-        pin: derive(pin, (root / pin.path).read_text(encoding="utf-8").splitlines())
+        pin: (
+            f"pin {pin.path} source file is missing"
+            if snapshot[pin.path] is None
+            else derive(pin, snapshot[pin.path].splitlines())
+        )
         for pin in pins
-        if (root / pin.path).exists()
     }
 
 
-def _derived_anchors(ranges: dict[Pin, tuple[int, int] | str]) -> set[str]:
-    """Collect only ranges whose source blocks identify a valid anchor."""
+def _derived_anchors(ranges: dict[Pin, tuple[int, int] | str]) -> set[tuple[str, str]]:
+    """Collect valid anchors together with the answer keys they support."""
     return {
-        anchor_text(pin.path, *span) for pin, span in ranges.items() if not isinstance(span, str)
+        (key, anchor_text(pin.path, *span))
+        for pin, span in ranges.items()
+        if not isinstance(span, str)
+        for key in pin.keys
     }
 
 
@@ -172,26 +203,48 @@ def _pin_findings(
     return found
 
 
-def findings(answers: dict[str, str], root: Path, pins: tuple[Pin, ...] = PINS) -> list[str]:
+def _source_exists(root: Path, path: str, snapshot: dict[str, str | None]) -> bool:
+    """Use the pinned snapshot for presence checks, or stat an unpinned link."""
+    return snapshot[path] is not None if path in snapshot else (root / path).exists()
+
+
+def _answer_findings(
+    key: str, text: str, root: Path, valid: set[tuple[str, str]], snapshot: dict[str, str | None]
+) -> list[str]:
+    """Check one answer's complete anchor tokens and malformed fragments."""
+    matches = list(ANCHOR.finditer(text))
+    starts = {match.start() for match in matches}
+    found = [
+        f"{key}: malformed anchor {match.group(0)}"
+        for match in ANCHOR_FRAGMENT.finditer(text)
+        if match.start() not in starts
+    ]
+    for match in matches:
+        anchor = match.group(0).removeprefix("blob/main/")
+        if not _source_exists(root, match.group(1), snapshot):
+            found.append(f"{key}: anchor {anchor} links missing {match.group(1)}")
+        elif (key, anchor) not in valid:
+            found.append(
+                f"{key}: anchor {anchor} matches no pin for this answer; run tools/anchors.py fix"
+            )
+    return found
+
+
+def findings(
+    answers: dict[str, str],
+    root: Path,
+    pins: tuple[Pin, ...] = PINS,
+    *,
+    snapshot: dict[str, str | None] | None = None,
+) -> list[str]:
     """Find stale, unknown and missing anchors for each pin's declared answers."""
-    ranges = _ranges(root, pins)
+    if snapshot is None:
+        snapshot = _snapshot(root, pins)
+    ranges = _ranges(root, pins, snapshot)
     found = [span for span in ranges.values() if isinstance(span, str)]
-    valid = {
-        (key, anchor_text(pin.path, *span))
-        for pin, span in ranges.items()
-        if not isinstance(span, str)
-        for key in pin.keys
-    }
+    valid = _derived_anchors(ranges)
     for key, text in answers.items():
-        for match in ANCHOR.finditer(text):
-            anchor = match.group(0).removeprefix("blob/main/")
-            if not (root / match.group(1)).exists():
-                found.append(f"{key}: anchor {anchor} links missing {match.group(1)}")
-            elif (key, anchor) not in valid:
-                found.append(
-                    f"{key}: anchor {anchor} matches no pin for this answer; "
-                    "run tools/anchors.py fix"
-                )
+        found += _answer_findings(key, text, root, valid, snapshot)
     return found + _pin_findings(answers, pins, ranges)
 
 
@@ -210,14 +263,18 @@ def _references(answers: dict[str, str]) -> dict[str, tuple[str, int, int]]:
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run a bounded git read with the shared git environment."""
-    return subprocess.run(
-        ["git", "-C", str(root), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-        env=ciwf.git_env(),
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+            env=ciwf.git_env(),
+        )
+    except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as err:
+        raise OSError(f"git {' '.join(args)} in {root} failed: {err}") from err
 
 
 def _maps_to(pin: Pin, lines: list[str], start: int, end: int) -> bool:
@@ -230,67 +287,221 @@ def _maps_to(pin: Pin, lines: list[str], start: int, end: int) -> bool:
     )
 
 
-def _moves(
-    answers: dict[str, str], root: Path, base: str, pins: tuple[Pin, ...]
+def _base_oid(root: Path, base: str) -> str:
+    """Resolve the user's base once so subsequent reads use an immutable commit."""
+    done = _git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
+    if done.returncode != 0:
+        raise OSError(f"base revision {base} not found: {done.stderr.strip()}")
+    return done.stdout.strip()
+
+
+def _historical_lines(root: Path, oid: str, path: str, base: str) -> list[str]:
+    """Read a present historical file, treating only an empty tree listing as absence."""
+    listed = _git(root, "ls-tree", "--name-only", oid, "--", path)
+    if listed.returncode != 0:
+        raise OSError(f"cannot list {path} at {base}: {listed.stderr.strip()}")
+    if not listed.stdout:
+        return []
+    shown = _git(root, "show", f"{oid}:{path}")
+    if shown.returncode != 0:
+        raise OSError(f"cannot read {path} at {base}: {shown.stderr.strip()}")
+    return shown.stdout.splitlines()
+
+
+def _mapped_reference(
+    key: str,
+    old: str,
+    coordinates: tuple[str, int, int],
+    lines: list[str],
+    ranges: dict[Pin, tuple[int, int] | str],
+    pins: tuple[Pin, ...],
+    base: str,
+) -> tuple[str | None, list[str]]:
+    """Map one answer's anchor only through pins assigned to that answer."""
+    path, start, end = coordinates
+    matches = [
+        pin
+        for pin in pins
+        if key in pin.keys and pin.path == path and _maps_to(pin, lines, start, end)
+    ]
+    if not matches and (key, old) in _derived_anchors(ranges):
+        return old, []
+    if len(matches) != 1:
+        return None, [
+            f"anchor {old} for {key} cannot be mapped: matches {len(matches)} pins at {base}"
+        ]
+    span = ranges[matches[0]]
+    if isinstance(span, str):
+        return None, [f"anchor {old} cannot be mapped: {span}"]
+    return anchor_text(path, *span), []
+
+
+def _collect_moves(
+    answers: dict[str, str],
+    pins: tuple[Pin, ...],
+    ranges: dict[Pin, tuple[int, int] | str],
+    history: dict[str, list[str]],
+    base: str,
 ) -> tuple[dict[str, str], list[str]]:
-    """Resolve every old anchor against the base before allowing any write."""
+    """Combine per-answer mappings only when each literal has one destination."""
+    mapped, problems = {}, []
+    references = {
+        (key, old): coordinates
+        for key, text in answers.items()
+        for old, coordinates in _references({key: text}).items()
+    }
+    for (key, old), coordinates in references.items():
+        new, errors = _mapped_reference(
+            key, old, coordinates, history[coordinates[0]], ranges, pins, base
+        )
+        problems += errors
+        if new is None:
+            continue
+        if old in mapped and mapped[old] != new:
+            problems.append(f"anchor {old} maps to both {mapped[old]} and {new}")
+        mapped[old] = new
+    return {old: new for old, new in mapped.items() if old != new}, problems
+
+
+def _replace_anchors(text: str, moves: dict[str, str]) -> str:
+    """Replace complete anchor tokens once, preserving longer anchors and avoiding cascades."""
+    return ANCHOR.sub(
+        lambda match: (
+            "blob/main/"
+            + moves.get(
+                match.group(0).removeprefix("blob/main/"), match.group(0).removeprefix("blob/main/")
+            )
+        ),
+        text,
+    )
+
+
+def _moved_answers(answers: dict[str, str], moves: dict[str, str]) -> dict[str, str]:
+    """Apply simultaneous literal moves to each decoded answer."""
+    return {key: _replace_anchors(text, moves) for key, text in answers.items()}
+
+
+def _moves(
+    answers: dict[str, str],
+    root: Path,
+    base: str,
+    pins: tuple[Pin, ...],
+    snapshot: dict[str, str | None] | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve moves against one base and reject any findings left after applying them."""
+    if snapshot is None:
+        snapshot = _snapshot(root, pins)
     references = _references(answers)
     problems = [
         f"anchor {old} cannot be mapped: {path} is missing"
         for old, (path, _, _) in references.items()
-        if not (root / path).exists()
+        if not _source_exists(root, path, snapshot)
     ]
-    if problems or not findings(answers, root, pins):
+    if problems or not findings(answers, root, pins, snapshot=snapshot):
         return {}, problems
-    if _git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}").returncode != 0:
-        raise OSError(f"base revision {base} not found")
-    ranges = _ranges(root, pins)
-    valid = _derived_anchors(ranges)
     moves = {}
-    for old, (path, start, end) in references.items():
-        done = _git(root, "show", f"{base}:{path}")
-        lines = done.stdout.splitlines() if done.returncode == 0 else []
-        matches = [pin for pin in pins if pin.path == path and _maps_to(pin, lines, start, end)]
-        if not matches and old in valid:
-            continue
-        if len(matches) != 1:
-            problems.append(f"anchor {old} cannot be mapped: matches {len(matches)} pins at {base}")
-            continue
-        span = ranges[matches[0]]
-        if isinstance(span, str):
-            problems.append(f"anchor {old} cannot be mapped: {span}")
-            continue
-        new = anchor_text(path, *span)
-        if new != old:
-            moves[old] = new
+    if references:
+        oid = _base_oid(root, base)
+        paths = dict.fromkeys(path for path, _, _ in references.values())
+        history = {path: _historical_lines(root, oid, path, base) for path in paths}
+        moves, problems = _collect_moves(
+            answers, pins, _ranges(root, pins, snapshot), history, base
+        )
+    problems += [
+        f"after moves: {finding}"
+        for finding in findings(_moved_answers(answers, moves), root, pins, snapshot=snapshot)
+    ]
     return moves, problems
+
+
+def _updated_raw(raw: str, answers: dict[str, str], moves: dict[str, str]) -> str | None:
+    """Preserve JSON spelling and reject moves hidden behind escaped raw anchors."""
+    updated = JSON_STRING.sub(
+        lambda match: '"' + _replace_anchors(match.group(0)[1:-1], moves) + '"', raw
+    )
+    if json.loads(updated) != _moved_answers(answers, moves):
+        return None
+    return updated
+
+
+def _changed_inputs(path: Path, raw: bytes, snapshot: dict[str, str | None]) -> list[str]:
+    """Refuse replacement if the answers or any pinned source changed since capture."""
+    problems = []
+    if path.read_bytes() != raw:
+        problems.append(".bestpractices.json changed while fixing")
+    problems += [
+        f"{source} changed while fixing"
+        for source, text in snapshot.items()
+        if _source_text(path.parent / source) != text
+    ]
+    return problems
+
+
+def _write_atomic(
+    path: Path, raw: bytes, updated: bytes, snapshot: dict[str, str | None]
+) -> list[str]:
+    """Flush a same-directory temporary file and replace only unchanged inputs."""
+    temporary = None
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(updated)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(mode)
+        problems = _changed_inputs(path, raw, snapshot)
+        if problems:
+            return problems
+        os.replace(temporary, path)
+        return []
+    except OSError as err:
+        raise OSError(f"cannot atomically update {path}: {err}") from err
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as err:
+                raise OSError(
+                    f"cannot remove temporary file {temporary} for {path}: {err}"
+                ) from err
+
+
+def _report(problems: list[str]) -> bool:
+    """Report every refusal and indicate whether any problem blocks the operation."""
+    for problem in problems:
+        complain(f"FAIL: {problem}")
+    return bool(problems)
 
 
 def run(command: str, root: Path, base: str, pins: tuple[Pin, ...] = PINS) -> int:
     """Check answers or apply a complete set of unambiguous anchor moves."""
     path = root / ".bestpractices.json"
-    raw = path.read_bytes().decode("utf-8")
-    answers = json.loads(raw)
+    raw = path.read_bytes()
+    text = raw.decode("utf-8")
+    answers = json.loads(text)
+    if not isinstance(answers, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in answers.items()
+    ):
+        raise ValueError(".bestpractices.json must map answer names to text")
+    snapshot = _snapshot(root, pins)
     if command == "check":
-        problems = findings(answers, root, pins)
-        for problem in problems:
-            complain(f"FAIL: {problem}")
-        if problems:
+        if _report(findings(answers, root, pins, snapshot=snapshot)):
             return 1
         say(f"PASS: {len(_references(answers))} anchors match their pins")
         return 0
-    moves, problems = _moves(answers, root, base, pins)
-    for problem in problems:
-        complain(f"FAIL: {problem}")
-    if problems:
+    moves, problems = _moves(answers, root, base, pins, snapshot)
+    if _report(problems):
         return 1
     if not moves:
         say("PASS: no anchor to move")
         return 0
-    alternatives = "|".join(re.escape(old) for old in moves)
-    pattern = re.compile(r"blob/main/(" + alternatives + r")(?![\d-])")
-    updated = pattern.sub(lambda match: "blob/main/" + moves[match.group(1)], raw)
-    path.write_bytes(updated.encode("utf-8"))
+    updated = _updated_raw(text, answers, moves)
+    if updated is None:
+        _report(["anchor moves do not apply to the raw file (escaped spelling?)"])
+        return 1
+    if _report(_write_atomic(path, raw, updated.encode("utf-8"), snapshot)):
+        return 1
     for old, new in moves.items():
         say(f"moved {old} -> {new}")
     return 0
