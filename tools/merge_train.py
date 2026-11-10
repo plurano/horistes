@@ -88,14 +88,21 @@ MIN_KEY_BITS = 2048
 # The cap bounds the input; the writer thread fills the pipe while openssl reads,
 # so the pipe's capacity does not matter.
 MAX_KEY_CHARS = 16384
+# Metadata read lets repository tokens read collaborator permissions (ADR-0077).
 WRITE_RIGHTS = {
+    "metadata": "read",
     "actions": "read",
     "contents": "write",
     "pull_requests": "write",
     "workflows": "write",
     "checks": "read",
 }
-READ_RIGHTS = {"contents": "read", "pull_requests": "read", "checks": "read"}
+READ_RIGHTS = {
+    "metadata": "read",
+    "contents": "read",
+    "pull_requests": "read",
+    "checks": "read",
+}
 STATUS_RIGHTS = {"statuses": "read"}
 ISSUE_RIGHTS = {"issues": "write"}
 CLOSE_DAYS = 7
@@ -111,17 +118,29 @@ SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its produc
 REVIEW_BODY = "review body: "
 # Pull requests whose review bodies one run reads in one repository (ADR-0070).
 REVIEW_READS = 10
+# Distinct maintainer logins whose rights one pull request checks (ADR-0077).
+ANSWER_RIGHTS = 5
+# Association only orders the permission reads; it never decides an answer, because an
+# organisation member with private membership can show as CONTRIBUTOR (ADR-0077).
+ANSWER_ASSOCIATION_RANK = {
+    "OWNER": 0,
+    "MEMBER": 0,
+    "COLLABORATOR": 0,
+    "CONTRIBUTOR": 1,
+}
+# Any other or missing association ranks after every listed one.
+ANSWER_UNRANKED = max(ANSWER_ASSOCIATION_RANK.values()) + 1
 REVIEW_BODIES = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       reviews(first: 100) {
         totalCount
-        nodes { databaseId state body author { login __typename } }
+        nodes { databaseId state body authorAssociation author { login __typename } }
       }
       comments(first: 100) {
         totalCount
-        nodes { body author { login } }
+        nodes { body authorAssociation author { login __typename } }
       }
       commits(first: 100) {
         totalCount
@@ -1077,7 +1096,63 @@ def _is_review_answered(review_id, texts):
     return any(pattern.search(text) for text in texts)
 
 
-def review_body_hold(pull, detail):
+def _answer_candidates(pr_author, detail, review_id):
+    """Human non-author logins and associations whose comments or reviews name this review."""
+    nodes = [
+        node
+        for kind in ("comments", "reviews")
+        for node in (detail.get(kind) or {}).get("nodes") or []
+    ]
+    return [
+        (author["login"], node.get("authorAssociation"))
+        for node in nodes
+        if (author := node.get("author") or {}).get("login")
+        and author.get("__typename") != "Bot"
+        and author["login"] != pr_author
+        and _is_review_answered(review_id, [node.get("body") or ""])
+    ]
+
+
+def _ranked_logins(candidates):
+    """Distinct logins ordered by best association, with first-seen ties kept stable."""
+    ranks = {}
+    for answers in candidates:
+        for login, association in answers:
+            rank = ANSWER_ASSOCIATION_RANK.get(association, ANSWER_UNRANKED)
+            ranks[login] = min(ranks.get(login, ANSWER_UNRANKED), rank)
+    return sorted(ranks, key=ranks.get)
+
+
+def _candidate_findings(candidates, remaining, candidate):
+    """Still-unanswered findings named by this candidate's comments or reviews."""
+    return [
+        finding
+        for finding, answers in candidates
+        if finding in remaining and any(login == candidate for login, _ in answers)
+    ]
+
+
+def _maintainer_unanswered(pr_author, detail, unanswered, right):
+    """Remaining findings after at most ANSWER_RIGHTS globally ordered permission reads."""
+    candidates = [
+        (finding, _answer_candidates(pr_author, detail, finding[1])) for finding in unanswered
+    ]
+    allowed = _ranked_logins(answers for _, answers in candidates)[:ANSWER_RIGHTS]
+    remaining = set(unanswered)
+    for candidate in allowed:
+        pending = _candidate_findings(candidates, remaining, candidate)
+        if not pending:
+            continue
+        try:
+            granted = right(candidate)
+        except RefusedError as err:
+            raise RefusedError(f"cannot read the right of {candidate}: {err}") from err
+        if granted:
+            remaining.difference_update(pending)
+    return [finding for finding in unanswered if finding in remaining]
+
+
+def review_body_hold(pull, detail, right=None):
     """Why a pull request waits for an unanswered bot review body finding, or None."""
     for kind in ("reviews", "comments", "commits"):
         if ((detail.get(kind) or {}).get("totalCount") or 0) > 100:
@@ -1096,6 +1171,11 @@ def review_body_hold(pull, detail):
             review_id, texts
         ):
             unanswered.append((login, review_id))
+    if unanswered and is_bot(pull) and right is not None:
+        try:
+            unanswered = _maintainer_unanswered(pr_author, detail, unanswered, right)
+        except RefusedError as err:
+            return f"{REVIEW_BODY}{err}"[:200]
     if not unanswered:
         return None
     login, review_id = unanswered[0]
@@ -1115,6 +1195,21 @@ def pull_review_bodies(env, number):
     return (data.get("repository") or {}).get("pullRequest")
 
 
+def collaborator_right(env, login):
+    """Whether the collaborator has write or admin permission; a missing user does not."""
+    user = urllib.parse.quote(login, safe="")
+    url = (
+        f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/collaborators/{user}/permission"
+    )
+    try:
+        answer = call(url, env["TRAIN_TOKEN"], "GET")
+    except RefusedError as err:
+        if "HTTP 404" in str(err):
+            return False
+        raise
+    return answer.get("permission") in ("admin", "write")
+
+
 def read_review_hold(env, pull):
     """The review-body hold of one pull request, or None; a failed read holds it."""
     try:
@@ -1123,7 +1218,7 @@ def read_review_hold(env, pull):
         return f"{REVIEW_BODY}cannot read: {err}"[:200]
     if not detail:
         return f"{REVIEW_BODY}cannot read: the forge returned no pull request"
-    return review_body_hold(pull, detail)
+    return review_body_hold(pull, detail, right=lambda login: collaborator_right(env, login))
 
 
 def review_body_eligible(pull, reason, conf):
