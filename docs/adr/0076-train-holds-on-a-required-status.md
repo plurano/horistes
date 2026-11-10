@@ -85,9 +85,13 @@ the status, and every verdict is the one it was before.
   guards only the head commit through `expectedHeadOid`, so a status that
   changes after the read is not seen. Auto-merge that a person arms between
   train runs does not wait for the train either. A ruleset or branch protection
-  rule that requires the context closes both gaps: the forge checks the context
-  when the merge happens and refuses the merge, the train's included, while the
-  context does not pass, unless the merging actor may bypass the rule.
+  rule that requires the context closes both gaps only when it names the
+  writer's app as the expected source of the context, so neither a same-named
+  check run nor a status from another author satisfies it, and when the writer
+  reports the status on the head commit only, since the forge judges the test
+  merge commit instead once that commit carries a status. The forge checks the
+  context when the merge happens and refuses the merge, the train's included,
+  while the context does not pass, unless the merging actor may bypass the rule.
 - Tests in `tests/test_merge_train.py` hold the planted cases: absent and
   non-success held, success landed, unset unchanged; the status selected only
   when set and only on the head commit; Commit statuses read minted only when
