@@ -131,7 +131,9 @@ def test_every_draft_copy_is_covered(tmp_path: Path) -> None:
     for rel_path in workflows[:-1]:
         shutil.copy(ROOT / rel_path, planted)
     shutil.copy(ROOT / workflows[-1], planted / "new.yml")
-    assert draft_copies(tmp_path) != COPIES
+    renamed = ".github/workflows/new.yml"
+    expected = sorted((renamed if path == workflows[-1] else path, job) for path, job in COPIES)
+    assert draft_copies(tmp_path) == expected
 
     extra_root = tmp_path / "extra-job"
     rel_path = ".github/workflows/ci.yml"
@@ -141,9 +143,8 @@ def test_every_draft_copy_is_covered(tmp_path: Path) -> None:
     doc = ciwf.load(copied)
     doc["jobs"]["extra-floor"] = doc["jobs"]["floor"]
     copied.write_text(json.dumps(doc), encoding="utf-8")
-    found = draft_copies(extra_root)
-    assert (rel_path, "extra-floor") in found
-    assert found != [copy for copy in COPIES if copy[0] == rel_path]
+    in_file = [copy for copy in COPIES if copy[0] == rel_path]
+    assert draft_copies(extra_root) == sorted([*in_file, (rel_path, "extra-floor")])
 
 
 def test_draft_copies_preserves_duplicate_steps(tmp_path: Path) -> None:
