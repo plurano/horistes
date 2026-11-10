@@ -144,8 +144,8 @@ flight, it arms auto-merge on the oldest BEHIND pull request whose checks are
 not red and merges the default branch into it; an armed pull request that is
 BEHIND is updated first. Without `required_status` it updates no pull request
 it has not armed. With it, the train arms none: it updates a BEHIND pull request
-whose status is SUCCESS without arming it and lands it itself once it is CLEAN
-(decision record 0076). It updates none where a ruleset on the default branch
+whose status is SUCCESS without arming it, disarming an armed one first, and
+lands it itself once it is CLEAN (decision record 0076). It updates none where a ruleset on the default branch
 demands linear history (decision record 0044). A red pull request whose red
 runs failed only at the draft step gets a fresh event instead, a label added
 and removed (a re-run would replay the draft payload). It then closes the open

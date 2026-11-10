@@ -52,7 +52,9 @@ When `required_status` names a commit status context:
   held pull request stopped at the draft step still gets its fresh event.
 - The train arms no pull request for auto-merge. `updatable` picks the BEHIND
   pull requests decision record 0044 allows and arms none of them; the train
-  lands each one itself once it is CLEAN. Where the repository allows no
+  lands each one itself once it is CLEAN. An armed BEHIND pull request is
+  disarmed before its update (`advance`), so auto-merge cannot land the new
+  head before the train reads its status. Where the repository allows no
   auto-merge, an unarmed BEHIND pull request is still left as it is.
 - Each run reads every open pull request's own status rather than its verdict
   reason, so an earlier hold cannot hide a missing status. An armed pull
@@ -86,7 +88,8 @@ the status, and every verdict is the one it was before.
   non-success held, success landed, unset unchanged; the status selected only
   when set and only on the head commit; Commit statuses read minted only when
   set, and a status read refused without it; a BEHIND pull request updated
-  without arming; a retitled armed pull request disarmed and not armed again;
+  without arming; an armed BEHIND pull request disarmed before its update; a
+  retitled armed pull request disarmed and not armed again;
   an armed or queued pull request with an earlier hold and no status disarmed
   or dequeued; a held dependency pull request given its generated files; a
   regenerate head without the status write-holding other landings, and

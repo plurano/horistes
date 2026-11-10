@@ -491,6 +491,7 @@ class Forge:
         self.messages.append((kind, variables["id"], headline, body))
 
     def graphql(self, header: str, query: str, variables: dict) -> dict:
+        """Serve one GraphQL call: a mutation needs write rights and is recorded."""
         full, rights = self.repo_of(header)
         mutations = (
             "mergePullRequest",
@@ -606,6 +607,7 @@ class Forge:
         return {"data": {"repository": {"pullRequest": {"mergeStateStatus": state}}}}
 
     def _resolve_status(self, raw: dict | None, name: str | None) -> dict | None:
+        """The head status as a lookup by context name returns it: a state or a null context."""
         if raw is None:
             return None
         if "context" in raw:
@@ -618,6 +620,7 @@ class Forge:
     def _extract_page_nodes(
         self, nodes: list[dict], start: int, size: int, query: str, variables: dict
     ) -> list[dict]:
+        """One page of pull requests, the head status resolved by name where the query asks."""
         selects_status = bool(re.search(r"\bstatus\s*\{", query))
         status_name = variables.get("status")
         page_nodes = []
@@ -642,6 +645,7 @@ class Forge:
         return page_nodes
 
     def pull_page(self, full: str, query: str, variables: dict) -> dict:
+        """Answer the open pull request query: check its variables, return the asked page."""
         owner, name = full.split("/")
         after = variables.get("after")
         expected = {"owner": owner, "name": name}
@@ -666,6 +670,7 @@ class Forge:
         return {"data": {"repository": {**read, "pullRequests": page}}}
 
     def graphql_response(self, header: str, query: str, variables: dict) -> tuple[int, dict]:
+        """HTTP status and body of one GraphQL call; a status read without the right fails."""
         full, rights = self.repo_of(header)
         self.queries.append(query)
         if re.search(r"\bstatus\s*\{", query) and rights.get("statuses") != "read":
@@ -699,6 +704,7 @@ class Forge:
             self.writes.append(write)
 
     def update(self, header: str, full: str, number: int, body: dict) -> tuple[int, dict]:
+        """Record a branch update made with write rights; answer as queued, else accepted."""
         token_repo, rights = self.repo_of(header)
         assert token_repo == full and rights in (WRITE, {**WRITE, **STATUSES}), (
             token_repo,
@@ -710,6 +716,7 @@ class Forge:
         return code, {"message": message}
 
     def run_jobs(self, header: str, full: str, run_id: int) -> tuple[int, dict]:
+        """Record a jobs read made with write rights; return the jobs queued for that run."""
         token_repo, rights = self.repo_of(header)
         assert token_repo == full and rights in (WRITE, {**WRITE, **STATUSES}), (
             token_repo,
@@ -720,6 +727,7 @@ class Forge:
         return 200, {"jobs": self.jobs.get(run_id, [])}
 
     def label_write(self, header: str, full: str, write: tuple) -> tuple[int, dict]:
+        """Record a label write made with write rights; removing a missing label is a 404."""
         token_repo, rights = self.repo_of(header)
         assert token_repo == full and rights in (WRITE, {**WRITE, **STATUSES}), (
             token_repo,
@@ -7209,6 +7217,31 @@ def test_required_status_set_behind_pull_updated_without_arming(tmp_path):
         updated(1),
     ]
     assert "armed, updated from the default branch" in summary_unset
+
+
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge-on", "auto-merge-off"])
+def test_required_status_set_armed_behind_pull_disarmed_before_update(tmp_path, auto_merge):
+    """While required_status is set an armed BEHIND pull request is disarmed, then updated.
+
+    Auto-merge would otherwise land the new head before the train reads its status.
+    Unset, the same pull request is updated and stays armed.
+    """
+    fields = {
+        "author": {"login": "person"},
+        "autoMergeRequest": {"enabledAt": OLD},
+        "status": ctx("lanes/booked", "SUCCESS"),
+    }
+    forge = Forge(repository(pull(1, "BEHIND", **fields), rules=(), auto_merge=auto_merge))
+    done, summary = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1), updated(1)], forge.writes
+    assert "| #1 | BEHIND | disarmed, updated from the default branch |" in summary, summary
+
+    forge_unset = Forge(repository(pull(1, "BEHIND", **fields), rules=(), auto_merge=auto_merge))
+    done_unset, summary_unset = train(tmp_path, forge_unset)
+    assert done_unset.returncode == 0, done_unset.stdout + done_unset.stderr
+    assert forge_unset.writes == [updated(1)], forge_unset.writes
+    assert "| #1 | BEHIND | updated from the default branch |" in summary_unset, summary_unset
 
 
 def test_required_status_set_keeps_unarmed_behind_pull_as_is_without_auto_merge(tmp_path):

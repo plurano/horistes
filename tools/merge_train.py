@@ -542,7 +542,12 @@ def update(env, pull):
 
 
 def advance(env, conf, repo, rows, notes):
-    """Update the first pull request `updatable` names, arming it first where it says."""
+    """Update the first pull request `updatable` names, arming it first where it says.
+
+    While `required_status` is set an armed pull request is disarmed before its update:
+    auto-merge would otherwise land the new head before the train reads its status
+    (decision record 0076).
+    """
     for pull, arming in updatable(repo, rows, notes, conf):
         if arming:
             scanning = has_red_code_scanning(pull)
@@ -555,6 +560,9 @@ def advance(env, conf, repo, rows, notes):
                 notes[pull["number"]] = err.note
                 continue
             notes[pull["number"]] = "armed, updated from the default branch"
+        elif conf.get("required_status") and pull["autoMergeRequest"]:
+            graphql(env, DISARM, {"id": pull["id"]})
+            notes[pull["number"]] = "disarmed, updated from the default branch"
         else:
             notes[pull["number"]] = "updated from the default branch"
         if update(env, pull):
