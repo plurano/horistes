@@ -184,6 +184,44 @@ def test_without_code_spans_growth_is_bounded():
     assert timings[1] / max(timings[0], 1e-4) < 200
 
 
+@pytest.mark.parametrize(
+    "inline_links", [False, True], ids=["without_code_spans", "inline_link_finditer"]
+)
+def test_angle_destination_growth_is_bounded(inline_links):
+    """Bound 8x malformed angle input below 40x time; quadratic growth predicts 64x."""
+    timings = []
+    for size in (500, 4000):
+        line = "[](<a b)" * size + ">"
+        samples = []
+        for _ in range(5):
+            start = time.perf_counter()
+            if inline_links:
+                list(links.INLINE_LINK.finditer(line))
+            else:
+                links.without_code_spans(line)
+            samples.append(time.perf_counter() - start)
+        timings.append(min(samples))
+    assert timings[1] / max(timings[0], 1e-4) < 40
+
+
+@pytest.mark.parametrize(
+    ("line", "expected", "angle_target"),
+    [
+        ("[a](<b<c>.md>)", ["b<c>.md"], None),
+        ("[a](<x y.md>)", ["x y.md"], "x y.md"),
+    ],
+)
+def test_angle_destination_boundaries(line, expected, angle_target):
+    """Reject nested angle captures, retaining bare fallback and valid spaced destinations."""
+    inline = links.INLINE_LINK.search(line)
+    destination = links.LINK_DESTINATION.search(line)
+    assert inline is not None
+    assert destination is not None
+    assert inline.group(1) == angle_target
+    assert destination.group(1) == angle_target
+    assert links.extract_links(line) == expected
+
+
 def test_root_absolute_link_reads_from_the_repository_root(tree):
     """A link starting with `/` names a file from the repository root, not the linking folder."""
     good = {"docs/guide.md": "See [readme](/README.md).\n", "README.md": "# Readme\n"}

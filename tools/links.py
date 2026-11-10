@@ -21,8 +21,8 @@ from bisect import bisect_left
 from pathlib import Path
 from string import punctuation
 
-INLINE_LINK = re.compile(r"\[[^\]]*\]\((?:<([^>]+)>|([^)\s]+))(?:\s+[^)]*)?\)")
-LINK_DESTINATION = re.compile(r"\((?:<([^>]+)>|([^)\s]+))(?:\s+[^)]*)?\)")
+INLINE_LINK = re.compile(r"\[[^\]]*\]\((?:<([^<>\n]+)>|([^)\s]+))(?:\s+[^)]*)?\)")
+LINK_DESTINATION = re.compile(r"\((?:<([^<>\n]+)>|([^)\s]+))(?:\s+[^)]*)?\)")
 INLINE_MARKER = re.compile(r"`+|\\|\[|\]")
 REF_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))")
 FENCE_START = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
