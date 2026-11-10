@@ -31,29 +31,46 @@ class Pin:
     path: str
     first: tuple[str, ...]
     last: tuple[str, ...]
+    keys: tuple[str, ...]
 
+
+_CRYPTO_KEYS = (
+    "crypto_published_justification",
+    "crypto_call_justification",
+    "crypto_floss_justification",
+    "crypto_working_justification",
+)
 
 PINS: tuple[Pin, ...] = (
     Pin(
         "tools/merge_train.py",
         ("def app_jwt(",),
         ('return f"{signing_input}.{b64url(done.stdout)}"',),
+        (*_CRYPTO_KEYS, "crypto_weaknesses_justification", "crypto_random_justification"),
     ),
     Pin(
         "tools/merge_train.py",
         ("if hashlib.sha256(content).hexdigest() != sha:",),
         ("if hashlib.sha256(content).hexdigest() != sha:",),
+        _CRYPTO_KEYS,
     ),
-    Pin("tools/merge_train.py", ("blob_sha = hashlib.sha1(",), ("blob_sha = hashlib.sha1(",)),
+    Pin(
+        "tools/merge_train.py",
+        ("blob_sha = hashlib.sha1(",),
+        ("blob_sha = hashlib.sha1(",),
+        ("crypto_weaknesses_justification",),
+    ),
     Pin(
         "tools/merge_train.py",
         ("def key_bits(",),
         ("return int(match.group(1)) if match else None",),
+        ("crypto_call_justification",),
     ),
     Pin(
         "tools/merge_train.py",
         ("def key_bits(",),
         ('f"the app key has {bits} bits; at least {MIN_KEY_BITS} are required"',),
+        ("crypto_keylength_justification",),
     ),
     Pin(
         "tests/test_merge_train.py",
@@ -63,21 +80,25 @@ PINS: tuple[Pin, ...] = (
             "assert done.returncode == 0, done.stdout + done.stderr",
             'assert forge.writes == [("merge", "PR_1", f"{1:040x}", "SQUASH")]',
         ),
+        ("crypto_keylength_justification",),
     ),
     Pin(
         "tools/results.py",
         ("found = hashlib.sha256(data).hexdigest()",),
         ('raise ResultError(f"archive is sha256:{found[:12]}, the forge lists {digest[:19]}")',),
+        _CRYPTO_KEYS,
     ),
     Pin(
         "tools/hook_copy.py",
         ("def _sha256(path: Path) -> str:",),
         ('return hashlib.file_digest(source, "sha256").hexdigest()',),
+        _CRYPTO_KEYS,
     ),
     Pin(
         "tools/stranger.py",
         ("digest, size = hashlib.sha256(), 0",),
         ("digest, size = hashlib.sha256(), 0",),
+        _CRYPTO_KEYS,
     ),
 )
 
@@ -132,27 +153,46 @@ def _derived_anchors(ranges: dict[Pin, tuple[int, int] | str]) -> set[str]:
     }
 
 
+def _pin_findings(
+    answers: dict[str, str], pins: tuple[Pin, ...], ranges: dict[Pin, tuple[int, int] | str]
+) -> list[str]:
+    """Require every declared answer to link its pin's complete derived anchor."""
+    found = []
+    for pin in pins:
+        if not pin.keys:
+            found.append(f"pin {pin.path} lists no answer")
+        span = ranges.get(pin)
+        if span is None or isinstance(span, str):
+            continue
+        anchor = anchor_text(pin.path, *span)
+        for key in pin.keys:
+            linked = {match.group(0) for match in ANCHOR.finditer(answers.get(key, ""))}
+            if f"blob/main/{anchor}" not in linked:
+                found.append(f"pin {anchor} is not linked by {key}")
+    return found
+
+
 def findings(answers: dict[str, str], root: Path, pins: tuple[Pin, ...] = PINS) -> list[str]:
-    """Find stale, unknown and unused evidence anchors in existing files."""
+    """Find stale, unknown and missing anchors for each pin's declared answers."""
     ranges = _ranges(root, pins)
     found = [span for span in ranges.values() if isinstance(span, str)]
-    valid = _derived_anchors(ranges)
-    used = set()
+    valid = {
+        (key, anchor_text(pin.path, *span))
+        for pin, span in ranges.items()
+        if not isinstance(span, str)
+        for key in pin.keys
+    }
     for key, text in answers.items():
         for match in ANCHOR.finditer(text):
             if not (root / match.group(1)).exists():
                 continue
             anchor = match.group(0).removeprefix("blob/main/")
-            used.add(anchor)
-            if anchor not in valid:
-                found.append(f"{key}: anchor {anchor} matches no pin; run tools/anchors.py fix")
-    for pin, span in ranges.items():
-        if isinstance(span, str):
-            continue
-        anchor = anchor_text(pin.path, *span)
-        if anchor not in used:
-            found.append(f"pin {anchor} is used by no answer")
-    return found
+            if (key, anchor) not in valid:
+                found.append(
+                    f"{key}: anchor {anchor} matches no pin for this answer; "
+                    "run tools/anchors.py fix"
+                )
+    return found + _pin_findings(answers, pins, ranges)
 
 
 def _references(answers: dict[str, str]) -> dict[str, tuple[str, int, int]]:
@@ -168,19 +208,16 @@ def _references(answers: dict[str, str]) -> dict[str, tuple[str, int, int]]:
     }
 
 
-def _base_lines(root: Path, base: str, path: str) -> list[str]:
-    """Read the historical file, propagating git failures as file errors."""
-    done = subprocess.run(
-        ["git", "-C", str(root), "show", f"{base}:{path}"],
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a bounded git read with the shared git environment."""
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
         capture_output=True,
         text=True,
         check=False,
         timeout=30,
         env=ciwf.git_env(),
     )
-    if done.returncode != 0:
-        raise OSError(f"git show {base}:{path} failed: {done.stderr.strip()}")
-    return done.stdout.splitlines()
 
 
 def _maps_to(pin: Pin, lines: list[str], start: int, end: int) -> bool:
@@ -196,18 +233,26 @@ def _maps_to(pin: Pin, lines: list[str], start: int, end: int) -> bool:
 def _moves(
     answers: dict[str, str], root: Path, base: str, pins: tuple[Pin, ...]
 ) -> tuple[dict[str, str], list[str]]:
-    """Resolve all drifted anchors before allowing any write."""
+    """Resolve every old anchor against the base before allowing any write."""
+    references = _references(answers)
+    problems = [
+        f"anchor {old} cannot be mapped: {path} is missing"
+        for old, (path, _, _) in references.items()
+        if not (root / path).exists()
+    ]
+    if problems or not findings(answers, root, pins):
+        return {}, problems
+    if _git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}").returncode != 0:
+        raise OSError(f"base revision {base} not found")
     ranges = _ranges(root, pins)
     valid = _derived_anchors(ranges)
-    moves, problems = {}, []
-    for old, (path, start, end) in _references(answers).items():
-        if old in valid:
-            continue
-        if not (root / path).exists():
-            problems.append(f"anchor {old} cannot be mapped: {path} is missing")
-            continue
-        lines = _base_lines(root, base, path)
+    moves = {}
+    for old, (path, start, end) in references.items():
+        done = _git(root, "show", f"{base}:{path}")
+        lines = done.stdout.splitlines() if done.returncode == 0 else []
         matches = [pin for pin in pins if pin.path == path and _maps_to(pin, lines, start, end)]
+        if not matches and old in valid:
+            continue
         if len(matches) != 1:
             problems.append(f"anchor {old} cannot be mapped: matches {len(matches)} pins at {base}")
             continue
@@ -215,7 +260,9 @@ def _moves(
         if isinstance(span, str):
             problems.append(f"anchor {old} cannot be mapped: {span}")
             continue
-        moves[old] = anchor_text(path, *span)
+        new = anchor_text(path, *span)
+        if new != old:
+            moves[old] = new
     return moves, problems
 
 

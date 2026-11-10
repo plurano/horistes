@@ -152,22 +152,28 @@ def test_missing_linked_file_with_anchor_gets_no_anchor_finding(tmp_path: Path) 
 def test_planted_stale_first_line(tmp_path: Path) -> None:
     """Planted: the first block no longer appears in the linked file."""
     root = _tree(tmp_path, "drifted\nsecond\n")
-    pins = (anchors.Pin("tools/a.py", ("first",), ("second",)),)
+    pins = (anchors.Pin("tools/a.py", ("first",), ("second",), ("x_justification",)),)
     text = "Evidence: https://github.com/plurano/horistes/blob/main/tools/a.py#L1-L2"
     assert findings({"x_justification": text}, root, pins) == [
         "pin tools/a.py first text 'first' matches 0 places",
-        "x_justification: anchor tools/a.py#L1-L2 matches no pin; run tools/anchors.py fix",
+        (
+            "x_justification: anchor tools/a.py#L1-L2 matches no pin for this answer; "
+            "run tools/anchors.py fix"
+        ),
     ]
 
 
 def test_planted_stale_last_line_of_range(tmp_path: Path) -> None:
     """Planted: the last block no longer appears after the pinned start."""
     root = _tree(tmp_path, "first\ndrifted\n")
-    pins = (anchors.Pin("tools/a.py", ("first",), ("second",)),)
+    pins = (anchors.Pin("tools/a.py", ("first",), ("second",), ("x_justification",)),)
     text = "Evidence: https://github.com/plurano/horistes/blob/main/tools/a.py#L1-L2"
     assert findings({"x_justification": text}, root, pins) == [
         "pin tools/a.py last text 'second' matches no place at or after line 1",
-        "x_justification: anchor tools/a.py#L1-L2 matches no pin; run tools/anchors.py fix",
+        (
+            "x_justification: anchor tools/a.py#L1-L2 matches no pin for this answer; "
+            "run tools/anchors.py fix"
+        ),
     ]
 
 
@@ -177,14 +183,17 @@ def test_planted_anchor_matching_no_pin(tmp_path: Path, anchor: str) -> None:
     root = _tree(tmp_path, "first\nsecond\n")
     text = f"Evidence: https://github.com/plurano/horistes/blob/main/tools/a.py#{anchor}"
     assert findings({"x_justification": text}, root, ()) == [
-        f"x_justification: anchor tools/a.py#{anchor} matches no pin; run tools/anchors.py fix"
+        (
+            f"x_justification: anchor tools/a.py#{anchor} matches no pin for this answer; "
+            "run tools/anchors.py fix"
+        )
     ]
 
 
 def test_boundary_anchor_on_last_line_passes(tmp_path: Path) -> None:
     """Boundary: an anchor targeting the exact last line of a file passes."""
     root = _tree(tmp_path, "first\nlast\n")
-    pins = (anchors.Pin("tools/a.py", ("last",), ("last",)),)
+    pins = (anchors.Pin("tools/a.py", ("last",), ("last",), ("x_justification",)),)
     text = "Evidence: https://github.com/plurano/horistes/blob/main/tools/a.py#L2"
     assert findings({"x_justification": text}, root, pins) == []
 
@@ -192,30 +201,36 @@ def test_boundary_anchor_on_last_line_passes(tmp_path: Path) -> None:
 def test_boundary_single_line_anchor_checks_both_texts(tmp_path: Path) -> None:
     """Boundary: both distinct pinned substrings can occupy the same line."""
     root = _tree(tmp_path, "prefix suffix\n")
-    pins = (anchors.Pin("tools/a.py", ("prefix",), ("suffix",)),)
+    pins = (anchors.Pin("tools/a.py", ("prefix",), ("suffix",), ("x_justification",)),)
     text = "Evidence: https://github.com/plurano/horistes/blob/main/tools/a.py#L1"
     assert findings({"x_justification": text}, root, pins) == []
 
-    stale_second = (anchors.Pin("tools/a.py", ("prefix",), ("absent",)),)
+    stale_second = (anchors.Pin("tools/a.py", ("prefix",), ("absent",), ("x_justification",)),)
     assert findings({"x_justification": text}, root, stale_second) == [
         "pin tools/a.py last text 'absent' matches no place at or after line 1",
-        "x_justification: anchor tools/a.py#L1 matches no pin; run tools/anchors.py fix",
+        (
+            "x_justification: anchor tools/a.py#L1 matches no pin for this answer; "
+            "run tools/anchors.py fix"
+        ),
     ]
 
 
 def test_planted_ambiguous_first_text(tmp_path: Path) -> None:
     """Planted: two matching first blocks cannot identify a unique range."""
     root = _tree(tmp_path, "first\nfirst\nlast\n")
-    pins = (anchors.Pin("tools/a.py", ("first",), ("last",)),)
+    pins = (anchors.Pin("tools/a.py", ("first",), ("last",), ("x_justification",)),)
     text = "Evidence: https://github.com/plurano/horistes/blob/main/tools/a.py#L1-L3"
     assert findings({"x_justification": text}, root, pins) == [
         "pin tools/a.py first text 'first' matches 2 places",
-        "x_justification: anchor tools/a.py#L1-L3 matches no pin; run tools/anchors.py fix",
+        (
+            "x_justification: anchor tools/a.py#L1-L3 matches no pin for this answer; "
+            "run tools/anchors.py fix"
+        ),
     ]
 
 
 def test_planted_unused_pin(tmp_path: Path) -> None:
-    """Planted: a valid pin with no answer referencing its range is refused."""
+    """Planted: a valid pin without its declared answer's link is refused."""
     root = _tree(tmp_path, "first\n")
-    pins = (anchors.Pin("tools/a.py", ("first",), ("first",)),)
-    assert findings({}, root, pins) == ["pin tools/a.py#L1 is used by no answer"]
+    pins = (anchors.Pin("tools/a.py", ("first",), ("first",), ("x_justification",)),)
+    assert findings({}, root, pins) == ["pin tools/a.py#L1 is not linked by x_justification"]

@@ -12,7 +12,7 @@ import pytest
 from conftest import Tree
 
 URL = "https://github.com/plurano/horistes/blob/main/"
-PIN = anchors.Pin("tools/a.py", ("first",), ("last",))
+PIN = anchors.Pin("tools/a.py", ("first",), ("last",), ("one",))
 
 
 def repository(tree: Tree, source: str, raw: str) -> Path:
@@ -39,13 +39,14 @@ def test_planted_drift_moves_repeated_anchors_only(tree: Tree, capsys) -> None:
     )
     root = repository(tree, "header\nfirst\nlast\n", raw)
     before = (root / ".bestpractices.json").read_bytes()
+    pins = (anchors.Pin(PIN.path, PIN.first, PIN.last, ("one", "two")),)
     tree.write({"tools/a.py": "inserted\ninserted again\nheader\nfirst\nlast\n"})
-    assert invoke(root, "check", (PIN,)) == 1
+    assert invoke(root, "check", pins) == 1
     assert "matches no pin" in capsys.readouterr().err
-    assert invoke(root, "fix", (PIN,)) == 0
+    assert invoke(root, "fix", pins) == 0
     assert capsys.readouterr().out == "moved tools/a.py#L2-L3 -> tools/a.py#L4-L5\n"
     assert (root / ".bestpractices.json").read_bytes() == before.replace(b"#L2-L3", b"#L4-L5")
-    assert invoke(root, "check", (PIN,)) == 0
+    assert invoke(root, "check", pins) == 0
 
 
 def test_planted_unmappable_anchor_writes_nothing(tree: Tree, capsys) -> None:
@@ -76,9 +77,9 @@ def test_boundary_short_anchor_does_not_replace_longer_anchor(tree: Tree) -> Non
     root = repository(tree, "\n".join(lines) + "\n", raw)
     before = (root / ".bestpractices.json").read_bytes()
     pins = (
-        anchors.Pin("tools/a.py", ("first",), ("first",)),
+        anchors.Pin("tools/a.py", ("first",), ("first",), ("one",)),
         PIN,
-        anchors.Pin("tools/a.py", ("stable",), ("stable",)),
+        anchors.Pin("tools/a.py", ("stable",), ("stable",), ("one",)),
     )
     tree.write({"tools/a.py": "\n".join(["new", "new", *lines[:3], *lines[5:]]) + "\n"})
     assert invoke(root, "fix", pins) == 0
@@ -93,12 +94,91 @@ def test_boundary_moves_do_not_cascade(tree: Tree) -> None:
     root = repository(tree, "header\nfirst\nmiddle\nlast\n", raw)
     tree.write({"tools/a.py": "new\nnew\nheader\nfirst\nmiddle\nlast\n"})
     pins = (
-        anchors.Pin("tools/a.py", ("first",), ("first",)),
-        anchors.Pin("tools/a.py", ("last",), ("last",)),
+        anchors.Pin("tools/a.py", ("first",), ("first",), ("one",)),
+        anchors.Pin("tools/a.py", ("last",), ("last",), ("one",)),
     )
     assert invoke(root, "fix", pins) == 0
     expected = raw.replace("#L4", "#L6").replace("#L2", "#L4")
     assert (root / ".bestpractices.json").read_bytes() == expected.encode("utf-8")
+
+
+def test_planted_swapped_pins_keep_answer_bindings(tree: Tree, capsys) -> None:
+    """Planted: swapping two valid ranges must move each answer's own evidence."""
+    raw = f'{{"one": "{URL}tools/a.py#L2", "two": "{URL}tools/a.py#L3"}}\n'
+    root = repository(tree, "header\nalpha\nbeta\n", raw)
+    pins = (
+        anchors.Pin("tools/a.py", ("alpha",), ("alpha",), ("one",)),
+        anchors.Pin("tools/a.py", ("beta",), ("beta",), ("two",)),
+    )
+    tree.write({"tools/a.py": "header\nbeta\nalpha\n"})
+    assert invoke(root, "check", pins) == 1
+    errors = capsys.readouterr().err
+    assert "one: anchor tools/a.py#L2 matches no pin for this answer" in errors
+    assert "pin tools/a.py#L3 is not linked by one" in errors
+    assert invoke(root, "fix", pins) == 0
+    expected = f'{{"one": "{URL}tools/a.py#L3", "two": "{URL}tools/a.py#L2"}}\n'
+    assert (root / ".bestpractices.json").read_bytes() == expected.encode("utf-8")
+    assert invoke(root, "check", pins) == 0
+
+
+def test_boundary_file_absent_at_base_keeps_current_anchor(tree: Tree, capsys) -> None:
+    """Boundary: a new file's correct anchor survives a move in an older file."""
+    raw = f'{{"one": "{URL}tools/a.py#L2-L3", "two": "{URL}tools/new.py#L2"}}\n'
+    root = repository(tree, "header\nfirst\nlast\n", raw)
+    pins = (PIN, anchors.Pin("tools/new.py", ("new evidence",), ("new evidence",), ("two",)))
+    tree.write(
+        {
+            "tools/a.py": "inserted\nheader\nfirst\nlast\n",
+            "tools/new.py": "header\nnew evidence\n",
+        }
+    )
+    assert invoke(root, "fix", pins) == 0
+    assert capsys.readouterr().out == "moved tools/a.py#L2-L3 -> tools/a.py#L3-L4\n"
+    expected = raw.replace("#L2-L3", "#L3-L4")
+    assert (root / ".bestpractices.json").read_bytes() == expected.encode("utf-8")
+    assert invoke(root, "check", pins) == 0
+
+
+def test_boundary_unmoved_anchor_is_not_reported(tree: Tree, capsys) -> None:
+    """Boundary: fix names and rewrites only anchors whose lines changed."""
+    raw = f'{{"one": "{URL}tools/a.py#L2-L3", "two": "{URL}tools/a.py#L1"}}\n'
+    root = repository(tree, "stable\nfirst\nlast\n", raw)
+    pins = (PIN, anchors.Pin("tools/a.py", ("stable",), ("stable",), ("two",)))
+    tree.write({"tools/a.py": "stable\ninserted\nfirst\nlast\n"})
+    assert invoke(root, "fix", pins) == 0
+    assert capsys.readouterr().out == "moved tools/a.py#L2-L3 -> tools/a.py#L3-L4\n"
+    expected = raw.replace("#L2-L3", "#L3-L4")
+    assert (root / ".bestpractices.json").read_bytes() == expected.encode("utf-8")
+    assert invoke(root, "check", pins) == 0
+
+
+@pytest.mark.parametrize("raw", ["{}", '{"one": "No source link."}'])
+def test_planted_pin_answer_does_not_link_evidence(tree: Tree, capsys, raw: str) -> None:
+    """Planted: a declared answer must exist and link its pin's range."""
+    tree.write({"tools/a.py": "header\nfirst\n", ".bestpractices.json": raw})
+    pin = anchors.Pin("tools/a.py", ("first",), ("first",), ("one",))
+    assert invoke(tree.root, "check", (pin,)) == 1
+    assert "pin tools/a.py#L2 is not linked by one" in capsys.readouterr().err
+
+
+def test_planted_pin_lists_no_answer(tree: Tree, capsys) -> None:
+    """Planted: a pin without answer keys cannot declare required evidence."""
+    tree.write({"tools/a.py": "header\nfirst\nlast\n", ".bestpractices.json": "{}"})
+    pin = anchors.Pin(PIN.path, PIN.first, PIN.last, ())
+    assert invoke(tree.root, "check", (pin,)) == 1
+    assert "pin tools/a.py lists no answer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("suffix", ["3", "-L3"])
+def test_boundary_pin_requires_whole_anchor_match(tree: Tree, capsys, suffix: str) -> None:
+    """Boundary: neither L23 nor L2-L3 counts as a link to L2."""
+    raw = f'{{"one": "{URL}tools/a.py#L2{suffix}"}}'
+    tree.write({"tools/a.py": "header\nfirst\nlast\n", ".bestpractices.json": raw})
+    pin = anchors.Pin("tools/a.py", ("first",), ("first",), ("one",))
+    assert invoke(tree.root, "check", (pin,)) == 1
+    errors = capsys.readouterr().err
+    assert f"one: anchor tools/a.py#L2{suffix} matches no pin for this answer" in errors
+    assert "pin tools/a.py#L2 is not linked by one" in errors
 
 
 def test_planted_missing_base_is_git_error(tree: Tree, capsys) -> None:
@@ -108,7 +188,7 @@ def test_planted_missing_base_is_git_error(tree: Tree, capsys) -> None:
     before = (root / ".bestpractices.json").read_bytes()
     tree.write({"tools/a.py": "new\nheader\nfirst\nlast\n"})
     assert invoke(root, "fix", (PIN,), "--base", "missing-revision") == 3
-    assert "ERROR: git show missing-revision:tools/a.py failed:" in capsys.readouterr().err
+    assert "ERROR: base revision missing-revision not found" in capsys.readouterr().err
     assert (root / ".bestpractices.json").read_bytes() == before
 
 
@@ -188,21 +268,21 @@ def test_derive_refuses_missing_or_ambiguous_first(lines: list[str], count: int)
 
 def test_derive_multiline_blocks() -> None:
     """Consecutive blocks disambiguate individual repeated lines and include the whole end."""
-    pin = anchors.Pin("tools/a.py", ("first", "next"), ("end", "last"))
+    pin = anchors.Pin("tools/a.py", ("first", "next"), ("end", "last"), ("one",))
     lines = ["first", "wrong", "first", "next", "end", "wrong", "end", "last"]
     assert anchors.derive(pin, lines) == (3, 8)
 
 
 def test_derive_single_line() -> None:
     """Boundary: the same one-line block yields a single-line range."""
-    pin = anchors.Pin("tools/a.py", ("same",), ("same",))
+    pin = anchors.Pin("tools/a.py", ("same",), ("same",), ("one",))
     assert anchors.derive(pin, ["header", "same"]) == (2, 2)
     assert anchors.anchor_text(pin.path, 2, 2) == "tools/a.py#L2"
 
 
 def test_derive_last_block_cannot_start_before_first() -> None:
     """Planted: an ending block overlapping earlier lines cannot close the range."""
-    pin = anchors.Pin("tools/a.py", ("first",), ("earlier", "first"))
+    pin = anchors.Pin("tools/a.py", ("first",), ("earlier", "first"), ("one",))
     assert anchors.derive(pin, ["earlier", "first"]) == (
         "pin tools/a.py last text 'first' matches no place at or after line 2"
     )
@@ -210,9 +290,9 @@ def test_derive_last_block_cannot_start_before_first() -> None:
 
 def test_derive_incomplete_blocks_do_not_wrap() -> None:
     """Planted: the first and last blocks must fit completely before EOF."""
-    pin = anchors.Pin("tools/a.py", ("first", "next"), ("last",))
+    pin = anchors.Pin("tools/a.py", ("first", "next"), ("last",), ("one",))
     assert anchors.derive(pin, ["first"]) == "pin tools/a.py first text 'first' matches 0 places"
-    pin = anchors.Pin("tools/a.py", ("first",), ("last", "missing"))
+    pin = anchors.Pin("tools/a.py", ("first",), ("last", "missing"), ("one",))
     assert anchors.derive(pin, ["first", "last"]) == (
         "pin tools/a.py last text 'missing' matches no place at or after line 1"
     )
@@ -222,4 +302,4 @@ def test_derive_incomplete_blocks_do_not_wrap() -> None:
 def test_derive_refuses_empty_blocks(first: tuple[str, ...], last: tuple[str, ...]) -> None:
     """Planted: an empty block cannot delimit source evidence."""
     with pytest.raises(ValueError, match="needs nonempty first and last blocks"):
-        anchors.derive(anchors.Pin("tools/a.py", first, last), ["first", "last"])
+        anchors.derive(anchors.Pin("tools/a.py", first, last, ("one",)), ["first", "last"])
