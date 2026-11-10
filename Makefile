@@ -18,7 +18,7 @@ PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsc
 
 .PHONY: verify verify-all tools check-tools-stamp check-message requirements requirements-fuzz lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
-	interface-snapshot list-pins check-pins pin check-runners check-links check-examples
+	interface-snapshot list-pins check-pins pin check-runners check-links fix-anchors check-examples
 
 # The one gate is `make verify-all`: CI runs exactly that target, so a local
 # green run and a green status check mean the same thing. This repository's own
@@ -138,6 +138,9 @@ check-runners: tools
 
 check-links: tools
 	$(BIN)/python -B tools/links.py
+
+fix-anchors: tools
+	$(BIN)/python -B tools/anchors.py fix
 
 check-examples: tools
 	$(BIN)/python -B tools/examples.py
