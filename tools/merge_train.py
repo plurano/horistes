@@ -88,14 +88,21 @@ MIN_KEY_BITS = 2048
 # The cap bounds the input; the writer thread fills the pipe while openssl reads,
 # so the pipe's capacity does not matter.
 MAX_KEY_CHARS = 16384
+# Metadata read lets repository tokens read collaborator permissions (ADR-0077).
 WRITE_RIGHTS = {
+    "metadata": "read",
     "actions": "read",
     "contents": "write",
     "pull_requests": "write",
     "workflows": "write",
     "checks": "read",
 }
-READ_RIGHTS = {"contents": "read", "pull_requests": "read", "checks": "read"}
+READ_RIGHTS = {
+    "metadata": "read",
+    "contents": "read",
+    "pull_requests": "read",
+    "checks": "read",
+}
 STATUS_RIGHTS = {"statuses": "read"}
 ISSUE_RIGHTS = {"issues": "write"}
 CLOSE_DAYS = 7
@@ -113,17 +120,25 @@ REVIEW_BODY = "review body: "
 REVIEW_READS = 10
 # Distinct maintainer logins whose rights one pull request checks (ADR-0077).
 ANSWER_RIGHTS = 5
+# Association only orders the permission reads; it never decides an answer, because an
+# organisation member with private membership can show as CONTRIBUTOR (ADR-0077).
+ANSWER_ASSOCIATION_RANK = {
+    "OWNER": 0,
+    "MEMBER": 0,
+    "COLLABORATOR": 0,
+    "CONTRIBUTOR": 1,
+}
 REVIEW_BODIES = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       reviews(first: 100) {
         totalCount
-        nodes { databaseId state body author { login __typename } }
+        nodes { databaseId state body authorAssociation author { login __typename } }
       }
       comments(first: 100) {
         totalCount
-        nodes { body author { login __typename } }
+        nodes { body authorAssociation author { login __typename } }
       }
       commits(first: 100) {
         totalCount
@@ -1080,14 +1095,14 @@ def _is_review_answered(review_id, texts):
 
 
 def _answer_candidates(pr_author, detail, review_id):
-    """Non-bot, non-author logins whose comments or reviews name this review."""
+    """Human non-author logins and associations whose comments or reviews name this review."""
     nodes = [
         node
         for kind in ("comments", "reviews")
         for node in (detail.get(kind) or {}).get("nodes") or []
     ]
     return [
-        author["login"]
+        (author["login"], node.get("authorAssociation"))
         for node in nodes
         if (author := node.get("author") or {}).get("login")
         and author.get("__typename") != "Bot"
@@ -1096,24 +1111,43 @@ def _answer_candidates(pr_author, detail, review_id):
     ]
 
 
+def _ranked_logins(candidates):
+    """Distinct logins ordered by best association, with first-seen ties kept stable."""
+    ranks = {}
+    for answers in candidates:
+        for login, association in answers:
+            rank = ANSWER_ASSOCIATION_RANK.get(association, 2)
+            ranks[login] = min(ranks.get(login, 2), rank)
+    return sorted(ranks, key=ranks.get)
+
+
+def _candidate_findings(candidates, remaining, candidate):
+    """Still-unanswered findings named by this candidate's comments or reviews."""
+    return [
+        finding
+        for finding, answers in candidates
+        if finding in remaining and any(login == candidate for login, _ in answers)
+    ]
+
+
 def _maintainer_unanswered(pr_author, detail, unanswered, right):
-    """Remaining findings after at most ANSWER_RIGHTS distinct permission reads."""
-    rights = {}
-    remaining = []
-    for login, review_id in unanswered:
-        for candidate in _answer_candidates(pr_author, detail, review_id):
-            if candidate not in rights:
-                if len(rights) >= ANSWER_RIGHTS:
-                    continue
-                try:
-                    rights[candidate] = right(candidate)
-                except RefusedError as err:
-                    raise RefusedError(f"cannot read the right of {candidate}: {err}") from err
-            if rights[candidate]:
-                break
-        else:
-            remaining.append((login, review_id))
-    return remaining
+    """Remaining findings after at most ANSWER_RIGHTS globally ordered permission reads."""
+    candidates = [
+        (finding, _answer_candidates(pr_author, detail, finding[1])) for finding in unanswered
+    ]
+    allowed = _ranked_logins(answers for _, answers in candidates)[:ANSWER_RIGHTS]
+    remaining = set(unanswered)
+    for candidate in allowed:
+        pending = _candidate_findings(candidates, remaining, candidate)
+        if not pending:
+            continue
+        try:
+            granted = right(candidate)
+        except RefusedError as err:
+            raise RefusedError(f"cannot read the right of {candidate}: {err}") from err
+        if granted:
+            remaining.difference_update(pending)
+    return [finding for finding in unanswered if finding in remaining]
 
 
 def review_body_hold(pull, detail, right=None):

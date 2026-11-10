@@ -72,13 +72,14 @@ MERGE_IN_PROGRESS = {
 }
 CLIENT_ID = "Iv23planted"
 WRITE = {
+    "metadata": "read",
     "actions": "read",
     "contents": "write",
     "pull_requests": "write",
     "workflows": "write",
     "checks": "read",
 }
-READ = {"contents": "read", "pull_requests": "read", "checks": "read"}
+READ = {"metadata": "read", "contents": "read", "pull_requests": "read", "checks": "read"}
 STATUSES = {"statuses": "read"}
 ISSUES = {"issues": "write"}
 BOT = "merge-train-app"
@@ -891,7 +892,10 @@ class Handler(BaseHTTPRequestHandler):
             assert forge.repo_of(self.headers["Authorization"])[0] == full
             login = unquote(tail.removesuffix("/permission"))
             forge.right_calls.append(login)
-            if login in forge.right_refusals:
+            token = self.headers["Authorization"].removeprefix("Bearer ")
+            if forge.tokens[token][3].get("metadata") != "read":
+                self.answer(403, {"message": "Resource not accessible by integration"})
+            elif login in forge.right_refusals:
                 self.answer(forge.right_refusals[login], {"message": "Permission read refused"})
             elif login in forge.rights:
                 permission = forge.rights[login]
@@ -6528,7 +6532,8 @@ def test_review_bodies_query_fields(tmp_path, monkeypatch):
         "body",
         "author { login __typename }",
         "comments(first: 100)",
-        "nodes { body author { login __typename } }",
+        "nodes { databaseId state body authorAssociation author { login __typename } }",
+        "nodes { body authorAssociation author { login __typename } }",
         "commits(first: 100)",
         "commit { message }",
     ):
@@ -6949,12 +6954,15 @@ def test_review_body_reads_stop_at_the_bound_security_update_first(tmp_path):
     assert expected in summary, summary
 
 
-def _maintainer_answer(login="maintainer", typename="User", review_id=1701):
+def _maintainer_answer(login="maintainer", typename="User", review_id=1701, association=None):
     """One comment or review body naming the review it answers."""
-    return {
+    node = {
         "body": f"Addressed pullrequestreview-{review_id}.",
         "author": {"login": login, "__typename": typename},
     }
+    if association is not None:
+        node["authorAssociation"] = association
+    return node
 
 
 def _maintainer_forge(comments=(), reviews=(), **fields):
@@ -7163,6 +7171,104 @@ def test_maintainer_right_refusal_reason_stays_bounded(tmp_path, monkeypatch):
     prefix = "review body: cannot read the right of maintainer: permission refused "
     assert reason.startswith(prefix)
     assert len(reason) == 200
+
+
+def test_maintainer_right_read_needs_metadata_on_the_repository_token(tmp_path):
+    """A repository token without metadata read cannot confirm a maintainer's right."""
+    source = script()
+    mutant = source.replace('WRITE_RIGHTS = {\n    "metadata": "read",', "WRITE_RIGHTS = {")
+    assert mutant != source
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.rights = {"maintainer": "write"}
+    done, summary = train(tmp_path, forge, text=mutant)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review body: cannot read the right of maintainer:" in summary
+    assert "HTTP 403" in summary
+    assert forge.right_calls == ["maintainer"]
+
+
+@pytest.mark.parametrize("kind", ["comments", "reviews"])
+@pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR"])
+def test_maintainer_collaborator_answer_precedes_five_none_commenters(tmp_path, kind, association):
+    """A collaborator's answer takes priority over five NONE accounts naming the review."""
+    comments = [_maintainer_answer(f"outsider-{n}", association="NONE") for n in range(5)]
+    fields = {"comments": comments, "reviews": []}
+    fields[kind].append(_maintainer_answer(association=association))
+    forge = _maintainer_forge(**fields)
+    forge.rights = {"maintainer": "write"}
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_maintainer_best_association_spans_answers(tmp_path):
+    """A later review improves a login's rank without its earlier NONE answer hiding it."""
+    comments = [_maintainer_answer(f"outsider-{n}", association="NONE") for n in range(5)]
+    forge = _maintainer_forge(
+        comments=[*comments, _maintainer_answer(association="NONE")],
+        reviews=[_maintainer_answer(association="MEMBER")],
+    )
+    forge.rights = {"maintainer": "write"}
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_maintainer_private_member_contributor_answer_precedes_none(tmp_path):
+    """A private member seen as CONTRIBUTOR still has its write permission checked first."""
+    comments = [_maintainer_answer(f"outsider-{n}", association="NONE") for n in range(5)]
+    forge = _maintainer_forge(comments=[*comments, _maintainer_answer(association="CONTRIBUTOR")])
+    forge.rights = {"maintainer": "write"}
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_maintainer_none_writer_after_five_contributors_stays_held(tmp_path):
+    """Five higher-ranked non-writers exhaust the budget before a NONE writer's answer."""
+    comments = [_maintainer_answer(f"contributor-{n}", association="CONTRIBUTOR") for n in range(5)]
+    forge = _maintainer_forge(comments=[*comments, _maintainer_answer(association="NONE")])
+    forge.rights = {"maintainer": "write"}
+    _assert_maintainer_hold(tmp_path, forge)
+    assert forge.right_calls == [f"contributor-{n}" for n in range(5)]
+
+
+def test_maintainer_member_on_later_review_gets_global_priority(tmp_path):
+    """A MEMBER answering a later finding is read first while the earlier finding stays held."""
+    comments = [_maintainer_answer(f"outsider-{n}", association="NONE") for n in range(5)]
+    forge = _maintainer_forge(
+        comments=[*comments, _maintainer_answer(review_id=1702, association="MEMBER")],
+        reviews=[_bot_review(1702, "sourcery-ai", "Needs a human reviewer")],
+    )
+    forge.rights = {"maintainer": "write"}
+    _assert_maintainer_hold(tmp_path, forge)
+    done_calls = ["maintainer", *[f"outsider-{n}" for n in range(4)]]
+    assert forge.right_calls == done_calls
+
+
+@pytest.mark.parametrize("late_refusal", [False, True])
+def test_maintainer_right_refusal_disarms_then_next_run_lands(tmp_path, late_refusal):
+    """A refused initial or late right read disarms; the next healthy run lands directly."""
+    forge1 = _maintainer_forge(comments=[_maintainer_answer()], autoMergeRequest={"enabledAt": OLD})
+    forge1.right_refusals = {"maintainer": 500}
+    if late_refusal:
+        forge1.review_details[1] = [_detail(), forge1.review_details[1]]
+    done1, summary1 = train(tmp_path, forge1)
+    assert done1.returncode == 0, done1.stdout + done1.stderr
+    assert forge1.writes == [disarmed(1)]
+    assert "disarmed: review body: cannot read the right of maintainer:" in summary1
+
+    forge2 = _maintainer_forge(comments=[_maintainer_answer()], autoMergeRequest=None)
+    forge2.rights = {"maintainer": "write"}
+    done2, summary2 = train(tmp_path, forge2)
+    assert done2.returncode == 0, done2.stdout + done2.stderr
+    assert forge2.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary2
+    assert forge2.right_calls == ["maintainer", "maintainer"]
 
 
 def test_planted_required_status_absent_holds_clean_pull(tmp_path):
