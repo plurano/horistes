@@ -36,6 +36,7 @@ SYNCED = json.loads((ROOT / "settings-sync.json").read_text(encoding="utf-8"))
 PLANTED_SYNCED = "tests/fixtures/update-bot/planted-settings-sync.json"
 # Without a file name Renovate reads `default.json` of the named repository.
 REFERENCE = "github>plurano/horistes"
+DIGEST_NOTE_PHRASES = ("digest", "no release age", "re-pushed tag", "fork")
 
 # What the preset may hold, and what one of its rules may hold. Allow-lists on
 # purpose: a key that names a manager, a file or a package of one repository
@@ -59,8 +60,10 @@ RULE = {
     "matchDepTypes",
     "enabled",
     "matchDatasources",
+    "matchUpdateTypes",
     "matchPackageNames",
     "minimumReleaseAge",
+    "prBodyNotes",
 }
 # The fleet organisations whose own releases wait for no release age.
 ORGS = (
@@ -289,7 +292,9 @@ def patterns_match(patterns: list[str], package: str) -> bool:
     return not (has_positive and not positive_matched)
 
 
-def release_age(preset: dict, datasource: str, package: str) -> str | None:
+def release_age(
+    preset: dict, datasource: str, package: str, update_type: str | None = None
+) -> str | None:
     """Emulate Renovate packageRules matching for minimumReleaseAge."""
     current_age = preset.get("minimumReleaseAge")
     rules = preset.get("packageRules", [])
@@ -299,6 +304,8 @@ def release_age(preset: dict, datasource: str, package: str) -> str | None:
         if "enabled" in rule:
             continue
         if "matchDatasources" in rule and datasource not in rule["matchDatasources"]:
+            continue
+        if "matchUpdateTypes" in rule and update_type not in rule["matchUpdateTypes"]:
             continue
         if "matchPackageNames" in rule and not patterns_match(rule["matchPackageNames"], package):
             continue
@@ -342,14 +349,49 @@ def held_forks(preset: dict) -> list[str]:
     """Forks of outside projects that are not held for three days."""
     problems = []
     for fork in FORKS[:20]:
-        for datasource, package in (
-            ("github-tags", fork),
-            ("go", f"github.com/{fork}"),
-            ("docker", f"ghcr.io/{fork}"),
+        for datasource, package, update_type in (
+            ("github-tags", fork, None),
+            ("go", f"github.com/{fork}", None),
+            ("docker", f"ghcr.io/{fork}", None),
+            ("docker", f"ghcr.io/{fork}", "digest"),
         ):
-            if release_age(preset, datasource, package) != "3 days":
-                problems.append(f"{datasource}:{package}")
+            if release_age(preset, datasource, package, update_type) != "3 days":
+                suffix = f"@{update_type}" if update_type else ""
+                problems.append(f"{datasource}:{package}{suffix}")
     return problems
+
+
+def digest_rule_problems(preset: dict) -> list[str]:
+    """Missing digest-only release-age exception or its explanation in the PR body."""
+    rules = preset.get("packageRules", [])
+    if len(rules) > MAX_RULES:
+        raise ValueError(f"preset has {len(rules)} packageRules, at most {MAX_RULES} supported")
+    matching = [
+        rule
+        for rule in rules[:MAX_RULES]
+        if rule.get("matchDatasources") == ["docker"] and rule.get("matchUpdateTypes") == ["digest"]
+    ]
+    if len(matching) != 1:
+        return ["digest rule"]
+    rule = matching[0]
+    problems = []
+    if "minimumReleaseAge" not in rule or rule["minimumReleaseAge"] is not None:
+        problems.append("digest minimumReleaseAge")
+    if not digest_note_is_complete(rule.get("prBodyNotes")):
+        problems.append("digest prBodyNotes")
+    return problems
+
+
+def digest_note_is_complete(notes: object) -> bool:
+    """One nonblank note explains the digest exception, its reason and the fork wait."""
+    if (
+        not isinstance(notes, list)
+        or len(notes) != 1
+        or not isinstance(notes[0], str)
+        or not notes[0].strip()
+    ):
+        return False
+    return all(phrase in notes[0].lower() for phrase in DIGEST_NOTE_PHRASES)
 
 
 def own_pattern_problems(preset: dict) -> list[str]:
@@ -1018,6 +1060,118 @@ def test_own_releases_skip_the_waiting_time(org, datasource, template):
 )
 def test_outside_releases_keep_the_waiting_time(datasource, package):
     assert release_age(PRESET, datasource, package) == "3 days"
+
+
+def test_docker_digest_rule_has_a_pr_body_explanation():
+    assert digest_rule_problems(PRESET) == []
+    assert PRESET["packageRules"][-2]["matchUpdateTypes"] == ["digest"]
+    assert PRESET["packageRules"][-3]["matchDatasources"] == ["npm"]
+
+
+@pytest.mark.parametrize(
+    "package", ["docker.io/library/ubuntu", "ubuntu", "docker.io/library/python"]
+)
+def test_outside_docker_digest_updates_skip_the_release_age(package):
+    assert release_age(PRESET, "docker", package, "digest") is None
+
+
+@pytest.mark.parametrize("update_type", ["major", "minor", "patch", None])
+def test_outside_docker_releases_keep_the_release_age(update_type):
+    assert release_age(PRESET, "docker", "docker.io/library/ubuntu", update_type) == "3 days"
+
+
+@pytest.mark.parametrize("org", ORGS)
+def test_own_docker_digest_updates_skip_the_release_age(org):
+    assert release_age(PRESET, "docker", f"ghcr.io/{org}/img", "digest") is None
+
+
+@pytest.mark.parametrize("fork", FORKS)
+def test_fork_docker_digest_updates_keep_the_release_age(fork):
+    assert release_age(PRESET, "docker", f"ghcr.io/{fork}", "digest") == "3 days"
+
+
+@pytest.mark.parametrize(
+    ("datasource", "package"),
+    [("github-digest", "actions/checkout"), ("npm", "@types/node")],
+)
+def test_outside_non_docker_digest_updates_keep_the_release_age(datasource, package):
+    assert release_age(PRESET, datasource, package, "digest") == "3 days"
+
+
+def test_planted_missing_docker_digest_rule_is_refused():
+    preset = copy.deepcopy(PRESET)
+    preset["packageRules"].pop(-2)
+    assert release_age(preset, "docker", "docker.io/library/ubuntu", "digest") == "3 days"
+    assert digest_rule_problems(preset)
+
+
+def test_planted_docker_digest_rule_without_update_types_is_refused():
+    preset = copy.deepcopy(PRESET)
+    del preset["packageRules"][-2]["matchUpdateTypes"]
+    assert release_age(preset, "docker", "docker.io/library/ubuntu", "major") is None
+    assert digest_rule_problems(preset)
+
+
+def test_planted_docker_digest_rule_after_forks_is_refused():
+    preset = copy.deepcopy(PRESET)
+    preset["packageRules"].append(preset["packageRules"].pop(-2))
+    assert release_age(preset, "docker", "ghcr.io/lusoris/llama-swap", "digest") is None
+    problems = held_forks(preset)
+    assert "docker:ghcr.io/lusoris/llama-swap@digest" in problems
+    assert "docker:ghcr.io/lusoris/llama-swap" not in problems
+
+
+@pytest.mark.parametrize("age", [None, "3 days"])
+def test_planted_docker_digest_rule_with_a_release_age_is_refused(age):
+    preset = copy.deepcopy(PRESET)
+    rule = preset["packageRules"][-2]
+    del rule["minimumReleaseAge"]
+    if age is not None:
+        rule["minimumReleaseAge"] = age
+    assert digest_rule_problems(preset) == ["digest minimumReleaseAge"]
+
+
+@pytest.mark.parametrize("notes", [None, [], "digest update", [""], [1]])
+def test_planted_docker_digest_rule_without_pr_body_notes_is_refused(notes):
+    preset = copy.deepcopy(PRESET)
+    rule = preset["packageRules"][-2]
+    del rule["prBodyNotes"]
+    if notes is not None:
+        rule["prBodyNotes"] = notes
+    assert digest_rule_problems(preset) == ["digest prBodyNotes"]
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Updates are fine.",
+        "Digest updates wait for no release age because a re-pushed tag restarts the age.",
+        "Digest updates wait for no release age, except forks keep three days.",
+        "Updates wait for no release age because a re-pushed tag restarts the age; forks wait.",
+        "Digest updates skip the wait because a re-pushed tag restarts the age; forks wait.",
+    ],
+    ids=["irrelevant", "no-fork-exception", "no-reason", "no-digest", "no-release-age"],
+)
+def test_planted_docker_digest_rule_with_incomplete_pr_body_explanation_is_refused(note):
+    preset = copy.deepcopy(PRESET)
+    preset["packageRules"][-2]["prBodyNotes"] = [note]
+    assert digest_rule_problems(preset) == ["digest prBodyNotes"]
+
+
+def test_planted_docker_digest_rule_with_uppercase_pr_body_explanation_is_accepted():
+    preset = copy.deepcopy(PRESET)
+    notes = preset["packageRules"][-2]["prBodyNotes"]
+    notes[0] = notes[0].upper()
+    assert digest_rule_problems(preset) == []
+
+
+def test_planted_docker_digest_rule_with_singular_pr_body_note_is_refused():
+    preset = copy.deepcopy(PRESET)
+    rule = preset["packageRules"][-2]
+    rule["prBodyNote"] = rule.pop("prBodyNotes")[0]
+    assert outside_the_preset(preset) == [
+        f"packageRules[{len(preset['packageRules']) - 2}].prBodyNote"
+    ]
 
 
 @pytest.mark.parametrize("fork", FORKS)
