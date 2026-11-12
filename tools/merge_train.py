@@ -43,10 +43,12 @@ from train_rules import (
     REFRESH_LABEL,
     REGENERATE_HEADLINE,
     SECURITY_HOLD_LABEL,
+    SESSION_HOLD_LABEL,
     NoSignOffError,
     check_release_off,
     check_release_parallel,
     check_required_status,
+    dependency_hold_target,
     drifted,
     has_red_code_scanning,
     head_since,
@@ -55,7 +57,9 @@ from train_rules import (
     is_red,
     is_security,
     issues_to_close,
+    label_names,
     lease_until,
+    newest_suites,
     pull_query,
     refresh,
     required_status_hold,
@@ -194,6 +198,78 @@ class UngrantedError(RefusedError):
 
 class InvalidSettingError(Exception):
     """A setting outside its allowed values."""
+
+
+def check_session_hold_hours(raw, error_cls=ValueError):
+    """Maximum hold per update, whole hours from 1 to 48."""
+    if not re.fullmatch(r"[0-9]{1,2}", raw) or not 1 <= int(raw) <= 48:
+        raise error_cls(f"session_hold_hours is {raw!r}, not a whole number from 1 to 48")
+    return int(raw)
+
+
+def session_candidate(pull, default_branch, conf):
+    """An open, unheld session branch whose checks have not gone red."""
+    author = pull.get("author") or {}
+    return (
+        isinstance(author, dict)
+        and author.get("login") in conf["session_authors"]
+        and pull.get("state", "OPEN") == "OPEN"
+        and not pull["isDraft"]
+        and not pull["isCrossRepository"]
+        and pull["baseRefName"] == default_branch
+        and not pull["headRefName"].startswith(conf["dependency"])
+        and not label_names(pull) & conf["hold"]
+        and not is_red(pull)
+    )
+
+
+def runs_pending(pull):
+    """Whether the newest run of a workflow on the head commit has not finished yet.
+
+    Only suites of workflow runs count: an app suite that never runs stays open forever.
+    """
+    nodes = pull["latest"]["nodes"]
+    suites = nodes[-1]["commit"]["checkSuites"]["nodes"] if nodes else []
+    return any(
+        suite.get("workflowRun") and suite["conclusion"] is None
+        for suite in newest_suites(suites).values()
+    )
+
+
+def session_waiting(pull, default_branch, conf):
+    """A session PR ready to land, behind, or waiting only on checks (record 0079)."""
+    if not session_candidate(pull, default_branch, conf):
+        return False
+    state = pull["mergeStateStatus"]
+    return (
+        state in conf["accept"] or state == "BEHIND" or (state == "BLOCKED" and runs_pending(pull))
+    )
+
+
+def session_hold_expired(pull, conf, now):
+    """The earliest session label event bounds this update's hold across later runs."""
+    stamps = [
+        datetime.fromisoformat(event["createdAt"])
+        for event in (pull.get("holds") or {}).get("nodes", [])
+        if event and (event.get("label") or {}).get("name") == SESSION_HOLD_LABEL
+    ]
+    return bool(stamps) and now - min(stamps) > conf["session_hold"]
+
+
+def session_hold(rows, default_branch, conf, now):
+    """(waiting session PR or None, updates to hold, labelled updates to release)."""
+    sessions = [pull for pull, _ in rows if session_waiting(pull, default_branch, conf)]
+    marked = [pull for pull, _ in rows if SESSION_HOLD_LABEL in label_names(pull)]
+    if not sessions:
+        return None, [], marked
+    release = [pull for pull in marked if session_hold_expired(pull, conf, now)]
+    hold = [
+        pull
+        for pull, _ in rows
+        if dependency_hold_target(pull, default_branch, conf, SESSION_HOLD_LABEL)
+        and not session_hold_expired(pull, conf, now)
+    ]
+    return sessions[0], hold, release
 
 
 def write_key(write_end, key):
@@ -347,6 +423,14 @@ def settings(env):
         "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
         "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
         "required_status": required_status,
+        "session_authors": frozenset(
+            name.strip() for name in env.get("TRAIN_SESSION_AUTHORS", "").split(",") if name.strip()
+        ),
+        "session_hold": timedelta(
+            hours=check_session_hold_hours(
+                env.get("TRAIN_SESSION_HOLD_HOURS", "4"), InvalidSettingError
+            )
+        ),
     }
 
 
@@ -609,31 +693,72 @@ def toggle_refresh(env, pull):
             raise
 
 
-def hold_for_security(env, repo, rows, notes, conf):
-    """Turn dependency updates into drafts while a security update is open; release them after.
-
-    Returns the numbers held in this run: the rest of the run leaves them alone.
-    """
+def hold_dependency_updates(env, repo, rows, notes, conf, now):
+    """Plan both dependency holds before shared writes; return each newly held PR's label."""
     if repo["defaultBranchRef"] is None:
-        return frozenset()
-    fix, hold, release = security_hold(rows, repo["defaultBranchRef"]["name"], conf)
+        return {}
+    default_branch = repo["defaultBranchRef"]["name"]
+    fix, hold, release = security_hold(rows, default_branch, conf)
+    additions = [
+        (pull, SECURITY_HOLD_LABEL, f"held as a draft: security update #{fix['number']} is open")
+        for pull in hold
+    ]
+    removals = [(pull, SECURITY_HOLD_LABEL, "released from the security hold") for pull in release]
+    session, hold, release = session_hold(rows, default_branch, conf, now)
+    hours = conf["session_hold"] // timedelta(hours=1)
+    additions += [
+        (
+            pull,
+            SESSION_HOLD_LABEL,
+            f"held as a draft: session pull request #{session['number']} waits (bound {hours} h)",
+        )
+        for pull in hold
+    ]
+    removals += [
+        (
+            pull,
+            SESSION_HOLD_LABEL,
+            "released from the session hold: "
+            + (
+                f"held {hours} h, the bound"
+                if session is not None and session_hold_expired(pull, conf, now)
+                else "no session pull request waits"
+            ),
+        )
+        for pull in release
+    ]
+    apply_dependency_holds(env, rows, additions, removals, notes)
+    return {pull["number"]: label for pull, label, _ in additions}
+
+
+def apply_dependency_holds(env, rows, additions, removals, notes):
+    """Share label, draft and ready writes; only the last remaining hold may ready a draft."""
     api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
-    for pull in hold:
-        url = f"{api}/issues/{pull['number']}/labels"
-        call(url, env["TRAIN_TOKEN"], "POST", {"labels": [SECURITY_HOLD_LABEL]})
-        graphql(env, DRAFT, {"id": pull["id"]})
-        notes[pull["number"]] = f"held as a draft: security update #{fix['number']} is open"
-    for pull in release:
-        if pull["isDraft"]:
+    remaining = {pull["number"]: set(label_names(pull)) for pull, _ in rows}
+    drafts = {pull["number"] for pull, _ in rows if pull["isDraft"]}
+    changes = {}
+    for pull, label, note in additions:
+        number = pull["number"]
+        call(f"{api}/issues/{number}/labels", env["TRAIN_TOKEN"], "POST", {"labels": [label]})
+        remaining[number].add(label)
+        if number not in drafts:
+            graphql(env, DRAFT, {"id": pull["id"]})
+            drafts.add(number)
+        changes.setdefault(number, []).append(note)
+    for pull, label, note in removals:
+        number = pull["number"]
+        remaining[number].discard(label)
+        if number in drafts and not remaining[number] & {SECURITY_HOLD_LABEL, SESSION_HOLD_LABEL}:
             graphql(env, READY, {"id": pull["id"]})
-        name = urllib.parse.quote(SECURITY_HOLD_LABEL, safe="")
+            drafts.remove(number)
+        name = urllib.parse.quote(label, safe="")
         try:
-            call(f"{api}/issues/{pull['number']}/labels/{name}", env["TRAIN_TOKEN"], "DELETE")
+            call(f"{api}/issues/{number}/labels/{name}", env["TRAIN_TOKEN"], "DELETE")
         except RefusedError as err:
             if "HTTP 404" not in str(err):
                 raise
-        notes[pull["number"]] = "released from the security hold"
-    return frozenset(pull["number"] for pull in hold)
+        changes.setdefault(number, []).append(note)
+    notes.update({number: "; ".join(messages) for number, messages in changes.items()})
 
 
 def bot_identity(env, conf, token):
@@ -1299,9 +1424,9 @@ def run(env, conf, repo, now, notes=None):
     lease = lander_lease(repo, now)
     served = serving_order(rows, conf)
     # A security update a review body holds is still the fix the others wait for (record 0062).
-    held = hold_for_security(env, repo, serving_order(verdicts, conf), notes, conf)
+    held = hold_dependency_updates(env, repo, serving_order(verdicts, conf), notes, conf, now)
     served = [
-        (pull, f"labelled {SECURITY_HOLD_LABEL}" if pull["number"] in held else reason)
+        (pull, f"labelled {held[pull['number']]}" if pull["number"] in held else reason)
         for pull, reason in served
     ]
     if lease:
