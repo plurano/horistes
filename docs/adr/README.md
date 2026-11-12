@@ -85,3 +85,4 @@ record that supersedes it.
 | [0075](0075-caller-pins-name-one-ref.md) | 2026-11-09 | Caller pins name one ref | Accepted |
 | [0076](0076-train-holds-on-a-required-status.md) | 2026-11-10 | Train holds on a required status | Accepted |
 | [0077](0077-maintainer-answers-count-on-bot-pull-requests.md) | 2026-11-10 | Maintainer answers count on bot pull requests | Accepted |
+| [0080](0080-the-train-outlasts-transient-forge-errors.md) | 2026-11-12 | The train outlasts transient forge errors | Accepted |

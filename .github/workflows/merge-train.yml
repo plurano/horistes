@@ -1849,8 +1849,26 @@ jobs:
           PENDING: ${{ steps.settings.outputs.pending }}
         run: python3 "$RUNNER_TEMP/release_labels.py" after
 
+      # A forge Server Error fails the first attempt (record 0080); the second one judges.
       - name: Open or update the release pull request
+        id: release-pr
         if: steps.settings.outputs.frozen == 'false'
+        continue-on-error: true
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.token.outputs.token }}
+          repo-url: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      - name: Wait before the second release pull request attempt
+        if: steps.release-pr.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+
+      - name: Open or update the release pull request, second attempt
+        if: steps.release-pr.outcome == 'failure'
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ steps.token.outputs.token }}

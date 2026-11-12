@@ -70,6 +70,15 @@ MERGE_IN_PROGRESS = {
     "locations": [{"line": 4, "column": 3}],
     "message": "Merge already in progress",
 }
+# The forge's answer after another merge left the pull request behind (k8s run 43245308767).
+NOT_MERGEABLE = {
+    "type": "UNPROCESSABLE",
+    "path": ["mergePullRequest"],
+    "locations": [{"line": 4, "column": 3}],
+    "message": "Pull Request is not mergeable",
+}
+# A queued REST fault that closes the connection without an answer (RemoteDisconnected).
+DROP = "drop"
 CLIENT_ID = "Iv23planted"
 WRITE = {
     "metadata": "read",
@@ -363,6 +372,8 @@ class Forge:
         self.ungranted: set[int] = set()
         self.jobs: dict[int, list[dict]] = {}
         self.jobs_calls: list[int] = []
+        # Faults the REST stand-in answers first, per kind ("jobs", "revoke"): a status or DROP.
+        self.rest_faults: dict[str, list[int | str]] = {}
         self.label_missing = False
         self.install(7, "fleet", app=list(reads))
 
@@ -792,6 +803,18 @@ class Handler(BaseHTTPRequestHandler):
     def body(self) -> dict:
         return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
 
+    def fault(self, kind: str) -> bool:
+        """Answer the next queued fault of kind: a status, or DROP closes without an answer."""
+        queued = self.server.forge.rest_faults.get(kind, [])
+        if not queued:
+            return False
+        fault = queued.pop(0)
+        if fault == DROP:
+            self.close_connection = True
+        else:
+            self.answer(int(fault), {"message": f"stand-in forge: queued HTTP {fault}"})
+        return True
+
     def app_call(self) -> bool:
         """Refuse a call of the app whose JWT does not hold; True when refused."""
         refusal = self.server.forge.jwt_refusal(self.headers["Authorization"])
@@ -913,6 +936,8 @@ class Handler(BaseHTTPRequestHandler):
         elif re.fullmatch(r"/repos/[^/]+/[^/]+/actions/runs/\d+/jobs", path):
             full, _, tail = path.removeprefix("/repos/").partition("/actions/runs/")
             run_id = int(tail.removesuffix("/jobs"))
+            if self.fault("jobs"):
+                return
             self.answer(*self.server.forge.run_jobs(self.headers["Authorization"], full, run_id))
         else:
             raise AssertionError(self.path)
@@ -965,6 +990,8 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(*self.server.forge.label_write(self.headers["Authorization"], full, write))
             return
         assert self.path == "/installation/token", self.path
+        if self.fault("revoke"):
+            return
         self.server.forge.revoked.append(self.headers["Authorization"].removeprefix("Bearer "))
         self.answer(204, None)
 
@@ -2644,7 +2671,8 @@ def release_job_findings(doc: dict) -> list[str]:
     steps = job.get("steps", [])
     minting = [s for s in steps if str(s.get("uses", "")).startswith(APP_TOKEN)]
     running = [s for s in steps if str(s.get("uses", "")).startswith(RELEASE_PLEASE)]
-    if len(minting) != 1 or len(running) != 2:
+    # Release, pull request, and the pull request's second attempt (record 0080).
+    if len(minting) != 1 or len(running) != 3:
         return [f"{len(minting)} token steps and {len(running)} release-please steps"]
     mint = minting[0].get("with", {})
     if mint.get("owner") != "${{ matrix.repository.owner }}":
@@ -2658,23 +2686,26 @@ def release_job_findings(doc: dict) -> list[str]:
     expected_repo = "${{ matrix.repository.owner }}/${{ matrix.repository.name }}"
     create_step, pr_step = running[0], running[1]
     create_with = create_step.get("with", {})
-    pr_with = pr_step.get("with", {})
     if create_with.get("token") != expected_token:
         found.append(f"release step token is {create_with.get('token')!r}, not the app's")
-    if pr_with.get("token") != expected_token:
-        found.append(f"pull-request step token is {pr_with.get('token')!r}, not the app's")
     if create_with.get("repo-url") != expected_repo:
         found.append("release step runs on another repository")
-    if pr_with.get("repo-url") != expected_repo:
-        found.append("pull-request step runs on another repository")
+    for name, step in (("pull-request step", pr_step), ("second pull-request step", running[2])):
+        pr_with = step.get("with", {})
+        if pr_with.get("token") != expected_token:
+            found.append(f"{name} token is {pr_with.get('token')!r}, not the app's")
+        if pr_with.get("repo-url") != expected_repo:
+            found.append(f"{name} runs on another repository")
+        if pr_with.get("skip-github-release") not in (True, "true"):
+            found.append(f"{name} does not skip releases")
     if create_with.get("skip-github-pull-request") not in (True, "true"):
         found.append("release step does not skip pull requests")
     if create_step.get("continue-on-error") not in (True, "true"):
         found.append("release step does not continue on error")
     if "steps.settings.outputs.skip == 'false'" not in str(create_step.get("if", "")):
         found.append("release step does not check skip setting")
-    if pr_with.get("skip-github-release") not in (True, "true"):
-        found.append("pull-request step does not skip releases")
+    if running[2].get("if") != f"steps.{pr_step.get('id')}.outcome == 'failure'":
+        found.append("second pull-request step runs without a failed first attempt")
     found += frozen_findings(steps, pr_step)
     judging = [s for s in steps if str(s.get("run", "")).endswith('release_labels.py" after')]
     judge_env = judging[0].get("env", {}) if len(judging) == 1 else {}
@@ -2732,6 +2763,11 @@ def test_release_job_runs_release_please_with_the_app_token():
             "pull-request step token is '${{ github.token }}', not the app's",
         ),
         (1, lambda w: w.pop("token"), "pull-request step token is None, not the app's"),
+        (
+            2,
+            lambda w: w.update(token="${{ github.token }}"),
+            "second pull-request step token is '${{ github.token }}', not the app's",
+        ),
     ],
 )
 def test_github_token_for_release_please_is_found(step_index, change, finding):
@@ -2749,6 +2785,7 @@ def test_github_token_for_release_please_is_found(step_index, change, finding):
     [
         (0, "release step runs on another repository"),
         (1, "pull-request step runs on another repository"),
+        (2, "second pull-request step runs on another repository"),
     ],
 )
 def test_release_please_repo_url_is_found(step_index, finding):
@@ -2778,6 +2815,10 @@ def test_release_please_repo_url_is_found(step_index, finding):
         (
             lambda steps: steps[1]["with"].pop("skip-github-release"),
             "pull-request step does not skip releases",
+        ),
+        (
+            lambda steps: steps[2]["with"].pop("skip-github-release"),
+            "second pull-request step does not skip releases",
         ),
     ],
 )
@@ -4438,6 +4479,7 @@ def test_check_release_off_refuses_invalid_entry(tmp_path, invalid):
     "mutate",
     [
         lambda job: job["steps"][-1].pop("if"),
+        lambda job: next(s for s in job["steps"] if s.get("id") == "release-pr").pop("if"),
         lambda job: [s.get("env", {}).pop("HOLD_LABELS", None) for s in job["steps"]],
     ],
 )
@@ -7735,3 +7777,85 @@ def test_planted_input_wiring_mutants_are_found(mutator, drop, finding):
     elif drop:
         source = source.replace(drop, '"GONE"')
     assert input_wiring_findings(doc, source) == [finding]
+
+
+# Transient forge failures (decision record 0080): the k8s runs of 2026-11-12 went red on a
+# dropped revocation (43203110717), a 502 on the jobs read (43251161246) and a merge refused
+# after another merge moved the pull request (43245308767).
+
+
+@pytest.mark.parametrize("fault", [502, 503, 504, DROP])
+def test_transient_rest_read_is_tried_again(tmp_path, fault):
+    """Planted: the jobs read fails once at the gateway or drops; the refresh still runs."""
+    forge = stopped_forge()
+    forge.rest_faults["jobs"] = [fault]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == refreshed(1)
+    assert forge.rest_faults["jobs"] == []
+    assert "### fleet/app: refreshed #1" in summary
+
+
+@pytest.mark.parametrize("fault", [502, DROP])
+def test_exhausted_rest_read_retries_refuse_the_repository(tmp_path, fault):
+    forge = stopped_forge()
+    forge.rest_faults["jobs"] = [fault] * 4
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "::error title=Merge train refused::fleet/app: GET " in done.stdout
+    assert "Traceback" not in done.stderr
+    assert forge.rest_faults["jobs"] == [fault]
+    assert forge.writes == []
+
+
+def test_rest_read_500_is_not_tried_again(tmp_path):
+    forge = stopped_forge()
+    forge.rest_faults["jobs"] = [500, 500]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 500" in done.stdout
+    assert forge.rest_faults["jobs"] == [500]
+
+
+def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
+    """Mutation: a GET that runs once turns the planted 502 on the jobs read red."""
+    text = script()
+    old = 'retries = READ_ATTEMPTS - 1 if method == "GET" else 0'
+    assert text.count(old) == 1
+    forge = stopped_forge()
+    forge.rest_faults["jobs"] = [502]
+    done, _ = train(tmp_path, forge, text.replace(old, "retries = 0"))
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+
+
+@pytest.mark.parametrize("fault", [DROP, 502])
+def test_failed_revocation_warns_and_the_sweep_goes_on(tmp_path, fault):
+    """Planted: the first revocation drops or fails; every repository is still served."""
+    forge = sweep_forge()
+    forge.rest_faults["revoke"] = [fault]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.where == [
+        ("fleet/app", landed(1)),
+        ("other/b", armed(2)),
+        ("other/b", updated(2)),
+    ]
+    warning = "::warning title=Merge train::token not revoked, it expires within the hour: DELETE "
+    assert warning in done.stdout
+    assert "### fleet/app: landed #1" in summary
+    # A revocation is a write: it runs once, so exactly one token stays unrevoked.
+    assert len(forge.revoked) == len(forge.tokens) - 1
+
+
+@pytest.mark.parametrize(("state", "code"), [("BEHIND", 0), ("UNKNOWN", 0), ("CLEAN", 1)])
+def test_merge_refused_as_not_mergeable_reads_the_state_again(tmp_path, state, code):
+    """Planted: the merge is refused as not mergeable; a moved pull request is a note."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merge_errors = [NOT_MERGEABLE]
+    forge.merge_states[1] = state
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == code, done.stdout + done.stderr
+    moved = f"### fleet/app: not landed: the merge state moved to {state} #1"
+    assert (moved in summary) == (code == 0), summary
+    assert ("Pull Request is not mergeable" in done.stdout) == (code == 1)
