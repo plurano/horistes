@@ -89,7 +89,7 @@
       ],
       "minimumReleaseAge": null,
       "prBodyNotes": [
-        "This container image digest update waits for no release age because a re-pushed tag restarts the age."
+        "Digest updates of container images wait for no release age because a re-pushed tag restarts the age, except digests of forks of outside projects, which keep three days."
       ]
     },
     {

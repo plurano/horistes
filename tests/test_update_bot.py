@@ -36,6 +36,7 @@ SYNCED = json.loads((ROOT / "settings-sync.json").read_text(encoding="utf-8"))
 PLANTED_SYNCED = "tests/fixtures/update-bot/planted-settings-sync.json"
 # Without a file name Renovate reads `default.json` of the named repository.
 REFERENCE = "github>plurano/horistes"
+DIGEST_NOTE_PHRASES = ("digest", "no release age", "re-pushed tag", "fork")
 
 # What the preset may hold, and what one of its rules may hold. Allow-lists on
 # purpose: a key that names a manager, a file or a package of one repository
@@ -376,15 +377,21 @@ def digest_rule_problems(preset: dict) -> list[str]:
     problems = []
     if "minimumReleaseAge" not in rule or rule["minimumReleaseAge"] is not None:
         problems.append("digest minimumReleaseAge")
-    notes = rule.get("prBodyNotes")
+    if not digest_note_is_complete(rule.get("prBodyNotes")):
+        problems.append("digest prBodyNotes")
+    return problems
+
+
+def digest_note_is_complete(notes: object) -> bool:
+    """One nonblank note explains the digest exception, its reason and the fork wait."""
     if (
         not isinstance(notes, list)
         or len(notes) != 1
         or not isinstance(notes[0], str)
         or not notes[0].strip()
     ):
-        problems.append("digest prBodyNotes")
-    return problems
+        return False
+    return all(phrase in notes[0].lower() for phrase in DIGEST_NOTE_PHRASES)
 
 
 def own_pattern_problems(preset: dict) -> list[str]:
@@ -1132,6 +1139,30 @@ def test_planted_docker_digest_rule_without_pr_body_notes_is_refused(notes):
     if notes is not None:
         rule["prBodyNotes"] = notes
     assert digest_rule_problems(preset) == ["digest prBodyNotes"]
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Updates are fine.",
+        "Digest updates wait for no release age because a re-pushed tag restarts the age.",
+        "Digest updates wait for no release age, except forks keep three days.",
+        "Updates wait for no release age because a re-pushed tag restarts the age; forks wait.",
+        "Digest updates skip the wait because a re-pushed tag restarts the age; forks wait.",
+    ],
+    ids=["irrelevant", "no-fork-exception", "no-reason", "no-digest", "no-release-age"],
+)
+def test_planted_docker_digest_rule_with_incomplete_pr_body_explanation_is_refused(note):
+    preset = copy.deepcopy(PRESET)
+    preset["packageRules"][-2]["prBodyNotes"] = [note]
+    assert digest_rule_problems(preset) == ["digest prBodyNotes"]
+
+
+def test_planted_docker_digest_rule_with_uppercase_pr_body_explanation_is_accepted():
+    preset = copy.deepcopy(PRESET)
+    notes = preset["packageRules"][-2]["prBodyNotes"]
+    notes[0] = notes[0].upper()
+    assert digest_rule_problems(preset) == []
 
 
 def test_planted_docker_digest_rule_with_singular_pr_body_note_is_refused():

@@ -632,8 +632,8 @@ Own releases skip the waiting time; forks of outside projects keep three days
 update of a container image skips the waiting time too, because a re-pushed tag
 restarts it; version updates of outside images keep three days, and the last
 package rule keeps fork image digests at three days
-([ADR-0078](docs/adr/0078-docker-digest-updates-wait-for-no-release-age.md),
-proposed). The digest rule adds a `prBodyNotes` explanation to the proposal.
+([ADR-0078](docs/adr/0078-docker-digest-updates-wait-for-no-release-age.md)).
+The digest rule adds a `prBodyNotes` explanation to the proposal.
 
 A fix of a known vulnerability skips the waiting time
 ([ADR-0050](docs/adr/0050-a-vulnerability-fix-skips-the-waiting-time.md)) and is

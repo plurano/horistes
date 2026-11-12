@@ -47,19 +47,11 @@ request 478 (`ubuntu:26.04` digest), had been open since 2026-11-01 with
 
 ## Decision
 
-Propose one rule after the own npm rule and before the final forks rule:
-
-```json
-{
-  "description": "Digest updates of container images wait for no release age, since a re-pushed tag restarts the age.",
-  "matchDatasources": ["docker"],
-  "matchUpdateTypes": ["digest"],
-  "minimumReleaseAge": null,
-  "prBodyNotes": [
-    "This container image digest update waits for no release age because a re-pushed tag restarts the age."
-  ]
-}
-```
+The package rule in [`default.json`](../../default.json) whose description starts
+"Digest updates of container images" sits after the own npm rule and before the
+final forks rule. It limits the exception to the Docker datasource and digest
+update type, removes the release-age wait and adds one PR body note explaining
+the reason and the fork exception.
 
 Only Docker datasource updates of type `digest` receive this exception. The
 three-day default still covers major, minor and patch updates of outside images.
