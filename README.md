@@ -589,9 +589,10 @@ from `renovate.json` and the preset it extends, `default.json`
 ([ADR-0019](docs/adr/0019-update-proposals-from-renovate-configured-here.md),
 [ADR-0020](docs/adr/0020-shared-update-bot-values-as-a-preset.md),
 [ADR-0036](docs/adr/0036-the-update-bot-moves-pinned-release-tools-and-checksums.md)).
-A proposal waits three days after the release unless it fixes a known
-vulnerability, is never merged by the bot and has to pass the gate like any
-other pull request.
+A proposal waits three days after the release, with exceptions for known
+vulnerability fixes, own releases and container image digest updates; forks of
+outside projects keep three days. It is never merged by the bot and has to pass
+the gate like any other pull request.
 
 | Read by the bot | Where | How it finds the release |
 | :--- | :--- | :--- |
@@ -620,11 +621,19 @@ and reports to the forge's code scanning ([ADR-0043](docs/adr/0043-codeql-report
 | :--- | :--- |
 | base | `config:recommended` |
 | commits of the bot | carry the sign-off line (`:gitSignOff`) |
-| waiting time after a release | three days; none for a fix of a known vulnerability |
+| waiting time after a release | three days; none for a fix of a known vulnerability, own releases or container image digest updates; forks of outside projects keep three days |
 | merge by the bot | never |
 | after a Go module update | `go mod tidy` (`gomodTidy`) |
 | pull request body | `prHeader` adds the description and verification checklist; every box stays unticked. The header matches the template that `praetorctl adopt` ships. A repository with a different template sets its own `prHeader` in its `renovate.json`. |
 | the machine a job runs on | not proposed |
+
+Own releases skip the waiting time; forks of outside projects keep three days
+([ADR-0054](docs/adr/0054-own-releases-skip-the-waiting-time.md)). A digest
+update of a container image skips the waiting time too, because a re-pushed tag
+restarts it; version updates of outside images keep three days, and the last
+package rule keeps fork image digests at three days
+([ADR-0078](docs/adr/0078-docker-digest-updates-wait-for-no-release-age.md)).
+The digest rule adds a `prBodyNotes` explanation to the proposal.
 
 A fix of a known vulnerability skips the waiting time
 ([ADR-0050](docs/adr/0050-a-vulnerability-fix-skips-the-waiting-time.md)) and is
