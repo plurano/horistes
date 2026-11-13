@@ -335,6 +335,10 @@ class Forge:
         self.read_calls: list[tuple[str, dict]] = []
         self.read_statuses: dict[str, list[int]] = {}
         self.mutation_statuses: dict[str, list[int]] = {}
+        self.merge_state_statuses: list[int] = []
+        # GraphQL answers to cut under their full length, per kind ("read" or a mutation name).
+        self.graphql_cuts: dict[str, int] = {}
+        self.enqueue_errors: list[dict] = []
         self.archived: set[str] = set()
         self.tokens: dict[str, tuple] = {}
         self.minted: list[tuple[int, dict]] = []
@@ -351,6 +355,9 @@ class Forge:
         self.artifacts: dict[tuple[str, str], list[dict]] = {}
         self.storage: dict[int, bytes] = {}
         self.storage_cut: dict[int, int] = {}
+        # Downloads of an artifact still to cut; absent, every download is cut.
+        self.storage_cuts_left: dict[int, int] = {}
+        self.storage_reads: list[int] = []
         self.storage_auth_seen: list[str] = []
         self.users_auth_seen: list[str] = []
         self.artifact_redirect_locations: dict[int, str | None] = {}
@@ -538,6 +545,8 @@ class Forge:
             }
         if "enqueuePullRequest" in query:
             self.write(full, ("enqueue", variables["id"], variables["oid"]))
+            if self.enqueue_errors:
+                return {"errors": self.enqueue_errors}
             entry = {"state": "QUEUED"} if self.merged else None
             return {"data": {"enqueuePullRequest": {"mergeQueueEntry": entry}}}
         if "mergePullRequest" in query:
@@ -705,6 +714,9 @@ class Forge:
                 return 502, {"message": "stand-in forge: read page size exceeds 25"}
             statuses = self.read_statuses.get(full, [])
             body = None
+        elif "mergeStateStatus" in query and "pullRequest(" in query:
+            statuses = self.merge_state_statuses
+            body = None
         else:
             statuses = []
             body = None
@@ -712,6 +724,15 @@ class Forge:
         if status != 200:
             return status, {"message": f"stand-in forge: queued HTTP {status}"}
         return status, body or self.graphql(header, query, variables)
+
+    def graphql_cut(self, query: str) -> bool:
+        """Whether this GraphQL answer is cut: a cut of its kind is still queued."""
+        match = re.search(r"\b(\w+)\(\s*input:", query)
+        kind = match[1] if query.lstrip().startswith("mutation") and match else "read"
+        if self.graphql_cuts.get(kind, 0) <= 0:
+            return False
+        self.graphql_cuts[kind] -= 1
+        return True
 
     def write(self, full: str, write: tuple) -> None:
         self.where.append((full, write))
@@ -800,6 +821,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def cut_answer(self, code: int, body: dict) -> None:
+        """Answer under the full Content-Length with half the body, then close."""
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data[: len(data) // 2])
+        self.close_connection = True
+
     def body(self) -> dict:
         return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
 
@@ -864,6 +895,7 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(400, {"message": "storage URL refuses Authorization header"})
             return
         art_id = int(path.removeprefix("/storage/"))
+        self.server.forge.storage_reads.append(art_id)
         data = self.server.forge.storage.get(art_id)
         if data is None:
             self.answer(404, {"message": "Not Found"})
@@ -873,7 +905,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         cut = self.server.forge.storage_cut.get(art_id)
-        if cut is not None:
+        left = self.server.forge.storage_cuts_left.get(art_id)
+        if left is not None:
+            self.server.forge.storage_cuts_left[art_id] = left - 1
+        if cut is not None and (left is None or left > 0):
             self.wfile.write(data[:cut])
             self.close_connection = True
             return
@@ -956,10 +991,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/graphql":
             request = self.body()
+            forge = self.server.forge
             header = self.headers["Authorization"]
-            self.answer(
-                *self.server.forge.graphql_response(header, request["query"], request["variables"])
-            )
+            code, body = forge.graphql_response(header, request["query"], request["variables"])
+            if forge.graphql_cut(request["query"]):
+                self.cut_answer(code, body)
+            else:
+                self.answer(code, body)
             return
         prefix, _, tail = self.path.partition("/app/installations/")
         number, _, action = tail.partition("/")
@@ -7859,3 +7897,123 @@ def test_merge_refused_as_not_mergeable_reads_the_state_again(tmp_path, state, c
     moved = f"### fleet/app: not landed: the merge state moved to {state} #1"
     assert (moved in summary) == (code == 0), summary
     assert ("Pull Request is not mergeable" in done.stdout) == (code == 1)
+
+
+# Review of horistes PR 173: a cut body is transient, an enqueue refusal can be a move, and
+# the moved-state read is tried again like every other GraphQL read.
+ENQUEUE_NOT_MERGEABLE = {**NOT_MERGEABLE, "path": ["enqueuePullRequest"]}
+CUT_CAUSE = "raise RefusedError(message) from cut"
+
+
+def test_cut_read_answer_is_tried_again(tmp_path):
+    """Planted: the page read answer stops halfway under its full length; the read runs again."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.graphql_cuts["read"] = 1
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert len(forge.read_calls) == 2
+    assert forge.graphql_cuts["read"] == 0
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_cut_mutation_answer_is_not_tried_again(tmp_path):
+    """A merge whose answer is cut may have landed; it runs once and the repository is refused."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.graphql_cuts["mergePullRequest"] = 2
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "body cut:" in done.stdout
+    assert forge.writes == [landed(1)]
+    assert forge.graphql_cuts["mergePullRequest"] == 1
+
+
+def test_cut_artifact_body_once_is_downloaded_again(tmp_path):
+    """Planted: the first artifact download is cut; the second whole one is committed."""
+    forge = cut_artifact_forge()
+    forge.storage_cuts_left[101] = 1
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert any(w[0] == "commit" for w in forge.writes)
+    assert "body cut" not in summary
+    assert forge.storage_reads == [101, 101]
+
+
+def test_without_the_cut_cause_a_cut_read_refuses(tmp_path):
+    """Mutation: a cut refusal without its cause is not transient, so the planted read fails."""
+    assert script().count(CUT_CAUSE) == 1
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.graphql_cuts["read"] = 1
+    flow = script().replace(CUT_CAUSE, "raise RefusedError(message)")
+    done, _ = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "body cut:" in done.stdout
+    assert forge.writes == []
+
+
+@pytest.mark.parametrize(("state", "code"), [("BEHIND", 0), ("UNKNOWN", 0), ("CLEAN", 1)])
+def test_enqueue_refused_as_not_mergeable_reads_the_state_again(tmp_path, state, code):
+    """Planted: the queue refuses the pull request as not mergeable; a moved one is a note."""
+    forge = Forge(repository(pull(1, "CLEAN"), queue=True))
+    forge.enqueue_errors = [ENQUEUE_NOT_MERGEABLE]
+    forge.merge_states[1] = state
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == code, done.stdout + done.stderr
+    assert forge.writes == [queued(1)]
+    moved = f"### fleet/app: not landed: the merge state moved to {state} #1"
+    assert (moved in summary) == (code == 0), summary
+    assert ("Pull Request is not mergeable" in done.stdout) == (code == 1)
+
+
+def test_without_the_enqueue_handler_a_moved_pull_request_refuses(tmp_path):
+    """Mutation: an enqueue refusal that skips moved_state turns the BEHIND case red."""
+    old = """        data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
+    except RefusedError as err:"""
+    assert script().count(old) == 1
+    flow = script().replace(old, old.replace("except RefusedError", "except ZeroDivisionError"))
+    forge = Forge(repository(pull(1, "CLEAN"), queue=True))
+    forge.enqueue_errors = [ENQUEUE_NOT_MERGEABLE]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "not landed: the merge state moved" not in summary
+
+
+@pytest.mark.parametrize("fault", [502, 503, 504])
+def test_moved_state_read_is_tried_again(tmp_path, fault):
+    """Planted: the merge is refused as not mergeable and the state read fails once."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merge_errors = [NOT_MERGEABLE]
+    forge.merge_states[1] = "BEHIND"
+    forge.merge_state_statuses = [fault]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.merge_state_statuses == []
+    assert "### fleet/app: not landed: the merge state moved to BEHIND #1" in summary
+
+
+def test_exhausted_moved_state_reads_refuse_the_repository(tmp_path):
+    """Boundary: three failed state reads refuse the repository; the fourth is never sent."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merge_errors = [NOT_MERGEABLE]
+    forge.merge_states[1] = "BEHIND"
+    forge.merge_state_statuses = [502] * 4
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 502" in done.stdout
+    assert forge.merge_state_statuses == [502]
+    assert "not landed: the merge state moved" not in summary
+
+
+def test_without_the_read_wrapper_the_state_read_refuses(tmp_path):
+    """Mutation: the moved-state read sent through graphql runs once and the 502 refuses."""
+    old = "data = read_graphql(env, MERGE_STATE, {"
+    assert script().count(old) == 1
+    flow = script().replace(old, "data = graphql(env, MERGE_STATE, {")
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merge_errors = [NOT_MERGEABLE]
+    forge.merge_states[1] = "BEHIND"
+    forge.merge_state_statuses = [502]
+    done, _ = train(tmp_path, forge, flow)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 502" in done.stdout

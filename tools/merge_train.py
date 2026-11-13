@@ -412,7 +412,10 @@ def request_once(url, token, method, body, raw, redirect):
             # read(amt) returns a short body without error if the peer closes early.
             length = answer.headers.get("Content-Length", "")
             if length.isdigit() and len(content) != int(length):
-                raise RefusedError(f"{method} {url}: body cut: {len(content)} of {length} bytes")
+                # The cause makes a cut body transient: a read is tried again, a write is not.
+                cut = http.client.IncompleteRead(content, int(length) - len(content))
+                message = f"{method} {url}: body cut: {len(content)} of {length} bytes"
+                raise RefusedError(message) from cut
             if raw:
                 return content
             text = content.decode()
@@ -450,16 +453,21 @@ def graphql(env, query, variables):
     return answer["data"]
 
 
-def read_page(env, variables, query):
-    """One page of the read; a gateway error or a dropped connection is tried again
-    (record 0080)."""
+def read_graphql(env, query, variables):
+    """A GraphQL read; a gateway error, a dropped connection or a cut body is tried again,
+    at most READ_ATTEMPTS times (record 0080). Mutations go through graphql and run once."""
     for attempt in range(1, READ_ATTEMPTS + 1):
         try:
-            return graphql(env, query, variables)["repository"]
+            return graphql(env, query, variables)
         except RefusedError as err:
             if not transient(err) or attempt == READ_ATTEMPTS:
                 raise
             time.sleep(READ_BACKOFF_SECONDS)
+
+
+def read_page(env, variables, query):
+    """One page of the read."""
+    return read_graphql(env, query, variables)["repository"]
 
 
 def pull_pages(env, conf):
@@ -497,7 +505,7 @@ def fetch(env, conf):
 def pull_commits(env, number):
     """The non-merge commit messages of one pull request, oldest first."""
     owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
-    data = graphql(env, COMMITS, {"owner": owner, "name": name, "number": number})
+    data = read_graphql(env, COMMITS, {"owner": owner, "name": name, "number": number})
     commits = data["repository"]["pullRequest"]["commits"]
     if commits["totalCount"] > 100:
         raise RefusedError(f"#{number}: more than 100 commits, cannot read every sign-off")
@@ -511,7 +519,7 @@ def pull_commits(env, number):
 def pull_merge_state(env, number):
     """The live mergeStateStatus of one pull request."""
     owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
-    data = graphql(env, MERGE_STATE, {"owner": owner, "name": name, "number": number})
+    data = read_graphql(env, MERGE_STATE, {"owner": owner, "name": name, "number": number})
     pr = (data.get("repository") or {}).get("pullRequest") or {}
     return pr.get("mergeStateStatus")
 
@@ -547,7 +555,7 @@ def commit_variables(env, conf, pull):
 
 
 def moved_state(env, conf, pull, err):
-    """The note for a merge the forge refused as not mergeable after the pull request moved.
+    """The note for a merge or enqueue the forge refused as not mergeable after a move.
 
     Between the read and the merge another pull request can land and leave this one
     BEHIND. The live state is read once more: still at an accepted state, the refusal
@@ -561,13 +569,24 @@ def moved_state(env, conf, pull, err):
     return f"not landed: the merge state moved to {state}"
 
 
+def enqueue(env, conf, pull):
+    """Add a signed pull request to the merge queue; a moved one is a note (record 0080)."""
+    signed_message(env, conf, pull)
+    try:
+        data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
+    except RefusedError as err:
+        moved = moved_state(env, conf, pull, err)
+        if moved:
+            return moved
+        raise
+    if not data["enqueuePullRequest"]["mergeQueueEntry"]:
+        raise RefusedError(f"#{pull['number']}: no merge queue entry")
+    return "queued"
+
+
 def land(env, conf, pull, queue):
     if queue:
-        signed_message(env, conf, pull)
-        data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
-        if not data["enqueuePullRequest"]["mergeQueueEntry"]:
-            raise RefusedError(f"#{pull['number']}: no merge queue entry")
-        return "queued"
+        return enqueue(env, conf, pull)
     try:
         data = graphql(env, MERGE, commit_variables(env, conf, pull))
     except MergeInProgressError:
@@ -1241,7 +1260,7 @@ def review_body_hold(pull, detail, right=None):
 def pull_review_bodies(env, number):
     """The reviews, issue comments, and commits of one pull request for body-hold checks."""
     owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
-    data = graphql(env, REVIEW_BODIES, {"owner": owner, "name": name, "number": number})
+    data = read_graphql(env, REVIEW_BODIES, {"owner": owner, "name": name, "number": number})
     return (data.get("repository") or {}).get("pullRequest")
 
 
@@ -1500,7 +1519,7 @@ def close_issues(env, conf, installation, target, now):
     an issue is to be closed.
     """
     owner, name = target["full_name"].split("/", 1)
-    data = graphql(env, MERGED, {"owner": owner, "name": name})
+    data = read_graphql(env, MERGED, {"owner": owner, "name": name})
     merged = data["repository"]["pullRequests"]["nodes"]
     bot = conf["bot_login"].removesuffix("[bot]")
     since = now - timedelta(days=CLOSE_DAYS)

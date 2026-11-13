@@ -32,16 +32,19 @@ six hours. None of the failures came from a pull request the train serves:
 - **Reads are tried again; writes are not.** `call` sends a GET at most
   `READ_ATTEMPTS` (3) times, `READ_BACKOFF_SECONDS` apart, when the forge answers
   502, 503 or 504 (`RETRY_CODES`) or the connection drops or times out
-  (`transient`). `read_page` uses the same test for the GraphQL page read. Every
+  (`transient`). `read_graphql` uses the same test for every GraphQL read: the
+  page read, commits, merge state, review bodies and merged pull requests. Every
   other method runs once: a write that reached the forge before the answer was
   lost must not run twice. A 500 is not tried again; it stays a refusal.
 - **Transport errors are refusals.** `request_once` turns every `OSError` and
   `http.client.HTTPException` into `RefusedError`, so a dropped connection
-  refuses one call and is judged like any other refusal.
+  refuses one call and is judged like any other refusal. A body shorter than its
+  `Content-Length` is refused with `http.client.IncompleteRead` as the cause, so
+  a cut read counts as transient and a cut write still runs once.
 - **A failed revocation warns.** `revoke` writes a `::warning` and the sweep goes
   on. The installation token expires within the hour on its own.
-- **A moved pull request is a note.** When the forge refuses a merge as not
-  mergeable (compared in lower case), `moved_state` reads the live merge state
+- **A moved pull request is a note.** When the forge refuses a merge or an
+  enqueue as not mergeable (compared in lower case), `moved_state` reads the live merge state
   once more. If the state is no longer one the caller accepts, the run writes
   "not landed: the merge state moved to STATE" and the next run serves the pull
   request from its new state. If the state is still accepted, the refusal

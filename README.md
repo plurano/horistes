@@ -167,11 +167,12 @@ of the fleet; its rights are in `apps/merge-train.json`, and a test holds them
 equal to what the train asks the forge for.
 
 The train outlasts short forge faults (decision record 0080). A read (GET, and
-the GraphQL page read) is tried up to three times when the forge answers 502,
-503 or 504 or drops the connection; a write runs once and a 500 stays a
-refusal. A failed token revocation is a warning, since the token expires
-within the hour. A merge refused as not mergeable after another merge moved
-the pull request is a note, and the next run serves its new state. A failed
+every GraphQL read) is tried up to three times when the forge answers 502, 503
+or 504, drops the connection or cuts the body short; a write runs once and a
+500 stays a refusal. A failed token revocation is a warning, since the token
+expires within the hour. A merge or enqueue refused as not mergeable after
+another merge moved the pull request is a note, and the next run serves its
+new state. A failed
 release pull request step gets one second attempt after 30 seconds.
 
 When `required_status` names a commit status context, the train requires that
