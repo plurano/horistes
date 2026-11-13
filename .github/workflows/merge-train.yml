@@ -378,31 +378,53 @@ jobs:
 
 
           _REVIEW_HOLD = frozenset({"CHANGES_REQUESTED", "COMMENTED"})
+          # On app PRs, User comments/approvals answer earlier reviews; change requests still hold.
+          _PERSON_RESPONSE = frozenset({"COMMENTED", "APPROVED"})
+
+
+          def _is_bot_author(author):
+              """Whether an author is a bot account: GraphQL type Bot, or a [bot] login."""
+              if not isinstance(author, dict):
+                  return False
+              return (
+                  author.get("__typename") == "Bot" or (author.get("login") or "").endswith("[bot]")
+              )
 
 
           def is_bot_dependency(pull, conf):
               """Whether a pull request is a bot-authored dependency update."""
               if not pull["headRefName"].startswith(conf["dependency"]):
                   return False
-              author = pull.get("author")
-              if not isinstance(author, dict):
-                  return False
-              login = author.get("login") or ""
-              return author.get("__typename") == "Bot" or login.endswith("[bot]")
+              return _is_bot_author(pull.get("author"))
+
+
+          def _responds(review, pr_author, app_author):
+              """Whether a review on the head answers the reviews before it."""
+              author = review.get("author") or {}
+              if author.get("login") == pr_author:
+                  return True
+              return (
+                  app_author and author.get("__typename") == "User"
+                  and review.get("state") in _PERSON_RESPONSE
+              )
 
 
           def review_settle(pull, conf, now):
-              """Why a person-authored PR waits for its reviews to settle, or None.
+              """Why a pull request waits for its reviews to settle, or None.
 
               A submitted review on the current head that is newer than the author's
               last push (head commit date) or reply (author review on the same head)
-              holds the PR from landing.  Bot PRs (dependency prefix AND bot author)
-              skip this check.  Approved, dismissed, and pending reviews do not hold.
+              holds the PR from landing. On an app-authored PR (Bot author), a person's
+              commented or approving review on the head is the reply; a person's
+              request for changes holds, an app's review never answers (ADR-0081).
+              Bot PRs (dependency prefix AND bot author) skip this check.
+              Approved, dismissed, and pending reviews do not hold.
               """
               if is_bot_dependency(pull, conf):
                   return None
               author_field = pull.get("author") or {}
               pr_author = author_field.get("login", "") if isinstance(author_field, dict) else ""
+              app_author = _is_bot_author(author_field)
               head_oid = pull["headRefOid"]
               nodes = pull["latest"]["nodes"]
               if not nodes:
@@ -415,7 +437,7 @@ jobs:
               ]
               external = [
                   r for r in on_head
-                  if (r.get("author") or {}).get("login") != pr_author
+                  if not _responds(r, pr_author, app_author)
                   and r.get("state") in _REVIEW_HOLD
               ]
               if not external:
@@ -423,11 +445,14 @@ jobs:
               newest_ext = max(datetime.fromisoformat(r["submittedAt"]) for r in external)
               author_acts = [
                   r for r in on_head
-                  if (r.get("author") or {}).get("login") == pr_author and r.get("submittedAt")
+                  if _responds(r, pr_author, app_author)
               ]
               reply_at = max(
                   (datetime.fromisoformat(r["submittedAt"]) for r in author_acts),
-                  default=datetime.min.replace(tzinfo=push_at.tzinfo) if push_at.tzinfo else datetime.min,
+                  default=(
+                      datetime.min.replace(tzinfo=push_at.tzinfo)
+                      if push_at.tzinfo else datetime.min
+                  ),
               )
               settle_at = max(push_at, reply_at)
               if newest_ext > settle_at:
@@ -843,7 +868,7 @@ jobs:
                     nodes {
                       submittedAt
                       state
-                      author { login }
+                      author { login __typename }
                       commit { oid }
                     }
                   }

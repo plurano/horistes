@@ -87,3 +87,4 @@ record that supersedes it.
 | [0077](0077-maintainer-answers-count-on-bot-pull-requests.md) | 2026-11-10 | Maintainer answers count on bot pull requests | Accepted |
 | [0078](0078-docker-digest-updates-wait-for-no-release-age.md) | 2026-11-12 | Docker digest updates wait for no release age | Accepted |
 | [0080](0080-the-train-outlasts-transient-forge-errors.md) | 2026-11-12 | The train outlasts transient forge errors | Accepted |
+| [0081](0081-a-person-review-answers-an-app-pull-request.md) | 2026-11-13 | A person's review answers an app pull request | Accepted |

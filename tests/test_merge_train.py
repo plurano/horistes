@@ -92,6 +92,7 @@ READ = {"metadata": "read", "contents": "read", "pull_requests": "read", "checks
 STATUSES = {"statuses": "read"}
 ISSUES = {"issues": "write"}
 BOT = "merge-train-app"
+APP = {"login": "plurano-merge-train", "__typename": "Bot"}
 
 
 SCRIPT = ROOT / "tools/merge_train.py"
@@ -6107,8 +6108,208 @@ def test_the_query_reads_author_and_reviews(tmp_path):
     """The GraphQL pull query requests the PR author and recent reviews."""
     rules = load_rules(tmp_path)
     assert "author { login __typename }" in rules.QUERY
-    assert "author { login }" in rules.QUERY
+    assert re.search(
+        r"reviews\(last: 20\) \{\s*nodes \{\s*submittedAt\s*state\s*"
+        r"author \{ login __typename \}",
+        rules.QUERY,
+    )
     assert "reviews(last: 20)" in rules.QUERY
+
+
+def _head_review(login, typename, submitted_at, state="COMMENTED"):
+    """One submitted review on pull request 1's current head."""
+    return {
+        "submittedAt": submitted_at,
+        "state": state,
+        "author": {"login": login, "__typename": typename},
+        "commit": {"oid": f"{1:040x}"},
+    }
+
+
+def test_planted_app_pr_person_reply_settles(tmp_path):
+    """A person's commented review answers an earlier app review on an app PR."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("lusoris", "User", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_planted_app_pr_without_reply_holds(tmp_path):
+    """An unanswered app review still holds a non-dependency app PR."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00")],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:43:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_planted_live_7747_person_reply_alone_settles(tmp_path):
+    """The person's lone thread reply on live PR 7747 does not become a holding review."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:43:07+00:00",
+        reviews=[_head_review("lusoris", "User", "2026-11-13T15:47:50+00:00")],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_app_pr_person_approval_settles(tmp_path):
+    """A person's approval answers earlier app reviews on an app PR."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("lusoris", "User", "2026-11-13T15:47:00+00:00", "APPROVED"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_app_pr_person_change_request_holds(tmp_path):
+    """A person's request for changes holds an app PR rather than answering it."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("lusoris", "User", "2026-11-13T15:47:00+00:00", "CHANGES_REQUESTED"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_app_pr_app_reply_does_not_settle(tmp_path):
+    """Another app's commented review cannot answer an app review."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("coderabbitai", "Bot", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_person_pr_other_person_review_still_holds(tmp_path):
+    """A different person's review still holds a person-authored PR."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="feat/x",
+        author={"login": "person", "__typename": "User"},
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_head_review("other", "User", "2026-11-13T15:47:00+00:00")],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_app_pr_person_reply_before_bot_review_holds(tmp_path):
+    """A person's reply cannot settle an app review submitted afterward."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("lusoris", "User", "2026-11-13T15:42:00+00:00"),
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:45:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:45:00Z on head, last response at 15:42:00Z"
+    )
+
+
+def test_is_bot_author_shapes(tmp_path):
+    """Bot detection accepts the GraphQL type and legacy suffix, including missing authors."""
+    rules = load_rules(tmp_path)
+    assert rules._is_bot_author(None) is False
+    assert rules._is_bot_author({"login": "x"}) is False
+    assert rules._is_bot_author({"login": "renovate[bot]"}) is True
+    assert rules._is_bot_author({"login": "renovate", "__typename": "Bot"}) is True
+    assert rules._is_bot_author({"login": "person", "__typename": "User"}) is False
+
+
+def test_planted_train_lands_app_pr_after_person_reply(tmp_path):
+    """The step lands a non-dependency app PR after a person answers its app review."""
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        createdAt=OLD,
+        committedDate=(NOW - timedelta(minutes=20)).isoformat(),
+        reviews=[
+            _head_review("sourcery-ai", "Bot", (NOW - timedelta(minutes=10)).isoformat()),
+            _head_review("lusoris", "User", (NOW - timedelta(minutes=6)).isoformat()),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_planted_train_holds_app_pr_without_reply(tmp_path):
+    """The step keeps a non-dependency app PR held until its review is answered."""
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        createdAt=OLD,
+        committedDate=(NOW - timedelta(minutes=20)).isoformat(),
+        reviews=[_head_review("sourcery-ai", "Bot", (NOW - timedelta(minutes=10)).isoformat())],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | CLEAN | review settle:" in summary
 
 
 def _detail(
@@ -7079,6 +7280,87 @@ def test_maintainer_write_answer_lands_bot_pull_request(tmp_path):
     assert forge.writes == [landed(1)]
     assert "### fleet/app: landed #1" in summary
     assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_planted_app_image_pin_owner_answer_lands(tmp_path):
+    """An owner's named answer releases the live app image-pin review-body finding."""
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+    )
+    forge = Forge(repository(p))
+    forge.commits[1] = [
+        ("chore(image): pin kb-mcp\n\nSigned-off-by: Producer <producer@example.org>", 1)
+    ]
+    forge.review_details[1] = _detail(
+        reviews=[
+            _bot_review(
+                5869705498,
+                "sourcery-ai",
+                "Hey - I've found 1 issue\n\n### Sourcery assessment\n\n"
+                "**Needs a human reviewer.** The pin changes the served image.",
+            )
+        ],
+        comments=[
+            {
+                "body": "Answer to pullrequestreview-5869705498: each of its 1 findings is also "
+                "an inline thread, answered and resolved there.",
+                "authorAssociation": "OWNER",
+                "author": {"login": "owner", "__typename": "User"},
+            },
+            {
+                "body": "<!-- ai/pr-reviewer:v1 -->\nRisk review: low.",
+                "authorAssociation": "OWNER",
+                "author": {"login": "owner", "__typename": "User"},
+            },
+        ],
+    )
+    forge.rights = {"owner": "admin"}
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_app_image_pin_unrelated_owner_comment_holds(tmp_path, monkeypatch):
+    """An unrelated owner comment leaves the Sourcery finding unanswered."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    body = (
+        "Hey - I've found 1 issue\n\n### Sourcery assessment\n\n"
+        "**Needs a human reviewer.** The pin changes the served image."
+    )
+    assert merge_train._bot_body_has_finding("sourcery-ai", body) is True
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+    )
+    forge = Forge(repository(p))
+    forge.commits[1] = [
+        ("chore(image): pin kb-mcp\n\nSigned-off-by: Producer <producer@example.org>", 1)
+    ]
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(5869705498, "sourcery-ai", body)],
+        comments=[
+            {
+                "body": "<!-- ai/pr-reviewer:v1 -->\nRisk review: low.",
+                "authorAssociation": "OWNER",
+                "author": {"login": "owner", "__typename": "User"},
+            }
+        ],
+    )
+    forge.rights = {"owner": "admin"}
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        "| #1 | CLEAN | review body: sourcery-ai review 5869705498 has findings "
+        "without a reply naming pullrequestreview-5869705498 |"
+    ) in summary
+    assert forge.right_calls == []
 
 
 def test_maintainer_admin_answer_lands_bot_pull_request(tmp_path):
