@@ -365,6 +365,7 @@ class Forge:
         self.jobs: dict[int, list[dict]] = {}
         self.jobs_calls: list[int] = []
         self.label_missing = False
+        self.unlabel_status: int | None = None
         self.install(7, "fleet", app=list(reads))
 
     def set_allowlist(self, repo: str, default_branch: str, paths: list[str]) -> None:
@@ -741,6 +742,8 @@ class Forge:
         )
         if write[0] == "unlabel" and self.label_missing:
             return 404, {"message": "Label does not exist"}
+        if write[0] == "unlabel" and self.unlabel_status:
+            return self.unlabel_status, {"message": "stand-in forge: label removal failed"}
         self.write(full, write)
         return 200, {}
 
@@ -4622,13 +4625,15 @@ def test_held_update_is_released_when_no_security_update_is_open(tmp_path):
     assert "released from the security hold" in summary, summary
 
 
-def test_held_update_a_person_marked_ready_is_not_held_again(tmp_path):
-    ready = pull(1, "BLOCKED", headRefName="renovate/go-snaps", labels=(HOLD,))
+def test_held_update_a_person_marked_ready_is_drafted_again_and_not_landed(tmp_path):
+    ready = pull(1, "CLEAN", headRefName="renovate/go-snaps", labels=(HOLD,))
     fix = pull(2, "BEHIND", headRefName="renovate/x-net", labels=("security",))
     forge = Forge(repository(ready, fix, rules=LINEAR))
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert not [w for w in forge.writes if w[0] in ("label", "draft", "unlabel")], forge.writes
+    holds = [w for w in forge.writes if w[0] in ("label", "draft", "unlabel")]
+    assert holds == [("draft", "PR_1")], forge.writes
+    assert landed(1) not in forge.writes, forge.writes
 
 
 def test_release_of_an_update_already_ready_only_removes_the_label(tmp_path):
@@ -4887,22 +4892,161 @@ def test_session_hold_expired_ready_update_is_never_held_again(tmp_path):
     assert forge.writes == [landed(1)], forge.writes
 
 
-def test_session_hold_bound_exact_boundary_and_missing_events(tmp_path, monkeypatch):
+def test_session_hold_bound_is_inclusive_and_missing_events_keep_the_hold(tmp_path, monkeypatch):
     train_mod = load_train(tmp_path, monkeypatch)
     conf = {"session_hold": timedelta(hours=4)}
     update = pull(1, "CLEAN", holds=session_events(4))
-    assert not train_mod.session_hold_expired(update, conf, NOW)
-    assert train_mod.session_hold_expired(update, conf, NOW + timedelta(seconds=1))
+    assert train_mod.session_hold_expired(update, conf, NOW)
+    assert not train_mod.session_hold_expired(update, conf, NOW - timedelta(seconds=1))
     assert not train_mod.session_hold_expired(pull(1, "CLEAN"), conf, NOW)
 
 
-def test_session_hold_a_person_marked_ready_is_not_drafted_again(tmp_path):
+def unrelated_events(count):
+    """Label events of other labels only, oldest first."""
+    return {"nodes": [{"createdAt": OLD, "label": {"name": "unrelated"}}] * count}
+
+
+def test_session_hold_full_event_page_without_the_session_event_is_expired(tmp_path, monkeypatch):
+    train_mod = load_train(tmp_path, monkeypatch)
+    conf = {"session_hold": timedelta(hours=4)}
+    full = train_mod.HOLD_EVENT_PAGE
+    assert train_mod.session_hold_expired(pull(1, "CLEAN", holds=unrelated_events(full)), conf, NOW)
+    short = pull(1, "CLEAN", holds=unrelated_events(full - 1))
+    assert not train_mod.session_hold_expired(short, conf, NOW)
+    paged = unrelated_events(full - 1)
+    paged["nodes"].append(session_events(1)["nodes"][1])
+    assert not train_mod.session_hold_expired(pull(1, "CLEAN", holds=paged), conf, NOW)
+
+
+def test_session_hold_full_event_page_releases_the_update(tmp_path):
     update, session = session_pair()
-    update.update(mergeStateStatus="BLOCKED", labels={"nodes": [{"name": SESSION}]})
+    update.update(isDraft=True, labels={"nodes": [{"name": SESSION}]}, holds=unrelated_events(20))
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("ready", "PR_1"), ("unlabel", 1, SESSION)], forge.writes
+
+
+def test_session_hold_a_person_marked_ready_is_drafted_again(tmp_path):
+    update, session = session_pair()
+    update["labels"] = {"nodes": [{"name": SESSION}]}
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("draft", "PR_1")], forge.writes
+    assert "held as a draft: session pull request #2 waits (bound 4 h)" in summary
+
+
+def test_session_hold_failed_draft_write_is_retried_and_never_lands(tmp_path):
+    update, session = session_pair()
+    forge = Forge(repository(update, session, rules=LINEAR))
+    forge.mutation_statuses["convertPullRequestToDraft"] = [502]
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode != 0
+    assert "HTTP 502" in done.stdout + done.stderr
+    assert forge.writes == [("label", 1, SESSION), ("draft", "PR_1")], forge.writes
+    update["labels"] = {"nodes": [{"name": SESSION}]}
+    again = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, again, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert again.writes == [("draft", "PR_1")], again.writes
+
+
+@pytest.mark.parametrize("label", [HOLD, SESSION])
+def test_failed_label_removal_keeps_the_hold_and_is_retried(tmp_path, label):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps", isDraft=True, labels=(label,))
+    forge = Forge(repository(update))
+    forge.unlabel_status = 500
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode != 0
+    assert "HTTP 500" in done.stdout + done.stderr
+    assert forge.writes == [("ready", "PR_1")], forge.writes
+    update["isDraft"] = False
+    again = Forge(repository(update))
+    done, _ = train(tmp_path, again, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert again.writes == [("unlabel", 1, label)], again.writes
+
+
+@pytest.mark.parametrize("label", [HOLD, SESSION])
+def test_managed_hold_label_is_never_landable(tmp_path, label):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps", labels=(label,))
+    forge = Forge(repository(update))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("unlabel", 1, label)], forge.writes
+
+
+@pytest.mark.parametrize("draft", [True, False])
+def test_session_hold_releases_a_security_update_at_once(tmp_path, draft):
+    session = session_pair()[1]
+    fix = pull(
+        3,
+        "CLEAN",
+        headRefName="renovate/x-net",
+        isDraft=draft,
+        labels=("security", SESSION),
+        holds=session_events(1),
+    )
+    forge = Forge(repository(session, fix, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = ([("ready", "PR_3")] if draft else []) + [("unlabel", 3, SESSION)]
+    assert forge.writes[: len(expected)] == expected, forge.writes
+    assert ("draft", "PR_3") not in forge.writes
+    assert "released from the session hold: a security update is exempt" in summary
+
+
+@pytest.mark.parametrize(
+    "decision,held",
+    [("REVIEW_REQUIRED", False), ("CHANGES_REQUESTED", False), ("APPROVED", True), (None, True)],
+)
+def test_session_hold_waits_only_when_checks_alone_block(tmp_path, decision, held):
+    update, session = session_pair(reviewDecision=decision)
     forge = Forge(repository(update, session, rules=LINEAR))
     done, _ = train(tmp_path, forge, session_authors="lusoris")
     assert done.returncode == 0, done.stdout + done.stderr
-    assert forge.writes == [], forge.writes
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+    assert (landed(1) in forge.writes) is not held, forge.writes
+
+
+@pytest.mark.parametrize("status,held", [(None, False), (ctx("lanes/booked", "SUCCESS"), True)])
+def test_session_accepted_state_waits_only_when_required_status_passes(tmp_path, status, held):
+    update, session = session_pair("CLEAN", suites=["SUCCESS"], status=status)
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris", required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+
+
+@pytest.mark.parametrize("count,held", [(29, False), (30, True)])
+def test_session_full_suite_page_counts_as_pending(tmp_path, count, held):
+    update, session = session_pair(suites=["SUCCESS"] * count)
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+
+
+@pytest.mark.parametrize(
+    "count,authors,held", [(101, "lusoris", True), (101, "", False), (100, "lusoris", False)]
+)
+def test_session_hold_with_unread_pages_holds_bounded(tmp_path, count, authors, held):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps")
+    others = [pull(n, "DIRTY") for n in range(2, count + 1)]
+    forge = Forge(repository(update, *others, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors=authors)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+    assert (landed(1) in forge.writes) is not held, forge.writes
+    note = "held as a draft: a session pull request past the pages read may wait (bound 4 h)"
+    assert (note in summary) is held, summary
+
+
+def test_train_job_runs_one_at_a_time_per_app():
+    concurrency = ciwf.load(TRAIN)["jobs"]["train"]["concurrency"]
+    assert "${{ inputs.app_client_id }}" in concurrency["group"], concurrency
+    assert concurrency["cancel-in-progress"] is False, concurrency
 
 
 @pytest.mark.parametrize("labels", [(HOLD, SESSION), (SESSION,)])
@@ -4991,12 +5135,17 @@ def test_session_hold_hours_settings_boundaries(tmp_path, hours):
     assert forge.writes == [("label", 1, SESSION), ("draft", "PR_1")]
 
 
-def test_session_hold_query_keeps_required_status_selection_replaceable(tmp_path):
+def test_session_hold_query_keeps_required_status_selection_replaceable(tmp_path, monkeypatch):
     rules = load_rules(tmp_path)
+    train_mod = load_train(tmp_path, monkeypatch)
     for query in (rules.QUERY, rules.STATUS_QUERY):
         assert "statusCheckRollup" not in query
         assert "workflowRun { databaseId workflow { databaseId } }" in query
-        assert "holds: timelineItems(itemTypes: [LABELED_EVENT], first: 20)" in query
+        # The page sizes the full-page checks compare against are the sizes the query asks.
+        assert f"checkSuites(first: {train_mod.SUITE_PAGE})" in query
+        events = f"timelineItems(itemTypes: [LABELED_EVENT], first: {train_mod.HOLD_EVENT_PAGE})"
+        assert f"holds: {events}" in query
+        assert "mergeStateStatus isInMergeQueue reviewDecision" in query
         assert "... on LabeledEvent { createdAt label { name } }" in query
         assert "signature { wasSignedByGitHub }" in query
     assert "status { context(name: $status) { state } }" in rules.STATUS_QUERY

@@ -39,33 +39,48 @@ dependency branch prefix, carries no configured hold label, and has no red
 head check suite. Its merge state must be accepted by the train, BEHIND, or
 BLOCKED while the newest run of a workflow on the head commit has not finished. A
 BLOCKED pull request whose workflow runs have all finished does not trigger the
-hold: it may be blocked by review requirements or unresolved threads. Only check
+hold: it may be blocked by review requirements or unresolved threads. A session
+whose review decision is REVIEW_REQUIRED or CHANGES_REQUESTED never waits, since
+checks alone cannot unblock it, and an accepted merge state does not wait while
+a configured required status is missing or failing. Only check
 suites of workflow runs count, because the train already reads them with its
 checks read right; an app suite without a workflow run can stay open forever, and
 the status-check rollup would need the statuses read right on every repository.
 A commit status or an app check still running therefore does not hold updates.
 
 While a session waits, label eligible non-security dependency updates
-`merge-train: session hold` and convert them to drafts. Forks, other bases,
-already labelled updates and drafts no managed hold keeps are left alone. Security updates
-remain eligible to land. A person marking a held update ready does not cause
-another draft conversion while its session label remains.
+`merge-train: session hold` and convert them to drafts. Forks, other bases and
+drafts no managed hold keeps are left alone. Security updates remain eligible
+to land; a security update that already carries the session label is released
+at once. A managed hold label keeps an update from landing whatever its draft
+state, and a labelled update a person marks ready, or whose draft conversion
+failed, is converted to a draft again on the next run.
 
 Recompute holds each run. If no qualifying session remains, remove every session
 hold label and mark a held draft ready when no other managed hold remains.
 Merging, closing, red checks, conversion to draft, or a configured hold label
-can end a session's wait. Also release an update when its earliest session-label
-event is older than `session_hold_hours`; retain that event as evidence to skip
-holding it again on later runs. The query reads the first 20 labelled timeline
-events. No separate persisted state is introduced.
+can end a session's wait. Also release an update once its earliest session-label
+event is at least `session_hold_hours` old; retain that event as evidence to
+skip holding it again on later runs. No separate persisted state is introduced.
+
+Full query pages fail closed. Thirty check suites on a head commit count as a
+pending run, and more than 100 open pull requests keep the hold while
+`session_authors` is set, because a waiting session may sit past the pages read;
+both stay bounded by `session_hold_hours` per update. The query reads the first
+20 labelled timeline events; a full page without the session-label event counts
+as expired, so the update is released rather than held without a bound.
 
 The security and session holds share one writer. Apply new labels before
-releasing holds, draft an update at most once, and mark it ready only after
-both managed holds are gone. Either hold can label a draft the other keeps, so
-an update the security hold releases while a session waits passes straight to
-the session hold without a ready and a second draft. An author's draft without a managed hold label is never marked
-ready. Held and released notes reach the step summary; session hold notes name
-the waiting pull request and the configured bound.
+releasing holds, add a label only when it is missing, draft an update that is
+not a draft, and mark it ready only after both managed holds are gone. A
+release marks the draft ready before it removes the label, so a failed removal
+leaves the label holding and the next run retries it. The train job runs one
+at a time per app client, so two runs cannot interleave these writes. Either
+hold can label a draft the other keeps, so an update the security hold
+releases while a session waits passes straight to the session hold without a
+ready and a second draft. An author's draft without a managed hold label is
+never marked ready. Held and released notes reach the step summary; session
+hold notes name the waiting pull request and the configured bound.
 
 ## Consequences
 
@@ -77,8 +92,11 @@ keep it in draft; security updates themselves remain unaffected.
 
 The existing pull-request and label write paths supply the required rights.
 `tests/test_merge_train.py` covers pending and behind sessions, exclusions,
-release, the earliest-event bound, manual readiness, both holds together and
-invalid settings. `test_planted_session_hold_that_finds_no_session_lands_update`
+release, the inclusive earliest-event bound, manual readiness, both holds
+together, invalid settings, review-blocked sessions, the required status for
+accepted states, each full query page, failed draft and label-removal writes,
+managed labels in the verdict, the security release and the per-app
+concurrency group. `test_planted_session_hold_that_finds_no_session_lands_update`
 removes the session predicate and demonstrates the dependency update landing
 before the waiting session.
 

@@ -80,6 +80,11 @@ ERROR_TEXT = 500
 SETTLE_ROUNDS = 3
 SETTLE_SECONDS = 5
 PULL_PAGES = 4
+# Page sizes of the pull query's check suites and label events; a full page may hide more.
+SUITE_PAGE = 30
+HOLD_EVENT_PAGE = 20
+# Review states that block a session pull request whatever its checks do (record 0079).
+REVIEW_BLOCKS = ("REVIEW_REQUIRED", "CHANGES_REQUESTED")
 READ_ATTEMPTS = 3
 READ_BACKOFF_SECONDS = 5
 SWEEP_SECONDS = 1500
@@ -227,9 +232,12 @@ def runs_pending(pull):
     """Whether the newest run of a workflow on the head commit has not finished yet.
 
     Only suites of workflow runs count: an app suite that never runs stays open forever.
+    A full page of suites counts as pending: a running suite may sit past it.
     """
     nodes = pull["latest"]["nodes"]
     suites = nodes[-1]["commit"]["checkSuites"]["nodes"] if nodes else []
+    if len(suites) >= SUITE_PAGE:
+        return True
     return any(
         suite.get("workflowRun") and suite["conclusion"] is None
         for suite in newest_suites(suites).values()
@@ -237,39 +245,55 @@ def runs_pending(pull):
 
 
 def session_waiting(pull, default_branch, conf):
-    """A session PR ready to land, behind, or waiting only on checks (record 0079)."""
+    """A session PR ready to land, behind, or blocked only by pending checks (record 0079)."""
     if not session_candidate(pull, default_branch, conf):
         return False
+    if pull.get("reviewDecision") in REVIEW_BLOCKS:
+        return False
     state = pull["mergeStateStatus"]
-    return (
-        state in conf["accept"] or state == "BEHIND" or (state == "BLOCKED" and runs_pending(pull))
-    )
+    if state in conf["accept"]:
+        return required_status_hold(pull, conf) is None
+    return state == "BEHIND" or (state == "BLOCKED" and runs_pending(pull))
 
 
 def session_hold_expired(pull, conf, now):
-    """The earliest session label event bounds this update's hold across later runs."""
+    """The earliest session label event bounds this update's hold across later runs.
+
+    Events come oldest first. A full page without the event cannot prove the hold is
+    within the bound, so the update counts as expired and is released.
+    """
+    nodes = (pull.get("holds") or {}).get("nodes", [])
     stamps = [
         datetime.fromisoformat(event["createdAt"])
-        for event in (pull.get("holds") or {}).get("nodes", [])
+        for event in nodes
         if event and (event.get("label") or {}).get("name") == SESSION_HOLD_LABEL
     ]
-    return bool(stamps) and now - min(stamps) > conf["session_hold"]
+    if not stamps:
+        return len(nodes) >= HOLD_EVENT_PAGE
+    return now - min(stamps) >= conf["session_hold"]
 
 
-def session_hold(rows, default_branch, conf, now):
-    """(waiting session PR or None, updates to hold, labelled updates to release)."""
+def session_hold(rows, default_branch, conf, now, unread=False):
+    """(why updates wait or None, updates to hold, labelled updates to release)."""
     sessions = [pull for pull, _ in rows if session_waiting(pull, default_branch, conf)]
     marked = [pull for pull, _ in rows if SESSION_HOLD_LABEL in label_names(pull)]
-    if not sessions:
+    if sessions:
+        why = f"session pull request #{sessions[0]['number']} waits"
+    elif unread and conf["session_authors"]:
+        # A waiting session may sit past the pages read: hold, still bounded per update.
+        why = "a session pull request past the pages read may wait"
+    else:
         return None, [], marked
-    release = [pull for pull in marked if session_hold_expired(pull, conf, now)]
+    release = [
+        pull for pull in marked if is_security(pull, conf) or session_hold_expired(pull, conf, now)
+    ]
     hold = [
         pull
         for pull, _ in rows
         if dependency_hold_target(pull, default_branch, conf, SESSION_HOLD_LABEL)
         and not session_hold_expired(pull, conf, now)
     ]
-    return sessions[0], hold, release
+    return why, hold, release
 
 
 def write_key(write_end, key):
@@ -704,31 +728,31 @@ def hold_dependency_updates(env, repo, rows, notes, conf, now):
         for pull in hold
     ]
     removals = [(pull, SECURITY_HOLD_LABEL, "released from the security hold") for pull in release]
-    session, hold, release = session_hold(rows, default_branch, conf, now)
+    unread = repo["pullRequests"]["pageInfo"]["hasNextPage"]
+    why, hold, release = session_hold(rows, default_branch, conf, now, unread)
     hours = conf["session_hold"] // timedelta(hours=1)
     additions += [
-        (
-            pull,
-            SESSION_HOLD_LABEL,
-            f"held as a draft: session pull request #{session['number']} waits (bound {hours} h)",
-        )
-        for pull in hold
+        (pull, SESSION_HOLD_LABEL, f"held as a draft: {why} (bound {hours} h)") for pull in hold
     ]
     removals += [
         (
             pull,
             SESSION_HOLD_LABEL,
-            "released from the session hold: "
-            + (
-                f"held {hours} h, the bound"
-                if session is not None and session_hold_expired(pull, conf, now)
-                else "no session pull request waits"
-            ),
+            "released from the session hold: " + session_release_reason(pull, why, conf, now),
         )
         for pull in release
     ]
     apply_dependency_holds(env, rows, additions, removals, notes)
     return {pull["number"]: label for pull, label, _ in additions}
+
+
+def session_release_reason(pull, why, conf, now):
+    """Why the session hold lets go of a labelled update."""
+    if is_security(pull, conf):
+        return "a security update is exempt"
+    if why is not None and session_hold_expired(pull, conf, now):
+        return f"held {conf['session_hold'] // timedelta(hours=1)} h, the bound"
+    return "no session pull request waits"
 
 
 def apply_dependency_holds(env, rows, additions, removals, notes):
@@ -739,8 +763,10 @@ def apply_dependency_holds(env, rows, additions, removals, notes):
     changes = {}
     for pull, label, note in additions:
         number = pull["number"]
-        call(f"{api}/issues/{number}/labels", env["TRAIN_TOKEN"], "POST", {"labels": [label]})
-        remaining[number].add(label)
+        # A labelled update a person readied, or whose draft write failed, is drafted again.
+        if label not in remaining[number]:
+            call(f"{api}/issues/{number}/labels", env["TRAIN_TOKEN"], "POST", {"labels": [label]})
+            remaining[number].add(label)
         if number not in drafts:
             graphql(env, DRAFT, {"id": pull["id"]})
             drafts.add(number)

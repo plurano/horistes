@@ -223,6 +223,10 @@ jobs:
     runs-on: ${{ inputs.runner }}
     environment: merge-train
     timeout-minutes: 30
+    # One train per app at a time: an overlapping run could release a hold the other just saw.
+    concurrency:
+      group: horistes-merge-train-${{ inputs.app_client_id }}
+      cancel-in-progress: false
     permissions: {}
     outputs:
       releases: ${{ steps.sweep.outputs.releases }}
@@ -330,7 +334,7 @@ jobs:
 
 
           def dependency_hold_target(pull, default_branch, conf, label):
-              """An update this hold may mark; a draft only while the other managed hold keeps it."""
+              """An update this hold may mark, or draft again; a draft only while the other hold keeps it."""
               labels = label_names(pull)
               other = {SECURITY_HOLD_LABEL, SESSION_HOLD_LABEL} - {label}
               return (
@@ -339,7 +343,7 @@ jobs:
                   and (not pull["isDraft"] or bool(labels & other))
                   and not pull["isCrossRepository"]
                   and pull["baseRefName"] == default_branch
-                  and label not in labels
+                  and (label not in labels or not pull["isDraft"])
               )
 
 
@@ -518,7 +522,8 @@ jobs:
           def verdict(pull, repo, conf, now, replaced=frozenset()):
               """land, behind, or the reason the train leaves the pull request alone."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
-              held = sorted(labels & conf["hold"])
+              # A managed hold label holds even when a write failed or a person readied the update.
+              held = sorted(labels & (conf["hold"] | {SECURITY_HOLD_LABEL, SESSION_HOLD_LABEL}))
               if pull["baseRefName"] != repo["defaultBranchRef"]["name"]:
                   return "not for the default branch"
               if pull["isDraft"]:
@@ -855,7 +860,7 @@ jobs:
                 pageInfo { hasNextPage endCursor }
                 nodes {
                   number id title body createdAt isDraft isCrossRepository baseRefName headRefName headRefOid
-                  mergeStateStatus isInMergeQueue
+                  mergeStateStatus isInMergeQueue reviewDecision
                   author { login __typename }
                   autoMergeRequest { enabledAt commitHeadline mergeMethod }
                   labels(first: 50) { nodes { name } }

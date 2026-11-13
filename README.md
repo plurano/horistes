@@ -169,10 +169,17 @@ equal to what the train asks the forge for.
 When `session_authors` lists comma-separated logins, non-security dependency
 updates become drafts labelled `merge-train: session hold` while a matching
 session pull request is ready to land, BEHIND, or BLOCKED only by pending checks.
-The hold is off by default. It releases when no session waits or the update's
-first hold exceeds `session_hold_hours` (default 4, whole hours 1–48); an update
-that reaches the bound is never session-held again. Security updates keep
-landing, and a draft stays a draft until both managed holds are gone
+A session that still needs a review, or whose configured `required_status` is
+missing or failing, does not wait. The hold is off by default. It releases when
+no session waits or the update's first hold reaches `session_hold_hours`
+(default 4, whole hours 1–48); an update that reaches the bound is never
+session-held again. A managed hold label keeps an update from landing even when
+a person marks it ready, and the next run drafts it again. Full query pages
+fail closed: 30 check suites count as pending, more than 100 open pull requests
+keep the hold within the bound, and 20 label events without the session event
+release the update. The train job runs one at a time per app client. Security
+updates keep landing, and a draft stays a draft until both managed holds are
+gone
 ([ADR-0079](docs/adr/0079-dependency-updates-wait-while-a-session-pull-request-lands.md)).
 
 When `required_status` names a commit status context, the train requires that
