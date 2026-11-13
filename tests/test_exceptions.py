@@ -766,26 +766,30 @@ def real_check(day: str) -> subprocess.CompletedProcess:
 
 
 def test_real_repository_ruff_toml_passes_today_and_fails_after_expiry():
-    """The real repository check passes on 2026-11-13 and 2026-11-18 and fails after.
+    """The real repository check passes from 2026-11-13 to 2026-11-23 and fails after.
 
     The first pass day is the newest entry date in `exceptions.yaml`: before it,
-    the CIIBestPracticesID entry ends more than its category's 10 days ahead
-    (`category_problem` in `tools/exceptions.py`). 2026-11-18 passes only with the
-    renewed CIIBestPracticesID entry, entry 1: its old end, 2026-11-17, fails then.
+    the entries end more than their category's 10 days ahead (`category_problem`
+    in `tools/exceptions.py`). 2026-11-23 is the last day of every category C
+    entry and of the `ruff.toml` ignore. Their old ends fail before it: the
+    `ruff.toml` ignore on 2026-11-19 and the engine-file entries 2 to 12 on
+    2026-11-20.
     """
     done_pass = real_check("2026-11-13")
     assert done_pass.returncode == 0, done_pass.stderr
     assert "accepted finding(s)" in done_pass.stdout
     done_renewed = real_check("2026-11-18")
     assert done_renewed.returncode == 0, done_renewed.stderr
-    done_fail = real_check("2026-11-19")
+    done_last = real_check("2026-11-23")
+    assert done_last.returncode == 0, done_last.stderr
+    done_fail = real_check("2026-11-24")
     assert done_fail.returncode == 1
     assert (
-        "ruff.toml: .config/agent/hooks/block_evasion.py expired on 2026-11-18" in done_fail.stderr
+        "ruff.toml: .config/agent/hooks/block_evasion.py expired on 2026-11-23" in done_fail.stderr
     )
-    done_cii = real_check("2026-11-24")
-    assert done_cii.returncode == 1
-    assert "exceptions.yaml: entry 1 expired on 2026-11-23" in done_cii.stderr
+    assert "exceptions.yaml: entry 1 expired on 2026-11-23" in done_fail.stderr
+    assert "exceptions.yaml: entry 2 expired on 2026-11-23" in done_fail.stderr
+    assert "exceptions.yaml: entry 12 expired on 2026-11-23" in done_fail.stderr
 
 
 def test_category_problem_3d():
