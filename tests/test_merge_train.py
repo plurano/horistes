@@ -238,6 +238,14 @@ def pull(number: int, state: str, **fields) -> dict:
         pr_author = {"login": f"author-{number}"}
     reviews = fields.pop("reviews", [])
     review_nodes = reviews if isinstance(reviews, dict) else {"nodes": reviews}
+    opinions = fields.pop("opinions", None)
+    if opinions is None:
+        opinion_nodes = [
+            r
+            for r in review_nodes.get("nodes") or []
+            if r.get("state") in {"APPROVED", "CHANGES_REQUESTED"}
+        ]
+        opinions = {"totalCount": len(opinion_nodes), "nodes": opinion_nodes[-100:]}
     status = fields.pop("status", None)
     commit_node = build_commit_node(number, suites, status=status, **fields)
     node = {
@@ -256,6 +264,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "autoMergeRequest": None,
         "labels": {"nodes": [{"name": name} for name in labels]},
         "reviews": review_nodes,
+        "opinions": opinions,
         "refreshes": {"nodes": []},
         "latest": {"nodes": [{"commit": commit_node}]},
     }
@@ -6419,6 +6428,120 @@ def test_planted_app_pr_change_request_survives_other_approval(tmp_path):
     )
     assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
         "review settle: change request by alice at 15:45:00Z on head stands"
+    )
+
+
+def test_planted_app_pr_change_request_survives_review_window(tmp_path):
+    """Twenty later thread replies cannot hide a standing change request."""
+    rules = load_rules(tmp_path)
+    request = _head_review("alice", "User", "2026-11-13T15:45:00+00:00", "CHANGES_REQUESTED")
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _thread_reply("bob", f"2026-11-13T15:46:{second:02d}+00:00") for second in range(20)
+        ],
+        opinions={"totalCount": 1, "nodes": [request]},
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: change request by alice at 15:45:00Z on head stands"
+    )
+
+
+def test_planted_app_pr_truncated_opinions_hold(tmp_path):
+    """An unread opinion may be a change request, so an app PR holds."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_thread_reply("bob", "2026-11-13T15:47:00+00:00")],
+        opinions={
+            "totalCount": 101,
+            "nodes": [
+                _head_review("bob", "User", "2026-11-13T15:45:00+00:00", "APPROVED")
+                for _ in range(100)
+            ],
+        },
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: 101 approvals or change requests, 100 read"
+    )
+
+
+def test_app_pr_complete_opinions_boundary_settles(tmp_path):
+    """Reading all one hundred approvals leaves no unknown change request."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_thread_reply("bob", "2026-11-13T15:47:00+00:00")],
+        opinions={
+            "totalCount": 100,
+            "nodes": [
+                _head_review("bob", "User", "2026-11-13T15:45:00+00:00", "APPROVED")
+                for _ in range(100)
+            ],
+        },
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_app_pr_dismissed_change_request_settles(tmp_path):
+    """A dismissed change request is absent from opinions and cannot hold."""
+    rules = load_rules(tmp_path)
+    request = _head_review("alice", "User", "2026-11-13T15:45:00+00:00", "CHANGES_REQUESTED")
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            {**request, "state": "DISMISSED"},
+            _thread_reply("bob", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert p["opinions"] == {"totalCount": 0, "nodes": []}
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_person_pr_truncated_opinions_do_not_hold(tmp_path):
+    """The opinions completeness hold applies only to app pull requests."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "bob", "__typename": "User"},
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_thread_reply("bob", "2026-11-13T15:47:00+00:00")],
+        opinions={
+            "totalCount": 101,
+            "nodes": [
+                _head_review("bob", "User", "2026-11-13T15:45:00+00:00", "APPROVED")
+                for _ in range(100)
+            ],
+        },
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_opinions_query_reads_bounded_review_states(tmp_path):
+    """The opinions window excludes replies and includes its total count."""
+    rules = load_rules(tmp_path)
+    assert re.search(
+        r"opinions: reviews\(last: 100, states: \[APPROVED, CHANGES_REQUESTED\]\) "
+        r"\{\s*totalCount nodes \{ submittedAt state author \{ login __typename \} "
+        r"commit \{ oid \} \} \}",
+        rules.QUERY,
     )
 
 

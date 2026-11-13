@@ -455,10 +455,10 @@ jobs:
               )
 
 
-          def _on_head_reviews(pull):
-              """Submitted reviews on the current head; the query reads at most twenty."""
+          def _on_head_reviews(pull, connection="reviews"):
+              """Submitted head reviews from the named connection."""
               head_oid = pull["headRefOid"]
-              reviews = pull.get("reviews", {}).get("nodes") or []
+              reviews = pull.get(connection, {}).get("nodes") or []
               return [
                   r for r in reviews
                   if (r.get("commit") or {}).get("oid") == head_oid and r.get("submittedAt")
@@ -497,6 +497,7 @@ jobs:
               a new person review holds. A person's change request holds until that
               person approves later. An app's review, including the authoring app's
               own review, never answers on an app PR (ADR-0081).
+              Opinions read separately; truncated reads hold app PRs.
               Bot PRs (dependency prefix AND bot author) skip this check.
               Approved, dismissed, and pending reviews do not hold.
               """
@@ -514,7 +515,11 @@ jobs:
               if timing_hold:
                   return timing_hold
               if app_author:
-                  standing = _standing_change_request(on_head)
+                  opinions = pull["opinions"]
+                  total, read = opinions["totalCount"], len(opinions["nodes"])
+                  if total > read:
+                      return f"review settle: {total} approvals or change requests, {read} read"
+                  standing = _standing_change_request(_on_head_reviews(pull, "opinions"))
                   if standing:
                       login = standing["author"]["login"]
                       at = datetime.fromisoformat(standing["submittedAt"])
@@ -926,6 +931,8 @@ jobs:
                   author { login __typename }
                   autoMergeRequest { enabledAt commitHeadline mergeMethod }
                   labels(first: 50) { nodes { name } }
+                  opinions: reviews(last: 100, states: [APPROVED, CHANGES_REQUESTED]) {
+                    totalCount nodes { submittedAt state author { login __typename } commit { oid } } }
                   reviews(last: 20) {
                     nodes {
                       submittedAt

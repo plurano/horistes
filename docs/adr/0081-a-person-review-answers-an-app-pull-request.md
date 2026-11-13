@@ -53,6 +53,9 @@ The following changes live in
   A different person's reply or approval cannot clear it
   (`test_planted_app_pr_change_request_survives_other_reply`,
   `test_planted_app_pr_change_request_survives_other_approval`).
+- Read the latest 100 approvals and change requests in a separate list, so thread
+  replies cannot push a change request out of the read. Hold an app pull request
+  when that list has more entries than were read.
 - In `review_settle`, use `_on_head_reviews` and `_review_timing_hold` to compare
   holding reviews with responses classified by `_responds` on the current head.
   A holding review at or after the last push or qualifying
@@ -121,3 +124,11 @@ The stricter reply classification and standing change requests are pinned by
 `test_app_pr_standalone_review_answered_by_reply_settles` and
 `test_person_reply_shapes`. The query test also pins the body and thread-reply
 fields, including the comment count needed to reject truncated pages.
+
+The separate opinions list and its completeness hold are pinned by
+`test_planted_app_pr_change_request_survives_review_window`,
+`test_planted_app_pr_truncated_opinions_hold`,
+`test_app_pr_complete_opinions_boundary_settles`,
+`test_app_pr_dismissed_change_request_settles`,
+`test_person_pr_truncated_opinions_do_not_hold` and
+`test_opinions_query_reads_bounded_review_states`.

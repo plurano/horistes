@@ -37,8 +37,8 @@ Move `MERGE_STATE`, `COMMITS`, `MERGED`, `MERGE`, `ENQUEUE`, `DEQUEUE`, `ARM`,
 them. `QUERY` and `STATUS_QUERY` stay in the rules module because `pull_query`
 there selects one.
 
-Without these documents the rules step counts 3601 fields, and 3918 with
-ADR-0081: 178 fields under the cap of
+Without these documents the rules step counts 3601 fields, and 3975 with
+ADR-0081: 121 fields under the cap of
 [ADR-0053](0053-the-train-sweep-is-a-checked-out-file.md), counted with the same rule.
 
 ## Consequences
@@ -56,7 +56,7 @@ A run script over the cap still fails the engine audit before commit through
 [.config/lefthook/engine.sh](../../.config/lefthook/engine.sh) and in CI through
 [.github/workflows/ci.yml](../../.github/workflows/ci.yml).
 
-The rules step keeps a margin of only 178 fields with ADR-0081. The next large
+The rules step keeps a margin of only 121 fields with ADR-0081. The next large
 rule should move to [tools/merge_train.py](../../tools/merge_train.py) too.
 
 ## Tests
