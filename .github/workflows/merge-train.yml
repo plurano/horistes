@@ -218,16 +218,16 @@ jobs:
       releases: ${{ steps.sweep.outputs.releases }}
     steps:
       # The train's pure rules (which pull request it lands, updates or leaves
-      # alone, which issues it closes, and the squash message) and its GraphQL
-      # documents, written as a module the train script imports. They stayed
-      # inline when the sweep moved to tools/merge_train.py, since this run
-      # script is within the engine's cap of 4096 fields per run script
-      # (decision records 0034, 0037, 0039, 0053).
+      # alone, which issues it closes, and the squash message) and its pull query,
+      # written as a module the train script imports. The train's other GraphQL
+      # documents live in tools/merge_train.py, so this run script stays within
+      # the engine's cap of 4096 fields per run script (decision records 0034,
+      # 0037, 0039, 0053, 0082).
       - name: Write the train rules module
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/train_rules.py" <<'PY'
-          """Merge train rules: verdicts, issues to close, squash message, GraphQL documents."""
+          """Merge train rules: verdicts, issues to close, squash message, the pull query."""
 
           import re
           from datetime import datetime, timedelta
@@ -380,61 +380,153 @@ jobs:
           _REVIEW_HOLD = frozenset({"CHANGES_REQUESTED", "COMMENTED"})
 
 
+          def _thread_replies_only(review):
+              """Whether a review has no body and all comments are fetched thread replies."""
+              comments = review.get("comments") or {}
+              nodes = comments.get("nodes") or []
+              return (
+                  not (review.get("body") or "").strip()
+                  and bool(nodes)
+                  and comments.get("totalCount") == len(nodes)
+                  and all(node.get("replyTo") for node in nodes)
+              )
+
+
+          def _person_reply(review):
+              """Whether a person's review on an app PR answers the reviews before it:
+              an approval, or thread replies only.
+              """
+              if (review.get("author") or {}).get("__typename") != "User":
+                  return False
+              if review.get("state") == "APPROVED":
+                  return True
+              if review.get("state") != "COMMENTED":
+                  return False
+              return _thread_replies_only(review)
+
+
+          def _is_bot_author(author):
+              """Whether an author is a bot account: GraphQL type Bot, or a [bot] login."""
+              if not isinstance(author, dict):
+                  return False
+              return (
+                  author.get("__typename") == "Bot" or (author.get("login") or "").endswith("[bot]")
+              )
+
+
           def is_bot_dependency(pull, conf):
               """Whether a pull request is a bot-authored dependency update."""
               if not pull["headRefName"].startswith(conf["dependency"]):
                   return False
-              author = pull.get("author")
-              if not isinstance(author, dict):
-                  return False
-              login = author.get("login") or ""
-              return author.get("__typename") == "Bot" or login.endswith("[bot]")
+              return _is_bot_author(pull.get("author"))
 
 
-          def review_settle(pull, conf, now):
-              """Why a person-authored PR waits for its reviews to settle, or None.
+          def _responds(review, pr_author, app_author):
+              """Whether a head review answers: person reply on app PRs, author login otherwise."""
+              if app_author:
+                  return _person_reply(review)
+              author = review.get("author") or {}
+              return author.get("login") == pr_author
 
-              A submitted review on the current head that is newer than the author's
-              last push (head commit date) or reply (author review on the same head)
-              holds the PR from landing.  Bot PRs (dependency prefix AND bot author)
-              skip this check.  Approved, dismissed, and pending reviews do not hold.
+
+          def _standing_change_request(on_head):
+              """The newest person change request on the head that the same person has not
+              approved since, or None.
               """
-              if is_bot_dependency(pull, conf):
-                  return None
-              author_field = pull.get("author") or {}
-              pr_author = author_field.get("login", "") if isinstance(author_field, dict) else ""
+              approvals = {}
+              for review in on_head:
+                  author = review.get("author") or {}
+                  if author.get("__typename") == "User" and review.get("state") == "APPROVED":
+                      login = author.get("login")
+                      at = datetime.fromisoformat(review["submittedAt"])
+                      approvals[login] = max(approvals.get(login, at), at)
+              standing = []
+              for review in on_head:
+                  author = review.get("author") or {}
+                  at = datetime.fromisoformat(review["submittedAt"])
+                  if (
+                      author.get("__typename") == "User"
+                      and review.get("state") == "CHANGES_REQUESTED"
+                      and approvals.get(author.get("login"), at) <= at
+                  ):
+                      standing.append(review)
+              return max(
+                  standing, key=lambda r: datetime.fromisoformat(r["submittedAt"]), default=None
+              )
+
+
+          def _on_head_reviews(pull, connection="reviews"):
+              """Submitted head reviews from the named connection."""
               head_oid = pull["headRefOid"]
-              nodes = pull["latest"]["nodes"]
-              if not nodes:
-                  return None
-              push_at = datetime.fromisoformat(nodes[-1]["commit"]["committedDate"])
-              reviews = pull.get("reviews", {}).get("nodes") or []
-              on_head = [
+              reviews = pull.get(connection, {}).get("nodes") or []
+              return [
                   r for r in reviews
                   if (r.get("commit") or {}).get("oid") == head_oid and r.get("submittedAt")
               ]
+
+
+          def _review_timing_hold(on_head, pr_author, app_author, push_at):
+              """Why a holding head review needs a strictly later push or reply, or None."""
               external = [
                   r for r in on_head
-                  if (r.get("author") or {}).get("login") != pr_author
+                  if not _responds(r, pr_author, app_author)
                   and r.get("state") in _REVIEW_HOLD
               ]
               if not external:
                   return None
               newest_ext = max(datetime.fromisoformat(r["submittedAt"]) for r in external)
-              author_acts = [
-                  r for r in on_head
-                  if (r.get("author") or {}).get("login") == pr_author and r.get("submittedAt")
-              ]
-              reply_at = max(
-                  (datetime.fromisoformat(r["submittedAt"]) for r in author_acts),
-                  default=datetime.min.replace(tzinfo=push_at.tzinfo) if push_at.tzinfo else datetime.min,
+              responses = (
+                  datetime.fromisoformat(r["submittedAt"]) for r in on_head
+                  if _responds(r, pr_author, app_author)
               )
-              settle_at = max(push_at, reply_at)
-              if newest_ext > settle_at:
+              settle_at = max(push_at, max(responses, default=push_at))
+              if newest_ext >= settle_at:
                   return (
                       f"review settle: review at {newest_ext:%H:%M:%SZ} on head, "
                       f"last response at {settle_at:%H:%M:%SZ}"
                   )
+              return None
+
+
+          def review_settle(pull, conf, now):
+              """Why a pull request waits for its reviews to settle, or None.
+
+              A submitted holding review on the current head at or after the author's
+              last push or response holds the PR from landing; a tie holds on every PR.
+              On an app PR, a person thread reply or approval answers earlier reviews;
+              a new person review holds. A person's change request holds until that
+              person approves later. An app's review, including the authoring app's
+              own review, never answers on an app PR (ADR-0081).
+              Opinions read separately; truncated reads hold app PRs.
+              Bot PRs (dependency prefix AND bot author) skip this check.
+              Approved, dismissed, and pending reviews do not hold.
+              """
+              if is_bot_dependency(pull, conf):
+                  return None
+              author_field = pull.get("author") or {}
+              pr_author = author_field.get("login", "") if isinstance(author_field, dict) else ""
+              app_author = _is_bot_author(author_field)
+              nodes = pull["latest"]["nodes"]
+              if not nodes:
+                  return None
+              push_at = datetime.fromisoformat(nodes[-1]["commit"]["committedDate"])
+              on_head = _on_head_reviews(pull)
+              timing_hold = _review_timing_hold(on_head, pr_author, app_author, push_at)
+              if timing_hold:
+                  return timing_hold
+              if app_author:
+                  opinions = pull["opinions"]
+                  total, read = opinions["totalCount"], len(opinions["nodes"])
+                  if total > read:
+                      return f"review settle: {total} approvals or change requests, {read} read"
+                  standing = _standing_change_request(_on_head_reviews(pull, "opinions"))
+                  if standing:
+                      login = standing["author"]["login"]
+                      at = datetime.fromisoformat(standing["submittedAt"])
+                      return (
+                          f"review settle: change request by {login} "
+                          f"at {at:%H:%M:%SZ} on head stands"
+                      )
               return None
 
 
@@ -839,12 +931,16 @@ jobs:
                   author { login __typename }
                   autoMergeRequest { enabledAt commitHeadline mergeMethod }
                   labels(first: 50) { nodes { name } }
+                  opinions: reviews(last: 100, states: [APPROVED, CHANGES_REQUESTED]) {
+                    totalCount nodes { submittedAt state author { login __typename } commit { oid } } }
                   reviews(last: 20) {
                     nodes {
                       submittedAt
                       state
-                      author { login }
+                      author { login __typename }
                       commit { oid }
+                      body
+                      comments(first: 10) { totalCount nodes { replyTo { id } } }
                     }
                   }
                   refreshes: timelineItems(itemTypes: [UNLABELED_EVENT], last: 5) {
@@ -889,118 +985,6 @@ jobs:
           def pull_query(conf):
               """The open pull request query; it selects the required status only when one is set."""
               return STATUS_QUERY if conf.get("required_status") else QUERY
-
-
-          MERGE_STATE = """
-          query($owner: String!, $name: String!, $number: Int!) {
-            repository(owner: $owner, name: $name) {
-              pullRequest(number: $number) {
-                mergeStateStatus
-              }
-            }
-          }
-          """
-          COMMITS = """
-          query($owner: String!, $name: String!, $number: Int!) {
-            repository(owner: $owner, name: $name) {
-              pullRequest(number: $number) {
-                commits(first: 100) {
-                  totalCount
-                  nodes { commit { message parents { totalCount } } }
-                }
-              }
-            }
-          }
-          """
-          # The newest merged pull requests and the issues each one closes, for the close step.
-          MERGED = """
-          query($owner: String!, $name: String!) {
-            repository(owner: $owner, name: $name) {
-              pullRequests(states: MERGED, first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                nodes {
-                  number mergedAt
-                  mergedBy { login }
-                  mergeCommit { oid }
-                  closingIssuesReferences(first: 25) {
-                    nodes {
-                      number state
-                      repository { nameWithOwner }
-                      timelineItems(itemTypes: [REOPENED_EVENT], last: 5) {
-                        nodes { ... on ReopenedEvent { createdAt } }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          """
-          MERGE = """
-          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
-                   $headline: String, $body: String) {
-            mergePullRequest(
-              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
-                      commitHeadline: $headline, commitBody: $body}
-            ) {
-              pullRequest { merged }
-            }
-          }
-          """
-          # A default branch with a merge queue refuses a direct merge; the queue lands it.
-          ENQUEUE = """
-          mutation($id: ID!, $oid: GitObjectID!) {
-            enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
-              mergeQueueEntry { state }
-            }
-          }
-          """
-          # Dequeue a pull request from the merge queue.
-          DEQUEUE = """
-          mutation($id: ID!) {
-            dequeuePullRequest(input: {id: $id}) {
-              mergeQueueEntry { id }
-            }
-          }
-          """
-          ARM = """
-          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
-                   $headline: String, $body: String) {
-            enablePullRequestAutoMerge(
-              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
-                      commitHeadline: $headline, commitBody: $body}
-            ) {
-              pullRequest { autoMergeRequest { enabledAt } }
-            }
-          }
-          """
-          DISARM = """
-          mutation($id: ID!) {
-            disablePullRequestAutoMerge(input: {pullRequestId: $id}) {
-              pullRequest { autoMergeRequest { enabledAt } }
-            }
-          }
-          """
-          DRAFT = """
-          mutation($id: ID!) {
-            convertPullRequestToDraft(input: {pullRequestId: $id}) {
-              pullRequest { isDraft }
-            }
-          }
-          """
-          READY = """
-          mutation($id: ID!) {
-            markPullRequestReadyForReview(input: {pullRequestId: $id}) {
-              pullRequest { isDraft }
-            }
-          }
-          """
-          COMMIT_MUTATION = """
-          mutation($input: CreateCommitOnBranchInput!) {
-            createCommitOnBranch(input: $input) {
-              commit { oid }
-            }
-          }
-          """
           PY
 
       # The sweep script is tools/merge_train.py of this workflow's own commit,

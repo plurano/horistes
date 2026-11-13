@@ -92,6 +92,7 @@ READ = {"metadata": "read", "contents": "read", "pull_requests": "read", "checks
 STATUSES = {"statuses": "read"}
 ISSUES = {"issues": "write"}
 BOT = "merge-train-app"
+APP = {"login": "plurano-merge-train", "__typename": "Bot"}
 
 
 SCRIPT = ROOT / "tools/merge_train.py"
@@ -237,6 +238,14 @@ def pull(number: int, state: str, **fields) -> dict:
         pr_author = {"login": f"author-{number}"}
     reviews = fields.pop("reviews", [])
     review_nodes = reviews if isinstance(reviews, dict) else {"nodes": reviews}
+    opinions = fields.pop("opinions", None)
+    if opinions is None:
+        opinion_nodes = [
+            r
+            for r in review_nodes.get("nodes") or []
+            if r.get("state") in {"APPROVED", "CHANGES_REQUESTED"}
+        ]
+        opinions = {"totalCount": len(opinion_nodes), "nodes": opinion_nodes[-100:]}
     status = fields.pop("status", None)
     commit_node = build_commit_node(number, suites, status=status, **fields)
     node = {
@@ -255,6 +264,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "autoMergeRequest": None,
         "labels": {"nodes": [{"name": name} for name in labels]},
         "reviews": review_nodes,
+        "opinions": opinions,
         "refreshes": {"nodes": []},
         "latest": {"nodes": [{"commit": commit_node}]},
     }
@@ -4077,11 +4087,11 @@ def test_merge_method_merge_sends_no_headline_or_body(tmp_path, state, kind):
 
 
 def test_without_commit_body_in_merge_mutation_the_planted_test_fails(tmp_path):
-    mutant = module().replace(", commitBody: $body", "")
-    assert mutant != module()
+    mutant = script().replace(", commitBody: $body", "")
+    assert mutant != script()
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.commits[1] = list(PLANTED_COMMITS)
-    done, _ = train(tmp_path, forge, helper=mutant)
+    done, _ = train(tmp_path, forge, text=mutant)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.messages == [("merge", "PR_1", "change 1 (#1)", None)]
     assert forge.messages[0][3] != PLANTED_BODY
@@ -6107,8 +6117,611 @@ def test_the_query_reads_author_and_reviews(tmp_path):
     """The GraphQL pull query requests the PR author and recent reviews."""
     rules = load_rules(tmp_path)
     assert "author { login __typename }" in rules.QUERY
-    assert "author { login }" in rules.QUERY
+    assert re.search(
+        r"reviews\(last: 20\) \{\s*nodes \{\s*submittedAt\s*state\s*"
+        r"author \{ login __typename \}",
+        rules.QUERY,
+    )
     assert "reviews(last: 20)" in rules.QUERY
+    assert re.search(
+        r"commit \{ oid \}\s*body\s*comments\(first: 10\) "
+        r"\{ totalCount nodes \{ replyTo \{ id \} \} \}",
+        rules.QUERY,
+    )
+
+
+def _head_review(login, typename, submitted_at, state="COMMENTED"):
+    """One submitted review on pull request 1's current head."""
+    return {
+        "submittedAt": submitted_at,
+        "state": state,
+        "author": {"login": login, "__typename": typename},
+        "commit": {"oid": f"{1:040x}"},
+    }
+
+
+def _thread_reply(login, submitted_at):
+    """A person's review containing only a reply to an existing finding."""
+    return {
+        **_head_review(login, "User", submitted_at),
+        "body": "",
+        "comments": {"totalCount": 1, "nodes": [{"replyTo": {"id": "PRRC_finding"}}]},
+    }
+
+
+def test_planted_app_pr_person_reply_settles(tmp_path):
+    """A person's commented review answers an earlier app review on an app PR."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _thread_reply("lusoris", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_planted_app_pr_without_reply_holds(tmp_path):
+    """An unanswered app review still holds a non-dependency app PR."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00")],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:43:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_planted_live_7747_person_reply_alone_settles(tmp_path):
+    """The person's lone thread reply on live PR 7747 does not become a holding review."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:43:07+00:00",
+        reviews=[_thread_reply("lusoris", "2026-11-13T15:47:50+00:00")],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_app_pr_person_approval_settles(tmp_path):
+    """A person's approval answers earlier app reviews on an app PR."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("lusoris", "User", "2026-11-13T15:47:00+00:00", "APPROVED"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_app_pr_person_change_request_holds(tmp_path):
+    """A person's request for changes holds an app PR rather than answering it."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("lusoris", "User", "2026-11-13T15:47:00+00:00", "CHANGES_REQUESTED"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_app_pr_app_reply_does_not_settle(tmp_path):
+    """Another app's commented review cannot answer an app review."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("coderabbitai", "Bot", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_person_pr_other_person_review_still_holds(tmp_path):
+    """A different person's review still holds a person-authored PR."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="feat/x",
+        author={"login": "person", "__typename": "User"},
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_head_review("other", "User", "2026-11-13T15:47:00+00:00")],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_app_pr_person_reply_before_bot_review_holds(tmp_path):
+    """A person's reply cannot settle an app review submitted afterward."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _thread_reply("lusoris", "2026-11-13T15:42:00+00:00"),
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:45:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:45:00Z on head, last response at 15:42:00Z"
+    )
+
+
+def test_is_bot_author_shapes(tmp_path):
+    """Bot detection accepts the GraphQL type and legacy suffix, including missing authors."""
+    rules = load_rules(tmp_path)
+    assert rules._is_bot_author(None) is False
+    assert rules._is_bot_author({"login": "x"}) is False
+    assert rules._is_bot_author({"login": "renovate[bot]"}) is True
+    assert rules._is_bot_author({"login": "renovate", "__typename": "Bot"}) is True
+    assert rules._is_bot_author({"login": "person", "__typename": "User"}) is False
+
+
+def test_planted_train_lands_app_pr_after_person_reply(tmp_path):
+    """The step lands a non-dependency app PR after a person answers its app review."""
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        createdAt=OLD,
+        committedDate=(NOW - timedelta(minutes=20)).isoformat(),
+        reviews=[
+            _head_review("sourcery-ai", "Bot", (NOW - timedelta(minutes=10)).isoformat()),
+            _thread_reply("lusoris", (NOW - timedelta(minutes=6)).isoformat()),
+        ],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_planted_train_holds_app_pr_without_reply(tmp_path):
+    """The step keeps a non-dependency app PR held until its review is answered."""
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        createdAt=OLD,
+        committedDate=(NOW - timedelta(minutes=20)).isoformat(),
+        reviews=[_head_review("sourcery-ai", "Bot", (NOW - timedelta(minutes=10)).isoformat())],
+    )
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | CLEAN | review settle:" in summary
+
+
+def test_planted_app_pr_own_app_review_does_not_settle(tmp_path):
+    """The authoring app cannot answer another app's review."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("plurano-merge-train", "Bot", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_planted_app_pr_tie_holds(tmp_path):
+    """An app review holds when its timestamp ties a person's reply."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:47:00+00:00"),
+            _thread_reply("lusoris", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:47:00Z"
+    )
+
+
+def test_planted_person_pr_tie_holds(tmp_path):
+    """A person's PR also holds when another person's review ties the reply."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="feat/x",
+        author={"login": "person", "__typename": "User"},
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("other", "User", "2026-11-13T15:47:00+00:00"),
+            _head_review("person", "User", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:47:00Z"
+    )
+
+
+def test_planted_app_pr_change_request_survives_other_reply(tmp_path):
+    """A different person's thread reply cannot clear a change request."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            _head_review("alice", "User", "2026-11-13T15:45:00+00:00", "CHANGES_REQUESTED"),
+            _thread_reply("bob", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: change request by alice at 15:45:00Z on head stands"
+    )
+
+
+def test_planted_app_pr_change_request_survives_other_approval(tmp_path):
+    """A different person's approval cannot clear a change request."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("alice", "User", "2026-11-13T15:45:00+00:00", "CHANGES_REQUESTED"),
+            _head_review("bob", "User", "2026-11-13T15:47:00+00:00", "APPROVED"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: change request by alice at 15:45:00Z on head stands"
+    )
+
+
+def test_planted_app_pr_change_request_survives_review_window(tmp_path):
+    """Twenty later thread replies cannot hide a standing change request."""
+    rules = load_rules(tmp_path)
+    request = _head_review("alice", "User", "2026-11-13T15:45:00+00:00", "CHANGES_REQUESTED")
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _thread_reply("bob", f"2026-11-13T15:46:{second:02d}+00:00") for second in range(20)
+        ],
+        opinions={"totalCount": 1, "nodes": [request]},
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: change request by alice at 15:45:00Z on head stands"
+    )
+
+
+def test_planted_app_pr_truncated_opinions_hold(tmp_path):
+    """An unread opinion may be a change request, so an app PR holds."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_thread_reply("bob", "2026-11-13T15:47:00+00:00")],
+        opinions={
+            "totalCount": 101,
+            "nodes": [
+                _head_review("bob", "User", "2026-11-13T15:45:00+00:00", "APPROVED")
+                for _ in range(100)
+            ],
+        },
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: 101 approvals or change requests, 100 read"
+    )
+
+
+def test_app_pr_complete_opinions_boundary_settles(tmp_path):
+    """Reading all one hundred approvals leaves no unknown change request."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_thread_reply("bob", "2026-11-13T15:47:00+00:00")],
+        opinions={
+            "totalCount": 100,
+            "nodes": [
+                _head_review("bob", "User", "2026-11-13T15:45:00+00:00", "APPROVED")
+                for _ in range(100)
+            ],
+        },
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_app_pr_dismissed_change_request_settles(tmp_path):
+    """A dismissed change request is absent from opinions and cannot hold."""
+    rules = load_rules(tmp_path)
+    request = _head_review("alice", "User", "2026-11-13T15:45:00+00:00", "CHANGES_REQUESTED")
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            {**request, "state": "DISMISSED"},
+            _thread_reply("bob", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert p["opinions"] == {"totalCount": 0, "nodes": []}
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_person_pr_truncated_opinions_do_not_hold(tmp_path):
+    """The opinions completeness hold applies only to app pull requests."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        author={"login": "bob", "__typename": "User"},
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[_thread_reply("bob", "2026-11-13T15:47:00+00:00")],
+        opinions={
+            "totalCount": 101,
+            "nodes": [
+                _head_review("bob", "User", "2026-11-13T15:45:00+00:00", "APPROVED")
+                for _ in range(100)
+            ],
+        },
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_opinions_query_reads_bounded_review_states(tmp_path):
+    """The opinions window excludes replies and includes its total count."""
+    rules = load_rules(tmp_path)
+    assert re.search(
+        r"opinions: reviews\(last: 100, states: \[APPROVED, CHANGES_REQUESTED\]\) "
+        r"\{\s*totalCount nodes \{ submittedAt state author \{ login __typename \} "
+        r"commit \{ oid \} \} \}",
+        rules.QUERY,
+    )
+
+
+def test_app_pr_change_request_cleared_by_same_person_approval(tmp_path):
+    """The requesting person's later approval clears the change request."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("alice", "User", "2026-11-13T15:45:00+00:00", "CHANGES_REQUESTED"),
+            _head_review("alice", "User", "2026-11-13T15:47:00+00:00", "APPROVED"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_app_pr_approval_before_change_request_holds(tmp_path):
+    """An earlier approval cannot clear the same person's later change request."""
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("alice", "User", "2026-11-13T15:44:00+00:00", "APPROVED"),
+            _head_review("alice", "User", "2026-11-13T15:45:00+00:00", "CHANGES_REQUESTED"),
+            _thread_reply("bob", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: change request by alice at 15:45:00Z on head stands"
+    )
+
+
+def test_planted_app_pr_person_standalone_review_holds(tmp_path):
+    """A new review body holds rather than answering the earlier app review."""
+    rules = load_rules(tmp_path)
+    person_review = {
+        **_head_review("lusoris", "User", "2026-11-13T15:47:00+00:00"),
+        "body": "Please also bump the chart.",
+    }
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            person_review,
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_planted_app_pr_person_new_inline_comment_holds(tmp_path):
+    """A new inline comment holds even with an empty review body."""
+    rules = load_rules(tmp_path)
+    person_review = {
+        **_head_review("lusoris", "User", "2026-11-13T15:47:00+00:00"),
+        "body": "",
+        "comments": {"totalCount": 1, "nodes": [{"replyTo": None}]},
+    }
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            person_review,
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_app_pr_reply_mixed_with_new_comment_holds(tmp_path):
+    """A reply mixed with a new inline comment remains a holding review."""
+    rules = load_rules(tmp_path)
+    person_review = {
+        **_thread_reply("lusoris", "2026-11-13T15:47:00+00:00"),
+        "comments": {
+            "totalCount": 2,
+            "nodes": [{"replyTo": {"id": "PRRC_finding"}}, {"replyTo": None}],
+        },
+    }
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            person_review,
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_app_pr_truncated_comments_hold(tmp_path):
+    """A truncated comment page cannot prove that every comment answers a thread."""
+    rules = load_rules(tmp_path)
+    person_review = {
+        **_thread_reply("lusoris", "2026-11-13T15:47:00+00:00"),
+        "comments": {
+            "totalCount": 11,
+            "nodes": [{"replyTo": {"id": "PRRC_finding"}} for _ in range(10)],
+        },
+    }
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            person_review,
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) == (
+        "review settle: review at 15:47:00Z on head, last response at 15:40:00Z"
+    )
+
+
+def test_app_pr_standalone_review_answered_by_reply_settles(tmp_path):
+    """A later thread reply answers a person's earlier standalone review."""
+    rules = load_rules(tmp_path)
+    person_review = {
+        **_head_review("alice", "User", "2026-11-13T15:45:00+00:00"),
+        "body": "Check the digest.",
+    }
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+        committedDate="2026-11-13T15:40:00+00:00",
+        reviews=[
+            _head_review("sourcery-ai", "Bot", "2026-11-13T15:43:00+00:00"),
+            person_review,
+            _thread_reply("bob", "2026-11-13T15:47:00+00:00"),
+        ],
+    )
+    assert rules.review_settle(p, {"dependency": ("renovate/",)}, NOW) is None
+
+
+def test_person_reply_shapes(tmp_path):
+    """Only a User approval or a review consisting entirely of thread replies answers."""
+    rules = load_rules(tmp_path)
+    assert (
+        rules._person_reply(_head_review("alice", "User", "2026-11-13T15:47:00+00:00", "APPROVED"))
+        is True
+    )
+    assert rules._person_reply(_thread_reply("alice", "2026-11-13T15:47:00+00:00")) is True
+    assert (
+        rules._person_reply({**_thread_reply("app", "2026-11-13T15:47:00+00:00"), "author": APP})
+        is False
+    )
+    assert (
+        rules._person_reply(
+            _head_review("alice", "User", "2026-11-13T15:47:00+00:00", "CHANGES_REQUESTED")
+        )
+        is False
+    )
+    assert rules._person_reply(_head_review("alice", "User", "2026-11-13T15:47:00+00:00")) is False
 
 
 def _detail(
@@ -7079,6 +7692,87 @@ def test_maintainer_write_answer_lands_bot_pull_request(tmp_path):
     assert forge.writes == [landed(1)]
     assert "### fleet/app: landed #1" in summary
     assert forge.right_calls == ["maintainer", "maintainer"]
+
+
+def test_planted_app_image_pin_owner_answer_lands(tmp_path):
+    """An owner's named answer releases the live app image-pin review-body finding."""
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+    )
+    forge = Forge(repository(p))
+    forge.commits[1] = [
+        ("chore(image): pin kb-mcp\n\nSigned-off-by: Producer <producer@example.org>", 1)
+    ]
+    forge.review_details[1] = _detail(
+        reviews=[
+            _bot_review(
+                5869705498,
+                "sourcery-ai",
+                "Hey - I've found 1 issue\n\n### Sourcery assessment\n\n"
+                "**Needs a human reviewer.** The pin changes the served image.",
+            )
+        ],
+        comments=[
+            {
+                "body": "Answer to pullrequestreview-5869705498: each of its 1 findings is also "
+                "an inline thread, answered and resolved there.",
+                "authorAssociation": "OWNER",
+                "author": {"login": "owner", "__typename": "User"},
+            },
+            {
+                "body": "<!-- ai/pr-reviewer:v1 -->\nRisk review: low.",
+                "authorAssociation": "OWNER",
+                "author": {"login": "owner", "__typename": "User"},
+            },
+        ],
+    )
+    forge.rights = {"owner": "admin"}
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+def test_app_image_pin_unrelated_owner_comment_holds(tmp_path, monkeypatch):
+    """An unrelated owner comment leaves the Sourcery finding unanswered."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    body = (
+        "Hey - I've found 1 issue\n\n### Sourcery assessment\n\n"
+        "**Needs a human reviewer.** The pin changes the served image."
+    )
+    assert merge_train._bot_body_has_finding("sourcery-ai", body) is True
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="image-pin/kb-mcp",
+        author=APP,
+    )
+    forge = Forge(repository(p))
+    forge.commits[1] = [
+        ("chore(image): pin kb-mcp\n\nSigned-off-by: Producer <producer@example.org>", 1)
+    ]
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(5869705498, "sourcery-ai", body)],
+        comments=[
+            {
+                "body": "<!-- ai/pr-reviewer:v1 -->\nRisk review: low.",
+                "authorAssociation": "OWNER",
+                "author": {"login": "owner", "__typename": "User"},
+            }
+        ],
+    )
+    forge.rights = {"owner": "admin"}
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        "| #1 | CLEAN | review body: sourcery-ai review 5869705498 has findings "
+        "without a reply naming pullrequestreview-5869705498 |"
+    ) in summary
+    assert forge.right_calls == []
 
 
 def test_maintainer_admin_answer_lands_bot_pull_request(tmp_path):
