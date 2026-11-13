@@ -4078,11 +4078,11 @@ def test_merge_method_merge_sends_no_headline_or_body(tmp_path, state, kind):
 
 
 def test_without_commit_body_in_merge_mutation_the_planted_test_fails(tmp_path):
-    mutant = module().replace(", commitBody: $body", "")
-    assert mutant != module()
+    mutant = script().replace(", commitBody: $body", "")
+    assert mutant != script()
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.commits[1] = list(PLANTED_COMMITS)
-    done, _ = train(tmp_path, forge, helper=mutant)
+    done, _ = train(tmp_path, forge, text=mutant)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.messages == [("merge", "PR_1", "change 1 (#1)", None)]
     assert forge.messages[0][3] != PLANTED_BODY
