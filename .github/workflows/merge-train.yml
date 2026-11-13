@@ -378,8 +378,31 @@ jobs:
 
 
           _REVIEW_HOLD = frozenset({"CHANGES_REQUESTED", "COMMENTED"})
-          # On app PRs, User comments/approvals answer earlier reviews; change requests still hold.
-          _PERSON_RESPONSE = frozenset({"COMMENTED", "APPROVED"})
+
+
+          def _thread_replies_only(review):
+              """Whether a review has no body and all comments are fetched thread replies."""
+              comments = review.get("comments") or {}
+              nodes = comments.get("nodes") or []
+              return (
+                  not (review.get("body") or "").strip()
+                  and bool(nodes)
+                  and comments.get("totalCount") == len(nodes)
+                  and all(node.get("replyTo") for node in nodes)
+              )
+
+
+          def _person_reply(review):
+              """Whether a person's review on an app PR answers the reviews before it:
+              an approval, or thread replies only.
+              """
+              if (review.get("author") or {}).get("__typename") != "User":
+                  return False
+              if review.get("state") == "APPROVED":
+                  return True
+              if review.get("state") != "COMMENTED":
+                  return False
+              return _thread_replies_only(review)
 
 
           def _is_bot_author(author):
@@ -399,42 +422,51 @@ jobs:
 
 
           def _responds(review, pr_author, app_author):
-              """Whether a review on the head answers the reviews before it."""
+              """Whether a head review answers: person reply on app PRs, author login otherwise."""
+              if app_author:
+                  return _person_reply(review)
               author = review.get("author") or {}
-              if author.get("login") == pr_author:
-                  return True
-              return (
-                  app_author and author.get("__typename") == "User"
-                  and review.get("state") in _PERSON_RESPONSE
+              return author.get("login") == pr_author
+
+
+          def _standing_change_request(on_head):
+              """The newest person change request on the head that the same person has not
+              approved since, or None.
+              """
+              approvals = {}
+              for review in on_head:
+                  author = review.get("author") or {}
+                  if author.get("__typename") == "User" and review.get("state") == "APPROVED":
+                      login = author.get("login")
+                      at = datetime.fromisoformat(review["submittedAt"])
+                      approvals[login] = max(approvals.get(login, at), at)
+              standing = []
+              for review in on_head:
+                  author = review.get("author") or {}
+                  at = datetime.fromisoformat(review["submittedAt"])
+                  if (
+                      author.get("__typename") == "User"
+                      and review.get("state") == "CHANGES_REQUESTED"
+                      and approvals.get(author.get("login"), at) <= at
+                  ):
+                      standing.append(review)
+              return max(
+                  standing, key=lambda r: datetime.fromisoformat(r["submittedAt"]), default=None
               )
 
 
-          def review_settle(pull, conf, now):
-              """Why a pull request waits for its reviews to settle, or None.
-
-              A submitted review on the current head that is newer than the author's
-              last push (head commit date) or reply (author review on the same head)
-              holds the PR from landing. On an app-authored PR (Bot author), a person's
-              commented or approving review on the head is the reply; a person's
-              request for changes holds, an app's review never answers (ADR-0081).
-              Bot PRs (dependency prefix AND bot author) skip this check.
-              Approved, dismissed, and pending reviews do not hold.
-              """
-              if is_bot_dependency(pull, conf):
-                  return None
-              author_field = pull.get("author") or {}
-              pr_author = author_field.get("login", "") if isinstance(author_field, dict) else ""
-              app_author = _is_bot_author(author_field)
+          def _on_head_reviews(pull):
+              """Submitted reviews on the current head; the query reads at most twenty."""
               head_oid = pull["headRefOid"]
-              nodes = pull["latest"]["nodes"]
-              if not nodes:
-                  return None
-              push_at = datetime.fromisoformat(nodes[-1]["commit"]["committedDate"])
               reviews = pull.get("reviews", {}).get("nodes") or []
-              on_head = [
+              return [
                   r for r in reviews
                   if (r.get("commit") or {}).get("oid") == head_oid and r.get("submittedAt")
               ]
+
+
+          def _review_timing_hold(on_head, pr_author, app_author, push_at):
+              """Why a holding head review needs a strictly later push or reply, or None."""
               external = [
                   r for r in on_head
                   if not _responds(r, pr_author, app_author)
@@ -443,23 +475,53 @@ jobs:
               if not external:
                   return None
               newest_ext = max(datetime.fromisoformat(r["submittedAt"]) for r in external)
-              author_acts = [
-                  r for r in on_head
+              responses = (
+                  datetime.fromisoformat(r["submittedAt"]) for r in on_head
                   if _responds(r, pr_author, app_author)
-              ]
-              reply_at = max(
-                  (datetime.fromisoformat(r["submittedAt"]) for r in author_acts),
-                  default=(
-                      datetime.min.replace(tzinfo=push_at.tzinfo)
-                      if push_at.tzinfo else datetime.min
-                  ),
               )
-              settle_at = max(push_at, reply_at)
-              if newest_ext > settle_at:
+              settle_at = max(push_at, max(responses, default=push_at))
+              if newest_ext >= settle_at:
                   return (
                       f"review settle: review at {newest_ext:%H:%M:%SZ} on head, "
                       f"last response at {settle_at:%H:%M:%SZ}"
                   )
+              return None
+
+
+          def review_settle(pull, conf, now):
+              """Why a pull request waits for its reviews to settle, or None.
+
+              A submitted holding review on the current head at or after the author's
+              last push or response holds the PR from landing; a tie holds on every PR.
+              On an app PR, a person thread reply or approval answers earlier reviews;
+              a new person review holds. A person's change request holds until that
+              person approves later. An app's review, including the authoring app's
+              own review, never answers on an app PR (ADR-0081).
+              Bot PRs (dependency prefix AND bot author) skip this check.
+              Approved, dismissed, and pending reviews do not hold.
+              """
+              if is_bot_dependency(pull, conf):
+                  return None
+              author_field = pull.get("author") or {}
+              pr_author = author_field.get("login", "") if isinstance(author_field, dict) else ""
+              app_author = _is_bot_author(author_field)
+              nodes = pull["latest"]["nodes"]
+              if not nodes:
+                  return None
+              push_at = datetime.fromisoformat(nodes[-1]["commit"]["committedDate"])
+              on_head = _on_head_reviews(pull)
+              timing_hold = _review_timing_hold(on_head, pr_author, app_author, push_at)
+              if timing_hold:
+                  return timing_hold
+              if app_author:
+                  standing = _standing_change_request(on_head)
+                  if standing:
+                      login = standing["author"]["login"]
+                      at = datetime.fromisoformat(standing["submittedAt"])
+                      return (
+                          f"review settle: change request by {login} "
+                          f"at {at:%H:%M:%SZ} on head stands"
+                      )
               return None
 
 
@@ -870,6 +932,8 @@ jobs:
                       state
                       author { login __typename }
                       commit { oid }
+                      body
+                      comments(first: 10) { totalCount nodes { replyTo { id } } }
                     }
                   }
                   refreshes: timelineItems(itemTypes: [UNLABELED_EVENT], last: 5) {
