@@ -1313,3 +1313,23 @@ def test_without_reads_own_release_the_skip_stays_false(tmp_path, forge):
     assert done.returncode == 0, done.stdout + done.stderr
     assert outputs == "skip=false\npending=[]\nfrozen=false\n"
     assert "runs release-please in its own workflow" not in done.stdout
+
+
+def test_a_failed_release_pull_request_attempt_runs_once_more():
+    """A forge Server Error on the release pull request (k8s run 43262049834) gets a second
+    attempt after a wait, and only the second attempt can fail the job (record 0080)."""
+    found = ciwf.load(TRAIN)["jobs"]["release"]["steps"]
+    named = {s.get("name"): s for s in found}
+    first = named["Open or update the release pull request"]
+    wait = named["Wait before the second release pull request attempt"]
+    second = named["Open or update the release pull request, second attempt"]
+    failed = "steps.release-pr.outcome == 'failure'"
+    assert first["id"] == "release-pr"
+    assert first.get("continue-on-error") is True
+    assert wait["if"] == failed and wait["run"].strip() == "sleep 30"
+    assert second["if"] == failed
+    assert "continue-on-error" not in second
+    assert (second["uses"], second["with"]) == (first["uses"], first["with"])
+    order = [s.get("name") for s in found]
+    assert order.index(first["name"]) + 1 == order.index(wait["name"])
+    assert order.index(wait["name"]) + 1 == order.index(second["name"])
