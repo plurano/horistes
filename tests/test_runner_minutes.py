@@ -104,8 +104,8 @@ def test_read_timeout_minutes_from_repository_workflows():
     workflows = runners.load_workflow_timeouts(ROOT)
 
     ci = workflows[[".github", "workflows", "ci.yml"][-1]]
-    assert ci["timeout_minutes"] == 15
-    assert ci["job_timeouts"]["verify"] == 15
+    assert ci["timeout_minutes"] == 25
+    assert ci["job_timeouts"]["verify"] == 25
     assert ci["job_timeouts"]["floor"] == 10
     assert ci["job_timeouts"]["fuzz"] == 10
 
