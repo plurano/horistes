@@ -766,19 +766,26 @@ def real_check(day: str) -> subprocess.CompletedProcess:
 
 
 def test_real_repository_ruff_toml_passes_today_and_fails_after_expiry():
-    """The real repository check passes on 2026-11-13 and fails on 2026-11-19.
+    """The real repository check passes on 2026-11-13 and 2026-11-18 and fails after.
 
-    The pass day is the newest entry date in `exceptions.yaml`: before it, the
-    CIIBestPracticesID entry ends more than its category's 10 days ahead.
+    The first pass day is the newest entry date in `exceptions.yaml`: before it,
+    the CIIBestPracticesID entry ends more than its category's 10 days ahead
+    (`category_problem` in `tools/exceptions.py`). 2026-11-18 passes only with the
+    renewed CIIBestPracticesID entry, entry 1: its old end, 2026-11-17, fails then.
     """
     done_pass = real_check("2026-11-13")
     assert done_pass.returncode == 0, done_pass.stderr
     assert "accepted finding(s)" in done_pass.stdout
+    done_renewed = real_check("2026-11-18")
+    assert done_renewed.returncode == 0, done_renewed.stderr
     done_fail = real_check("2026-11-19")
     assert done_fail.returncode == 1
     assert (
         "ruff.toml: .config/agent/hooks/block_evasion.py expired on 2026-11-18" in done_fail.stderr
     )
+    done_cii = real_check("2026-11-24")
+    assert done_cii.returncode == 1
+    assert "exceptions.yaml: entry 1 expired on 2026-11-23" in done_cii.stderr
 
 
 def test_category_problem_3d():
