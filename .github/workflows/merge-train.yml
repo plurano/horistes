@@ -218,16 +218,16 @@ jobs:
       releases: ${{ steps.sweep.outputs.releases }}
     steps:
       # The train's pure rules (which pull request it lands, updates or leaves
-      # alone, which issues it closes, and the squash message) and its GraphQL
-      # documents, written as a module the train script imports. They stayed
-      # inline when the sweep moved to tools/merge_train.py, since this run
-      # script is within the engine's cap of 4096 fields per run script
-      # (decision records 0034, 0037, 0039, 0053).
+      # alone, which issues it closes, and the squash message) and its pull query,
+      # written as a module the train script imports. The train's other GraphQL
+      # documents live in tools/merge_train.py, so this run script stays within
+      # the engine's cap of 4096 fields per run script (decision records 0034,
+      # 0037, 0039, 0053, 0082).
       - name: Write the train rules module
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/train_rules.py" <<'PY'
-          """Merge train rules: verdicts, issues to close, squash message, GraphQL documents."""
+          """Merge train rules: verdicts, issues to close, squash message, the pull query."""
 
           import re
           from datetime import datetime, timedelta
@@ -914,118 +914,6 @@ jobs:
           def pull_query(conf):
               """The open pull request query; it selects the required status only when one is set."""
               return STATUS_QUERY if conf.get("required_status") else QUERY
-
-
-          MERGE_STATE = """
-          query($owner: String!, $name: String!, $number: Int!) {
-            repository(owner: $owner, name: $name) {
-              pullRequest(number: $number) {
-                mergeStateStatus
-              }
-            }
-          }
-          """
-          COMMITS = """
-          query($owner: String!, $name: String!, $number: Int!) {
-            repository(owner: $owner, name: $name) {
-              pullRequest(number: $number) {
-                commits(first: 100) {
-                  totalCount
-                  nodes { commit { message parents { totalCount } } }
-                }
-              }
-            }
-          }
-          """
-          # The newest merged pull requests and the issues each one closes, for the close step.
-          MERGED = """
-          query($owner: String!, $name: String!) {
-            repository(owner: $owner, name: $name) {
-              pullRequests(states: MERGED, first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                nodes {
-                  number mergedAt
-                  mergedBy { login }
-                  mergeCommit { oid }
-                  closingIssuesReferences(first: 25) {
-                    nodes {
-                      number state
-                      repository { nameWithOwner }
-                      timelineItems(itemTypes: [REOPENED_EVENT], last: 5) {
-                        nodes { ... on ReopenedEvent { createdAt } }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          """
-          MERGE = """
-          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
-                   $headline: String, $body: String) {
-            mergePullRequest(
-              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
-                      commitHeadline: $headline, commitBody: $body}
-            ) {
-              pullRequest { merged }
-            }
-          }
-          """
-          # A default branch with a merge queue refuses a direct merge; the queue lands it.
-          ENQUEUE = """
-          mutation($id: ID!, $oid: GitObjectID!) {
-            enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
-              mergeQueueEntry { state }
-            }
-          }
-          """
-          # Dequeue a pull request from the merge queue.
-          DEQUEUE = """
-          mutation($id: ID!) {
-            dequeuePullRequest(input: {id: $id}) {
-              mergeQueueEntry { id }
-            }
-          }
-          """
-          ARM = """
-          mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
-                   $headline: String, $body: String) {
-            enablePullRequestAutoMerge(
-              input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
-                      commitHeadline: $headline, commitBody: $body}
-            ) {
-              pullRequest { autoMergeRequest { enabledAt } }
-            }
-          }
-          """
-          DISARM = """
-          mutation($id: ID!) {
-            disablePullRequestAutoMerge(input: {pullRequestId: $id}) {
-              pullRequest { autoMergeRequest { enabledAt } }
-            }
-          }
-          """
-          DRAFT = """
-          mutation($id: ID!) {
-            convertPullRequestToDraft(input: {pullRequestId: $id}) {
-              pullRequest { isDraft }
-            }
-          }
-          """
-          READY = """
-          mutation($id: ID!) {
-            markPullRequestReadyForReview(input: {pullRequestId: $id}) {
-              pullRequest { isDraft }
-            }
-          }
-          """
-          COMMIT_MUTATION = """
-          mutation($input: CreateCommitOnBranchInput!) {
-            createCommitOnBranch(input: $input) {
-              commit { oid }
-            }
-          }
-          """
           PY
 
       # The sweep script is tools/merge_train.py of this workflow's own commit,
