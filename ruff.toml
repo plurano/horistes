@@ -14,7 +14,7 @@ ignore = []
 # Every entry names one file and ends in `# expires YYYY-MM-DD category <A|B|C|D>: reason`;
 # tools/exceptions.py fails an entry without it or past its day.
 [lint.per-file-ignores]
-".config/agent/hooks/block_evasion.py" = ["ISC001", "ISC004"] # expires 2026-11-18 category C: written by praetorctl adopt not edited by hand; ends when the engine render is ISC clean (engine-hook-render-isc-clean-20261108)
+".config/agent/hooks/block_evasion.py" = ["ISC001", "ISC004"] # expires 2026-11-23 category C: written by praetorctl adopt not edited by hand (cordanaLLM/praetor#1878); renewed once on 2026-11-13 and not again: re-adoption drops it once the engine render is ISC clean (engine-hook-render-isc-clean-20261108) and cordanaLLM/praetor#1853 is fixed
 
 [lint.isort]
 force-sort-within-sections = false
