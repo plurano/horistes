@@ -11,11 +11,15 @@ exceptions:
     path: .bestpractices.json
     issue: plurano/horistes#116
     category: C
-    entered: "2026-11-07"
+    entered: "2026-11-13"
     reason: >-
-      project answers are in .bestpractices.json; registration on
-      bestpractices.dev approved and waiting for completion
-    expires: "2026-11-17"
+      category C: project 16453 is registered and its answers match
+      .bestpractices.json; four criteria stay Unmet until the first release
+      (version_unique; version_semver; version_tags; release_notes; see
+      docs/adr/0069-the-first-release-is-0-1-0-from-release-please.md) and
+      release PR 150 for milestone 0.1.0 is held; the entry is renewed on
+      its category C interval until 0.1.0 ships and is then dropped
+    expires: "2026-11-23"
   - rule: MD013
     path: CLAUDE.md
     issue: cordanaLLM/praetor#1878
