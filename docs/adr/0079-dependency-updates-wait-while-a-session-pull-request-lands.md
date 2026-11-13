@@ -44,7 +44,9 @@ BLOCKED pull request whose workflow runs have all finished does not trigger the
 hold: it may be blocked by review requirements or unresolved threads. A session
 whose review decision is REVIEW_REQUIRED or CHANGES_REQUESTED never waits, since
 checks alone cannot unblock it, and an accepted merge state does not wait while
-a configured required status is missing or failing. Only check
+a configured required status is missing or failing. The train does not read
+review thread state, so a session blocked by an unresolved conversation still
+waits while a run is pending; `session_hold_hours` bounds that case. Only check
 suites of workflow runs count, because the train already reads them with its
 checks read right; an app suite without a workflow run can stay open forever, and
 the status-check rollup would need the statuses read right on every repository.
