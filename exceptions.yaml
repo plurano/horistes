@@ -11,11 +11,13 @@ exceptions:
     path: .bestpractices.json
     issue: plurano/horistes#116
     category: C
-    entered: "2026-11-07"
+    entered: "2026-11-13"
     reason: >-
-      project answers are in .bestpractices.json; registration on
-      bestpractices.dev approved and waiting for completion
-    expires: "2026-11-17"
+      category C: project 16453 is registered and its answers match
+      .bestpractices.json; the criteria version_unique and release_notes
+      stay Unmet until the first release (release PR 150 for milestone
+      0.1.0 is held); the entry ends when 0.1.0 ships
+    expires: "2026-11-23"
   - rule: MD013
     path: CLAUDE.md
     issue: cordanaLLM/praetor#1878

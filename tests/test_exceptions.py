@@ -766,8 +766,12 @@ def real_check(day: str) -> subprocess.CompletedProcess:
 
 
 def test_real_repository_ruff_toml_passes_today_and_fails_after_expiry():
-    """The real repository check passes on 2026-11-09 and fails on 2026-11-19."""
-    done_pass = real_check("2026-11-09")
+    """The real repository check passes on 2026-11-13 and fails on 2026-11-19.
+
+    The pass day is the newest entry date in `exceptions.yaml`: before it, the
+    CIIBestPracticesID entry ends more than its category's 10 days ahead.
+    """
+    done_pass = real_check("2026-11-13")
     assert done_pass.returncode == 0, done_pass.stderr
     assert "accepted finding(s)" in done_pass.stdout
     done_fail = real_check("2026-11-19")
