@@ -169,8 +169,10 @@ equal to what the train asks the forge for.
 When `session_authors` lists comma-separated logins, non-security dependency
 updates become drafts labelled `merge-train: session hold` while a matching
 session pull request is ready to land, BEHIND, or BLOCKED only by pending checks.
-A session that still needs a review, or whose configured `required_status` is
-missing or failing, does not wait. The hold is off by default. It releases when
+A session that still needs a review, or is superseded the way the train's
+verdict reads it, does not wait; neither does one in an accepted merge state
+whose configured `required_status` is missing or failing, while a BEHIND or
+pending session still waits. The hold is off by default. It releases when
 no session waits or the update's first hold reaches `session_hold_hours`
 (default 4, whole hours 1–48); an update that reaches the bound is never
 session-held again. A managed hold label keeps an update from landing even when

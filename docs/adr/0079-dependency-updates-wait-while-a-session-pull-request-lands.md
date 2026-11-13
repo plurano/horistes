@@ -35,8 +35,10 @@ a comma-separated list of logins, and `session_hold_hours`, a whole number from
 
 An open session pull request waits when its author is listed, it is ready for
 review, comes from the same repository, targets the default branch, uses no
-dependency branch prefix, carries no configured hold label, and has no red
-head check suite. Its merge state must be accepted by the train, BEHIND, or
+dependency branch prefix, carries no configured hold label, is not superseded
+(the `superseded` label, its own "superseded by #N", or another open pull
+request's "Supersedes #N", as the verdict reads them), and has no red head
+check suite. Its merge state must be accepted by the train, BEHIND, or
 BLOCKED while the newest run of a workflow on the head commit has not finished. A
 BLOCKED pull request whose workflow runs have all finished does not trigger the
 hold: it may be blocked by review requirements or unresolved threads. A session
@@ -93,8 +95,8 @@ keep it in draft; security updates themselves remain unaffected.
 The existing pull-request and label write paths supply the required rights.
 `tests/test_merge_train.py` covers pending and behind sessions, exclusions,
 release, the inclusive earliest-event bound, manual readiness, both holds
-together, invalid settings, review-blocked sessions, the required status for
-accepted states, each full query page, failed draft and label-removal writes,
+together, invalid settings, review-blocked and superseded sessions, the required
+status for accepted states, each full query page, failed draft and label-removal writes,
 managed labels in the verdict, the security release and the per-app
 concurrency group. `test_planted_session_hold_that_finds_no_session_lands_update`
 removes the session predicate and demonstrates the dependency update landing

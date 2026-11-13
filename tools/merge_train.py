@@ -212,9 +212,10 @@ def check_session_hold_hours(raw, error_cls=ValueError):
     return int(raw)
 
 
-def session_candidate(pull, default_branch, conf):
-    """An open, unheld session branch whose checks have not gone red."""
+def session_candidate(pull, default_branch, conf, replaced=frozenset()):
+    """An open, unheld, unsuperseded session branch whose checks have not gone red."""
     author = pull.get("author") or {}
+    labels = label_names(pull)
     return (
         isinstance(author, dict)
         and author.get("login") in conf["session_authors"]
@@ -223,7 +224,9 @@ def session_candidate(pull, default_branch, conf):
         and not pull["isCrossRepository"]
         and pull["baseRefName"] == default_branch
         and not pull["headRefName"].startswith(conf["dependency"])
-        and not label_names(pull) & conf["hold"]
+        and not labels & conf["hold"]
+        and "superseded" not in labels
+        and pull["number"] not in replaced
         and not is_red(pull)
     )
 
@@ -244,9 +247,9 @@ def runs_pending(pull):
     )
 
 
-def session_waiting(pull, default_branch, conf):
+def session_waiting(pull, default_branch, conf, replaced=frozenset()):
     """A session PR ready to land, behind, or blocked only by pending checks (record 0079)."""
-    if not session_candidate(pull, default_branch, conf):
+    if not session_candidate(pull, default_branch, conf, replaced):
         return False
     if pull.get("reviewDecision") in REVIEW_BLOCKS:
         return False
@@ -273,9 +276,12 @@ def session_hold_expired(pull, conf, now):
     return now - min(stamps) >= conf["session_hold"]
 
 
-def session_hold(rows, default_branch, conf, now, unread=False):
-    """(why updates wait or None, updates to hold, labelled updates to release)."""
-    sessions = [pull for pull, _ in rows if session_waiting(pull, default_branch, conf)]
+def session_hold(rows, default_branch, conf, now, unread=False, replaced=frozenset()):
+    """(why updates wait or None, updates to hold, labelled updates to release).
+
+    `replaced` is the supersession set the verdicts use; a superseded session never waits.
+    """
+    sessions = [pull for pull, _ in rows if session_waiting(pull, default_branch, conf, replaced)]
     marked = [pull for pull, _ in rows if SESSION_HOLD_LABEL in label_names(pull)]
     if sessions:
         why = f"session pull request #{sessions[0]['number']} waits"
@@ -729,7 +735,8 @@ def hold_dependency_updates(env, repo, rows, notes, conf, now):
     ]
     removals = [(pull, SECURITY_HOLD_LABEL, "released from the security hold") for pull in release]
     unread = repo["pullRequests"]["pageInfo"]["hasNextPage"]
-    why, hold, release = session_hold(rows, default_branch, conf, now, unread)
+    replaced = superseded([pull for pull, _ in rows])
+    why, hold, release = session_hold(rows, default_branch, conf, now, unread, replaced)
     hours = conf["session_hold"] // timedelta(hours=1)
     additions += [
         (pull, SESSION_HOLD_LABEL, f"held as a draft: {why} (bound {hours} h)") for pull in hold

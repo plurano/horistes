@@ -4700,7 +4700,7 @@ APP_SUITE = {
     "workflowRun": None,
 }
 SESSION_PREDICATE = (
-    "sessions = [pull for pull, _ in rows if session_waiting(pull, default_branch, conf)]"
+    "sessions = [pull for pull, _ in rows if session_waiting(pull, default_branch, conf, replaced)]"
 )
 
 
@@ -5004,6 +5004,26 @@ def test_session_hold_releases_a_security_update_at_once(tmp_path, draft):
 def test_session_hold_waits_only_when_checks_alone_block(tmp_path, decision, held):
     update, session = session_pair(reviewDecision=decision)
     forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+    assert (landed(1) in forge.writes) is not held, forge.writes
+
+
+@pytest.mark.parametrize(
+    "session_fields,other_body,held",
+    [
+        ({"labels": ("superseded",)}, "", False),
+        ({"body": "Superseded by #9."}, "", False),
+        ({}, "Supersedes #2.", False),
+        ({}, "Follows up #2.", True),
+    ],
+    ids=["label", "own-body", "other-body", "control"],
+)
+def test_superseded_session_never_waits(tmp_path, session_fields, other_body, held):
+    update, session = session_pair(**session_fields)
+    other = pull(3, "BLOCKED", body=other_body)
+    forge = Forge(repository(update, session, other, rules=LINEAR))
     done, _ = train(tmp_path, forge, session_authors="lusoris")
     assert done.returncode == 0, done.stdout + done.stderr
     assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
