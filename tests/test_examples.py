@@ -4,12 +4,22 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 
 import examples
 import pytest
 from conftest import ROOT, Tree
+
+POSIX_HEREDOC_INPUTS = {
+    "body": "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\n",
+    "after_body": "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\ngit ls-remote origin <branch>\n",
+    "dash": "cat <<-EOF\n\t<EOF>\nnot code (\n\tEOF\ngit ls-remote origin <branch>\n",
+}
+SH_EXIT_INPUT = "exit 24"
+SH_ALIAS_INPUT = "echo x"
+SH_BRACKETS_INPUT = "echo [broken toml or yaml: [["
 
 
 def check(tree: Tree, files: dict[str, str], *args: str) -> subprocess.CompletedProcess:
@@ -97,7 +107,7 @@ def test_languages_without_a_parser_are_ignored(tree: Tree):
 
 def test_shell_block_is_now_checked(tree: Tree):
     """A shell command containing unmatched data brackets is valid and counted."""
-    done = check(tree, {"README.md": "```sh\necho [broken toml or yaml: [[\n```\n"})
+    done = check(tree, {"README.md": f"```sh\n{SH_BRACKETS_INPUT}\n```\n"})
     assert done.returncode == 0, done.stderr
     assert "1 examples verified" in done.stdout
 
@@ -127,7 +137,7 @@ def test_valid_json_python_bash_and_sh_pass(tree: Tree):
         '```json\n{"a": 1}\n```\n'
         '```python\nraise RuntimeError("parse only")\n```\n'
         "```bash\nexit 23\n```\n"
-        "```sh\nexit 24\n```\n"
+        f"```sh\n{SH_EXIT_INPUT}\n```\n"
     )
     done = check(tree, {"README.md": content})
     assert done.returncode == 0, done.stderr
@@ -135,7 +145,7 @@ def test_valid_json_python_bash_and_sh_pass(tree: Tree):
 
 
 @pytest.mark.parametrize(
-    ("language", "content"), [("yml", "a: 1"), ("py", "x = 1"), ("shell", "echo x")]
+    ("language", "content"), [("yml", "a: 1"), ("py", "x = 1"), ("shell", SH_ALIAS_INPUT)]
 )
 def test_language_alias_is_checked(tree: Tree, language: str, content: str):
     """Each supported alias dispatches to its parser and counts the block."""
@@ -276,22 +286,53 @@ def test_python_statement_and_parser_limits_fail(tree: Tree, content: str):
     assert "Traceback" not in done.stderr
 
 
-@pytest.mark.parametrize("language", ["bash", "sh"])
 @pytest.mark.parametrize(
-    "content",
+    ("content", "language"),
     [
-        "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\n",
-        "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\ngit ls-remote origin <branch>\n",
-        "cat <<-EOF\n\t<EOF>\nnot code (\n\tEOF\ngit ls-remote origin <branch>\n",
-        "cat <<< word\necho <name>\n",
-    ],
-    ids=["body", "after_body", "dash", "here_string"],
+        pytest.param(content, language, id=f"{name}-{language}")
+        for name, content in POSIX_HEREDOC_INPUTS.items()
+        for language in ["bash", "sh"]
+    ]
+    + [pytest.param("cat <<< word\necho <name>\n", "bash", id="here_string-bash")],
 )
 def test_shell_heredoc_placeholders_pass(tree: Tree, language: str, content: str):
     """Heredoc bodies remain literal while placeholders in shell code are normalized."""
     done = check(tree, {"README.md": f"```{language}\n{content}```\n"})
     assert done.returncode == 0, done.stderr
     assert "1 examples verified" in done.stdout
+
+
+def test_sh_inputs_parse_as_posix():
+    """Successful sh fixtures and tracked sh fences also parse on bash-as-sh hosts."""
+    if shutil.which("shfmt") is None:
+        pytest.skip("shfmt absent; CI /bin/sh is dash, which parses POSIX directly")
+    inputs = [
+        ("test_valid_json_python_bash_and_sh_pass", SH_EXIT_INPUT),
+        ("test_language_alias_is_checked[shell]", SH_ALIAS_INPUT),
+        ("test_shell_block_is_now_checked", SH_BRACKETS_INPUT),
+    ]
+    inputs.extend(
+        (f"test_shell_heredoc_placeholders_pass[{name}-sh]", content)
+        for name, content in POSIX_HEREDOC_INPUTS.items()
+    )
+    for path in examples.tracked_markdown(ROOT):
+        for start_line, lang, content in examples.fenced_blocks(path.read_text(encoding="utf-8")):
+            if examples.CHECKERS.get(lang) is examples._check_sh:
+                inputs.append((f"{path.relative_to(ROOT).as_posix()}:{start_line}", content))
+    failures = []
+    for source, content in inputs:
+        done = subprocess.run(
+            ["shfmt", "-ln", "posix"],
+            input=examples._shell_input(content),
+            capture_output=True,
+            text=True,
+            timeout=examples.DEADLINE_SECONDS,
+            check=False,
+        )
+        if done.returncode != 0:
+            first_line = next(iter(done.stderr.splitlines()), f"exit {done.returncode}")
+            failures.append(f"{source}: {first_line}")
+    assert not failures, "\n".join(failures)
 
 
 @pytest.mark.parametrize("extra", [0, 1], ids=["exact", "over"])

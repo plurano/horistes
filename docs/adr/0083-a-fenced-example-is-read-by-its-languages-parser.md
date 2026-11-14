@@ -88,6 +88,14 @@ on the Ubuntu runner selected by
 [tests/test_examples.py](../../tests/test_examples.py) therefore assert file,
 line, language and status rather than interpreter-specific messages.
 
+Where `/bin/sh` is bash, `sh -n` also accepts bash syntax in `sh` and `shell`
+blocks: a here-string (`<<<`) in an `sh` test case passed the workstation
+gate and failed under dash on CI. `test_sh_inputs_parse_as_posix` in
+[tests/test_examples.py](../../tests/test_examples.py) therefore also parses
+every `sh` pass case and every tracked `sh` or `shell` block with
+`shfmt -ln posix`. Where shfmt is not installed it skips with that reason,
+and CI's dash parses POSIX directly.
+
 The gate already needs a POSIX shell (`SHELL := /bin/sh` at
 [Makefile:5](../../Makefile#L5)), and
 [.github/workflows/ci.yml](../../.github/workflows/ci.yml) runs only on
