@@ -266,6 +266,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "reviews": review_nodes,
         "opinions": opinions,
         "refreshes": {"nodes": []},
+        "holds": {"nodes": []},
         "latest": {"nodes": [{"commit": commit_node}]},
     }
     if commits is not None:
@@ -392,6 +393,7 @@ class Forge:
         # Faults the REST stand-in answers first, per kind ("jobs", "revoke"): a status or DROP.
         self.rest_faults: dict[str, list[int | str]] = {}
         self.label_missing = False
+        self.unlabel_status: int | None = None
         self.install(7, "fleet", app=list(reads))
 
     def set_allowlist(self, repo: str, default_branch: str, paths: list[str]) -> None:
@@ -782,6 +784,8 @@ class Forge:
         )
         if write[0] == "unlabel" and self.label_missing:
             return 404, {"message": "Label does not exist"}
+        if write[0] == "unlabel" and self.unlabel_status:
+            return self.unlabel_status, {"message": "stand-in forge: label removal failed"}
         self.write(full, write)
         return 200, {}
 
@@ -1051,6 +1055,26 @@ def serve(forge: Forge) -> ThreadingHTTPServer:
     return server
 
 
+# The step's environment apart from the forge address, the paths and the app key.
+TRAIN_DEFAULTS = {
+    "PATH": "/usr/bin:/bin",
+    "TRAIN_APP_CLIENT_ID": CLIENT_ID,
+    "TRAIN_SWITCH": "on",
+    "TRAIN_MERGE_METHOD": "SQUASH",
+    "TRAIN_ACCEPT_STATES": "",
+    "TRAIN_MIN_AGE_DAYS": "3",
+    "TRAIN_HOLD_LABELS": "hold,do-not-merge,planted",
+    "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
+    "TRAIN_PERSON_BRANCHES": "release-please--",
+    "TRAIN_RELEASE_OFF": "",
+    "TRAIN_RELEASE_MAX_PARALLEL": "3",
+    "TRAIN_SECURITY_LABELS": "security",
+    "TRAIN_REQUIRED_STATUS": "",
+    "TRAIN_SESSION_AUTHORS": "",
+    "TRAIN_SESSION_HOLD_HOURS": "4",
+}
+
+
 def train(
     tmp_path: Path,
     forge: Forge,
@@ -1074,26 +1098,14 @@ def train(
     server = serve(forge)
     url = f"http://127.0.0.1:{server.server_address[1]}"
     env = measured(
-        {
-            "PATH": "/usr/bin:/bin",
+        TRAIN_DEFAULTS
+        | {
             "GITHUB_API_URL": url,
             "GITHUB_GRAPHQL_URL": f"{url}/graphql",
             "GITHUB_STEP_SUMMARY": str(summary),
             "GITHUB_OUTPUT": str(output),
             "RUNNER_TEMP": str(tmp_path),
-            "TRAIN_APP_CLIENT_ID": CLIENT_ID,
             "TRAIN_APP_KEY": app_key()[0],
-            "TRAIN_SWITCH": "on",
-            "TRAIN_MERGE_METHOD": "SQUASH",
-            "TRAIN_ACCEPT_STATES": "",
-            "TRAIN_MIN_AGE_DAYS": "3",
-            "TRAIN_HOLD_LABELS": "hold,do-not-merge,planted",
-            "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
-            "TRAIN_PERSON_BRANCHES": "release-please--",
-            "TRAIN_RELEASE_OFF": "",
-            "TRAIN_RELEASE_MAX_PARALLEL": "3",
-            "TRAIN_SECURITY_LABELS": "security",
-            "TRAIN_REQUIRED_STATUS": "",
             **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
         }
     )
@@ -4703,13 +4715,15 @@ def test_held_update_is_released_when_no_security_update_is_open(tmp_path):
     assert "released from the security hold" in summary, summary
 
 
-def test_held_update_a_person_marked_ready_is_not_held_again(tmp_path):
-    ready = pull(1, "BLOCKED", headRefName="renovate/go-snaps", labels=(HOLD,))
+def test_held_update_a_person_marked_ready_is_drafted_again_and_not_landed(tmp_path):
+    ready = pull(1, "CLEAN", headRefName="renovate/go-snaps", labels=(HOLD,))
     fix = pull(2, "BEHIND", headRefName="renovate/x-net", labels=("security",))
     forge = Forge(repository(ready, fix, rules=LINEAR))
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert not [w for w in forge.writes if w[0] in ("label", "draft", "unlabel")], forge.writes
+    holds = [w for w in forge.writes if w[0] in ("label", "draft", "unlabel")]
+    assert holds == [("draft", "PR_1")], forge.writes
+    assert landed(1) not in forge.writes, forge.writes
 
 
 def test_release_of_an_update_already_ready_only_removes_the_label(tmp_path):
@@ -4764,6 +4778,498 @@ def test_a_security_update_the_train_does_not_serve_holds_nothing(tmp_path, fix)
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert not [w for w in forge.writes if w[0] in ("label", "draft")], forge.writes
+
+
+SESSION = "merge-train: session hold"
+# An open suite of an app that starts no workflow run; it can stay open forever.
+APP_SUITE = {
+    "databaseId": 900,
+    "conclusion": None,
+    "createdAt": "2026-10-18T00:00:00Z",
+    "app": {"slug": "review-app"},
+    "workflowRun": None,
+}
+SESSION_PREDICATE = (
+    "sessions = [pull for pull, _ in rows if session_waiting(pull, default_branch, conf, replaced)]"
+)
+
+
+def session_pair(state="BLOCKED", **fields):
+    """A clean dependency update and a person's session PR whose head workflow run is running."""
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps")
+    fields.setdefault("suites", [None])
+    session = pull(2, state, author={"login": "lusoris"}, **fields)
+    return update, session
+
+
+@pytest.mark.parametrize("suites", [[None], ["SUCCESS", None]], ids=["running", "one-running"])
+def test_session_pending_holds_dependency_update_as_a_draft(tmp_path, suites):
+    update, session = session_pair(suites=suites)
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, SESSION), ("draft", "PR_1")], forge.writes
+    assert landed(1) not in forge.writes
+    assert "held as a draft: session pull request #2 waits (bound 4 h)" in summary, summary
+
+
+def test_session_behind_holds_dependency_update(tmp_path):
+    forge = Forge(repository(*session_pair("BEHIND"), rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, SESSION), ("draft", "PR_1")], forge.writes
+    assert "session pull request #2 waits (bound 4 h)" in summary
+
+
+@pytest.mark.parametrize(
+    "state,accept", [("CLEAN", ""), ("UNSTABLE", "UNSTABLE"), ("HAS_HOOKS", "HAS_HOOKS")]
+)
+def test_session_accepted_state_holds_dependency_update(tmp_path, state, accept):
+    forge = Forge(repository(*session_pair(state), rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="other, lusoris ", accept_states=accept)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes[:2] == [("label", 1, SESSION), ("draft", "PR_1")], forge.writes
+    assert landed(1) not in forge.writes
+    assert landed(2) in forge.writes
+
+
+@pytest.mark.parametrize(
+    "fields,settings,include",
+    [
+        ({}, {"session_authors": "lusoris"}, False),
+        ({}, {"session_authors": "someone-else"}, True),
+        ({}, {"session_authors": ""}, True),
+        ({}, {}, True),
+        ({"suites": ["SUCCESS"]}, {"session_authors": "lusoris"}, True),
+        ({"suites": ["SUCCESS", "SKIPPED"]}, {"session_authors": "lusoris"}, True),
+        ({"suites": [None, "CANCELLED"]}, {"session_authors": "lusoris"}, True),
+        ({"suites": []}, {"session_authors": "lusoris"}, True),
+        ({"suites": ["FAILURE"]}, {"session_authors": "lusoris"}, True),
+        ({"isDraft": True}, {"session_authors": "lusoris"}, True),
+        ({"isCrossRepository": True}, {"session_authors": "lusoris"}, True),
+        ({"baseRefName": "next"}, {"session_authors": "lusoris"}, True),
+        ({"labels": ("hold",)}, {"session_authors": "lusoris"}, True),
+        ({"headRefName": "renovate/other"}, {"session_authors": "lusoris"}, True),
+        ({"author": None}, {"session_authors": "lusoris"}, True),
+        ({"author": "author@example.com"}, {"session_authors": "lusoris"}, True),
+        ({"suites": [APP_SUITE]}, {"session_authors": "lusoris"}, True),
+        ({"latest": {"nodes": []}}, {"session_authors": "lusoris"}, True),
+    ],
+    ids=[
+        "none",
+        "unlisted",
+        "disabled",
+        "default",
+        "success",
+        "finished",
+        "red-beside-running",
+        "absent",
+        "red",
+        "draft",
+        "fork",
+        "base",
+        "held",
+        "dependency",
+        "no-author",
+        "string-author",
+        "app-suite",
+        "missing-head",
+    ],
+)
+def test_session_nonwaiting_does_not_hold_dependency_update(tmp_path, fields, settings, include):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps")
+    defaults = {"author": {"login": "lusoris"}, "suites": [None]}
+    session = pull(2, "BLOCKED", **(defaults | fields))
+    forge = Forge(repository(update, *([session] if include else []), rules=LINEAR))
+    done, _ = train(tmp_path, forge, **settings)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert landed(1) in forge.writes, forge.writes
+    assert ("label", 1, SESSION) not in forge.writes
+
+
+@pytest.mark.parametrize(
+    "fields", [{"labels": ("security",)}, {"title": "fix(deps): [SECURITY] x/net"}]
+)
+def test_session_hold_never_holds_security_updates(tmp_path, fields):
+    session = session_pair()[1]
+    fix = pull(3, "CLEAN", headRefName="renovate/x-net", **fields)
+    forge = Forge(repository(session, fix))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert landed(3) in forge.writes, forge.writes
+    assert ("label", 3, SESSION) not in forge.writes
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"headRefName": "feat/update"},
+        {"isDraft": True},
+        {"isCrossRepository": True},
+        {"baseRefName": "next"},
+    ],
+)
+def test_session_hold_leaves_other_targets_alone(tmp_path, fields):
+    update, session = session_pair()
+    update.update(fields)
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not [w for w in forge.writes if w[0] in ("label", "draft", "ready")], forge.writes
+
+
+@pytest.mark.parametrize("draft", [True, False])
+@pytest.mark.parametrize("missing", [True, False])
+def test_session_hold_release_when_session_is_gone(tmp_path, draft, missing):
+    update = pull(1, "BLOCKED", headRefName="renovate/go-snaps", isDraft=draft, labels=(SESSION,))
+    forge = Forge(repository(update))
+    forge.label_missing = missing
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = ([("ready", "PR_1")] if draft else []) + (
+        [] if missing else [("unlabel", 1, SESSION)]
+    )
+    assert forge.writes == expected, forge.writes
+    assert "released from the session hold: no session pull request waits" in summary
+
+
+@pytest.mark.parametrize("change", ["red", "draft", "held"])
+def test_session_hold_releases_when_session_stops_waiting(tmp_path, change):
+    update, session = session_pair()
+    update.update(isDraft=True, labels={"nodes": [{"name": SESSION}]})
+    if change == "red":
+        session = session_pair(suites=["FAILURE"])[1]
+    elif change == "draft":
+        session["isDraft"] = True
+    else:
+        session["labels"]["nodes"] = [{"name": "hold"}]
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("ready", "PR_1"), ("unlabel", 1, SESSION)], forge.writes
+    assert "released from the session hold: no session pull request waits" in summary
+
+
+def session_events(*hours):
+    """Session label events, including unrelated events to exercise the earliest matching one."""
+    return {
+        "nodes": [
+            {"createdAt": OLD, "label": {"name": "unrelated"}},
+            *[
+                {"createdAt": (NOW - timedelta(hours=age)).isoformat(), "label": {"name": SESSION}}
+                for age in hours
+            ],
+        ]
+    }
+
+
+def test_session_hold_bound_releases_from_earliest_label_event(tmp_path):
+    update, session = session_pair()
+    update.update(isDraft=True, labels={"nodes": [{"name": SESSION}]}, holds=session_events(1, 5))
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("ready", "PR_1"), ("unlabel", 1, SESSION)], forge.writes
+    assert "released from the session hold: held 4 h, the bound" in summary
+
+
+def test_session_hold_expired_ready_update_is_never_held_again(tmp_path):
+    update, session = session_pair()
+    update["holds"] = session_events(5)
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)], forge.writes
+
+
+def test_session_hold_bound_is_inclusive_and_missing_events_keep_the_hold(tmp_path, monkeypatch):
+    train_mod = load_train(tmp_path, monkeypatch)
+    conf = {"session_hold": timedelta(hours=4)}
+    update = pull(1, "CLEAN", holds=session_events(4))
+    assert train_mod.session_hold_expired(update, conf, NOW)
+    assert not train_mod.session_hold_expired(update, conf, NOW - timedelta(seconds=1))
+    assert not train_mod.session_hold_expired(pull(1, "CLEAN"), conf, NOW)
+
+
+def unrelated_events(count):
+    """Label events of other labels only, oldest first."""
+    return {"nodes": [{"createdAt": OLD, "label": {"name": "unrelated"}}] * count}
+
+
+def test_session_hold_full_event_page_without_the_session_event_is_expired(tmp_path, monkeypatch):
+    train_mod = load_train(tmp_path, monkeypatch)
+    conf = {"session_hold": timedelta(hours=4)}
+    full = train_mod.HOLD_EVENT_PAGE
+    assert train_mod.session_hold_expired(pull(1, "CLEAN", holds=unrelated_events(full)), conf, NOW)
+    short = pull(1, "CLEAN", holds=unrelated_events(full - 1))
+    assert not train_mod.session_hold_expired(short, conf, NOW)
+    paged = unrelated_events(full - 1)
+    paged["nodes"].append(session_events(1)["nodes"][1])
+    assert not train_mod.session_hold_expired(pull(1, "CLEAN", holds=paged), conf, NOW)
+
+
+def test_session_hold_full_event_page_releases_the_update(tmp_path):
+    update, session = session_pair()
+    update.update(isDraft=True, labels={"nodes": [{"name": SESSION}]}, holds=unrelated_events(20))
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("ready", "PR_1"), ("unlabel", 1, SESSION)], forge.writes
+
+
+def test_session_hold_a_person_marked_ready_is_drafted_again(tmp_path):
+    update, session = session_pair()
+    update["labels"] = {"nodes": [{"name": SESSION}]}
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("draft", "PR_1")], forge.writes
+    assert "held as a draft: session pull request #2 waits (bound 4 h)" in summary
+
+
+def test_session_hold_failed_draft_write_is_retried_and_never_lands(tmp_path):
+    update, session = session_pair()
+    forge = Forge(repository(update, session, rules=LINEAR))
+    forge.mutation_statuses["convertPullRequestToDraft"] = [502]
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode != 0
+    assert "HTTP 502" in done.stdout + done.stderr
+    assert forge.writes == [("label", 1, SESSION), ("draft", "PR_1")], forge.writes
+    update["labels"] = {"nodes": [{"name": SESSION}]}
+    again = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, again, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert again.writes == [("draft", "PR_1")], again.writes
+
+
+@pytest.mark.parametrize("label", [HOLD, SESSION])
+def test_failed_label_removal_keeps_the_hold_and_is_retried(tmp_path, label):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps", isDraft=True, labels=(label,))
+    forge = Forge(repository(update))
+    forge.unlabel_status = 500
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode != 0
+    assert "HTTP 500" in done.stdout + done.stderr
+    assert forge.writes == [("ready", "PR_1")], forge.writes
+    update["isDraft"] = False
+    again = Forge(repository(update))
+    done, _ = train(tmp_path, again, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert again.writes == [("unlabel", 1, label)], again.writes
+
+
+@pytest.mark.parametrize("label", [HOLD, SESSION])
+def test_managed_hold_label_is_never_landable(tmp_path, label):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps", labels=(label,))
+    forge = Forge(repository(update))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("unlabel", 1, label)], forge.writes
+
+
+@pytest.mark.parametrize("draft", [True, False])
+def test_session_hold_releases_a_security_update_at_once(tmp_path, draft):
+    session = session_pair()[1]
+    fix = pull(
+        3,
+        "CLEAN",
+        headRefName="renovate/x-net",
+        isDraft=draft,
+        labels=("security", SESSION),
+        holds=session_events(1),
+    )
+    forge = Forge(repository(session, fix, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = ([("ready", "PR_3")] if draft else []) + [("unlabel", 3, SESSION)]
+    assert forge.writes[: len(expected)] == expected, forge.writes
+    assert ("draft", "PR_3") not in forge.writes
+    assert "released from the session hold: a security update is exempt" in summary
+
+
+@pytest.mark.parametrize(
+    "decision,held",
+    [("REVIEW_REQUIRED", False), ("CHANGES_REQUESTED", False), ("APPROVED", True), (None, True)],
+)
+def test_session_hold_waits_only_when_checks_alone_block(tmp_path, decision, held):
+    update, session = session_pair(reviewDecision=decision)
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+    assert (landed(1) in forge.writes) is not held, forge.writes
+
+
+@pytest.mark.parametrize(
+    "session_fields,other_body,held",
+    [
+        ({"labels": ("superseded",)}, "", False),
+        ({"body": "Superseded by #9."}, "", False),
+        ({}, "Supersedes #2.", False),
+        ({}, "Follows up #2.", True),
+    ],
+    ids=["label", "own-body", "other-body", "control"],
+)
+def test_superseded_session_never_waits(tmp_path, session_fields, other_body, held):
+    update, session = session_pair(**session_fields)
+    other = pull(3, "BLOCKED", body=other_body)
+    forge = Forge(repository(update, session, other, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+    assert (landed(1) in forge.writes) is not held, forge.writes
+
+
+@pytest.mark.parametrize("status,held", [(None, False), (ctx("lanes/booked", "SUCCESS"), True)])
+def test_session_accepted_state_waits_only_when_required_status_passes(tmp_path, status, held):
+    update, session = session_pair("CLEAN", suites=["SUCCESS"], status=status)
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris", required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+
+
+@pytest.mark.parametrize("count,held", [(29, False), (30, True)])
+def test_session_full_suite_page_counts_as_pending(tmp_path, count, held):
+    update, session = session_pair(suites=["SUCCESS"] * count)
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+
+
+@pytest.mark.parametrize(
+    "count,authors,held", [(101, "lusoris", True), (101, "", False), (100, "lusoris", False)]
+)
+def test_session_hold_with_unread_pages_holds_bounded(tmp_path, count, authors, held):
+    update = pull(1, "CLEAN", headRefName="renovate/go-snaps")
+    others = [pull(n, "DIRTY") for n in range(2, count + 1)]
+    forge = Forge(repository(update, *others, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors=authors)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (("label", 1, SESSION) in forge.writes) is held, forge.writes
+    assert (landed(1) in forge.writes) is not held, forge.writes
+    note = "held as a draft: a session pull request past the pages read may wait (bound 4 h)"
+    assert (note in summary) is held, summary
+
+
+def test_train_job_runs_one_at_a_time_per_app():
+    concurrency = ciwf.load(TRAIN)["jobs"]["train"]["concurrency"]
+    assert "${{ inputs.app_client_id }}" in concurrency["group"], concurrency
+    assert concurrency["cancel-in-progress"] is False, concurrency
+
+
+@pytest.mark.parametrize("labels", [(HOLD, SESSION), (SESSION,)])
+def test_session_release_preserves_security_hold_including_new_hold(tmp_path, labels):
+    update = pull(1, "BLOCKED", headRefName="renovate/go-snaps", isDraft=True, labels=labels)
+    fix = pull(3, "BEHIND", headRefName="renovate/x-net", labels=("security",))
+    forge = Forge(repository(update, fix, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = ([] if HOLD in labels else [("label", 1, HOLD)]) + [("unlabel", 1, SESSION)]
+    assert forge.writes == expected, forge.writes
+    assert "released from the session hold: no session pull request waits" in summary
+
+
+def test_security_release_preserves_session_hold(tmp_path):
+    update, session = session_pair()
+    update.update(isDraft=True, labels={"nodes": [{"name": HOLD}, {"name": SESSION}]})
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("unlabel", 1, HOLD)], forge.writes
+
+
+def test_security_release_preserves_session_hold_added_in_same_run(tmp_path):
+    update, session = session_pair()
+    update.update(mergeStateStatus="BLOCKED", labels={"nodes": [{"name": HOLD}]})
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, SESSION), ("draft", "PR_1"), ("unlabel", 1, HOLD)], (
+        forge.writes
+    )
+    assert "held as a draft: session pull request #2 waits (bound 4 h)" in summary
+    assert "released from the security hold" in summary
+
+
+def test_security_released_draft_moves_to_session_hold_without_ready(tmp_path):
+    """A security-held draft goes straight to the session hold: no ready, no second draft."""
+    update, session = session_pair()
+    update.update(isDraft=True, mergeStateStatus="BLOCKED", labels={"nodes": [{"name": HOLD}]})
+    forge = Forge(repository(update, session, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, SESSION), ("unlabel", 1, HOLD)], forge.writes
+    assert "held as a draft: session pull request #2 waits (bound 4 h)" in summary
+
+
+def test_session_and_security_hold_additions_draft_only_once(tmp_path):
+    update, session = session_pair()
+    fix = pull(3, "BEHIND", headRefName="renovate/x-net", labels=("security",))
+    forge = Forge(repository(update, session, fix, rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, HOLD), ("draft", "PR_1"), ("label", 1, SESSION)], (
+        forge.writes
+    )
+    assert "held as a draft: security update #3 is open" in summary
+    assert "held as a draft: session pull request #2 waits (bound 4 h)" in summary
+
+
+def test_session_and_security_hold_release_ready_only_once(tmp_path):
+    update = pull(1, "BLOCKED", isDraft=True, labels=(HOLD, SESSION))
+    forge = Forge(repository(update))
+    done, _ = train(tmp_path, forge, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("unlabel", 1, HOLD), ("ready", "PR_1"), ("unlabel", 1, SESSION)], (
+        forge.writes
+    )
+
+
+@pytest.mark.parametrize("raw", ["0", "49", "x", "1.5", "-1", ""])
+def test_session_hold_hours_invalid_settings_fail(tmp_path, raw):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, session_hold_hours=raw)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "session_hold_hours" in done.stdout + done.stderr
+    assert forge.writes == []
+
+
+@pytest.mark.parametrize("hours", ["1", "48"])
+def test_session_hold_hours_settings_boundaries(tmp_path, hours):
+    forge = Forge(repository(*session_pair(), rules=LINEAR))
+    done, summary = train(tmp_path, forge, session_authors="lusoris", session_hold_hours=hours)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"session pull request #2 waits (bound {hours} h)" in summary
+    assert forge.writes == [("label", 1, SESSION), ("draft", "PR_1")]
+
+
+def test_session_hold_query_keeps_required_status_selection_replaceable(tmp_path, monkeypatch):
+    rules = load_rules(tmp_path)
+    train_mod = load_train(tmp_path, monkeypatch)
+    for query in (rules.QUERY, rules.STATUS_QUERY):
+        assert "statusCheckRollup" not in query
+        assert "workflowRun { databaseId workflow { databaseId } }" in query
+        # The page sizes the full-page checks compare against are the sizes the query asks.
+        assert f"checkSuites(first: {train_mod.SUITE_PAGE})" in query
+        events = f"timelineItems(itemTypes: [LABELED_EVENT], first: {train_mod.HOLD_EVENT_PAGE})"
+        assert f"holds: {events}" in query
+        assert "mergeStateStatus isInMergeQueue reviewDecision" in query
+        assert "... on LabeledEvent { createdAt label { name } }" in query
+        assert "signature { wasSignedByGitHub }" in query
+    assert "status { context(name: $status) { state } }" in rules.STATUS_QUERY
+    assert "status { context(name: $status) { state } }" not in rules.QUERY
+
+
+def test_planted_session_hold_that_finds_no_session_lands_update(tmp_path):
+    mutant = script()
+    assert mutant.count(SESSION_PREDICATE) == 1
+    mutant = mutant.replace(SESSION_PREDICATE, "sessions = []")
+    forge = Forge(repository(*session_pair(), rules=LINEAR))
+    done, _ = train(tmp_path, forge, text=mutant, session_authors="lusoris")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)], forge.writes
 
 
 def armed_squash(headline: str = "old title (#1)", method: str = "SQUASH") -> dict:

@@ -190,6 +190,16 @@ on:
         type: string
         required: false
         default: security
+      session_authors:
+        description: Session pull request authors to wait for, comma-separated; empty disables the hold.
+        type: string
+        required: false
+        default: ""
+      session_hold_hours:
+        description: Maximum session hold per dependency update, whole hours from 1 to 48.
+        type: string
+        required: false
+        default: "4"
       required_status:
         description: >-
           Commit status context the head commit must report as success before
@@ -213,6 +223,10 @@ jobs:
     runs-on: ${{ inputs.runner }}
     environment: merge-train
     timeout-minutes: 30
+    # One train per app at a time: an overlapping run could release a hold the other just saw.
+    concurrency:
+      group: horistes-merge-train-${{ inputs.app_client_id }}
+      cancel-in-progress: false
     permissions: {}
     outputs:
       releases: ${{ steps.sweep.outputs.releases }}
@@ -244,6 +258,7 @@ jobs:
           DRAFT_STEP = "Stop on a draft pull request"
           REFRESH_LABEL = "merge-train: refresh"
           SECURITY_HOLD_LABEL = "merge-train: security hold"
+          SESSION_HOLD_LABEL = "merge-train: session hold"
           RELEASE_HEAD = "release-please--"
           RELEASE_LABEL = "autorelease:"
           REFRESH_LIMIT = 3
@@ -318,6 +333,20 @@ jobs:
               return frozenset(label["name"] for label in pull["labels"]["nodes"])
 
 
+          def dependency_hold_target(pull, default_branch, conf, label):
+              """An update this hold may mark, or draft again; a draft only while the other hold keeps it."""
+              labels = label_names(pull)
+              other = {SECURITY_HOLD_LABEL, SESSION_HOLD_LABEL} - {label}
+              return (
+                  pull["headRefName"].startswith(conf["dependency"])
+                  and not is_security(pull, conf)
+                  and (not pull["isDraft"] or bool(labels & other))
+                  and not pull["isCrossRepository"]
+                  and pull["baseRefName"] == default_branch
+                  and (label not in labels or not pull["isDraft"])
+              )
+
+
           def security_hold(rows, default_branch, conf):
               """(open security update or None, pull requests to hold, pull requests to release).
 
@@ -339,12 +368,7 @@ jobs:
               hold = [
                   pull
                   for pull, _ in rows
-                  if pull["headRefName"].startswith(conf["dependency"])
-                  and not is_security(pull, conf)
-                  and not pull["isDraft"]
-                  and not pull["isCrossRepository"]
-                  and pull["baseRefName"] == default_branch
-                  and SECURITY_HOLD_LABEL not in label_names(pull)
+                  if dependency_hold_target(pull, default_branch, conf, SECURITY_HOLD_LABEL)
               ]
               return fixes[0], hold, []
 
@@ -590,7 +614,8 @@ jobs:
           def verdict(pull, repo, conf, now, replaced=frozenset()):
               """land, behind, or the reason the train leaves the pull request alone."""
               labels = frozenset(label["name"] for label in pull["labels"]["nodes"])
-              held = sorted(labels & conf["hold"])
+              # A managed hold label holds even when a write failed or a person readied the update.
+              held = sorted(labels & (conf["hold"] | {SECURITY_HOLD_LABEL, SESSION_HOLD_LABEL}))
               if pull["baseRefName"] != repo["defaultBranchRef"]["name"]:
                   return "not for the default branch"
               if pull["isDraft"]:
@@ -927,7 +952,7 @@ jobs:
                 pageInfo { hasNextPage endCursor }
                 nodes {
                   number id title body createdAt isDraft isCrossRepository baseRefName headRefName headRefOid
-                  mergeStateStatus isInMergeQueue
+                  mergeStateStatus isInMergeQueue reviewDecision
                   author { login __typename }
                   autoMergeRequest { enabledAt commitHeadline mergeMethod }
                   labels(first: 50) { nodes { name } }
@@ -942,6 +967,9 @@ jobs:
                       body
                       comments(first: 10) { totalCount nodes { replyTo { id } } }
                     }
+                  }
+                  holds: timelineItems(itemTypes: [LABELED_EVENT], first: 20) {
+                    nodes { ... on LabeledEvent { createdAt label { name } } }
                   }
                   refreshes: timelineItems(itemTypes: [UNLABELED_EVENT], last: 5) {
                     nodes { ... on UnlabeledEvent { createdAt label { name } } }
@@ -1030,6 +1058,8 @@ jobs:
           TRAIN_RELEASE_OFF: ${{ inputs.release_off }}
           TRAIN_RELEASE_MAX_PARALLEL: ${{ inputs.release_max_parallel }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
+          TRAIN_SESSION_AUTHORS: ${{ inputs.session_authors }}
+          TRAIN_SESSION_HOLD_HOURS: ${{ inputs.session_hold_hours }}
           TRAIN_REQUIRED_STATUS: ${{ inputs.required_status }}
         run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/merge_train.py"
 
