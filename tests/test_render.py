@@ -277,6 +277,29 @@ def test_scorecard_template_renders_into_the_recorded_caller():
     assert rendered_real_template(REAL_SCORECARD) == RENDERED_SCORECARD
 
 
+def actionlint(tree, name) -> subprocess.CompletedProcess:
+    # The runner label a consumer's adoption declares to actionlint, as here.
+    config = ["-config-file", str(ROOT / ".github/actionlint.yaml")]
+    return subprocess.run(
+        [*external("ACTIONLINT", "actionlint"), *config, str(tree.root / name)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def zizmor(tree) -> subprocess.CompletedProcess:
+    command = [*external("ZIZMOR", "zizmor"), "--offline", "--strict-collection"]
+    return subprocess.run(
+        [*command, "--persona", "pedantic", str(tree.root)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
 @pytest.mark.parametrize(
     ("template", "name"),
     sorted(CALLER_TEMPLATES.items()),
@@ -285,25 +308,32 @@ def test_scorecard_template_renders_into_the_recorded_caller():
 def test_rendered_caller_passes_both_linters(tree, template, name):
     """A rendered caller passes actionlint and zizmor checks."""
     tree.write({name: rendered_real_template(template)})
-    # The runner label a consumer's adoption declares to actionlint, as here.
-    config = ["-config-file", str(ROOT / ".github/actionlint.yaml")]
-    done = subprocess.run(
-        [*external("ACTIONLINT", "actionlint"), *config, str(tree.root / name)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
+    done = actionlint(tree, name)
     assert done.returncode == 0, done.stdout + done.stderr
-    command = [*external("ZIZMOR", "zizmor"), "--offline", "--strict-collection"]
-    done = subprocess.run(
-        [*command, "--persona", "pedantic", str(tree.root)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
+    done = zizmor(tree)
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize(
+    ("template", "name"),
+    sorted(CALLER_TEMPLATES.items()),
+    ids=CALLER_IDS,
+)
+def test_rendered_caller_fails_each_linter_on_its_planted_defect(tree, template, name):
+    """Each linter rejects its planted defect in every rendered caller."""
+    text = rendered_real_template(template)
+    pin = "@" + render.SAMPLE["Shared"]["Commit"]
+    assert text.count(pin) == 1
+
+    tree.write({name: text + "bogus-key: 1\n"})
+    done = actionlint(tree, name)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "unexpected key" in done.stdout + done.stderr
+
+    tree.write({name: text.replace(pin, "@main")})
+    done = zizmor(tree)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "unpinned-uses" in done.stdout + done.stderr
 
 
 def test_good_template_passes(tree):
