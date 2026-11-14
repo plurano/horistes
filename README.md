@@ -185,6 +185,9 @@ release the update. The train job runs one at a time per app client. Security
 updates keep landing, and a draft stays a draft until both managed holds are
 gone
 ([ADR-0079](docs/adr/0079-dependency-updates-wait-while-a-session-pull-request-lands.md)).
+To turn the hold off, clear `session_authors` and keep the train enabled until
+a run has removed every `merge-train: session hold` label; a train without the
+hold, such as an older pin, does not release those drafts.
 
 The train outlasts short forge faults (decision record 0080). A read (GET, and
 every GraphQL read) is tried up to three times when the forge answers 502, 503
