@@ -41,6 +41,8 @@ def test_planted_broken_toml_fails(tree: Tree):
     assert done.returncode == 1, done.stdout
     assert "README.md:2" in done.stderr
     assert "toml" in done.stderr
+    assert "README.md:2: toml:" in done.stderr
+    assert "Traceback" not in done.stderr
 
 
 def test_valid_yaml_and_toml_pass(tree: Tree):
@@ -72,6 +74,8 @@ def test_broken_yaml_fails(tree: Tree):
     assert done.returncode == 1, done.stdout
     assert "README.md:2" in done.stderr
     assert "yaml" in done.stderr
+    assert "README.md:2: yaml:" in done.stderr
+    assert "Traceback" not in done.stderr
 
 
 def test_languages_without_a_parser_are_ignored(tree: Tree):
@@ -113,6 +117,8 @@ def test_planted_broken_example_fails(tree: Tree, language: str, content: str):
     assert done.returncode == 1, done.stdout
     assert "README.md:2" in done.stderr
     assert f": {language}:" in done.stderr
+    assert f"README.md:2: {language}:" in done.stderr
+    assert "Traceback" not in done.stderr
 
 
 def test_valid_json_python_bash_and_sh_pass(tree: Tree):
@@ -158,6 +164,7 @@ def test_empty_placeholder_fails(tree: Tree):
     done = check(tree, {"README.md": "```bash\necho <>\n```\n"})
     assert done.returncode == 1, done.stdout
     assert "README.md:1: bash:" in done.stderr
+    assert "Traceback" not in done.stderr
 
 
 @pytest.mark.parametrize("language", ["bash", "sh"])
@@ -170,6 +177,7 @@ def test_missing_shell_interpreter_fails(tree: Tree, tmp_path, language: str):
     assert done.returncode == 1, done.stdout
     assert f"{language} not found" in done.stderr
     assert f"README.md:1: {language}:" in done.stderr
+    assert "Traceback" not in done.stderr
 
 
 @pytest.mark.parametrize("checker", [examples._check_bash, examples._check_sh])
@@ -185,7 +193,9 @@ def test_shell_parse_call_is_isolated(monkeypatch, checker):
         assert kwargs["check"] is False
         assert set(kwargs["env"]) == {"PATH", "LC_ALL"}
         assert kwargs["env"]["LC_ALL"] == "C"
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv == ["bash", "-n"]:
+            return subprocess.CompletedProcess(["bash", "-n"], 0, "", "")
+        return subprocess.CompletedProcess(["sh", "-n"], 0, "", "")
 
     monkeypatch.setattr(examples.subprocess, "run", parsed)
     assert checker("echo <issue-id>\ncat < input.txt") is None
@@ -232,3 +242,106 @@ def test_mutation_without_tomllib_loads_planted_case_passes_proving_guard(tree: 
         timeout=60,
     )
     assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize("content", ['{"a": NaN}', "[Infinity]", "[-Infinity]"])
+def test_non_json_constants_fail(tree: Tree, content: str):
+    """Nonstandard numeric constants fail with a block diagnostic and no traceback."""
+    done = check(tree, {"README.md": f"# Test\n```json\n{content}\n```\n"})
+    assert done.returncode == 1, done.stdout
+    assert "README.md:2: json:" in done.stderr
+    assert "is not JSON" in done.stderr
+    assert "Traceback" not in done.stderr
+
+
+@pytest.mark.parametrize(
+    "content", ["1" * 5000, "[" * 200000 + "]" * 200000], ids=["digits", "depth"]
+)
+def test_json_parser_limits_fail(tree: Tree, content: str):
+    """Digit and depth limits fail with a block diagnostic and no traceback."""
+    done = check(tree, {"README.md": f"# Test\n```json\n{content}\n```\n"})
+    assert done.returncode == 1, done.stdout
+    assert "README.md:2: json:" in done.stderr
+    assert "Traceback" not in done.stderr
+
+
+@pytest.mark.parametrize(
+    "content", ["return 1", "break", "x=" + "-" * 200000 + "1"], ids=["return", "break", "complex"]
+)
+def test_python_statement_and_parser_limits_fail(tree: Tree, content: str):
+    """Invalid statement placement and parser complexity fail without a traceback."""
+    done = check(tree, {"README.md": f"# Test\n```python\n{content}\n```\n"})
+    assert done.returncode == 1, done.stdout
+    assert "README.md:2: python:" in done.stderr
+    assert "Traceback" not in done.stderr
+
+
+@pytest.mark.parametrize("language", ["bash", "sh"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\n",
+        "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\ngit ls-remote origin <branch>\n",
+        "cat <<-EOF\n\t<EOF>\nnot code (\n\tEOF\ngit ls-remote origin <branch>\n",
+        "cat <<< word\necho <name>\n",
+    ],
+    ids=["body", "after_body", "dash", "here_string"],
+)
+def test_shell_heredoc_placeholders_pass(tree: Tree, language: str, content: str):
+    """Heredoc bodies remain literal while placeholders in shell code are normalized."""
+    done = check(tree, {"README.md": f"```{language}\n{content}```\n"})
+    assert done.returncode == 0, done.stderr
+    assert "1 examples verified" in done.stdout
+
+
+@pytest.mark.parametrize("extra", [0, 1], ids=["exact", "over"])
+def test_example_size_boundary(tree: Tree, extra: int):
+    """Exactly the character limit passes and one extra character fails as a block problem."""
+    content = '"' + "a" * (examples.MAX_EXAMPLE_CHARS - 2 + extra) + '"'
+    markdown = f"# Test\n```json\n{content}\n```\n"
+    assert len(examples.fenced_blocks(markdown)[0][2]) == examples.MAX_EXAMPLE_CHARS + extra
+    done = check(tree, {"README.md": markdown})
+    if extra:
+        assert done.returncode == 1, done.stdout
+        assert "README.md:2: json:" in done.stderr
+        assert f"longer than {examples.MAX_EXAMPLE_CHARS} characters" in done.stderr
+        assert "Traceback" not in done.stderr
+    else:
+        assert done.returncode == 0, done.stderr
+        assert "1 examples verified" in done.stdout
+
+
+def test_json_depth_limit_is_a_problem():
+    """Direct JSON parser depth failures become diagnostics even without the size guard."""
+    assert examples._check_json("[" * 200000 + "]" * 200000) is not None
+
+
+@pytest.mark.parametrize("error", [SyntaxError, ValueError, RecursionError, MemoryError])
+def test_python_parser_error_is_a_problem(monkeypatch, error):
+    """Compiler failures become parser diagnostics without running the code object."""
+
+    def failed_compile(*args, **kwargs):
+        raise error("source too complex")
+
+    monkeypatch.setattr(examples, "compile", failed_compile, raising=False)
+    assert examples._check_python("x = 1") == "source too complex"
+
+
+def test_shell_input_preserves_pending_heredocs():
+    """Quoted FIFO heredocs preserve CRLF bodies and tab-stripped delimiters byte for byte."""
+    content = "cat <<'ONE' <<-\"TWO\"\r\n<ONE>\r\nONE\r\n\t<TWO>\r\n\tTWO\r\necho <name>\r\n"
+    expected = content.replace("echo <name>", "echo name")
+    assert examples._shell_input(content) == expected
+
+
+def test_oversized_example_skips_parser(tree: Tree, monkeypatch):
+    """An oversized supported block is counted and refused before its parser runs."""
+
+    def unexpected_parser(content):
+        pytest.fail("oversized block reached parser")
+
+    tree.write({"README.md": "```json\n" + "1" * (examples.MAX_EXAMPLE_CHARS + 1) + "\n```\n"})
+    monkeypatch.setitem(examples.CHECKERS, "json", unexpected_parser)
+    problems, count = examples.check_examples(tree.root, [tree.root / "README.md"])
+    assert count == 1
+    assert problems == [f"README.md:1: json: longer than {examples.MAX_EXAMPLE_CHARS} characters"]

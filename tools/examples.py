@@ -15,13 +15,13 @@ Exit codes: 0 pass, 1 parse failure, 3 file or git error.
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import os
 import re
 import subprocess
 import sys
 import tomllib
+from collections import deque
 from pathlib import Path
 
 try:
@@ -32,7 +32,10 @@ except ImportError:
 
 FENCE_START = re.compile(r"^(\s{0,3})(`{3,}|~{3,})(.*)")
 PLACEHOLDER = re.compile(r"<([A-Za-z][A-Za-z0-9_.:/-]*)>")
+HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\2")
 DEADLINE_SECONDS = 30
+# Largest tracked fence: 670 characters on 2026-11-14.
+MAX_EXAMPLE_CHARS = 100_000
 
 
 def say(line: str) -> None:
@@ -91,18 +94,23 @@ def _check_toml(content: str) -> str | None:
     return None
 
 
+def _reject_json_constant(constant: str) -> None:
+    raise ValueError(f"{constant} is not JSON")
+
+
 def _check_json(content: str) -> str | None:
     try:
-        json.loads(content)
-    except json.JSONDecodeError as err:
+        json.loads(content, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError) as err:
         return str(err)
     return None
 
 
 def _check_python(content: str) -> str | None:
     try:
-        ast.parse(content)
-    except (SyntaxError, ValueError) as err:
+        compile(content, "<example>", "exec", dont_inherit=True)
+    # CPython's parser uses MemoryError for source too complex, not other allocation failures.
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as err:
         return str(err)
     return None
 
@@ -119,11 +127,31 @@ def _shell_error(done: subprocess.CompletedProcess[str]) -> str | None:
     )
 
 
+def _shell_input(content: str) -> str:
+    pending: deque[tuple[str, bool]] = deque()
+    lines: list[str] = []
+    for line in content.splitlines(keepends=True):
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            end = line.rstrip("\r\n")
+            if strip_tabs:
+                end = end.lstrip("\t")
+            if end == delimiter:
+                pending.popleft()
+            lines.append(line)
+        else:
+            pending.extend(
+                (match.group(3), bool(match.group(1))) for match in HEREDOC.finditer(line)
+            )
+            lines.append(PLACEHOLDER.sub(r"\1", line))
+    return "".join(lines)
+
+
 def _check_bash(content: str) -> str | None:
     try:
         done = subprocess.run(
             ["bash", "-n"],
-            input=PLACEHOLDER.sub(r"\1", content),
+            input=_shell_input(content),
             capture_output=True,
             text=True,
             check=False,
@@ -141,7 +169,7 @@ def _check_sh(content: str) -> str | None:
     try:
         done = subprocess.run(
             ["sh", "-n"],
-            input=PLACEHOLDER.sub(r"\1", content),
+            input=_shell_input(content),
             capture_output=True,
             text=True,
             check=False,
@@ -182,7 +210,11 @@ def check_examples(root: Path, paths: list[Path]) -> tuple[list[str], int]:
             if checker is None:
                 continue
             count += 1
-            err = checker(content)
+            err = (
+                f"longer than {MAX_EXAMPLE_CHARS} characters"
+                if len(content) > MAX_EXAMPLE_CHARS
+                else checker(content)
+            )
             if err is not None:
                 problems.append(f"{rel_md}:{start_line}: {lang}: {err}")
     return problems, count

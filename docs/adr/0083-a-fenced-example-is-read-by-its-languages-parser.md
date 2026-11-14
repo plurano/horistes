@@ -39,14 +39,19 @@ through `CHECKERS` to its language's parser:
 | :--- | :--- |
 | `yaml`, `yml` | PyYAML `safe_load_all` |
 | `toml` | `tomllib.loads` |
-| `json` | `json.loads` |
-| `python`, `py` | `ast.parse` |
+| `json` | `json.loads`, refusing `NaN`, `Infinity` and `-Infinity` |
+| `python`, `py` | `compile` to a code object that is never run (syntax and statement placement) |
 | `bash` | `bash -n`, reading stdin |
 | `sh`, `shell` | `sh -n`, reading stdin |
 
 The shell checkers in [tools/examples.py](../../tools/examples.py) replace
 `<([A-Za-z][A-Za-z0-9_.:/-]*)>` with the captured bare word before parsing.
-This preserves line numbers. A space after `<` and an empty `<>` do not
+Substitution skips heredoc bodies, preserving their contents and line numbers;
+`test_shell_heredoc_placeholders_pass` and
+`test_shell_input_preserves_pending_heredocs` in
+[tests/test_examples.py](../../tests/test_examples.py) cover placeholders after
+heredoc terminators, tab-stripped terminators, quoted delimiters and here-strings.
+A space after `<` and an empty `<>` do not
 match; `test_spaced_input_redirection_passes` and
 `test_empty_placeholder_fails` in
 [tests/test_examples.py](../../tests/test_examples.py) cover those boundaries.
@@ -57,6 +62,16 @@ timeout fails the block. Diagnostics name the Markdown file, opening fence
 line and language. These rules live in
 [tools/examples.py](../../tools/examples.py); valid, malformed, missing-shell
 and timeout cases live in [tests/test_examples.py](../../tests/test_examples.py).
+
+Supported blocks above `MAX_EXAMPLE_CHARS` (100 000 characters) fail before
+parsing and still count as checked examples. A parser's depth or digit limit
+is a problem of the block, never a traceback. The size guard and parser error
+handling live in [tools/examples.py](../../tools/examples.py);
+`test_example_size_boundary`, `test_oversized_example_skips_parser`,
+`test_json_parser_limits_fail`, `test_json_depth_limit_is_a_problem`,
+`test_python_statement_and_parser_limits_fail` and
+`test_python_parser_error_is_a_problem` in
+[tests/test_examples.py](../../tests/test_examples.py) cover these limits.
 
 ## Consequences
 
@@ -72,6 +87,13 @@ on the Ubuntu runner selected by
 2026-11-14 workstation check used bash for `sh`. The shell tests in
 [tests/test_examples.py](../../tests/test_examples.py) therefore assert file,
 line, language and status rather than interpreter-specific messages.
+
+The gate already needs a POSIX shell (`SHELL := /bin/sh` at
+[Makefile:5](../../Makefile#L5)), and
+[.github/workflows/ci.yml](../../.github/workflows/ci.yml) runs only on
+`ubuntu-26.04`. A missing `bash` or `sh` therefore continues to fail the block,
+never skip it; `test_missing_shell_interpreter_fails` in
+[tests/test_examples.py](../../tests/test_examples.py) keeps that platform rule.
 
 The placeholder rule in [tools/examples.py](../../tools/examples.py) accepts
 only word placeholders. A fence with a non-word placeholder such as `<a b>`
