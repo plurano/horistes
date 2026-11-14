@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Check fenced YAML and TOML code examples in tracked Markdown files.
+"""Check fenced YAML, TOML, JSON, Python and shell code examples in tracked Markdown files.
+
+A shell example's <name> placeholders are read as the bare word name before
+bash -n or sh -n; nothing is executed. A missing interpreter is a failure,
+never a skip.
 
     examples.py [check] [--root DIR]
 
@@ -11,6 +15,9 @@ Exit codes: 0 pass, 1 parse failure, 3 file or git error.
 from __future__ import annotations
 
 import argparse
+import ast
+import json
+import os
 import re
 import subprocess
 import sys
@@ -24,6 +31,7 @@ except ImportError:
     YAMLError = Exception
 
 FENCE_START = re.compile(r"^(\s{0,3})(`{3,}|~{3,})(.*)")
+PLACEHOLDER = re.compile(r"<([A-Za-z][A-Za-z0-9_.:/-]*)>")
 DEADLINE_SECONDS = 30
 
 
@@ -65,6 +73,101 @@ def fenced_blocks(text: str) -> list[tuple[int, str, str]]:
     return blocks
 
 
+def _check_yaml(content: str) -> str | None:
+    if safe_load_all is None:
+        return "PyYAML not installed"
+    try:
+        list(safe_load_all(content))
+    except (YAMLError, ValueError) as err:
+        return str(err)
+    return None
+
+
+def _check_toml(content: str) -> str | None:
+    try:
+        tomllib.loads(content)
+    except (tomllib.TOMLDecodeError, ValueError) as err:
+        return str(err)
+    return None
+
+
+def _check_json(content: str) -> str | None:
+    try:
+        json.loads(content)
+    except json.JSONDecodeError as err:
+        return str(err)
+    return None
+
+
+def _check_python(content: str) -> str | None:
+    try:
+        ast.parse(content)
+    except (SyntaxError, ValueError) as err:
+        return str(err)
+    return None
+
+
+def _shell_env() -> dict[str, str]:
+    return {"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C"}
+
+
+def _shell_error(done: subprocess.CompletedProcess[str]) -> str | None:
+    if done.returncode == 0:
+        return None
+    return next(
+        (line for line in done.stderr.splitlines() if line.strip()), f"exit {done.returncode}"
+    )
+
+
+def _check_bash(content: str) -> str | None:
+    try:
+        done = subprocess.run(
+            ["bash", "-n"],
+            input=PLACEHOLDER.sub(r"\1", content),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=DEADLINE_SECONDS,
+            env=_shell_env(),
+        )
+    except FileNotFoundError:
+        return "bash not found"
+    except subprocess.TimeoutExpired:
+        return f"timed out after {DEADLINE_SECONDS} s"
+    return _shell_error(done)
+
+
+def _check_sh(content: str) -> str | None:
+    try:
+        done = subprocess.run(
+            ["sh", "-n"],
+            input=PLACEHOLDER.sub(r"\1", content),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=DEADLINE_SECONDS,
+            env=_shell_env(),
+        )
+    except FileNotFoundError:
+        return "sh not found"
+    except subprocess.TimeoutExpired:
+        return f"timed out after {DEADLINE_SECONDS} s"
+    return _shell_error(done)
+
+
+CHECKERS = {
+    "yaml": _check_yaml,
+    "yml": _check_yaml,
+    "toml": _check_toml,
+    "json": _check_json,
+    "python": _check_python,
+    "py": _check_python,
+    "bash": _check_bash,
+    "sh": _check_sh,
+    "shell": _check_sh,
+}
+
+
 def check_examples(root: Path, paths: list[Path]) -> tuple[list[str], int]:
     problems: list[str] = []
     count = 0
@@ -75,27 +178,20 @@ def check_examples(root: Path, paths: list[Path]) -> tuple[list[str], int]:
             rel_md = path.as_posix()
         text = path.read_text(encoding="utf-8")
         for start_line, lang, content in fenced_blocks(text):
-            if lang in ("yaml", "yml"):
-                if safe_load_all is None:
-                    problems.append(f"{rel_md}:{start_line}: {lang}: PyYAML not installed")
-                    continue
-                count += 1
-                try:
-                    list(safe_load_all(content))
-                except (YAMLError, ValueError) as err:
-                    problems.append(f"{rel_md}:{start_line}: {lang}: {err}")
-            elif lang == "toml":
-                count += 1
-                try:
-                    tomllib.loads(content)
-                except (tomllib.TOMLDecodeError, ValueError) as err:
-                    problems.append(f"{rel_md}:{start_line}: {lang}: {err}")
+            checker = CHECKERS.get(lang)
+            if checker is None:
+                continue
+            count += 1
+            err = checker(content)
+            if err is not None:
+                problems.append(f"{rel_md}:{start_line}: {lang}: {err}")
     return problems, count
 
 
 def tracked_markdown(root: Path) -> list[Path]:
     proc = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "*.md"],
+        ["git", "ls-files", "*.md"],
+        cwd=root,
         capture_output=True,
         text=True,
         check=False,
