@@ -80,8 +80,8 @@ def planted(payload: str) -> str:
     return payload.format(**WORDS)
 
 
-def tree_problems(root: Path) -> list[str]:
-    """Find problems in tracked Python files as the working tree holds them.
+def tree_problems(root: Path, today: datetime.date = FIXED_TODAY) -> list[str]:
+    """Find problems in tracked Python files as the working tree holds them on `today`.
 
     The file list comes from git ls-files, capped at
     exceptions.MAX_TRACKED_FILES like the scanner's own. A tracked
@@ -90,7 +90,6 @@ def tree_problems(root: Path) -> list[str]:
     tracked file deleted from the working tree is skipped; any other
     path that cannot be read, such as a directory, raises OSError.
     """
-    today = datetime.date(2026, 11, 9)
     _, _, valid_map = exceptions._own(root, today)
     valid_exceptions = set(valid_map.keys())
     tracked = exceptions._tracked_files(root)
@@ -111,8 +110,12 @@ def tree_problems(root: Path) -> list[str]:
 
 
 def test_tracked_tree_has_no_problems() -> None:
-    """The tracked Python files in the working tree contain no suppression problems."""
-    assert tree_problems(ROOT) == []
+    """The tracked Python files in the working tree contain no suppression problems.
+
+    The day is the one the engine-file exceptions in exceptions.yaml were entered on:
+    before it, the BLE001 entry for the lefthook checkpoint script is not yet valid.
+    """
+    assert tree_problems(ROOT, datetime.date(2026, 11, 13)) == []
 
 
 def test_tree_problems_ignores_untracked_copy(tree: Tree) -> None:

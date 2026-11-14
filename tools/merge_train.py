@@ -29,17 +29,6 @@ from datetime import UTC, datetime, timedelta
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
 from train_rules import (
-    ARM,
-    COMMIT_MUTATION,
-    COMMITS,
-    DEQUEUE,
-    DISARM,
-    DRAFT,
-    ENQUEUE,
-    MERGE,
-    MERGE_STATE,
-    MERGED,
-    READY,
     REFRESH_LABEL,
     REGENERATE_HEADLINE,
     SECURITY_HOLD_LABEL,
@@ -119,6 +108,117 @@ ISSUE_RIGHTS = {"issues": "write"}
 CLOSE_DAYS = 7
 LIST_RIGHTS = {"metadata": "read"}
 METHODS = ("SQUASH", "MERGE")
+# The sweep's GraphQL documents; the rules module keeps only the pull query (ADR-0082).
+MERGE_STATE = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      mergeStateStatus
+    }
+  }
+}
+"""
+COMMITS = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(first: 100) {
+        totalCount
+        nodes { commit { message parents { totalCount } } }
+      }
+    }
+  }
+}
+"""
+# The newest merged pull requests and the issues each one closes, for the close step.
+MERGED = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: MERGED, first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number mergedAt
+        mergedBy { login }
+        mergeCommit { oid }
+        closingIssuesReferences(first: 25) {
+          nodes {
+            number state
+            repository { nameWithOwner }
+            timelineItems(itemTypes: [REOPENED_EVENT], last: 5) {
+              nodes { ... on ReopenedEvent { createdAt } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+MERGE = """
+mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
+         $headline: String, $body: String) {
+  mergePullRequest(
+    input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
+            commitHeadline: $headline, commitBody: $body}
+  ) {
+    pullRequest { merged }
+  }
+}
+"""
+# A default branch with a merge queue refuses a direct merge; the queue lands it.
+ENQUEUE = """
+mutation($id: ID!, $oid: GitObjectID!) {
+  enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
+    mergeQueueEntry { state }
+  }
+}
+"""
+# Dequeue a pull request from the merge queue.
+DEQUEUE = """
+mutation($id: ID!) {
+  dequeuePullRequest(input: {id: $id}) {
+    mergeQueueEntry { id }
+  }
+}
+"""
+ARM = """
+mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
+         $headline: String, $body: String) {
+  enablePullRequestAutoMerge(
+    input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
+            commitHeadline: $headline, commitBody: $body}
+  ) {
+    pullRequest { autoMergeRequest { enabledAt } }
+  }
+}
+"""
+DISARM = """
+mutation($id: ID!) {
+  disablePullRequestAutoMerge(input: {pullRequestId: $id}) {
+    pullRequest { autoMergeRequest { enabledAt } }
+  }
+}
+"""
+DRAFT = """
+mutation($id: ID!) {
+  convertPullRequestToDraft(input: {pullRequestId: $id}) {
+    pullRequest { isDraft }
+  }
+}
+"""
+READY = """
+mutation($id: ID!) {
+  markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+    pullRequest { isDraft }
+  }
+}
+"""
+COMMIT_MUTATION = """
+mutation($input: CreateCommitOnBranchInput!) {
+  createCommitOnBranch(input: $input) {
+    commit { oid }
+  }
+}
+"""
 ACCEPTABLE = ("UNSTABLE", "HAS_HOOKS")
 NO_NEW_COMMITS = "There are no new commits on the base branch."
 CONFLICT = "merge conflict between base and head"

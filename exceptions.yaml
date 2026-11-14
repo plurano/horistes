@@ -11,110 +11,147 @@ exceptions:
     path: .bestpractices.json
     issue: plurano/horistes#116
     category: C
-    entered: "2026-11-07"
+    entered: "2026-11-13"
     reason: >-
-      project answers are in .bestpractices.json; registration on
-      bestpractices.dev approved and waiting for completion
-    expires: "2026-11-17"
+      category C: project 16453 is registered and its answers match
+      .bestpractices.json; four criteria stay Unmet until the first release
+      (version_unique; version_semver; version_tags; release_notes; see
+      docs/adr/0069-the-first-release-is-0-1-0-from-release-please.md) and
+      release PR 150 for milestone 0.1.0 is held; the entry is renewed on
+      its category C interval until 0.1.0 ships and is then dropped
+    expires: "2026-11-23"
   - rule: MD013
     path: CLAUDE.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD025
     path: CLAUDE.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD013
     path: .codex/rules.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD025
     path: .codex/rules.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD013
     path: .gemini/GEMINI.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD025
     path: .gemini/GEMINI.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD013
     path: AGENTS.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD025
     path: AGENTS.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD013
     path: AGENTS.readonly.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: MD025
     path: AGENTS.readonly.md
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: BLE001
     path: .config/lefthook/scripts/checkpoint.py
     issue: cordanaLLM/praetor#1878
     category: C
-    entered: "2026-11-09"
-    expires: "2026-11-19"
+    entered: "2026-11-13"
+    expires: "2026-11-23"
     reason: >-
-      written by the engine (praetorctl compile-context or adopt) without
-      the fleet inline format; ends when the engine release emits it
+      category C: written by the engine (praetorctl compile-context or
+      adopt) without the fleet inline format (cordanaLLM/praetor#1878 and
+      order engine-hook-render-isc-clean-20261108); renewed once on
+      2026-11-13 and not again: re-adoption drops the entry once an engine
+      release fixes cordanaLLM/praetor#1878 and cordanaLLM/praetor#1853
   - rule: zizmor ref-version-mismatch on branch comments
     path: tools/pins.py
     issue: zizmorcore/zizmor#2378
