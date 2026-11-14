@@ -69,6 +69,9 @@ pre-push:
     tools-stamp:
       priority: 1
       run: make --no-print-directory check-tools-stamp
+    opengrep-stamp:
+      priority: 2
+      run: make --no-print-directory check-opengrep-stamp
     flavor-audit:
       run: sh .config/lefthook/engine.sh flavor audit .
     audit:

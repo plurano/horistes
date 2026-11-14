@@ -35,6 +35,10 @@ forge = [
 # Takes the toolchain from the runner's cache or the forge-hosted manifest;
 # when both miss it downloads from the Go distribution site, which redirects.
 "actions/setup-go" = ["go.dev", "dl.google.com"]
+# Reads the manifest from actions/node-versions on the forge and builds from
+# its release assets; on a manifest miss falls back to nodejs.org
+# (src/distributions/official_builds/official_builds.ts at v7.1.0, read 2026-11-14).
+"actions/setup-node" = ["nodejs.org"]
 # Reads the version manifest from raw.githubusercontent.com and the CPython
 # build from the forge's release assets (read src/install-python.ts at v7.0.0,
 # 2026-10-19), both forge hosts.
@@ -88,6 +92,12 @@ reason = "index of the hash-pinned tools in requirements/tools.txt, installed by
 [files.".github/workflows/ci.yml"."files.pythonhosted.org"]
 reason = "files of those tools"
 
+[files.".github/workflows/ci.yml"."registry.npmjs.org"]
+reason = "the Codacy analysis CLI pinned in tools/codacy_opengrep/package-lock.json, installed by `make opengrep-tools`"
+
+[files.".github/workflows/ci.yml"."nodejs.org"]
+reason = "Node distribution fallback when setup-node cannot find a build in the forge-hosted manifest"
+
 # The pin check of this repository's own workflows (decision record 0017). It
 # is no reusable workflow, so no input switches these hosts off. zizmor and the
 # tool ask only the forge.
@@ -96,6 +106,9 @@ reason = "index of the hash-pinned tools in requirements/tools.txt, installed by
 
 [files.".github/workflows/pins.yml"."files.pythonhosted.org"]
 reason = "files of those tools"
+
+[files.".github/workflows/pins.yml"."registry.npmjs.org"]
+reason = "named by the Makefile's opengrep-tools target, which `make check-pins` does not run; the host scan reads the whole Makefile of a workflow that runs make"
 
 # The shared workflow check installs the hash-pinned zizmor and PyYAML wheels from PyPI
 # (decision record 0057). It has no off switch: it is an exception with a day

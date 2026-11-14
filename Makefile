@@ -18,7 +18,8 @@ PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsc
 
 .PHONY: verify verify-all tools check-tools-stamp check-message requirements requirements-fuzz lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
-	interface-snapshot list-pins check-pins pin check-runners check-links fix-anchors check-examples
+	interface-snapshot list-pins check-pins pin check-runners check-links fix-anchors check-examples \
+	opengrep-tools check-opengrep-stamp check-opengrep
 
 # The one gate is `make verify-all`: CI runs exactly that target, so a local
 # green run and a green status check mean the same thing. This repository's own
@@ -30,8 +31,8 @@ verify-all: verify
 
 # This repository's own checks; they need no engine.
 verify: lint-yaml lint-python lint-workflows check-interface check-hosts check-exceptions check-templates \
-	check-scorecard check-runners check-links check-examples test verify-reuse
-	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, runner labels, markdown links, fenced examples, tests and licence headers.'
+	check-scorecard check-runners check-links check-examples check-opengrep test verify-reuse
+	@printf '%s\n' 'PASS: YAML, Python and workflow lint, interface lock, host scan, accepted findings, caller templates, scorecard service rules, runner labels, markdown links, fenced examples, Codacy Opengrep, tests and licence headers.'
 
 # One version of every tool for the local gate and CI, installed with the
 # hashes requirements/tools.txt records.
@@ -58,6 +59,21 @@ check-tools-stamp:
 		printf '%s\n' '$(VENV)/.stamp does not match requirements/tools.txt; run make tools' >&2; \
 		exit 1; \
 	fi
+
+# Codacy's checked-in Python rules run offline with the pinned CLI and binary
+# (ADR-0084). Only opengrep-tools reaches a host: npm ci against
+# registry.npmjs.org and the forge release asset of the binary. Pre-push
+# checks their stamp before the gate. The baseline can shrink against
+# BASE_REF, never grow.
+opengrep-tools:
+	$(PYTHON) -B tools/codacy_opengrep_scan.py --install
+
+check-opengrep-stamp:
+	$(PYTHON) -B tools/codacy_opengrep_scan.py --check-install
+
+check-opengrep: opengrep-tools
+	$(PYTHON) -B tools/codacy_opengrep_scan.py
+	$(PYTHON) -B tools/codacy_opengrep_scan.py --base-ref $(BASE_REF)
 
 # The commit-msg hook judges one message with tools/commit_message.py
 # (ADR-0074): lefthook names the message file in MESSAGE_FILE. Without it the

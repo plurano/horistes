@@ -467,8 +467,12 @@ def workflows() -> list[str]:
     return [str(path.relative_to(ROOT)) for path in found]
 
 
-def test_only_the_three_managers_run():
-    assert CONFIG["enabledManagers"] == ["github-actions", "pip-compile", "custom.regex"]
+def test_only_the_four_managers_run():
+    assert CONFIG["enabledManagers"] == ["github-actions", "pip-compile", "custom.regex", "npm"]
+
+
+def test_npm_reads_only_the_codacy_cli_package():
+    assert CONFIG["npm"] == {"managerFilePatterns": ["/^tools/codacy_opengrep/package\\.json$/"]}
 
 
 def test_waiting_time_is_three_days_and_nothing_merges_itself():

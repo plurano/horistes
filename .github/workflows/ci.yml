@@ -126,6 +126,11 @@ jobs:
           done
           gitleaks git --no-banner --verbose --redact --exit-code 1 --ignore-gitleaks-allow --timeout 300 .
 
+      - name: Set up Node for the pinned Codacy analysis CLI
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
       # The interface is compared with the commit the change starts from.
       - name: Verification gate
         env:

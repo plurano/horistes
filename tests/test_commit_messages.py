@@ -233,8 +233,8 @@ def test_message_without_credit_passes(message):
         (f"Assisted-by: Some Tool\n{SIGN_OFF}", ["trailer Assisted-by"]),
         (f"Generated with Some Tool\n\n{SIGN_OFF}", ["line Generated with Some Tool"]),
         (
-            f"\N{ROBOT FACE} Generated with [Some Tool](https://example.org)\n\n{SIGN_OFF}",
-            ["line \N{ROBOT FACE} Generated with [Some Tool](https://example.org)"],
+            f"\U0001f916 Generated with [Some Tool](https://example.org)\n\n{SIGN_OFF}",
+            ["line \U0001f916 Generated with [Some Tool](https://example.org)"],
         ),
     ],
     ids=["co-author", "co-author in small letters", "unlisted key", "footer", "footer with a sign"],
