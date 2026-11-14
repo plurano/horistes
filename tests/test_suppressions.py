@@ -551,3 +551,10 @@ def test_reader_needs_a_date() -> None:
     for reader in (suppression_problems, exceptions.comment_problems):
         param = inspect.signature(reader).parameters["today"]
         assert param.default is inspect.Parameter.empty
+
+
+def test_generated_opengrep_lockfile_is_excluded_globally() -> None:
+    """Generated lockfile has one global exclusion; engine exclusions remain forbidden."""
+    config = ciwf.load(ROOT / ".codacy.yml")
+    assert "tools/codacy_opengrep/package-lock.json" in config["exclude_paths"]
+    assert codacy_problems((ROOT / ".codacy.yml").read_text(encoding="utf-8")) == []

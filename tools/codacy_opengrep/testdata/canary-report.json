@@ -1,6 +1,6 @@
 {
   "capability": {
-    "checkedAt": "2026-11-14T17:45:06.131Z",
+    "checkedAt": "2026-11-14T22:22:55.631Z",
     "ready": [
       {
         "configSource": "codacy",
@@ -54,18 +54,18 @@
     }
   ],
   "metadata": {
-    "completedAt": "2026-11-14T17:45:11.122Z",
-    "durationMs": 7588,
+    "completedAt": "2026-11-14T22:23:00.905Z",
+    "durationMs": 6489,
     "executionMode": "strict",
     "phaseTimings": {
-      "availabilityMs": 2557,
-      "fileDiscoveryMs": 6,
-      "fileRoutingMs": 2,
+      "availabilityMs": 1193,
+      "fileDiscoveryMs": 5,
+      "fileRoutingMs": 3,
       "installMs": 0,
-      "toolExecutionMs": 4982,
-      "toolUpdateMs": 0
+      "toolExecutionMs": 5263,
+      "toolUpdateMs": 1
     },
-    "startedAt": "2026-11-14T17:45:03.534Z"
+    "startedAt": "2026-11-14T22:22:54.416Z"
   },
   "patternSummary": {
     "groups": [
@@ -109,7 +109,7 @@
   },
   "toolResults": [
     {
-      "durationMs": 4981,
+      "durationMs": 5263,
       "errorCount": 0,
       "filesAnalyzed": 2,
       "issueCount": 3,

@@ -1,11 +1,11 @@
 {
   "capability": {
-    "checkedAt": "2026-11-14T17:43:58.866Z",
+    "checkedAt": "2026-11-14T22:23:57.254Z",
     "ready": [
       {
         "configSource": "codacy",
         "displayName": "Opengrep",
-        "filesRouted": 88,
+        "filesRouted": 97,
         "installation": "codacy",
         "runner": "local",
         "toolId": "Semgrep",
@@ -705,31 +705,6 @@
     },
     {
       "category": "Security",
-      "column": 16,
-      "endColumn": 10,
-      "endLine": 151,
-      "filePath": "tools/codacy_opengrep_scan.py",
-      "line": 142,
-      "lineContent": "        return subprocess.run(",
-      "message": "Detected subprocess function 'run' without a static string.",
-      "multilineContent": [
-        "        return subprocess.run(",
-        "            argv,",
-        "            cwd=cwd,",
-        "            env=env,",
-        "            input=stdin,",
-        "            capture_output=True,",
-        "            text=True,",
-        "            timeout=timeout,",
-        "            check=False,",
-        "        )"
-      ],
-      "patternId": "Semgrep_python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit",
-      "severity": "Error",
-      "toolId": "Semgrep"
-    },
-    {
-      "category": "Security",
       "column": 20,
       "endColumn": 14,
       "endLine": 97,
@@ -739,7 +714,7 @@
       "message": "Detected subprocess function 'run' without a static string.",
       "multilineContent": [
         "            done = subprocess.run(",
-        "                # no\u0073emgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args expires 2027-03-09 category D: the GH variable picks the gh binary so tests run a stand-in  # noqa: E501",
+        "                # \u006eosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args expires 2027-03-09 category D: the GH variable picks the gh binary so tests run a stand-in  # noqa: E501",
         "                command,",
         "                capture_output=True,",
         "                check=False,",
@@ -1014,18 +989,18 @@
     }
   ],
   "metadata": {
-    "completedAt": "2026-11-14T17:44:16.324Z",
-    "durationMs": 18191,
+    "completedAt": "2026-11-14T22:24:23.298Z",
+    "durationMs": 27034,
     "executionMode": "strict",
     "phaseTimings": {
-      "availabilityMs": 719,
-      "fileDiscoveryMs": 5,
+      "availabilityMs": 965,
+      "fileDiscoveryMs": 6,
       "fileRoutingMs": 2,
       "installMs": 0,
-      "toolExecutionMs": 17447,
-      "toolUpdateMs": 1
+      "toolExecutionMs": 26027,
+      "toolUpdateMs": 0
     },
-    "startedAt": "2026-11-14T17:43:58.133Z"
+    "startedAt": "2026-11-14T22:23:56.264Z"
   },
   "patternSummary": {
     "groups": [
@@ -1035,8 +1010,8 @@
         "patterns": [
           {
             "category": "Security",
-            "fileCount": 23,
-            "issueCount": 36,
+            "fileCount": 22,
+            "issueCount": 35,
             "noisy": false,
             "patternId": "Semgrep_python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit",
             "severity": "Error",
@@ -1069,7 +1044,7 @@
         ],
         "severity": "Error",
         "severityLabel": "CRITICAL",
-        "totalIssues": 40,
+        "totalIssues": 39,
         "totalPatterns": 3
       },
       {
@@ -1129,15 +1104,15 @@
     ],
     "noisyPatternCount": 0,
     "noisyThreshold": 500,
-    "totalIssues": 48,
+    "totalIssues": 47,
     "totalPatterns": 7
   },
   "toolResults": [
     {
-      "durationMs": 17446,
+      "durationMs": 26025,
       "errorCount": 0,
-      "filesAnalyzed": 88,
-      "issueCount": 48,
+      "filesAnalyzed": 97,
+      "issueCount": 47,
       "status": "success",
       "toolId": "Semgrep"
     }

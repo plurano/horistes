@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 /.coverage*
 /tools/codacy_opengrep/node_modules/
+/tools/codacy_opengrep/.install.lock
 
 # The pre-push gate's local receipt.
 

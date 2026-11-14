@@ -63,7 +63,7 @@ check-tools-stamp:
 # Codacy's checked-in Python rules run offline with the pinned CLI and binary
 # (ADR-0084). Only opengrep-tools reaches a host: npm ci against
 # registry.npmjs.org and the forge release asset of the binary; CI runs it as
-# its own step. verify and pre-push only check its stamp, so the gate stays
+# its own step. verify and pre-push scan the installed tree, so the gate stays
 # offline. The baseline can shrink against BASE_REF, never grow.
 opengrep-tools:
 	$(PYTHON) -B tools/codacy_opengrep_scan.py --install
@@ -72,7 +72,6 @@ check-opengrep-stamp:
 	$(PYTHON) -B tools/codacy_opengrep_scan.py --check-install
 
 check-opengrep: check-opengrep-stamp
-	$(PYTHON) -B tools/codacy_opengrep_scan.py
 	$(PYTHON) -B tools/codacy_opengrep_scan.py --base-ref $(BASE_REF)
 
 # The commit-msg hook judges one message with tools/commit_message.py

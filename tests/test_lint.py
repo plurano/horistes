@@ -362,3 +362,19 @@ def test_rooted_reads_the_makefile_separator_under_a_backslash_sep(
     monkeypatch.setattr(os, "sep", "\\")
     assert rooted([".venv/bin/ruff"]) == [str(ROOT / ".venv/bin/ruff")]
     assert rooted(["ruff"]) == ["ruff"]
+
+
+def test_opengrep_recipe_scans_and_shrinks_in_one_process():
+    """One invocation shares the parsed baseline across scan and shrink checks."""
+    content = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert _recipe(content, "check-opengrep") == [
+        "$(PYTHON) -B tools/codacy_opengrep_scan.py --base-ref $(BASE_REF)"
+    ]
+    assert "check-opengrep-stamp" in _prerequisites(content, "check-opengrep")
+
+
+def test_check_opengrep_base_ref_defaults_to_origin_main():
+    """Boundary: with BASE_REF unset the shrink check compares with origin/main (ADR-0084)."""
+    content = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "BASE_REF ?= origin/main" in content.splitlines()
+    assert any("--base-ref $(BASE_REF)" in line for line in _recipe(content, "check-opengrep"))

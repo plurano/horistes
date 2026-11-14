@@ -21,19 +21,27 @@ for Semgrep remained open in [ADR-0028](0028-every-commit-is-scanned-for-secrets
 
 Horistes (Greek for a boundary commissioner, pronounced ho-RIS-tees;
 [ADR-0023](0023-the-name-is-horistes.md)) holds the scanner, rule configuration
-and dependency lockfile. [tools/codacy_opengrep_scan.py](../../tools/codacy_opengrep_scan.py)
-is adapted from `lusoris/SnatchArr`'s `tools/ci/codacy_opengrep_scan.py` at
-`21f590a3535f`, under EUPL-1.2, with source credit in its docstring.
+and dependency lockfile. The scanner is split by responsibility:
+
+- [codacy_opengrep_scan.py](../../tools/codacy_opengrep_scan.py): CLI and scan orchestration.
+- [codacy_opengrep_common.py](../../tools/codacy_opengrep_common.py): constants, subprocess boundaries, configuration and rule drift.
+- [codacy_opengrep_baseline.py](../../tools/codacy_opengrep_baseline.py): baseline validation and shrink comparison.
+- [codacy_opengrep_report.py](../../tools/codacy_opengrep_report.py): bounded source reads, fingerprints and report validation.
+- [codacy_opengrep_install.py](../../tools/codacy_opengrep_install.py): locked installation, tree validation and engine cache.
+
+These modules are adapted from `lusoris/SnatchArr`'s `tools/ci/codacy_opengrep_scan.py` at
+`21f590a3535f`, under EUPL-1.2, with source credit in each module's docstring.
 SnatchArr (spoken snatch-ar) asks the `*arr` media managers, such as Sonarr
 and Radarr, to search for missing items and cutoff-unmet upgrades. Each
 search is a snatch, and the `-arr` suffix follows that family's naming.
 Moving SnatchArr onto this copy is a separate, later change.
 
 [Makefile](../../Makefile) adds `make check-opengrep` to `verify`.
-It checks the installation stamp, scans against the baseline, verifies the
-canaries, and refuses baseline growth against `BASE_REF`; it never installs.
-The pre-push hook in [lefthook.yml](../../lefthook.yml) checks the same stamp
-before the remaining jobs; a missing or stale install names
+It checks the installation stamp and locked package versions, verifies rule drift,
+scans against the baseline, verifies the canaries, and refuses baseline growth
+against `BASE_REF` using the same parsed baseline snapshot; it never installs.
+The pre-push hook in [lefthook.yml](../../lefthook.yml) runs `make check-opengrep`
+before the remaining jobs; a missing, stale or damaged install names
 `make opengrep-tools`. The gate workflow
 [ci.yml](../../.github/workflows/ci.yml) runs `make opengrep-tools` as its
 own step before `make verify-all`. The installed npm tree is git-ignored,
@@ -54,7 +62,8 @@ The rule set is the checked-in read-only Codacy listing at
 Its SHA-256 and count are recorded in the metadata header of
 [opengrep-python.config.json](../../tools/codacy_opengrep/opengrep-python.config.json).
 A listing refresh is manual, taken from the read-only listing and checked
-offline with `--drift LISTING`. There is no Codacy fetch during a scan.
+offline with `--drift LISTING`. Every scan also compares the checked-in listing
+against the configured IDs. There is no Codacy fetch during a scan.
 
 [baseline.json](../../tools/codacy_opengrep/baseline.json) is shrink-only.
 Each entry records a content fingerprint, count, reason, issue, entry date,
@@ -82,8 +91,13 @@ so a larger file cannot silently disappear from coverage.
 ## Consequences
 
 The local gate and Codacy use the checked-in set of enabled Python rules.
-[tests/test_codacy_opengrep_scan.py](../../tests/test_codacy_opengrep_scan.py)
-replays recorded clean and planted reports in both directions and exercises
+The tests mirror the module split:
+[scan](../../tests/test_codacy_opengrep_scan.py),
+[common](../../tests/test_codacy_opengrep_common.py),
+[baseline](../../tests/test_codacy_opengrep_baseline.py),
+[report](../../tests/test_codacy_opengrep_report.py) and
+[install](../../tests/test_codacy_opengrep_install.py).
+They replay recorded clean and planted reports in both directions and exercise
 the scanner offline. The recorded reports quote scanned source. A quoted
 ignore comment is JSON-escaped there, so `make check-exceptions` counts it
 once, in its source file, and the decoded fingerprint stays unchanged. Every real scan also checks the `753b7aa` / `fc53740`
@@ -91,7 +105,10 @@ shape and the intrafile taint canary, so an unavailable engine or missing
 taint behavior fails instead of producing a clean result.
 
 Installation needs Node 24 and the declared hosts; an unchanged install is
-a no-op. Scans need the verified cache and installed lockfile stamp. Linux
+a no-op only when every versioned package matches the lockfile. Installation
+holds an exclusive, bounded-wait lock through package and binary verification;
+checks and scans hold shared locks while using the tree. Scans need the verified
+cache, intact package tree and installed lockfile stamp. Linux
 x64 CI enforces the scan; contributors on other platforms receive the stated
 skip. Rule refreshes and justified initial baseline entries require review;
 the baseline can subsequently shrink, and its dated entries must be resolved

@@ -245,17 +245,17 @@ def test_lefthook_pre_push_tools_stamp() -> None:
         assert stamp_prio < effective_prio
 
 
-def test_lefthook_pre_push_opengrep_stamp() -> None:
-    """The offline Opengrep stamp check runs after tools-stamp and before other jobs."""
+def test_lefthook_pre_push_opengrep() -> None:
+    """The offline Opengrep scan runs after tools-stamp and before other jobs."""
     commands = ciwf.load(ROOT / "lefthook.yml")["pre-push"]["commands"]
-    assert "opengrep-stamp" in commands
-    stamp = commands["opengrep-stamp"]
-    assert stamp["run"] == "make --no-print-directory check-opengrep-stamp"
+    assert "opengrep" in commands
+    stamp = commands["opengrep"]
+    assert stamp["run"] == "make --no-print-directory check-opengrep"
     priority = stamp["priority"]
     assert isinstance(priority, int)
     assert commands["tools-stamp"]["priority"] < priority
     for name, command in commands.items():
-        if name in {"tools-stamp", "opengrep-stamp"}:
+        if name in {"tools-stamp", "opengrep"}:
             continue
         other = command.get("priority")
         assert priority < (float("inf") if other in (None, 0) else other)
