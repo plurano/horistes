@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Offline checks for the Codacy Opengrep shared fixtures module."""
+"""Plain helpers shared by the Codacy Opengrep scanner tests.
+
+The fixtures that use them sit in conftest.py next to this module.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import threading
@@ -16,7 +18,6 @@ from typing import Self
 import codacy_opengrep_common as common
 import codacy_opengrep_install as installer
 import codacy_opengrep_report as reports
-import pytest
 
 TODAY = date(2026, 11, 14)
 
@@ -73,54 +74,6 @@ def entry(**changes: str) -> dict[str, str]:
         "reason": "Synthetic baseline for offline scanner validation.",
         **changes,
     }
-
-
-@pytest.fixture(autouse=True)
-def no_external_calls(monkeypatch: pytest.MonkeyPatch) -> None:
-    def refused(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("unexpected external call")
-
-    monkeypatch.setattr(installer.urllib.request, "urlopen", refused)
-    monkeypatch.setattr(common.subprocess, "run", refused)
-
-
-@pytest.fixture
-def installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict]:
-    root = tmp_path / "repo"
-    package = root / common.PACKAGE
-    document(
-        root, common.PACKAGE + "/package.json", {"dependencies": {common.CLI_PACKAGE: "0.29.0"}}
-    )
-    document(
-        root,
-        common.PACKAGE + "/package-lock.json",
-        {
-            "lockfileVersion": 3,
-            "packages": {
-                "": {},
-                "node_modules/@codacy/analysis-cli": {"version": "0.29.0"},
-                "node_modules/dependency": {"version": "1.0.0"},
-            },
-        },
-    )
-    document(package, "node_modules/" + common.CLI_PACKAGE + "/package.json", {"version": "0.29.0"})
-    document(package, "node_modules/dependency/package.json", {"version": "1.0.0"})
-    write(package, "node_modules/.bin/codacy-analysis", "fake CLI")
-    write(package, common.ADAPTER, f'preferredVersion: "{VERSION}",')
-    digest = hashlib.sha256(b"binary").hexdigest()
-    versions = {
-        "OPENGREP_VERSION": VERSION,
-        "OPENGREP_SHA256": digest,
-        "OPENGREP_URL": common.DOWNLOAD_PREFIX + VERSION + "/opengrep_manylinux_x86",
-    }
-    write(root, common.TOOL_VERSIONS, "\n".join(f"{k}={v}" for k, v in versions.items()))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    binary = installer.cache_path(versions)
-    binary.parent.mkdir(parents=True)
-    binary.write_bytes(b"binary")
-    stamp, expected = installer.npm_stamp(root)
-    stamp.write_text(expected + "\n", encoding="utf-8")
-    return root, versions
 
 
 class FakeResponse:

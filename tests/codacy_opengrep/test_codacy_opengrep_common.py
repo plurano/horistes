@@ -11,13 +11,12 @@ from types import SimpleNamespace
 import codacy_opengrep_common as common
 import codacy_opengrep_install as installer
 import pytest
-from codacy_opengrep_helpers import (
+
+from .codacy_opengrep_helpers import (
     document,
     result,
     write,
 )
-from codacy_opengrep_helpers import installed as installed
-from codacy_opengrep_helpers import no_external_calls as no_external_calls
 
 
 @pytest.mark.parametrize(

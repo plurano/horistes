@@ -15,7 +15,8 @@ import codacy_opengrep_common as common
 import codacy_opengrep_report as reports
 import exceptions
 import pytest
-from codacy_opengrep_helpers import (
+
+from .codacy_opengrep_helpers import (
     TODAY,
     VERSION,
     fixture_files,
@@ -24,8 +25,6 @@ from codacy_opengrep_helpers import (
     result,
     write,
 )
-from codacy_opengrep_helpers import installed as installed
-from codacy_opengrep_helpers import no_external_calls as no_external_calls
 
 
 @pytest.mark.parametrize(

@@ -14,14 +14,13 @@ import codacy_opengrep_baseline as baseline
 import codacy_opengrep_common as common
 import codacy_opengrep_scan as scan
 import pytest
-from codacy_opengrep_helpers import (
+
+from .codacy_opengrep_helpers import (
     TODAY,
     document,
     entry,
     result,
 )
-from codacy_opengrep_helpers import installed as installed
-from codacy_opengrep_helpers import no_external_calls as no_external_calls
 
 
 def test_checked_in_baseline_is_valid() -> None:

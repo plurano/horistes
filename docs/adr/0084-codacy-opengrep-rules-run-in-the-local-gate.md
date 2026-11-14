@@ -92,11 +92,14 @@ so a larger file cannot silently disappear from coverage.
 
 The local gate and Codacy use the checked-in set of enabled Python rules.
 The tests mirror the module split:
-[scan](../../tests/test_codacy_opengrep_scan.py),
-[common](../../tests/test_codacy_opengrep_common.py),
-[baseline](../../tests/test_codacy_opengrep_baseline.py),
-[report](../../tests/test_codacy_opengrep_report.py) and
-[install](../../tests/test_codacy_opengrep_install.py).
+[scan](../../tests/codacy_opengrep/test_codacy_opengrep_scan.py),
+[common](../../tests/codacy_opengrep/test_codacy_opengrep_common.py),
+[baseline](../../tests/codacy_opengrep/test_codacy_opengrep_baseline.py),
+[report](../../tests/codacy_opengrep/test_codacy_opengrep_report.py) and
+[install](../../tests/codacy_opengrep/test_codacy_opengrep_install.py).
+Their fixtures sit in that folder's
+[conftest.py](../../tests/codacy_opengrep/conftest.py), so the autouse guard
+against outside calls applies to these tests only.
 They replay recorded clean and planted reports in both directions and exercise
 the scanner offline. The recorded reports quote scanned source. A quoted
 ignore comment is JSON-escaped there, so `make check-exceptions` counts it

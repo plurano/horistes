@@ -11,22 +11,23 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
+import codacy_opengrep_baseline as baselines
 import codacy_opengrep_common as common
 import codacy_opengrep_install as installer
 import codacy_opengrep_report as reports
 import codacy_opengrep_scan as scan
 import pytest
-from codacy_opengrep_helpers import (
+
+from .codacy_opengrep_helpers import (
     TODAY,
     VERSION,
+    document,
     entry,
     issue,
     report,
     result,
     write,
 )
-from codacy_opengrep_helpers import installed as installed
-from codacy_opengrep_helpers import no_external_calls as no_external_calls
 
 
 @pytest.mark.parametrize("copies", [0, 2])
@@ -285,8 +286,6 @@ def test_unrunnable_engine_never_reaches_cli(
 
 
 def test_scan_checks_mirrored_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from codacy_opengrep_helpers import document
-
     listing = write(tmp_path, common.FIXTURES + "/enabled-python-ids.txt", "kept\nremoved\n")
     config = {
         "tools": [
@@ -320,9 +319,6 @@ def test_scan_checks_mirrored_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 def test_scan_uses_one_baseline_snapshot(installed: tuple, monkeypatch: pytest.MonkeyPatch) -> None:
-    import codacy_opengrep_baseline as baselines
-    from codacy_opengrep_helpers import document
-
     root, _ = installed
     document(
         root,
