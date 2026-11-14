@@ -11,18 +11,32 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import ROOT, external
+from conftest import CALLER_IDS, CALLER_TEMPLATES, ROOT, external
 
 sys.path.insert(0, str(ROOT / "tools"))
 import render
 
-CALLERS = [
-    ("templates/callers/licence.yml.tmpl", ".github/workflows/licence-check.yml"),
-    ("templates/callers/scorecard.yml.tmpl", ".github/workflows/scorecard-check.yml"),
-    ("templates/callers/merge-train.yml.tmpl", ".github/workflows/merge-train.yml"),
-    ("templates/callers/secret-scan.yml.tmpl", ".github/workflows/secret-scan.yml"),
-    ("templates/callers/workflow-check.yml.tmpl", ".github/workflows/workflow-check.yml"),
-]
+
+def test_every_caller_template_is_mapped() -> None:
+    templates = sorted(
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / render.TEMPLATES).glob("*" + render.SUFFIX)
+    )
+    mapped = sorted(CALLER_TEMPLATES)
+    missing = sorted(set(templates) - set(mapped))
+    extra = sorted(set(mapped) - set(templates))
+    assert mapped == templates, (
+        f"Missing caller templates: {missing}; extra caller templates: {extra}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("template", "name"),
+    sorted(CALLER_TEMPLATES.items()),
+    ids=CALLER_IDS,
+)
+def test_each_template_names_its_consumer_path(template: str, name: str) -> None:
+    assert name in (ROOT / template).read_text(encoding="utf-8")
 
 
 def lint(root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -37,8 +51,8 @@ def lint(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 @pytest.mark.parametrize(
     ("template", "name"),
-    CALLERS,
-    ids=["licence", "scorecard", "merge-train", "secret-scan", "workflow-check"],
+    sorted(CALLER_TEMPLATES.items()),
+    ids=CALLER_IDS,
 )
 def test_rendered_caller_passes_reuse_lint(tmp_path: Path, template: str, name: str) -> None:
     source = (ROOT / template).read_text(encoding="utf-8")

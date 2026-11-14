@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 import pytest
-from conftest import REUSABLE, ROOT, external
+from conftest import CALLER_IDS, CALLER_TEMPLATES, REUSABLE, ROOT, external
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
@@ -30,8 +30,6 @@ CONTEXT = {
 COMMIT = render.SAMPLE["Shared"]["Commit"]
 REAL = "templates/callers/licence.yml.tmpl"
 REAL_SCORECARD = "templates/callers/scorecard.yml.tmpl"
-REAL_TRAIN = "templates/callers/merge-train.yml.tmpl"
-REAL_WORKFLOW_CHECK = "templates/callers/workflow-check.yml.tmpl"
 TEMPLATE = "templates/callers/licence.yml.tmpl"
 CALLED = ".github/workflows/licence.yml"
 ISSUE = "cordanaLLM/praetor#1212"
@@ -281,13 +279,8 @@ def test_scorecard_template_renders_into_the_recorded_caller():
 
 @pytest.mark.parametrize(
     ("template", "name"),
-    [
-        (REAL, ".github/workflows/licence-check.yml"),
-        (REAL_SCORECARD, ".github/workflows/scorecard-check.yml"),
-        (REAL_TRAIN, ".github/workflows/merge-train.yml"),
-        (REAL_WORKFLOW_CHECK, ".github/workflows/workflow-check.yml"),
-    ],
-    ids=["licence", "scorecard", "merge-train", "workflow-check"],
+    sorted(CALLER_TEMPLATES.items()),
+    ids=CALLER_IDS,
 )
 def test_rendered_caller_passes_both_linters(tree, template, name):
     """A rendered caller passes actionlint and zizmor checks."""
