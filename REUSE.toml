@@ -25,6 +25,11 @@ path = [
     "requirements/tools.txt",
     "settings-sync.json",
     "suppression-baseline.json",
+    "tools/codacy_opengrep/baseline.json",
+    "tools/codacy_opengrep/opengrep-python.config.json",
+    "tools/codacy_opengrep/package-lock.json",
+    "tools/codacy_opengrep/package.json",
+    "tools/codacy_opengrep/testdata/enabled-python-ids.txt",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Lusoris <lusoris@pm.me>"
