@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Self
 
 import codacy_opengrep_scan as scan
+import exceptions
 import pytest
 
 
@@ -1209,6 +1210,22 @@ def test_recorded_reports_both_directions() -> None:
     assert scan.report_problems(
         main, fixture_files(main), baseline + Counter({"demo\0missing.py\0" + "0" * 64: 1}), VERSION
     )[0].startswith("stale baseline entry:")
+
+
+@pytest.mark.parametrize("name", ["main-report.json", "planted-report.json"])
+def test_recorded_reports_quote_suppressions_escaped(name: str) -> None:
+    """A quoted ignore comment is JSON-escaped, so check-exceptions does not count it twice."""
+    raw = (scan.ROOT / scan.FIXTURES / name).read_text(encoding="utf-8")
+    counts: dict[str, int] = {}
+    assert not exceptions.opengrep_problems(raw, name, TODAY, set(), counts)
+    assert not counts
+    quoted = [
+        (issue["filePath"], line)
+        for issue in json.loads(raw)["issues"]
+        for line in issue.get("multilineContent", [])
+        if exceptions.OPENGREP_AFTER_CODE.search(line)
+    ]
+    assert [path for path, _line in quoted] == ["tools/forge.py"]
 
 
 def test_unrunnable_engine_never_reaches_cli(

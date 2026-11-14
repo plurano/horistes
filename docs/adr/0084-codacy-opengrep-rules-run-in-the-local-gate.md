@@ -84,7 +84,9 @@ so a larger file cannot silently disappear from coverage.
 The local gate and Codacy use the checked-in set of enabled Python rules.
 [tests/test_codacy_opengrep_scan.py](../../tests/test_codacy_opengrep_scan.py)
 replays recorded clean and planted reports in both directions and exercises
-the scanner offline. Every real scan also checks the `753b7aa` / `fc53740`
+the scanner offline. The recorded reports quote scanned source. A quoted
+ignore comment is JSON-escaped there, so `make check-exceptions` counts it
+once, in its source file, and the decoded fingerprint stays unchanged. Every real scan also checks the `753b7aa` / `fc53740`
 shape and the intrafile taint canary, so an unavailable engine or missing
 taint behavior fails instead of producing a clean result.
 
