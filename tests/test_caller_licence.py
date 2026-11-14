@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,11 @@ from conftest import CALLER_IDS, CALLER_TEMPLATES, ROOT, external
 
 sys.path.insert(0, str(ROOT / "tools"))
 import render
+
+# The two phrasings a template header uses to name its consumer path.
+CONSUMER_PATH = re.compile(
+    r"(?:as a consumer keeps it in|repository as) (\.github/workflows/[\w.-]+\.yml)\."
+)
 
 
 def test_every_caller_template_is_mapped() -> None:
@@ -36,7 +42,10 @@ def test_every_caller_template_is_mapped() -> None:
     ids=CALLER_IDS,
 )
 def test_each_template_names_its_consumer_path(template: str, name: str) -> None:
-    assert name in (ROOT / template).read_text(encoding="utf-8")
+    """The map entry is the consumer path the template's header states."""
+    header = (ROOT / template).read_text(encoding="utf-8").split("*/ -%>", 1)[0]
+    paths = CONSUMER_PATH.findall(" ".join(header.split()))
+    assert paths == [name], f"{template}: stated consumer paths {paths}; expected {[name]}"
 
 
 def lint(root: Path, *args: str) -> subprocess.CompletedProcess:
