@@ -51,6 +51,8 @@ Substitution skips heredoc bodies, preserving their contents and line numbers;
 `test_shell_input_preserves_pending_heredocs` in
 [tests/test_examples.py](../../tests/test_examples.py) cover placeholders after
 heredoc terminators, tab-stripped terminators, quoted delimiters and here-strings.
+A `<<` inside quotes, a comment, after a backslash or inside `$((...))` opens no
+heredoc, as covered by `test_shell_false_heredoc_operators_pass`.
 A space after `<` and an empty `<>` do not
 match; `test_spaced_input_redirection_passes` and
 `test_empty_placeholder_fails` in

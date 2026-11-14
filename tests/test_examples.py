@@ -17,6 +17,14 @@ POSIX_HEREDOC_INPUTS = {
     "after_body": "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\ngit ls-remote origin <branch>\n",
     "dash": "cat <<-EOF\n\t<EOF>\nnot code (\n\tEOF\ngit ls-remote origin <branch>\n",
 }
+POSIX_FALSE_HEREDOC_INPUTS = {
+    "single_quote": "echo '<<EOF'\necho <issue-id>\n",
+    "double_quote": 'echo "<<EOF"\necho <issue-id>\n',
+    "comment": "true # cat <<EOF\necho <issue-id>\n",
+    "escaped": "echo \\<<EOF\necho <issue-id>\n",
+    "arithmetic": "echo $((1 << 2))\necho <issue-id>\n",
+    "multiline_single_quote": "echo 'a\n<<EOF'\necho <issue-id>\n",
+}
 SH_EXIT_INPUT = "exit 24"
 SH_ALIAS_INPUT = "echo x"
 SH_BRACKETS_INPUT = "echo [broken toml or yaml: [["
@@ -302,6 +310,16 @@ def test_shell_heredoc_placeholders_pass(tree: Tree, language: str, content: str
     assert "1 examples verified" in done.stdout
 
 
+@pytest.mark.parametrize("language", ["bash", "sh"])
+@pytest.mark.parametrize("case", POSIX_FALSE_HEREDOC_INPUTS)
+def test_shell_false_heredoc_operators_pass(tree: Tree, language: str, case: str):
+    """Quoted, commented, escaped and arithmetic operators do not open heredoc bodies."""
+    content = POSIX_FALSE_HEREDOC_INPUTS[case]
+    done = check(tree, {"README.md": f"```{language}\n{content}```\n"})
+    assert done.returncode == 0, done.stderr
+    assert "1 examples verified" in done.stdout
+
+
 def test_sh_inputs_parse_as_posix():
     """Successful sh fixtures and tracked sh fences also parse on bash-as-sh hosts."""
     if shutil.which("shfmt") is None:
@@ -314,6 +332,10 @@ def test_sh_inputs_parse_as_posix():
     inputs.extend(
         (f"test_shell_heredoc_placeholders_pass[{name}-sh]", content)
         for name, content in POSIX_HEREDOC_INPUTS.items()
+    )
+    inputs.extend(
+        (f"test_shell_false_heredoc_operators_pass[{name}-sh]", content)
+        for name, content in POSIX_FALSE_HEREDOC_INPUTS.items()
     )
     for path in examples.tracked_markdown(ROOT):
         for start_line, lang, content in examples.fenced_blocks(path.read_text(encoding="utf-8")):
@@ -368,9 +390,19 @@ def test_python_parser_error_is_a_problem(monkeypatch, error):
     assert examples._check_python("x = 1") == "source too complex"
 
 
-def test_shell_input_preserves_pending_heredocs():
-    """Quoted FIFO heredocs preserve CRLF bodies and tab-stripped delimiters byte for byte."""
-    content = "cat <<'ONE' <<-\"TWO\"\r\n<ONE>\r\nONE\r\n\t<TWO>\r\n\tTWO\r\necho <name>\r\n"
+@pytest.mark.parametrize(
+    "content",
+    [
+        "cat <<'ONE' <<-\"TWO\"\r\n<ONE>\r\nONE\r\n\t<TWO>\r\n\tTWO\r\necho <name>\r\n",
+        "echo '<<X' \"#\" <<EOF\n<a>\nEOF\necho <name>\n",
+        "cat <<EOF # <<X\n<a>\nEOF\necho <name>\n",
+        'echo "a\\"\n<<X" <<EOF\n<a>\nEOF\necho <name>\n',
+        "echo $# ${#x} <<EOF\n<a>\nEOF\necho <name>\n",
+    ],
+    ids=["fifo_crlf_tabs", "quoted_operators", "comment", "escaped_quote", "parameter_hash"],
+)
+def test_shell_input_preserves_pending_heredocs(content: str):
+    """Real heredoc bodies stay byte for byte; quoted, commented or `$#` text queues none."""
     expected = content.replace("echo <name>", "echo name")
     assert examples._shell_input(content) == expected
 

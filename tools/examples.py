@@ -33,6 +33,13 @@ except ImportError:
 FENCE_START = re.compile(r"^(\s{0,3})(`{3,}|~{3,})(.*)")
 PLACEHOLDER = re.compile(r"<([A-Za-z][A-Za-z0-9_.:/-]*)>")
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\2")
+SHELL_TOKEN = re.compile(
+    HEREDOC.pattern + r"|['\"]|\\.|\$\(\(.*?\)\)|(?P<comment>(?<![^\s;&|()])#)"
+)
+SHELL_QUOTED = {
+    "'": re.compile(r"[^']*(?P<closed>')?"),
+    '"': re.compile(r'(?:[^"\\]|\\.)*(?P<closed>")?'),
+}
 DEADLINE_SECONDS = 30
 # Largest tracked fence: 670 characters on 2026-11-14.
 MAX_EXAMPLE_CHARS = 100_000
@@ -127,9 +134,33 @@ def _shell_error(done: subprocess.CompletedProcess[str]) -> str | None:
     )
 
 
+def _heredocs(line: str, quote: str) -> tuple[list[tuple[str, bool]], str]:
+    """Find heredoc operators outside quoted, escaped, arithmetic and comment text."""
+    delimiters: list[tuple[str, bool]] = []
+    position = 0
+    for _ in range(len(line) + 1):
+        if quote:
+            match = SHELL_QUOTED[quote].match(line, position)
+            position = match.end()
+            if not match.group("closed"):
+                break
+            quote = ""
+        else:
+            match = SHELL_TOKEN.search(line, position)
+            if match is None or match.group("comment"):
+                break
+            position = match.end()
+            if match.group() in SHELL_QUOTED:
+                quote = match.group()
+            elif match.group(3):
+                delimiters.append((match.group(3), bool(match.group(1))))
+    return delimiters, quote
+
+
 def _shell_input(content: str) -> str:
     pending: deque[tuple[str, bool]] = deque()
     lines: list[str] = []
+    quote = ""
     for line in content.splitlines(keepends=True):
         if pending:
             delimiter, strip_tabs = pending[0]
@@ -140,9 +171,8 @@ def _shell_input(content: str) -> str:
                 pending.popleft()
             lines.append(line)
         else:
-            pending.extend(
-                (match.group(3), bool(match.group(1))) for match in HEREDOC.finditer(line)
-            )
+            delimiters, quote = _heredocs(line, quote)
+            pending.extend(delimiters)
             lines.append(PLACEHOLDER.sub(r"\1", line))
     return "".join(lines)
 
