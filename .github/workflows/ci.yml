@@ -131,6 +131,11 @@ jobs:
         with:
           node-version: '24'
 
+      # Only this step reaches registry.npmjs.org and the forge release asset;
+      # the gate's scan runs offline against the stamp it writes (ADR-0084).
+      - name: Install the pinned Codacy analysis CLI and Opengrep binary
+        run: make opengrep-tools
+
       # The interface is compared with the commit the change starts from.
       - name: Verification gate
         env:

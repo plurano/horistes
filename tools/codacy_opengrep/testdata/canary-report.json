@@ -1,0 +1,120 @@
+{
+  "capability": {
+    "checkedAt": "2026-11-14T17:45:06.131Z",
+    "ready": [
+      {
+        "configSource": "codacy",
+        "displayName": "Opengrep",
+        "filesRouted": 2,
+        "installation": "codacy",
+        "runner": "local",
+        "toolId": "Semgrep",
+        "version": "1.30.0"
+      }
+    ],
+    "unavailable": []
+  },
+  "errors": [],
+  "issues": [
+    {
+      "category": "Security",
+      "column": 16,
+      "endColumn": 60,
+      "filePath": "tests/test_examples.py",
+      "line": 233,
+      "lineContent": "        return subprocess.CompletedProcess(argv, 0, \"\", \"\")",
+      "message": "Detected subprocess function 'CompletedProcess' without a static string.",
+      "patternId": "Semgrep_python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit",
+      "severity": "Error",
+      "toolId": "Semgrep"
+    },
+    {
+      "category": "Security",
+      "column": 5,
+      "endColumn": 58,
+      "filePath": "tools/intrafile_canary.py",
+      "line": 18,
+      "lineContent": "    subprocess.run([tool_path()], check=False, timeout=5)",
+      "message": "Detected subprocess function 'run' without a static string.",
+      "patternId": "Semgrep_python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit",
+      "severity": "Error",
+      "toolId": "Semgrep"
+    },
+    {
+      "category": "Security",
+      "column": 20,
+      "endColumn": 33,
+      "filePath": "tools/intrafile_canary.py",
+      "line": 18,
+      "lineContent": "    subprocess.run([tool_path()], check=False, timeout=5)",
+      "message": "Detected subprocess function 'run' with user controlled data.",
+      "patternId": "Semgrep_python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args",
+      "severity": "Error",
+      "toolId": "Semgrep"
+    }
+  ],
+  "metadata": {
+    "completedAt": "2026-11-14T17:45:11.122Z",
+    "durationMs": 7588,
+    "executionMode": "strict",
+    "phaseTimings": {
+      "availabilityMs": 2557,
+      "fileDiscoveryMs": 6,
+      "fileRoutingMs": 2,
+      "installMs": 0,
+      "toolExecutionMs": 4982,
+      "toolUpdateMs": 0
+    },
+    "startedAt": "2026-11-14T17:45:03.534Z"
+  },
+  "patternSummary": {
+    "groups": [
+      {
+        "category": "Security",
+        "categoryLabel": "Security",
+        "patterns": [
+          {
+            "category": "Security",
+            "fileCount": 2,
+            "issueCount": 2,
+            "noisy": false,
+            "patternId": "Semgrep_python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit",
+            "severity": "Error",
+            "title": "Audit Dangerous Subprocess Use",
+            "toolDisplayName": "Opengrep",
+            "toolId": "Semgrep"
+          },
+          {
+            "category": "Security",
+            "fileCount": 1,
+            "issueCount": 1,
+            "noisy": false,
+            "patternId": "Semgrep_python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args",
+            "severity": "Error",
+            "title": "Avoid Dangerous Subprocess Use with Tainted Environment Arguments",
+            "toolDisplayName": "Opengrep",
+            "toolId": "Semgrep"
+          }
+        ],
+        "severity": "Error",
+        "severityLabel": "CRITICAL",
+        "totalIssues": 3,
+        "totalPatterns": 2
+      }
+    ],
+    "noisyPatternCount": 0,
+    "noisyThreshold": 500,
+    "totalIssues": 3,
+    "totalPatterns": 2
+  },
+  "toolResults": [
+    {
+      "durationMs": 4981,
+      "errorCount": 0,
+      "filesAnalyzed": 2,
+      "issueCount": 3,
+      "status": "success",
+      "toolId": "Semgrep"
+    }
+  ]
+}

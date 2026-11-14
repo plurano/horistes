@@ -3,9 +3,9 @@
 ---
 extends: default
 
-ignore: |
-  .venv/
-  .workingdir/
+# .gitignore names every tree that is not this repository's source: .venv/,
+# .workingdir/ and the npm tree `make opengrep-tools` installs (ADR-0084).
+ignore-from-file: .gitignore
 
 rules:
   line-length:

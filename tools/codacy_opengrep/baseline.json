@@ -484,6 +484,17 @@
       "expires": "2027-03-14",
       "issue": "186",
       "reason": "fetch() refuses any address that is not https and reads with a deadline and a byte cap; fetching the addresses the documentation names is the purpose of the stranger check."
+    },
+    {
+      "patternId": "Semgrep_python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit",
+      "filePath": "tools/codacy_opengrep_scan.py",
+      "contentSha256": "ea6e410c796c8b4231b2196656d8a051027f061fc8cf24bc521edba8dddcf19d",
+      "count": "1",
+      "category": "D",
+      "entered": "2026-11-14",
+      "expires": "2027-03-14",
+      "issue": "186",
+      "reason": "Category D audit: scanner runs locally constructed argv lists without a shell, capturing output under explicit subprocess deadlines; source paths never become shell text."
     }
   ]
 }
