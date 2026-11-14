@@ -33,13 +33,12 @@ except ImportError:
 FENCE_START = re.compile(r"^(\s{0,3})(`{3,}|~{3,})(.*)")
 PLACEHOLDER = re.compile(r"<([A-Za-z][A-Za-z0-9_.:/-]*)>")
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z0-9_][A-Za-z0-9_.-]*)\2")
+# Known limit: a case-pattern ')' inside $(...) ends the scanned substitution early.
 SHELL_TOKEN = re.compile(
-    HEREDOC.pattern + r"|['\"]|\\.|\$\(\(.*?\)\)|(?P<comment>(?<![^\s;&|()])#)"
+    HEREDOC.pattern + r"|['\"`()]|\\.|\$\(\(.*?\)\)|\$\((?!\()|(?P<comment>(?<![^\s;&|()])#)"
 )
-SHELL_QUOTED = {
-    "'": re.compile(r"[^']*(?P<closed>')?"),
-    '"': re.compile(r'(?:[^"\\]|\\.)*(?P<closed>")?'),
-}
+SHELL_SINGLE_QUOTED = re.compile(r"[^']*(?P<closed>')?")
+SHELL_DOUBLE_QUOTED = re.compile(r'"|\\.|\$\(\(.*?\)\)|\$\((?!\()|`')
 DEADLINE_SECONDS = 30
 # Largest tracked fence: 670 characters on 2026-11-14.
 MAX_EXAMPLE_CHARS = 100_000
@@ -134,33 +133,63 @@ def _shell_error(done: subprocess.CompletedProcess[str]) -> str | None:
     )
 
 
-def _heredocs(line: str, quote: str) -> tuple[list[tuple[str, bool]], str]:
-    """Find heredoc operators outside quoted, escaped, arithmetic and comment text."""
+def _shell_code_frame(token: str, frames: list[str]) -> None:
+    """Track quotes, substitutions and parentheses encountered in shell code."""
+    if token in ("'", '"', "$(", "("):
+        frames.append(token)
+    elif token == "`":
+        if frames and frames[-1] == "`":
+            frames.pop()
+        else:
+            frames.append(token)
+    elif token == ")" and frames and frames[-1] in ("$(", "("):
+        frames.pop()
+
+
+def _shell_quoted_frame(line: str, position: int, frames: list[str]) -> int:
+    """Advance quoted text, entering command substitutions inside double quotes."""
+    if frames[-1] == "'":
+        match = SHELL_SINGLE_QUOTED.match(line, position)
+        if match.group("closed"):
+            frames.pop()
+        return match.end()
+    match = SHELL_DOUBLE_QUOTED.search(line, position)
+    if match is None:
+        return len(line)
+    token = match.group()
+    if token == '"':
+        frames.pop()
+    elif token in ("$(", "`"):
+        frames.append(token)
+    return match.end()
+
+
+def _heredocs(line: str, frames: tuple[str, ...]) -> tuple[list[tuple[str, bool]], tuple[str, ...]]:
+    """Find heredocs in shell code, including code inside quoted substitutions."""
     delimiters: list[tuple[str, bool]] = []
+    stack = list(frames)
     position = 0
     for _ in range(len(line) + 1):
-        if quote:
-            match = SHELL_QUOTED[quote].match(line, position)
-            position = match.end()
-            if not match.group("closed"):
-                break
-            quote = ""
+        if position >= len(line):
+            break
+        if stack and stack[-1] in ("'", '"'):
+            position = _shell_quoted_frame(line, position, stack)
+            continue
+        match = SHELL_TOKEN.search(line, position)
+        if match is None or match.group("comment"):
+            break
+        position = match.end()
+        if match.group(3):
+            delimiters.append((match.group(3), bool(match.group(1))))
         else:
-            match = SHELL_TOKEN.search(line, position)
-            if match is None or match.group("comment"):
-                break
-            position = match.end()
-            if match.group() in SHELL_QUOTED:
-                quote = match.group()
-            elif match.group(3):
-                delimiters.append((match.group(3), bool(match.group(1))))
-    return delimiters, quote
+            _shell_code_frame(match.group(), stack)
+    return delimiters, tuple(stack)
 
 
 def _shell_input(content: str) -> str:
     pending: deque[tuple[str, bool]] = deque()
     lines: list[str] = []
-    quote = ""
+    frames: tuple[str, ...] = ()
     for line in content.splitlines(keepends=True):
         if pending:
             delimiter, strip_tabs = pending[0]
@@ -171,7 +200,7 @@ def _shell_input(content: str) -> str:
                 pending.popleft()
             lines.append(line)
         else:
-            delimiters, quote = _heredocs(line, quote)
+            delimiters, frames = _heredocs(line, frames)
             pending.extend(delimiters)
             lines.append(PLACEHOLDER.sub(r"\1", line))
     return "".join(lines)

@@ -53,6 +53,11 @@ Substitution skips heredoc bodies, preserving their contents and line numbers;
 heredoc terminators, tab-stripped terminators, quoted delimiters and here-strings.
 A `<<` inside quotes, a comment, after a backslash or inside `$((...))` opens no
 heredoc, as covered by `test_shell_false_heredoc_operators_pass`.
+Inside double quotes, a `$(...)` or backtick substitution is read as shell code
+again, so a heredoc opened there keeps its body, as covered by
+`test_shell_input_preserves_pending_heredocs`. The scan does not parse `case`
+patterns: a pattern's `)` inside `$(...)` ends the substitution early, a known
+limit.
 A space after `<` and an empty `<>` do not
 match; `test_spaced_input_redirection_passes` and
 `test_empty_placeholder_fails` in

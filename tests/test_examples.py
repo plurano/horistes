@@ -16,6 +16,19 @@ POSIX_HEREDOC_INPUTS = {
     "body": "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\n",
     "after_body": "cat <<EOF\nline\n<EOF>\nnot code (\nEOF\ngit ls-remote origin <branch>\n",
     "dash": "cat <<-EOF\n\t<EOF>\nnot code (\n\tEOF\ngit ls-remote origin <branch>\n",
+    "quoted_substitution": (
+        'value="$(cat <<EOF\n<EOF>\nnot code (\nEOF\n)"\ngit ls-remote origin <branch>\n'
+    ),
+    "subshell_in_substitution": (
+        'value="$( (true); cat <<EOF\n<EOF>\nnot code (\nEOF\n)"\ngit ls-remote origin <branch>\n'
+    ),
+    "quoted_backtick": (
+        'value="`cat <<EOF\n<EOF>\nnot code (\nEOF\n`"\ngit ls-remote origin <branch>\n'
+    ),
+    "nested_quoted_substitution": (
+        'value="$(printf \'%s\' "$(cat <<EOF\n<EOF>\nnot code (\nEOF\n)")"\n'
+        "git ls-remote origin <branch>\n"
+    ),
 }
 POSIX_FALSE_HEREDOC_INPUTS = {
     "single_quote": "echo '<<EOF'\necho <issue-id>\n",
@@ -24,6 +37,10 @@ POSIX_FALSE_HEREDOC_INPUTS = {
     "escaped": "echo \\<<EOF\necho <issue-id>\n",
     "arithmetic": "echo $((1 << 2))\necho <issue-id>\n",
     "multiline_single_quote": "echo 'a\n<<EOF'\necho <issue-id>\n",
+    "quoted_arithmetic": 'echo "cost $(( 1 << 2 )) <<EOF"\necho <issue-id>\n',
+    "escaped_substitution": 'echo "\\$(cat <<EOF"\necho <issue-id>\n',
+    "quoted_substitution_single_quote": "echo \"$(echo '<<EOF')\"\necho <issue-id>\n",
+    "nested_double_quote": 'echo "$(printf \'%s\' "<<EOF")"\necho <issue-id>\n',
 }
 SH_EXIT_INPUT = "exit 24"
 SH_ALIAS_INPUT = "echo x"
@@ -398,8 +415,22 @@ def test_python_parser_error_is_a_problem(monkeypatch, error):
         "cat <<EOF # <<X\n<a>\nEOF\necho <name>\n",
         'echo "a\\"\n<<X" <<EOF\n<a>\nEOF\necho <name>\n',
         "echo $# ${#x} <<EOF\n<a>\nEOF\necho <name>\n",
+        'value="$(cat <<EOF\n<EOF>\nnot code (\nEOF\n)"\necho <name>\n',
+        'value="$( (true); cat <<EOF\n<EOF>\nnot code (\nEOF\n)"\necho <name>\n',
+        'value="`cat <<EOF\n<EOF>\nnot code (\nEOF\n`"\necho <name>\n',
+        'value="$(printf \'%s\' "$(cat <<EOF\n<EOF>\nnot code (\nEOF\n)")"\necho <name>\n',
     ],
-    ids=["fifo_crlf_tabs", "quoted_operators", "comment", "escaped_quote", "parameter_hash"],
+    ids=[
+        "fifo_crlf_tabs",
+        "quoted_operators",
+        "comment",
+        "escaped_quote",
+        "parameter_hash",
+        "quoted_substitution",
+        "subshell_in_substitution",
+        "quoted_backtick",
+        "nested_quoted_substitution",
+    ],
 )
 def test_shell_input_preserves_pending_heredocs(content: str):
     """Real heredoc bodies stay byte for byte; quoted, commented or `$#` text queues none."""
