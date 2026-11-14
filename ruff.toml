@@ -7,8 +7,10 @@ line-length = 100
 target-version = "py312"
 
 [lint]
-# Codacy's ruff reports ISC; the repository's ruff must agree.
-select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "T20", "SIM", "ISC"]
+# Codacy's ruff reports ISC; the repository's ruff must agree. PLC0414 refuses
+# `from x import y as y`: ruff reads it as a re-export and F401 stays silent,
+# while Codacy's pyflakes and Pylint report the import as unused.
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "T20", "SIM", "ISC", "PLC0414"]
 ignore = []
 
 # Every entry names one file and ends in `# expires YYYY-MM-DD category <A|B|C|D>: reason`;
