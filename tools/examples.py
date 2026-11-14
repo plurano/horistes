@@ -133,16 +133,16 @@ def _shell_error(done: subprocess.CompletedProcess[str]) -> str | None:
     )
 
 
-def _shell_code_frame(token: str, frames: list[str]) -> None:
+def _shell_code_frame(symbol: str, frames: list[str]) -> None:
     """Track quotes, substitutions and parentheses encountered in shell code."""
-    if token in ("'", '"', "$(", "("):
-        frames.append(token)
-    elif token == "`":
+    if symbol in ("'", '"', "$(", "("):
+        frames.append(symbol)
+    elif symbol == "`":
         if frames and frames[-1] == "`":
             frames.pop()
         else:
-            frames.append(token)
-    elif token == ")" and frames and frames[-1] in ("$(", "("):
+            frames.append(symbol)
+    elif symbol == ")" and frames and frames[-1] in ("$(", "("):
         frames.pop()
 
 
@@ -156,11 +156,11 @@ def _shell_quoted_frame(line: str, position: int, frames: list[str]) -> int:
     match = SHELL_DOUBLE_QUOTED.search(line, position)
     if match is None:
         return len(line)
-    token = match.group()
-    if token == '"':
+    symbol = match.group()
+    if symbol == '"':
         frames.pop()
-    elif token in ("$(", "`"):
-        frames.append(token)
+    elif symbol in ("$(", "`"):
+        frames.append(symbol)
     return match.end()
 
 
