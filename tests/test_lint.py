@@ -59,11 +59,11 @@ except ImportError:
 """
 
 
-def actionlint(tree):
+def actionlint(tree, name=WORKFLOW, *options):
     """Run actionlint against the workflow file in the tree."""
     # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-09 category D: runs actionlint
     return subprocess.run(
-        [*external("ACTIONLINT", "actionlint"), str(tree.root / WORKFLOW)],
+        [*external("ACTIONLINT", "actionlint"), *options, str(tree.root / name)],
         capture_output=True,
         text=True,
         check=False,

@@ -10,16 +10,18 @@ some of it, and none of it is needed by a caller.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 
 import pytest
-from conftest import REUSABLE, ROOT, external
+from conftest import CALLER_IDS, CALLER_TEMPLATES, REUSABLE, ROOT
+from test_lint import actionlint, zizmor
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
 import render
 
+# The runner label a consumer's adoption declares to actionlint, as here.
+ACTIONLINT_CONFIG = ("-config-file", str(ROOT / ".github/actionlint.yaml"))
 CONTEXT = {
     "RunnerTag": "ubuntu-26.04",
     "HasGPU": True,
@@ -30,8 +32,6 @@ CONTEXT = {
 COMMIT = render.SAMPLE["Shared"]["Commit"]
 REAL = "templates/callers/licence.yml.tmpl"
 REAL_SCORECARD = "templates/callers/scorecard.yml.tmpl"
-REAL_TRAIN = "templates/callers/merge-train.yml.tmpl"
-REAL_WORKFLOW_CHECK = "templates/callers/workflow-check.yml.tmpl"
 TEMPLATE = "templates/callers/licence.yml.tmpl"
 CALLED = ".github/workflows/licence.yml"
 ISSUE = "cordanaLLM/praetor#1212"
@@ -281,36 +281,38 @@ def test_scorecard_template_renders_into_the_recorded_caller():
 
 @pytest.mark.parametrize(
     ("template", "name"),
-    [
-        (REAL, ".github/workflows/licence-check.yml"),
-        (REAL_SCORECARD, ".github/workflows/scorecard-check.yml"),
-        (REAL_TRAIN, ".github/workflows/merge-train.yml"),
-        (REAL_WORKFLOW_CHECK, ".github/workflows/workflow-check.yml"),
-    ],
-    ids=["licence", "scorecard", "merge-train", "workflow-check"],
+    sorted(CALLER_TEMPLATES.items()),
+    ids=CALLER_IDS,
 )
 def test_rendered_caller_passes_both_linters(tree, template, name):
     """A rendered caller passes actionlint and zizmor checks."""
     tree.write({name: rendered_real_template(template)})
-    # The runner label a consumer's adoption declares to actionlint, as here.
-    config = ["-config-file", str(ROOT / ".github/actionlint.yaml")]
-    done = subprocess.run(
-        [*external("ACTIONLINT", "actionlint"), *config, str(tree.root / name)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
+    done = actionlint(tree, name, *ACTIONLINT_CONFIG)
     assert done.returncode == 0, done.stdout + done.stderr
-    command = [*external("ZIZMOR", "zizmor"), "--offline", "--strict-collection"]
-    done = subprocess.run(
-        [*command, "--persona", "pedantic", str(tree.root)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
+    done = zizmor(tree)
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize(
+    ("template", "name"),
+    sorted(CALLER_TEMPLATES.items()),
+    ids=CALLER_IDS,
+)
+def test_rendered_caller_fails_each_linter_on_its_planted_defect(tree, template, name):
+    """Each linter rejects its planted defect in every rendered caller."""
+    text = rendered_real_template(template)
+    pin = "@" + render.SAMPLE["Shared"]["Commit"]
+    assert text.count(pin) == 1
+
+    tree.write({name: text + "bogus-key: 1\n"})
+    done = actionlint(tree, name, *ACTIONLINT_CONFIG)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "unexpected key" in done.stdout + done.stderr
+
+    tree.write({name: text.replace(pin, "@main")})
+    done = zizmor(tree)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "unpinned-uses" in done.stdout + done.stderr
 
 
 def test_good_template_passes(tree):

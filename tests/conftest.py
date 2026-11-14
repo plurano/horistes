@@ -28,6 +28,20 @@ import ciwf
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# The consumer path each template's header names.
+CALLER_TEMPLATES: dict[str, str] = {
+    "templates/callers/hook-copy.yml.tmpl": ".github/workflows/hook-copy.yml",
+    "templates/callers/licence.yml.tmpl": ".github/workflows/licence-check.yml",
+    "templates/callers/merge-train.yml.tmpl": ".github/workflows/merge-train.yml",
+    "templates/callers/release-please.yml.tmpl": ".github/workflows/release-please.yml",
+    "templates/callers/scorecard.yml.tmpl": ".github/workflows/scorecard-check.yml",
+    "templates/callers/secret-scan.yml.tmpl": ".github/workflows/secret-scan.yml",
+    "templates/callers/workflow-check.yml.tmpl": ".github/workflows/workflow-check.yml",
+}
+CALLER_IDS = [
+    Path(template).name.removesuffix(".yml.tmpl") for template in sorted(CALLER_TEMPLATES)
+]
+
 # The stub gh programs check only that GH_TOKEN is set; a random value per run
 # keeps a token-shaped literal out of the tests.
 STUB_GH_TOKEN = secrets.token_hex(8)
