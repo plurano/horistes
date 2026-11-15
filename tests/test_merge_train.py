@@ -9939,3 +9939,81 @@ def test_retry_hold_in_flight_read_before_older_unarmed_behind(tmp_path, held):
         assert "### fleet/app: #2 is armed and in flight" in summary
         assert forge.writes == []
         assert forge.retry_calls == [2]
+
+
+@pytest.mark.parametrize(
+    "before,after,held",
+    [
+        ("-old\n+new\n\\ No newline at end of file", "-old\n+new", False),
+        (
+            "-old\n\\ No newline at end of file\n+new",
+            "-old\n+new\n\\ No newline at end of file",
+            False,
+        ),
+        (
+            "-old\n+new\n\\ No newline at end of file",
+            "-old\n+new\n\\ No newline at end of file",
+            True,
+        ),
+        (
+            "-old\n+new\n last\n\\ No newline at end of file",
+            "-old\n+new\n last",
+            True,
+        ),
+    ],
+    ids=["repaired-newline", "moved-marker", "same-marker", "context-marker"],
+)
+def test_retry_hold_final_newline_marker_belongs_to_changed_line(tmp_path, before, after, held):
+    forge = retry_forge("BEHIND")
+    for oid, patch in (("a" * 40, before), (f"{1:040x}", after)):
+        hunk = "@@ -1,2 +1,2 @@" if "\n last" in patch else "@@ -1 +1 @@"
+        forge.comparisons[oid] = (200, {"files": [retry_file(patch=f"{hunk}\n{patch}")]})
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2 if held else 1)]
+    assert ("held for retry:" in summary) is held
+
+
+@pytest.mark.parametrize("attempts", ["held", "unheld", "all-held"])
+def test_retry_hold_behind_reads_in_update_order(tmp_path, attempts):
+    first = pull(1, "BEHIND")
+    second = pull(2, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(first, second))
+    if attempts != "unheld":
+        forge.retry_histories[2] = retry_history(2, retry_attempt(suites=[retry_suite()]))
+    if attempts == "all-held":
+        forge.retry_histories[1] = retry_history(1, retry_attempt(suites=[retry_suite()]))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    if attempts == "held":
+        assert "| #2 | BEHIND | held for retry:" in summary
+        assert forge.writes == [armed(1), updated(1)]
+    else:
+        assert forge.writes == [updated(2)]
+    assert forge.retry_calls == ([2] if attempts == "unheld" else [2, 1])
+    if attempts == "all-held":
+        assert "| #2 | BEHIND | updated from the default branch; retry hold released:" in summary
+        assert "retry hold released: no other pull request to serve" in summary
+
+
+@pytest.mark.parametrize("waiting", [{}, {"autoMergeRequest": {"enabledAt": OLD}}])
+def test_retry_hold_linear_history_behind_does_not_read_history(tmp_path, waiting):
+    forge = Forge(repository(pull(1, "BEHIND", **waiting), rules=("REQUIRED_LINEAR_HISTORY",)))
+    forge.retry_histories[1] = retry_history(1, retry_attempt(suites=[retry_suite()]))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.retry_calls == []
+    assert "| #1 | BEHIND | behind: linear history, a person rebases |" in summary
+
+
+def test_retry_hold_unarmed_behind_without_auto_merge_does_not_read_history(tmp_path):
+    first = pull(1, "BEHIND")
+    second = pull(2, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(first, second, auto_merge=False))
+    forge.retry_histories[1] = retry_history(1, retry_attempt(suites=[retry_suite()]))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2)]
+    assert forge.retry_calls == [2]
+    assert "| #1 | BEHIND | behind: auto-merge off, not armed, not updated |" in summary

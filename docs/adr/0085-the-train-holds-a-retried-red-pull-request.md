@@ -42,9 +42,15 @@ The sweep implements retry fairness in
 within its field budget
 ([ADR-0082](0082-the-train-graphql-documents-leave-the-rules-step.md)). After
 trying to land a clean pull request, `hold_retries` examines in-flight
-candidates first, then BEHIND candidates, preserving serving order within
-each group. `test_retry_hold_in_flight_read_before_older_unarmed_behind` in
-[tests/test_merge_train.py](../../tests/test_merge_train.py) pins this priority.
+candidates in serving order, then BEHIND candidates in the order `updatable`
+returns: security updates first, then armed pull requests within each group,
+then serving order. `updatable` in
+[.github/workflows/merge-train.yml](../../.github/workflows/merge-train.yml)
+returns none under linear history and skips unarmed pull requests when
+repository auto-merge is off.
+`test_retry_hold_in_flight_read_before_older_unarmed_behind` and
+`test_retry_hold_behind_reads_in_update_order` in
+[tests/test_merge_train.py](../../tests/test_merge_train.py) pin this priority.
 It reads at most `RETRY_READ_LIMIT = 5`
 candidates, stopping at the first unheld one. Security updates and the label
 `merge-train: urgent` bypass history reads.
@@ -68,9 +74,13 @@ against the history read's base oid, normalizing file names, previous names,
 status and added/deleted patch lines. Splitting only at LF preserves CRLF
 and form-feed characters as changed-line content, covered by
 `test_retry_hold_changed_line_preserves_content` in
-[tests/test_merge_train.py](../../tests/test_merge_train.py). Files without
-patches use their blob sha. Hunk offsets and context do not change this
-identity. When these identities match, `same_retry_change` in
+[tests/test_merge_train.py](../../tests/test_merge_train.py). `changed_lines`
+keeps a final-newline marker at its position only when the preceding raw
+line is an added or deleted line; markers following context are excluded.
+`test_retry_hold_final_newline_marker_belongs_to_changed_line` in the same
+test file covers repaired newlines, moved markers and unchanged controls.
+Files without patches use their blob sha. Hunk offsets and context do not
+change this identity. When these identities match, `same_retry_change` in
 [tools/merge_train.py](../../tools/merge_train.py) also compares tree-entry
 modes at the failed attempt and current head. A mode change releases the
 hold; removed files have no entry to read. Paths are GraphQL variables.
@@ -133,6 +143,13 @@ auto-merge requests remain outside the lease's power to stop the forge.
 The sweep's retry memory is bounded forge history, so an older attempt can
 age out of the queried window. The all-held release permits progress when
 history is unavailable; its summary explicitly records that choice.
+
+BEHIND pull requests under linear history, and unarmed BEHIND pull requests
+without repository auto-merge, incur no retry-history reads because `advance`
+updates neither. `test_retry_hold_linear_history_behind_does_not_read_history`
+and `test_retry_hold_unarmed_behind_without_auto_merge_does_not_read_history`
+in [tests/test_merge_train.py](../../tests/test_merge_train.py) assert these
+exclusions and preserve the skip notes written by `advance`.
 
 The additional logical API cost per candidate is at most 2 GraphQL reads
 (history and modes) plus 2 REST compares: 5 × (2 GraphQL + 2 REST) reads

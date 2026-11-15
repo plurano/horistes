@@ -1691,12 +1691,20 @@ def diff_file(file):
     patch = file.get("patch")
     if patch is not None and not isinstance(patch, str):
         raise ValueError("compare patch is not text")
-    changes = (
-        tuple(line for line in patch.split("\n") if line.startswith(("+", "-")))
-        if patch is not None
-        else file["sha"]
-    )
+    changes = changed_lines(patch) if patch is not None else file["sha"]
     return file["filename"], file.get("previous_filename", ""), file["status"], changes
+
+
+def changed_lines(patch):
+    """Changed lines with a newline marker only directly after the line it qualifies."""
+    changes = []
+    previous_changed = False
+    for line in patch.split("\n"):
+        changed = line.startswith(("+", "-"))
+        if changed or (line.startswith("\\") and previous_changed):
+            changes.append(line)
+        previous_changed = changed
+    return tuple(changes)
 
 
 def same_retry_change(env, base, before, after):
@@ -1761,10 +1769,10 @@ def retry_workflow(suite):
     return run["workflow"]["name"] if run else (suite["app"] or {}).get("slug", "unknown app")
 
 
-def hold_retries(env, conf, served, notes, now):
+def hold_retries(env, conf, repo, served, notes, now):
     """Hold retries before the first unheld candidate, within a scalar read budget."""
     candidates = [p for p, reason in served if in_flight(p, reason)]
-    candidates += [p for p, reason in served if reason == "behind"]
+    candidates += [pull for pull, _ in updatable(repo, served, {}, conf)]
     holds = {}
     for pull in candidates[:RETRY_READ_LIMIT]:
         hold = retry_hold(env, conf, pull, now)
@@ -1877,7 +1885,9 @@ def serve_cycle(env, conf, repo, served, notes, now, held, lease):
 
 def serve_pending(env, conf, repo, served, notes, now, lease):
     """Hold unchanged failed retries before checking in-flight heads or updating one."""
-    served, released = (served, None) if lease else hold_retries(env, conf, served, notes, now)
+    served, released = (
+        (served, None) if lease else hold_retries(env, conf, repo, served, notes, now)
+    )
     if released:
         notes[released[0]] = released[1]
     holding = [pull["number"] for pull, reason in served if in_flight(pull, reason)]
