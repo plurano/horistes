@@ -56,6 +56,8 @@ no registry or Codacy endpoint. The gate workflow's pinned `setup-node`
 uses the forge manifest and release assets, with `nodejs.org` as its fallback.
 [hosts.toml](../../hosts.toml) declares those hosts. This settles the
 outside-host note ADR-0028 left for Semgrep without adding a scan-time host.
+`npm ci` runs with `--include=optional`, so an inherited `omit=optional`
+cannot leave out a lock entry that the installed-tree check requires.
 
 The rule set is the checked-in read-only Codacy listing at
 [enabled-python-ids.txt](../../tools/codacy_opengrep/testdata/enabled-python-ids.txt).
@@ -70,6 +72,10 @@ Each entry records a content fingerprint, count, reason, issue, entry date,
 expiry and MEL category. Changed or increased findings, stale entries,
 expired entries, extended exceptions and growth against the base revision
 fail the check. A base revision without a baseline permits its first adoption.
+The fingerprint hashes the finding's source with whitespace outside string
+literals collapsed. Python 3.12 lets an f-string replacement field hold a
+literal in the outer quotes, so an f- or t-string that ends inside an open
+field has no boundary the scanner trusts, and its source is hashed whole.
 
 The Opengrep pin in [tool-versions.env](../../tools/codacy_opengrep/tool-versions.env)
 must equal the installed CLI adapter's `preferredVersion`. The scanner
@@ -83,8 +89,9 @@ automatic repair can download a replacement. The engine's log stays in the
 temporary scan directory.
 
 The binary supports Linux x64 only. Other hosts skip scan, installation
-and baseline checking with a line naming that reason and the host platform;
-offline drift checking runs everywhere. The CLI receives
+and baseline checking with a line naming that reason and the host platform.
+Offline drift checking runs everywhere: the scan modes compare the checked-in
+listing with the configured IDs before they skip. The CLI receives
 `--max-file-size 1MB`, and any `skippedFiles` or error entry fails the scan,
 so a larger file cannot silently disappear from coverage.
 

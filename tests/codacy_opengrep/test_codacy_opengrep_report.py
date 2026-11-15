@@ -263,6 +263,38 @@ def test_long_unterminated_literal(quote: str) -> None:
     assert reports.normalised_source(text) == text
 
 
+def test_same_quote_field_literal_keeps_its_whitespace() -> None:
+    wide = 'subprocess.run(f"echo {"a  b"}", shell=True)'
+    narrow = 'subprocess.run(f"echo {"a b"}", shell=True)'
+    assert reports.normalised_source(wide) == wide
+    assert reports.normalised_source(narrow) == narrow
+
+
+@pytest.mark.parametrize("prefix", ["f", "F", "rf", "Fr", "t", "RT"])
+@pytest.mark.parametrize("quote", ['"', "'", '"""'])
+def test_open_field_keeps_text(prefix: str, quote: str) -> None:
+    for text in (
+        f"{prefix}{quote}{{{quote}a  b{quote}}}{quote}",
+        f"  run({prefix}{quote}{{x[{quote}k  {quote}]}}{quote},   y)  ",
+    ):
+        assert reports.normalised_source(text) == text.strip()
+
+
+@pytest.mark.parametrize(
+    "text,want",
+    [
+        ('f"{x}"   +  y', 'f"{x}" + y'),
+        ('f"{{a  b"   +  y', 'f"{{a  b" + y'),
+        ("f'{\"a  b\"}'   +  y", "f'{\"a  b\"}' + y"),
+        ('b"{"   +  y', 'b"{" + y'),
+        ('xrf"{"   +  y', 'xrf"{" + y'),
+        ('_f"{"   +  y', '_f"{" + y'),
+    ],
+)
+def test_closed_literals_still_collapse(text: str, want: str) -> None:
+    assert reports.normalised_source(text) == want
+
+
 @pytest.mark.parametrize("kind", ["symlink", "fifo", "oversize", "boundary", "invalid-utf8"])
 def test_source_file_barriers(tmp_path: Path, kind: str) -> None:
     import os

@@ -138,8 +138,6 @@ def scan(
 ) -> list[str]:
     """Run the canary first, then scan every tracked Python file; return the failures."""
     with install_lock(root):
-        check_drift(root, root / FIXTURES / "enabled-python-ids.txt")
-        emit("Opengrep listing: exact match")
         versions = tool_versions(root)
         version = versions["OPENGREP_VERSION"]
         snapshot = load_baseline(root, today)
@@ -197,13 +195,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def listing_for(args: argparse.Namespace) -> Path | None:
+    """Return the listing the selected mode compares with the config, None for install modes.
+
+    The comparison reads only checked-in files, so it runs before the platform skip.
+    """
+    if args.drift:
+        return args.drift
+    if args.install or args.check_install:
+        return None
+    return ROOT / FIXTURES / "enabled-python-ids.txt"
+
+
 def main(argv: list[str]) -> int:
     """Dispatch the selected mode; report every failure and platform skip explicitly."""
     args = parse_args(argv)
     try:
-        if args.drift:
-            check_drift(ROOT, args.drift)
+        listing = listing_for(args)
+        if listing is not None:
+            check_drift(ROOT, listing)
             emit("Opengrep listing: exact match")
+        if args.drift:
             return 0
         system, machine = platform.system(), platform.machine()
         if system != "Linux" or machine != "x86_64":

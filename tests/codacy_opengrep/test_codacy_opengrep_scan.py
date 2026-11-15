@@ -133,7 +133,10 @@ def test_live_report_cleanup_on_failure(tmp_path: Path, monkeypatch: pytest.Monk
     assert not (tmp_path / ".codacy").exists()
 
 
-@pytest.mark.parametrize("mode", [[], ["--install"], ["--check-install"], ["--base-ref", "main"]])
+@pytest.mark.parametrize(
+    "mode,listed",
+    [([], True), (["--install"], False), (["--check-install"], False), (["--base-ref", "x"], True)],
+)
 @pytest.mark.parametrize(
     "system,machine", [("Darwin", "arm64"), ("Linux", "aarch64"), ("Windows", "AMD64")]
 )
@@ -141,15 +144,33 @@ def test_platform_skip(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture,
     mode: list[str],
+    listed: bool,
     system: str,
     machine: str,
 ) -> None:
     monkeypatch.setattr(scan.platform, "system", lambda: system)
     monkeypatch.setattr(scan.platform, "machine", lambda: machine)
     assert scan.main(mode) == 0
-    assert capsys.readouterr().out == (
+    assert capsys.readouterr().out == ("Opengrep listing: exact match\n" if listed else "") + (
         f"codacy-opengrep: skipped: the Opengrep pin is a Linux x64 binary ({system} {machine})\n"
     )
+
+
+@pytest.mark.parametrize("mode", [[], ["--base-ref", "main"]])
+def test_platform_skip_keeps_listing_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: list[str]
+) -> None:
+    listing = f"{common.FIXTURES}/enabled-python-ids.txt"
+    for name in (common.CONFIG, listing):
+        write(tmp_path, name, (common.ROOT / name).read_text(encoding="utf-8"))
+    write(tmp_path, listing, (tmp_path / listing).read_text(encoding="utf-8") + "Semgrep_added\n")
+    monkeypatch.setattr(scan, "ROOT", tmp_path)
+    monkeypatch.setattr(scan.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(scan.platform, "machine", lambda: "arm64")
+    assert scan.main(mode) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "codacy-opengrep: listing metadata hash or count differs\n"
 
 
 @pytest.mark.parametrize(
@@ -168,14 +189,18 @@ def test_main_dispatch(monkeypatch: pytest.MonkeyPatch, mode: list[str]) -> None
 
         monkeypatch.setattr(scan, name, called)
     assert scan.main([*mode, "--today", "2026-11-14", "--report-out", "reports"]) == 0
-    assert len(calls) == 1
     expected = {
-        "--install": "install",
-        "--check-install": "check_install",
-        "--base-ref": "scan",
-        "--drift": "check_drift",
+        "--install": ["install"],
+        "--check-install": ["check_install"],
+        "--base-ref": ["check_drift", "scan"],
+        "--drift": ["check_drift"],
     }
-    assert calls[0][0] == (expected[mode[0]] if mode else "scan")
+    names = expected[mode[0]] if mode else expected["--base-ref"]
+    assert [name for name, _args in calls] == names
+    if names[0] == "check_drift":
+        fixture = scan.ROOT / common.FIXTURES / "enabled-python-ids.txt"
+        wanted = Path("listing") if mode[:1] == ["--drift"] else fixture
+        assert calls[0][1] == (scan.ROOT, wanted)
 
 
 @pytest.mark.parametrize("failure", [common.ScanError("synthetic"), OSError("synthetic"), None])
@@ -243,7 +268,6 @@ def test_scan_lifecycle(
     key = reports.fingerprint(sample)
     baseline = {key: entry(contentSha256=key.split("\0")[2])}
     monkeypatch.setattr(scan, "install_lock", lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setattr(scan, "check_drift", lambda *_args: None)
     monkeypatch.setattr(scan, "tool_versions", lambda _root: {"OPENGREP_VERSION": VERSION})
     monkeypatch.setattr(scan, "load_baseline", lambda *_args: baseline)
     monkeypatch.setattr(scan, "tracked_files", lambda _root: ["a.py"])
@@ -278,14 +302,15 @@ def test_unrunnable_engine_never_reaches_cli(
     root, _versions = installed
     monkeypatch.setattr(installer, "engine_run", lambda *_args: result(rc=1))
     monkeypatch.setattr(scan, "install_lock", lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setattr(scan, "check_drift", lambda *_args: None)
     monkeypatch.setattr(scan, "load_baseline", lambda *_args: {})
     monkeypatch.setattr(scan, "tracked_files", lambda _root: ["a.py"])
     with pytest.raises(common.ScanError, match="refusing CLI auto-repair"):
         scan.scan(root, TODAY, None)
 
 
-def test_scan_checks_mirrored_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_checks_mirrored_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
     listing = write(tmp_path, common.FIXTURES + "/enabled-python-ids.txt", "kept\nremoved\n")
     config = {
         "tools": [
@@ -300,7 +325,10 @@ def test_scan_checks_mirrored_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         },
     }
     document(tmp_path, common.CONFIG, config)
+    monkeypatch.setattr(scan, "ROOT", tmp_path)
     monkeypatch.setattr(scan, "install_lock", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(scan.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(scan.platform, "machine", lambda: "x86_64")
     events = []
 
     def stop(_root: Path) -> dict:
@@ -308,13 +336,15 @@ def test_scan_checks_mirrored_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         raise common.ScanError("reached after drift")
 
     monkeypatch.setattr(scan, "tool_versions", stop)
-    with pytest.raises(common.ScanError, match="reached after drift"):
-        scan.scan(tmp_path, TODAY, None)
+    assert scan.main([]) == 1
+    assert capsys.readouterr().err == "codacy-opengrep: reached after drift\n"
     assert events == ["after-drift"]
     config["tools"][0]["patterns"].pop()
     document(tmp_path, common.CONFIG, config)
-    with pytest.raises(common.ScanError, match="removed"):
-        scan.scan(tmp_path, TODAY, None)
+    assert scan.main([]) == 1
+    assert capsys.readouterr().err == (
+        "codacy-opengrep: listing drift: added=['removed'], removed=[]\n"
+    )
     assert events == ["after-drift"]
 
 
@@ -338,7 +368,6 @@ def test_scan_uses_one_baseline_snapshot(installed: tuple, monkeypatch: pytest.M
         return load(path)
 
     monkeypatch.setattr(baselines, "load_json", reader)
-    monkeypatch.setattr(scan, "check_drift", lambda *_args: None)
     monkeypatch.setattr(scan, "tracked_files", lambda _root: ["a.py"])
     monkeypatch.setattr(scan, "codacy_home", lambda _versions: nullcontext(root))
     monkeypatch.setattr(scan, "canary_check", lambda *_args: [])

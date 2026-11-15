@@ -215,7 +215,7 @@ def test_install_fake_npm_and_opener(
         assert binary.stat().st_mode & 0o777 == 0o755
     assert commands == [
         (
-            ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+            ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--include=optional"],
             root / common.PACKAGE,
             common.NPM_TIMEOUT_SECONDS,
         )

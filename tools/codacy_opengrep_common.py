@@ -310,11 +310,15 @@ def emit(message: str, *, error: bool = False) -> None:
 
 
 def npm_run(root: Path) -> subprocess.CompletedProcess[str]:
-    """Install exactly the lockfile, without lifecycle scripts or registry extras."""
+    """Install exactly the lockfile, without lifecycle scripts or registry extras.
+
+    --include=optional overrides an inherited omit=optional: the tree check requires every
+    lock entry, the optional ones included.
+    """
     return run_checked(
         "npm",
         lambda: subprocess.run(
-            ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+            ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--include=optional"],
             cwd=root / PACKAGE,
             capture_output=True,
             text=True,

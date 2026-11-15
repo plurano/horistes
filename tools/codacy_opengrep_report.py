@@ -31,13 +31,40 @@ from codacy_opengrep_common import (
     pretty,
 )
 
+FIELD_PREFIXES = frozenset({"f", "rf", "fr", "t", "rt", "tr"})
+
+
+def string_prefix(text: str, start: int) -> str:
+    """Return the lower-cased identifier characters, at most three, before index START."""
+    begin = start
+    for _ in range(min(start, 3)):
+        if not (text[begin - 1].isalnum() or text[begin - 1] == "_"):
+            break
+        begin -= 1
+    return text[begin:start].lower()
+
+
+def open_field(text: str, match: re.Match[str]) -> bool:
+    """Tell whether MATCH is an f- or t-string that ends while a replacement field is open.
+
+    Since Python 3.12 (PEP 701) a field may hold a literal in the outer quotes, so the quote
+    that closed MATCH may instead open that inner literal.
+    """
+    if string_prefix(text, match.start()) not in FIELD_PREFIXES:
+        return False
+    body = match.group(0).replace("{{", "").replace("}}", "")
+    return body.count("{") > body.count("}")
+
 
 def normalised_source(text: str) -> str:
     """Collapse whitespace runs outside Python string literals to one space; keep literals
-    verbatim.
+    verbatim. Where an f- or t-string has no boundary this pass can trust, keep the whole
+    text apart from its ends.
     """
     parts, last = [], 0
     for match in LITERAL_RE.finditer(text):
+        if open_field(text, match):
+            return text.strip()
         parts += [re.sub(r"\s+", " ", text[last : match.start()]), match.group(0)]
         last = match.end()
     parts.append(re.sub(r"\s+", " ", text[last:]))

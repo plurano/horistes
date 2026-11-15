@@ -269,7 +269,7 @@ def test_cli_drops_git_selection() -> None:
 def expected_process_argv(tmp_path: Path) -> dict[str, list[str]]:
     """Exact allowed commands for each narrow subprocess boundary."""
     return {
-        "npm": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+        "npm": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--include=optional"],
         "engine": ["sh", str(tmp_path / "wrapper"), "--version"],
         "cli": [
             "node",
