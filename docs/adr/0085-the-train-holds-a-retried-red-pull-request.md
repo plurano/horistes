@@ -51,9 +51,26 @@ repository auto-merge is off.
 `test_retry_hold_in_flight_read_before_older_unarmed_behind` and
 `test_retry_hold_behind_reads_in_update_order` in
 [tests/test_merge_train.py](../../tests/test_merge_train.py) pin this priority.
-It reads at most `RETRY_READ_LIMIT = 5`
-candidates, stopping at the first unheld one. Security updates and the label
-`merge-train: urgent` bypass history reads.
+`hold_retries` and `advance` share one per-sweep cache and a budget of
+`RETRY_READ_LIMIT = 5` history reads in
+[tools/merge_train.py](../../tools/merge_train.py). The initial scan stops at
+the first unheld candidate; `advance` checks each subsequent row before
+arming, disarming or updating it, reusing cached results. An uncached row
+after the budget is spent receives a deferral note and ends advancement for
+that sweep. Security updates and the label `merge-train: urgent` take no
+budget and bypass holds even after five reads. When all inspected candidates
+are held, only the first is released; the other holds apply to both serving
+eligibility and summary notes. The planted tests
+`test_retry_hold_after_conflict_checks_next_candidate`,
+`test_retry_hold_after_scanning_skip_checks_next_candidate`,
+`test_retry_hold_after_unsigned_skip_checks_next_candidate`,
+`test_retry_hold_after_conflict_shares_read_budget`,
+`test_retry_hold_deferral_ends_advancement_before_later_urgent`,
+`test_retry_hold_all_held_conflict_keeps_other_holds`,
+`test_retry_hold_all_held_in_flight_keeps_other_holds`,
+`test_retry_hold_urgent_after_spent_budget_is_updated` and
+`test_retry_hold_security_after_spent_budget_is_updated` in
+[tests/test_merge_train.py](../../tests/test_merge_train.py) pin these paths.
 
 `RETRY_HISTORY` reads the last 20 commits and 20 force-push events. Each
 commit, including an event's previous head, carries up to 30 check suites.
@@ -94,10 +111,11 @@ with an explanation. `test_retry_hold_*` in
 boundaries, green reruns and diff changes.
 
 Held rows before an unheld candidate lose their in-flight/update eligibility
-for that sweep. If all inspected candidates are held, the original serving
-order stays and the first candidate receives a release note, permitting retries even
-when alone. Notes show the failed commit, workflows and UTC expiry, or the
-unreadable-history cause. `hold_retries` never writes a label, disarms a pull
+for that sweep. If all inspected candidates are held, the first candidate
+receives a release note and its cached result permits a retry even when
+alone; the remaining holds stay applied. Notes show the failed commit,
+workflows and UTC expiry, or the unreadable-history cause. `hold_retries`
+never writes a label, disarms a pull
 request or stores retry state. A live lease and a sweep that lands perform no
 retry-history reads; `test_retry_hold_live_lease_does_not_read_history` and
 `test_retry_hold_landing_run_does_not_read_history` pin those paths.
@@ -150,6 +168,26 @@ updates neither. `test_retry_hold_linear_history_behind_does_not_read_history`
 and `test_retry_hold_unarmed_behind_without_auto_merge_does_not_read_history`
 in [tests/test_merge_train.py](../../tests/test_merge_train.py) assert these
 exclusions and preserve the skip notes written by `advance`.
+
+A conflict does not let later candidates escape their retry holds in the
+same sweep. On the next sweep, the forge reports the conflicting pull
+request as no longer BEHIND; a lone held candidate can then receive the
+all-held release. `test_retry_hold_all_held_conflict_keeps_other_holds` in
+[tests/test_merge_train.py](../../tests/test_merge_train.py) exercises both
+sweeps. Rows skipped ahead of a candidate, including unsigned bots and
+code-scanning failures, can spend the shared budget during the initial
+scan or advancement and defer later rows. The deferral repeats on each
+sweep while those rows stay skipped or held, so a later row waits until a
+hold ends (after `RETRY_HOLD_DAYS`, on a green attempt or on an own-diff
+change) or a skipped row leaves the queue.
+`test_retry_hold_after_unsigned_skip_checks_next_candidate`,
+`test_retry_hold_after_scanning_skip_checks_next_candidate` and
+`test_retry_hold_after_conflict_shares_read_budget` in the same file cover
+these skips and budget exhaustion. The scanning regression prepares a
+BEHIND classification to exercise `advance`'s defensive guard; normal
+`verdict` classification in
+[.github/workflows/merge-train.yml](../../.github/workflows/merge-train.yml)
+filters a red code-scanning row earlier, before retry reads.
 
 The additional logical API cost per candidate is at most 2 GraphQL reads
 (history and modes) plus 2 REST compares: 5 × (2 GraphQL + 2 REST) reads

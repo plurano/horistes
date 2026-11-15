@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from datetime import UTC, datetime, timedelta
+from functools import partial
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
 from train_rules import (
@@ -74,6 +75,7 @@ PULL_PAGES = 4
 SUITE_PAGE = 30
 RETRY_HOLD_DAYS = 7
 RETRY_READ_LIMIT = 5
+RETRY_DEFERRED = object()
 URGENT_LABEL = "merge-train: urgent"
 COMPARE_FILE_LIMIT = 300
 HOLD_EVENT_PAGE = 20
@@ -877,7 +879,24 @@ def update(env, pull):
     return True
 
 
-def advance(env, conf, repo, rows, notes):
+def prepare_update(env, conf, pull, notes, arming):
+    """Arm or disarm before updating; an unsigned bot leaves the next row eligible."""
+    if arming:
+        try:
+            arm(env, conf, pull)
+        except UnsignedBotError as err:
+            notes[pull["number"]] = err.note
+            return False
+        notes[pull["number"]] = "armed, updated from the default branch"
+    elif conf.get("required_status") and pull["autoMergeRequest"]:
+        graphql(env, DISARM, {"id": pull["id"]})
+        notes[pull["number"]] = "disarmed, updated from the default branch"
+    else:
+        notes[pull["number"]] = "updated from the default branch"
+    return True
+
+
+def advance(env, conf, repo, rows, notes, check_retry=None):
     """Update the first pull request `updatable` names, arming it first where it says.
 
     While `required_status` is set an armed pull request is disarmed before its update:
@@ -885,22 +904,18 @@ def advance(env, conf, repo, rows, notes):
     (decision record 0076).
     """
     for pull, arming in updatable(repo, rows, notes, conf):
-        if arming:
-            scanning = has_red_code_scanning(pull)
-            if scanning:
-                notes[pull["number"]] = "not armed: code-scanning check failed"
-                continue
-            try:
-                arm(env, conf, pull)
-            except UnsignedBotError as err:
-                notes[pull["number"]] = err.note
-                continue
-            notes[pull["number"]] = "armed, updated from the default branch"
-        elif conf.get("required_status") and pull["autoMergeRequest"]:
-            graphql(env, DISARM, {"id": pull["id"]})
-            notes[pull["number"]] = "disarmed, updated from the default branch"
-        else:
-            notes[pull["number"]] = "updated from the default branch"
+        if arming and has_red_code_scanning(pull):
+            notes[pull["number"]] = "not armed: code-scanning check failed"
+            continue
+        hold = check_retry(pull) if check_retry is not None else None
+        if hold is RETRY_DEFERRED:
+            notes[pull["number"]] = "retry history deferred: read budget spent this sweep"
+            return
+        if hold:
+            notes[pull["number"]] = hold
+            continue
+        if not prepare_update(env, conf, pull, notes, arming):
+            continue
         if update(env, pull):
             return
         notes[pull["number"]] = "conflicts with the default branch"
@@ -1733,9 +1748,26 @@ def same_retry_change(env, base, before, after):
     return before_modes == after_modes
 
 
+def retry_exempt(pull, conf):
+    """Security updates and urgent pulls bypass retry history and its read budget."""
+    return is_security(pull, conf) or URGENT_LABEL in label_names(pull)
+
+
+def read_retry(env, conf, now, reads, pull):
+    """Cache one history result per pull in this sweep; defer uncached reads past the cap."""
+    if retry_exempt(pull, conf):
+        return None
+    number = pull["number"]
+    if number not in reads:
+        if len(reads) >= RETRY_READ_LIMIT:
+            return RETRY_DEFERRED
+        reads[number] = retry_hold(env, conf, pull, now)
+    return reads[number]
+
+
 def retry_hold(env, conf, pull, now):
     """Recover the latest completed attempt from forge history; unreadable history holds."""
-    if is_security(pull, conf) or URGENT_LABEL in label_names(pull):
+    if retry_exempt(pull, conf):
         return None
     try:
         owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
@@ -1769,22 +1801,30 @@ def retry_workflow(suite):
     return run["workflow"]["name"] if run else (suite["app"] or {}).get("slug", "unknown app")
 
 
-def hold_retries(env, conf, repo, served, notes, now):
+def hold_retries(env, conf, repo, served, notes, now, reads):
     """Hold retries before the first unheld candidate, within a scalar read budget."""
     candidates = [p for p, reason in served if in_flight(p, reason)]
     candidates += [pull for pull, _ in updatable(repo, served, {}, conf)]
     holds = {}
-    for pull in candidates[:RETRY_READ_LIMIT]:
-        hold = retry_hold(env, conf, pull, now)
+    unheld = False
+    for pull in candidates:
+        hold = read_retry(env, conf, now, reads, pull)
+        if hold is RETRY_DEFERRED:
+            break
         if not hold:
-            notes.update(holds)
-            return [(p, holds.get(p["number"], r)) for p, r in served], None
+            unheld = True
+            break
         holds[pull["number"]] = hold
-    if holds:
+    released = None
+    if holds and not unheld:
         first = candidates[0]["number"]
-        released = f"retry hold released: no other pull request to serve ({holds[first]})"
-        return served, (first, released)
-    return served, None
+        released = (
+            first,
+            f"retry hold released: no other pull request to serve ({holds.pop(first)})",
+        )
+        reads[first] = None
+    notes.update(holds)
+    return [(p, holds.get(p["number"], r)) for p, r in served], released
 
 
 def lander_order(repo):
@@ -1885,8 +1925,10 @@ def serve_cycle(env, conf, repo, served, notes, now, held, lease):
 
 def serve_pending(env, conf, repo, served, notes, now, lease):
     """Hold unchanged failed retries before checking in-flight heads or updating one."""
+    reads = {}
+    check_retry = None if lease else partial(read_retry, env, conf, now, reads)
     served, released = (
-        (served, None) if lease else hold_retries(env, conf, repo, served, notes, now)
+        (served, None) if lease else hold_retries(env, conf, repo, served, notes, now, reads)
     )
     if released:
         notes[released[0]] = released[1]
@@ -1897,7 +1939,7 @@ def serve_pending(env, conf, repo, served, notes, now, lease):
         served, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull), conf
     )
     if not outcome:
-        advance(env, conf, repo, served, notes)
+        advance(env, conf, repo, served, notes, check_retry)
     if released and notes[released[0]] != released[1]:
         notes[released[0]] += f"; {released[1]}"
     return outcome or "no pull request at a mergeable state"

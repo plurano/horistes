@@ -10017,3 +10017,156 @@ def test_retry_hold_unarmed_behind_without_auto_merge_does_not_read_history(tmp_
     assert forge.writes == [updated(2)]
     assert forge.retry_calls == [2]
     assert "| #1 | BEHIND | behind: auto-merge off, not armed, not updated |" in summary
+
+
+def retry_behind_forge(count, held, *, armed_pulls=True, **first_fields):
+    fields = {"autoMergeRequest": {"enabledAt": OLD}} if armed_pulls else {}
+    pulls = [
+        pull(n, "BEHIND", **(fields | (first_fields if n == 1 else {})))
+        for n in range(1, count + 1)
+    ]
+    forge = Forge(repository(*pulls))
+    for number in held:
+        forge.retry_histories[number] = retry_history(number, retry_attempt(suites=[retry_suite()]))
+    return forge
+
+
+def test_retry_hold_after_conflict_checks_next_candidate(tmp_path):
+    forge = retry_behind_forge(2, [2])
+    forge.update_answers[1] = (422, f"{CONFLICT}.")
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert forge.retry_calls == [1, 2]
+    assert "| #1 | BEHIND | conflicts with the default branch |" in summary
+    assert "| #2 | BEHIND | held for retry:" in summary
+
+
+def test_retry_hold_after_scanning_skip_checks_next_candidate(tmp_path):
+    forge = retry_behind_forge(
+        2,
+        [2],
+        armed_pulls=False,
+        suites=[suite(1001, "FAILURE", 10, None, "github-code-scanning")],
+    )
+    # Prepare a BEHIND row to reach advance's defensive scanning guard; verdict
+    # normally filters it earlier. The production rules module stays unchanged.
+    helper = module().replace(
+        "    if scanning:\n        return scanning",
+        "    if scanning:\n"
+        '        return "behind" if pull["mergeStateStatus"] == "BEHIND" else scanning',
+    )
+    assert helper != module()
+    done, summary = train(tmp_path, forge, helper=helper)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.retry_calls == [1, 2]
+    assert "| #1 | BEHIND | not armed: code-scanning check failed |" in summary
+    assert "| #2 | BEHIND | held for retry:" in summary
+
+
+def test_retry_hold_after_unsigned_skip_checks_next_candidate(tmp_path):
+    forge = retry_behind_forge(
+        2,
+        [2],
+        armed_pulls=False,
+        author={"login": "praetor-ops", "__typename": "Bot"},
+        headRefName="fix/x",
+    )
+    forge.commits[1] = [("fix: automated update without trailer", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.retry_calls == [1, 2]
+    assert "| #1 | BEHIND | skipped: bot pull request without Signed-off-by" in summary
+    assert "| #2 | BEHIND | held for retry:" in summary
+
+
+@pytest.mark.parametrize("fifth_held", [True, False], ids=["deferred", "unheld-fifth"])
+def test_retry_hold_after_conflict_shares_read_budget(tmp_path, fifth_held):
+    forge = retry_behind_forge(6, range(2, 6 if fifth_held else 5))
+    forge.update_answers[1] = (422, f"{CONFLICT}.")
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == ([updated(1)] if fifth_held else [updated(1), updated(5)])
+    assert forge.retry_calls == [1, 2, 3, 4, 5]
+    if fifth_held:
+        assert "| #6 | BEHIND | retry history deferred: read budget spent this sweep |" in summary
+    for number in range(2, 6 if fifth_held else 5):
+        assert f"| #{number} | BEHIND | held for retry:" in summary
+
+
+def test_retry_hold_all_held_conflict_keeps_other_holds(tmp_path):
+    forge = retry_behind_forge(2, [1, 2])
+    forge.update_answers[1] = (422, f"{CONFLICT}.")
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert forge.retry_calls == [1, 2]
+    assert "| #2 | BEHIND | held for retry:" in summary
+    assert "| #1 | BEHIND | conflicts with the default branch; retry hold released:" in summary
+    # The forge reports the conflict on the next sweep; #2 is now the lone candidate.
+    next_forge = retry_behind_forge(2, [1, 2])
+    next_forge.reads["fleet/app"][0]["pullRequests"]["nodes"][0]["mergeStateStatus"] = "DIRTY"
+    following = tmp_path / "following"
+    following.mkdir()
+    done, summary = train(following, next_forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert next_forge.writes == [updated(2)]
+    assert next_forge.retry_calls == [2]
+    assert "| #2 | BEHIND | updated from the default branch; retry hold released:" in summary
+
+
+def test_retry_hold_urgent_after_spent_budget_is_updated(tmp_path):
+    forge = retry_behind_forge(6, range(2, 6))
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"][-1]["labels"] = {
+        "nodes": [{"name": "merge-train: urgent"}]
+    }
+    forge.update_answers[1] = (422, f"{CONFLICT}.")
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1), updated(6)]
+    assert forge.retry_calls == [1, 2, 3, 4, 5]
+    assert "| #6 | BEHIND | updated from the default branch |" in summary
+
+
+def test_retry_hold_security_after_spent_budget_is_updated(tmp_path):
+    pulls = [
+        pull(n, "BLOCKED", autoMergeRequest={"enabledAt": OLD}, suites=[None]) for n in range(1, 6)
+    ]
+    security = pull(6, "BEHIND", autoMergeRequest={"enabledAt": OLD}, labels=["security"])
+    forge = Forge(repository(*pulls, security))
+    for number in range(1, 6):
+        forge.retry_histories[number] = retry_history(number, retry_attempt(suites=[retry_suite()]))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(6)]
+    assert forge.retry_calls == [1, 2, 3, 4, 5]
+    assert "| #6 | BEHIND | updated from the default branch |" in summary
+
+
+def test_retry_hold_all_held_in_flight_keeps_other_holds(tmp_path):
+    pulls = [pull(n, "BLOCKED", autoMergeRequest={"enabledAt": OLD}, suites=[None]) for n in (1, 2)]
+    forge = Forge(repository(*pulls))
+    for number in (1, 2):
+        forge.retry_histories[number] = retry_history(number, retry_attempt(suites=[retry_suite()]))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.retry_calls == [1, 2]
+    assert "retry hold released: no other pull request to serve" in summary
+    assert "| #2 | BLOCKED | held for retry:" in summary
+
+
+def test_retry_hold_deferral_ends_advancement_before_later_urgent(tmp_path):
+    forge = retry_behind_forge(7, range(2, 6))
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"][-1]["labels"] = {
+        "nodes": [{"name": "merge-train: urgent"}]
+    }
+    forge.update_answers[1] = (422, f"{CONFLICT}.")
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert forge.retry_calls == [1, 2, 3, 4, 5]
+    assert "| #6 | BEHIND | retry history deferred: read budget spent this sweep |" in summary
+    assert "| #7 | BEHIND | updated from the default branch" not in summary
