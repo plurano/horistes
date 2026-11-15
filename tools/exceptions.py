@@ -37,6 +37,8 @@ RUFF_TOP = frozenset({"line-length", "target-version", "lint"})
 RUFF_LINT = frozenset({"select", "ignore", "per-file-ignores", "isort"})
 FIELDS = ("rule", "path", "issue", "reason", "expires", "category", "entered")
 ALLOWED = frozenset(FIELDS)
+# A finding without a file may omit path.
+REQUIRED = tuple(field for field in FIELDS if field != "path")
 CATEGORY_DAYS = {"B": 3, "C": 10, "D": 120}
 INTERVAL_PATTERN = re.compile(r"\binterval\s+(\d+)\s+days\b")
 ISSUE = re.compile(r"^[\w.-]+/[\w.-]+#[1-9]\d*$")
@@ -183,7 +185,7 @@ def _check_fleet_match(match: re.Match[str], today: datetime.date) -> str:
 def _is_covered(
     rules_str: str,
     file_path: str,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
 ) -> bool:
     """Check whether every rule in rules_str is covered by valid_exceptions for file_path."""
     clean = rules_str.strip()
@@ -330,13 +332,26 @@ def _parse_entry_date(val: object, field: str, found: list[str]) -> datetime.dat
         raise ciwf.ReadError(f"names `{val}` as {field}, not YYYY-MM-DD: {err}") from err
 
 
+def _path_problems(entry: dict, root: Path) -> list[str]:
+    """Validate a path only when the entry names a file."""
+    if "path" not in entry:
+        return []
+    if not isinstance(entry["path"], str) or not entry["path"].strip():
+        return ["has no `path` (a text that is not empty)"]
+    if not _tracked_file(root, entry["path"]):
+        return [f"names `{entry['path']}`, which is no file of the repository"]
+    return []
+
+
 def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str]:
     """What is wrong with one entry of the repository's own list."""
     if not isinstance(entry, dict):
         return ["is no mapping"]
     unknown = sorted(set(entry) - ALLOWED)
     found = [f"has the unknown field `{key}`" for key in unknown]
-    empty = [key for key in FIELDS if not isinstance(entry.get(key), str) or not entry[key].strip()]
+    empty = [
+        key for key in REQUIRED if not isinstance(entry.get(key), str) or not entry[key].strip()
+    ]
     found += [f"has no `{key}` (a text that is not empty)" for key in empty]
     if "reason" not in empty:
         r_prob = reason_problem(str(entry.get("reason", "")))
@@ -344,8 +359,7 @@ def _entry_problems(entry: object, root: Path, today: datetime.date) -> list[str
             found.append(r_prob)
     if "issue" not in empty and not ISSUE.match(entry["issue"]):
         found.append(f"names the issue `{entry['issue']}`, not as owner/name#number")
-    if "path" not in empty and not _tracked_file(root, entry["path"]):
-        found.append(f"names `{entry['path']}`, which is no file of the repository")
+    found += _path_problems(entry, root)
     cat = entry.get("category")
     if "category" not in empty and cat not in ("A", "B", "C", "D"):
         found.append(f"names `{cat}` as category, not one of A, B, C, D")
@@ -423,7 +437,9 @@ def _tracked_files(root: Path) -> list[str]:
     return [p.decode("utf-8") for p in proc.stdout.split(b"\0") if p]
 
 
-def _own(root: Path, today: datetime.date) -> tuple[list[str], int, dict[tuple[str, str], dict]]:
+def _own(
+    root: Path, today: datetime.date
+) -> tuple[list[str], int, dict[tuple[str, str | None], dict]]:
     """What is wrong with the repository's own list, and how many entries were read."""
     path = root / OWN
     if not path.exists():
@@ -496,7 +512,7 @@ def _check_directive(
     kind: str,
     where: str,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
     path: str,
     rules_pattern: str | re.Pattern[str],
 ) -> list[str]:
@@ -517,7 +533,7 @@ def comment_problems(
     after_code: bool,
     where: str,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]] | None = None,
+    valid_exceptions: set[tuple[str, str | None]] | None = None,
     path: str = "",
     counts: dict[str, int] | None = None,
 ) -> list[str]:
@@ -587,7 +603,7 @@ def suppression_problems(
     text: str,
     name: str,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]] | None = None,
+    valid_exceptions: set[tuple[str, str | None]] | None = None,
     counts: dict[str, int] | None = None,
 ) -> list[str]:
     """Tokenize Python text and verify that all suppression comments meet requirements."""
@@ -631,7 +647,7 @@ def opengrep_problems(
     text: str,
     name: str,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
     counts: dict[str, int],
 ) -> list[str]:
     """Judge opengrep ignore lines for every non-python tracked text file.
@@ -669,7 +685,7 @@ def _shellcheck_line_problem(
     line: str,
     where: str,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
     name: str,
     counts: dict[str, int],
 ) -> list[str]:
@@ -697,7 +713,7 @@ def yaml_problems(
     text: str,
     name: str,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
     counts: dict[str, int],
 ) -> list[str]:
     """Check YAML comments for invalid or unapproved suppressions."""
@@ -719,7 +735,7 @@ def md_problems(
     text: str,
     name: str,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
     counts: dict[str, int],
 ) -> list[str]:
     """Check Markdown files for markdownlint directives."""
@@ -752,7 +768,7 @@ def sh_problems(
     text: str,
     name: str,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
     counts: dict[str, int],
 ) -> list[str]:
     """Check shell scripts for shellcheck directives."""
@@ -783,7 +799,7 @@ def _scan_tracked_file(
     rel: str,
     root: Path,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
     counts: dict[str, int],
 ) -> tuple[list[str], int]:
     """Scan one tracked file for suppression directives and invalid patterns."""
@@ -821,7 +837,7 @@ def _scan_tracked_file(
 def _tree_directives(
     root: Path,
     today: datetime.date,
-    valid_exceptions: set[tuple[str, str]],
+    valid_exceptions: set[tuple[str, str | None]],
 ) -> tuple[list[str], dict[str, int], list[str]]:
     """Scan all tracked files below root for directives and tally their counts by kind."""
     tracked = _tracked_files(root)

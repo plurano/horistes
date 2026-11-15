@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: EUPL-1.2
 ---
 # Exceptions to rules that neither the engine's list in .standards.yaml nor a
-# linter's configuration can carry. One entry is one rule in one file, with the
-# issue that tracks its cause, a reason, MEL category and a day it ends.
+# linter's configuration can carry. One entry names one rule in one file, or
+# one rule alone when its finding has no file (a repository-level check), with
+# the issue that tracks its cause, a reason, MEL category and a day it ends.
 # tools/exceptions.py is the only reader and fails the gate on an entry that is
 # incomplete, expired or invalid.
 exceptions:
   - rule: CIIBestPracticesID
-    path: .bestpractices.json
     issue: plurano/horistes#116
     category: C
     entered: "2026-11-13"
