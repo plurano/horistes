@@ -252,7 +252,9 @@ hashes.
   Python lint, actionlint and zizmor, the interface record, the host scan, the
   accepted findings and exceptions, the caller templates, the Scorecard
   service's rules, the runner labels, the relative Markdown links and their
-  heading anchors (`tools/links.py`, no host asked), the tests and the licence
+  heading anchors (`tools/links.py`, no host asked), fenced examples,
+  Codacy's checked-in Opengrep Python rules (`make check-opengrep`,
+  [ADR-0084](docs/adr/0084-codacy-opengrep-rules-run-in-the-local-gate.md)), the tests and the licence
   headers. The test run measures coverage and fails below the floor
   `fail_under` in `pyproject.toml` (94%), which only goes up;
   `tests/test_coverage_floor.py` holds the floor and the coverage steps of

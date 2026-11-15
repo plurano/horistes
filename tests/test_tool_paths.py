@@ -79,7 +79,8 @@ def test_makefile_test_recipe_passes_tool_variables():
 
 
 def test_no_test_reads_a_tool_variable_directly():
-    files = sorted(path for path in (ROOT / "tests").glob("*.py") if path.name != "conftest.py")
+    # Sub-folders count: the Opengrep scanner tests live in tests/codacy_opengrep/.
+    files = sorted(path for path in (ROOT / "tests").rglob("*.py") if path.name != "conftest.py")
     assert files
     found = {
         path.name: lines

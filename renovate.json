@@ -6,8 +6,14 @@
   "enabledManagers": [
     "github-actions",
     "pip-compile",
-    "custom.regex"
+    "custom.regex",
+    "npm"
   ],
+  "npm": {
+    "managerFilePatterns": [
+      "/^tools/codacy_opengrep/package\\.json$/"
+    ]
+  },
   "pip-compile": {
     "managerFilePatterns": [
       "/^requirements/tools\\.txt$/"

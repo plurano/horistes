@@ -1,0 +1,18 @@
+"""Planted Opengrep canary: the environment reaches a subprocess argument through a helper's return value.
+
+codacy_opengrep_scan.py writes this file as tools/intrafile_canary.py in its scan copy. Codacy scans
+with --taint-intrafile, so taint crosses the function boundary below; a local scan without that flag
+misses it, and the canary fails.
+"""
+import os
+import subprocess
+
+
+def tool_path() -> str:
+    """Return the tool path the environment names."""
+    return os.environ.get("CANARY_TOOL", "true")
+
+
+def run_tool() -> None:
+    """Run the tool; only an intrafile taint scan follows tool_path's return value here."""
+    subprocess.run([tool_path()], check=False, timeout=5)

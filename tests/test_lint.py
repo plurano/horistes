@@ -25,6 +25,8 @@ BY_TAG = f"{REUSABLE}      - name: Tool\n        uses: {IMAGE}:3\n"
 YAML_GOOD = "---\nkey: value\n"
 YAML_BROKEN_SYNTAX = "---\nkey: [unclosed\n"
 YAML_RULE_VIOLATION = "---\nkey: " + '"' + "a" * 130 + '"\n'
+# .yamllint.yaml reads its ignore list from .gitignore.
+YAMLLINT_CONFIG = (".yamllint.yaml", ".gitignore")
 PY_GOOD = "VALUE: int = 1\n"
 PY_LINT_FINDING = "import sys\n"
 PY_ISC_GOOD = """\
@@ -176,12 +178,27 @@ def test_actionlint_refuses(tree, workflow, finding):
 )
 def test_yamllint_refuses_planted_defects(tree, content, finding):
     """yamllint fails on broken syntax and rule violations, and passes clean YAML."""
-    tree.write({".yamllint.yaml": (ROOT / ".yamllint.yaml").read_text(encoding="utf-8")})
+    tree.write({name: (ROOT / name).read_text(encoding="utf-8") for name in YAMLLINT_CONFIG})
     good = yamllint(tree.write({"doc.yml": YAML_GOOD}))
     assert good.returncode == 0, good.stdout
     bad = yamllint(tree.write({"doc.yml": content}))
     assert bad.returncode != 0
     assert finding in bad.stdout
+
+
+@pytest.mark.parametrize(
+    ("path", "refused"),
+    [
+        ("tools/codacy_opengrep/node_modules/bl/.travis.yml", False),
+        ("tools/codacy_opengrep/vendored/.travis.yml", True),
+    ],
+    ids=["git-ignored-npm-tree", "tracked-neighbour"],
+)
+def test_yamllint_skips_git_ignored_trees(tree, path, refused):
+    """The npm tree `make opengrep-tools` installs is git-ignored, so yamllint skips it."""
+    tree.write({name: (ROOT / name).read_text(encoding="utf-8") for name in YAMLLINT_CONFIG})
+    done = yamllint(tree.write({path: YAML_RULE_VIOLATION}))
+    assert (done.returncode != 0) is refused, done.stdout
 
 
 def test_ruff_refuses_a_planted_lint_finding(tree):
@@ -280,25 +297,46 @@ def _recipe(makefile: str, target: str) -> list[str]:
     return recipe
 
 
+def _prerequisites(content: str, target: str) -> list[str]:
+    """Return the prerequisites of a Makefile rule, following backslash continuations."""
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith(f"{target}:"):
+            continue
+        found = line.split(":", 1)[1].removesuffix("\\").split()
+        curr, idx = line, i
+        while curr.endswith("\\") and idx + 1 < len(lines):
+            idx += 1
+            curr = lines[idx]
+            found.extend(curr.removesuffix("\\").split())
+        return found
+    return []
+
+
+def test_verify_runs_check_opengrep_before_test():
+    """Positive: verify runs check-opengrep before test, so verify-all scans (ADR-0084)."""
+    prereqs = _prerequisites((ROOT / "Makefile").read_text(encoding="utf-8"), "verify")
+    assert "check-opengrep" in prereqs
+    assert prereqs.index("check-opengrep") < prereqs.index("test")
+
+
+def test_prerequisites_reads_continuation_lines():
+    """Boundary: a prerequisite after a backslash continuation is still found."""
+    assert _prerequisites("verify: a \\\n\tb c\n", "verify") == ["a", "b", "c"]
+
+
+def test_prerequisites_of_a_missing_rule_is_empty():
+    """Negative: a Makefile without the rule yields no prerequisites."""
+    assert _prerequisites("lint:\n\ttrue\n", "verify") == []
+
+
 def test_makefile_lint_python_recipe_passes_config_flag():
     """Makefile lint-python recipe passes --config ruff.toml to ruff check and format."""
     content = (ROOT / "Makefile").read_text(encoding="utf-8")
     recipe = _recipe(content, "lint-python")
     assert "$(BIN)/ruff check --config ruff.toml tools tests fuzz" in recipe
     assert "$(BIN)/ruff format --check --config ruff.toml tools tests fuzz" in recipe
-    verify_prereqs: list[str] = []
-    lines = content.splitlines()
-    for i, line in enumerate(lines):
-        if line.startswith("verify:"):
-            curr = line
-            idx = i
-            verify_prereqs.extend(curr.split(":", 1)[1].removesuffix("\\").split())
-            while curr.endswith("\\") and idx + 1 < len(lines):
-                idx += 1
-                curr = lines[idx]
-                verify_prereqs.extend(curr.removesuffix("\\").split())
-            break
-    assert "lint-python" in verify_prereqs
+    assert "lint-python" in _prerequisites(content, "verify")
     for line in content.splitlines():
         if "$(BIN)/ruff check" in line or "$(BIN)/ruff format" in line:
             assert "--config ruff.toml" in line
@@ -324,3 +362,19 @@ def test_rooted_reads_the_makefile_separator_under_a_backslash_sep(
     monkeypatch.setattr(os, "sep", "\\")
     assert rooted([".venv/bin/ruff"]) == [str(ROOT / ".venv/bin/ruff")]
     assert rooted(["ruff"]) == ["ruff"]
+
+
+def test_opengrep_recipe_scans_and_shrinks_in_one_process():
+    """One invocation shares the parsed baseline across scan and shrink checks."""
+    content = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert _recipe(content, "check-opengrep") == [
+        "$(PYTHON) -B tools/codacy_opengrep_scan.py --base-ref $(BASE_REF)"
+    ]
+    assert "check-opengrep-stamp" in _prerequisites(content, "check-opengrep")
+
+
+def test_check_opengrep_base_ref_defaults_to_origin_main():
+    """Boundary: with BASE_REF unset the shrink check compares with origin/main (ADR-0084)."""
+    content = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "BASE_REF ?= origin/main" in content.splitlines()
+    assert any("--base-ref $(BASE_REF)" in line for line in _recipe(content, "check-opengrep"))

@@ -126,6 +126,16 @@ jobs:
           done
           gitleaks git --no-banner --verbose --redact --exit-code 1 --ignore-gitleaks-allow --timeout 300 .
 
+      - name: Set up Node for the pinned Codacy analysis CLI
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      # Only this step reaches registry.npmjs.org and the forge release asset;
+      # the gate's scan runs offline against the stamp it writes (ADR-0084).
+      - name: Install the pinned Codacy analysis CLI and Opengrep binary
+        run: make opengrep-tools
+
       # The interface is compared with the commit the change starts from.
       - name: Verification gate
         env:
