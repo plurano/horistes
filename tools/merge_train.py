@@ -29,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
 from train_rules import (
+    RED,
     REFRESH_LABEL,
     REGENERATE_HEADLINE,
     SECURITY_HOLD_LABEL,
@@ -71,6 +72,10 @@ SETTLE_SECONDS = 5
 PULL_PAGES = 4
 # Page sizes of the pull query's check suites and label events; a full page may hide more.
 SUITE_PAGE = 30
+RETRY_HOLD_DAYS = 7
+RETRY_READ_LIMIT = 5
+URGENT_LABEL = "merge-train: urgent"
+COMPARE_FILE_LIMIT = 300
 HOLD_EVENT_PAGE = 20
 # Review states that block a session pull request whatever its checks do (record 0079).
 REVIEW_BLOCKS = ("REVIEW_REQUIRED", "CHANGES_REQUESTED")
@@ -114,6 +119,28 @@ query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       mergeStateStatus
+    }
+  }
+}
+"""
+RETRY_HISTORY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid baseRefOid
+      commits(last: 20) { nodes { commit { ...Attempt } } }
+      timelineItems(last: 20, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) {
+        nodes { ... on HeadRefForcePushedEvent { beforeCommit { ...Attempt } } }
+      }
+    }
+  }
+}
+fragment Attempt on Commit {
+  oid
+  checkSuites(first: 30) {
+    nodes {
+      databaseId conclusion createdAt app { slug }
+      workflowRun { databaseId workflow { databaseId name } }
     }
   }
 }
@@ -1602,6 +1629,137 @@ def land_clean(env, conf, repo, served, notes):
     return None
 
 
+def completed_attempt(commit):
+    """A completed attempt's stamp, oid and failed suites, or None (ADR-0085)."""
+    if commit is None:
+        return None
+    nodes = commit["checkSuites"]["nodes"]
+    if len(nodes) >= SUITE_PAGE:
+        raise ValueError("30-suite page may hide retry checks")
+    suites = list(newest_suites(nodes).values())
+    failed = [s for s in suites if s["conclusion"] in RED]
+    if not failed and (not suites or any(s["workflowRun"] and not s["conclusion"] for s in suites)):
+        return None
+    stamp = max(datetime.fromisoformat(s["createdAt"]) for s in (failed or suites))
+    if stamp.tzinfo is None:
+        raise ValueError("retry check timestamp has no timezone")
+    return stamp, commit["oid"], failed
+
+
+def own_diff(env, base, head):
+    """Merge-base file changes, excluding context and hunk offsets; refuse a full page."""
+    url = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/compare/{base}...{head}"
+    files = call(url, env["TRAIN_TOKEN"], "GET")["files"]
+    if len(files) >= COMPARE_FILE_LIMIT:
+        raise ValueError("300 files may hide part of the own diff")
+    return sorted(diff_file(file) for file in files)
+
+
+def diff_file(file):
+    """One file's identity and changed lines, or its blob sha when no patch is available."""
+    patch = file.get("patch")
+    if patch is not None and not isinstance(patch, str):
+        raise ValueError("compare patch is not text")
+    changes = (
+        tuple(line for line in patch.splitlines() if line.startswith(("+", "-")))
+        if patch is not None
+        else file["sha"]
+    )
+    return file["filename"], file.get("previous_filename", ""), file["status"], changes
+
+
+def retry_hold(env, conf, pull, now):
+    """Recover the latest completed attempt from forge history; unreadable history holds."""
+    if is_security(pull, conf) or URGENT_LABEL in label_names(pull):
+        return None
+    try:
+        owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+        data = read_graphql(
+            env, RETRY_HISTORY, {"owner": owner, "name": name, "number": pull["number"]}
+        )
+        node = data["repository"]["pullRequest"]
+        if node["headRefOid"] != pull["headRefOid"]:
+            raise ValueError("head moved while reading retry history")
+        commits = [n["commit"] for n in node["commits"]["nodes"]]
+        commits += [n["beforeCommit"] for n in node["timelineItems"]["nodes"]]
+        completed = [attempt for c in commits if (attempt := completed_attempt(c))]
+        if not completed:
+            return None
+        stamp, oid, failed = max(completed, key=lambda attempt: attempt[0])
+        until = stamp + timedelta(days=RETRY_HOLD_DAYS)
+        if not failed or now >= until:
+            return None
+        if own_diff(env, node["baseRefOid"], oid) != own_diff(
+            env, node["baseRefOid"], pull["headRefOid"]
+        ):
+            return None
+        names = ", ".join(retry_workflow(s) for s in failed)
+        expiry = until.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return f"held for retry: diff unchanged since {oid[:12]} failed {names}; until {expiry}"
+    except (RefusedError, AttributeError, KeyError, TypeError, ValueError) as err:
+        return f"held for retry: history unreadable: {err}"
+
+
+def retry_workflow(suite):
+    """The failed workflow name, or the app slug for a non-Actions suite."""
+    run = suite["workflowRun"]
+    return run["workflow"]["name"] if run else (suite["app"] or {}).get("slug", "unknown app")
+
+
+def hold_retries(env, conf, served, notes, now):
+    """Hold retries before the first unheld candidate, within a scalar read budget."""
+    candidates = [p for p, reason in served if in_flight(p, reason) or reason == "behind"]
+    holds = {}
+    for pull in candidates[:RETRY_READ_LIMIT]:
+        hold = retry_hold(env, conf, pull, now)
+        if not hold:
+            notes.update(holds)
+            return [(p, holds.get(p["number"], r)) for p, r in served], None
+        holds[pull["number"]] = hold
+    if holds:
+        first = candidates[0]["number"]
+        released = f"retry hold released: no other pull request to serve ({holds[first]})"
+        return served, (first, released)
+    return served, None
+
+
+def lander_order(repo):
+    """The bounded order in an already validated lease description, or an empty tuple."""
+    raw = repo["landerLease"]["description"].partition("; order=")[2]
+    return tuple(int(number) for number in raw.split(",")) if raw else ()
+
+
+def next_planned(repo, order):
+    """The first open order entry, 0 when none is open, None when unordered or unknown.
+
+    An entry missing from the pages read counts as closed only when every page was read;
+    past an unread page it may still be open, so the order is unknown (ADR-0085).
+    """
+    opened = {p["number"] for p in repo["pullRequests"]["nodes"]}
+    unread = repo["pullRequests"]["pageInfo"]["hasNextPage"]
+    for number in order:
+        if number in opened:
+            return number
+        if unread:
+            return None
+    return 0 if order else None
+
+
+def serve_lander_order(served, notes, conf, lease, planned):
+    """Keep security rows and the next planned pull; no known order yields all."""
+    message = f"the lander holds the landing order until {lease}"
+    if planned is None:
+        return yield_to_lander(served, notes, conf, lease), message
+    message += f"; #{planned} is next" if planned else "; no planned pull request is open"
+    kept = []
+    for pull, reason in served:
+        if is_security(pull, conf) or pull["number"] == planned:
+            kept.append((pull, reason))
+        elif reason in ("land", "behind"):
+            notes[pull["number"]] = message
+    return kept, message
+
+
 def lander_lease(repo, now):
     """The live lander lease expiry stamp or None; raise RefusedError on invalid lease."""
     try:
@@ -1622,6 +1780,7 @@ def run(env, conf, repo, now, notes=None):
     notes.update({pull["number"]: reason for pull, reason in rows})
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
+    # Taking auto-merge off a red pull request lands nothing, so it precedes the lease check.
     disarm_red_scanning(env, rows, notes, conf)
     lease = lander_lease(repo, now)
     served = serving_order(rows, conf)
@@ -1631,35 +1790,51 @@ def run(env, conf, repo, now, notes=None):
         (pull, f"labelled {held[pull['number']]}" if pull["number"] in held else reason)
         for pull, reason in served
     ]
+    planned = next_planned(repo, lander_order(repo)) if lease else None
+    lease_note = f"the lander holds the landing order until {lease}"
     if lease:
-        served = yield_to_lander(served, notes, conf, lease)
+        served, lease_note = serve_lander_order(served, notes, conf, lease, planned)
     hold = write_hold(served, conf, now)
     if hold:
         served = yield_to_write(served, notes, conf, hold)
+    outcome = serve_cycle(env, conf, repo, served, notes, now, held, lease)
+    if lease and planned is not None:
+        outcome = f"{outcome}; {lease_note}"
+    elif lease and outcome == "no pull request at a mergeable state":
+        outcome = lease_note
+    return rows, notes, outcome
+
+
+def serve_cycle(env, conf, repo, served, notes, now, held, lease):
+    """Try a write or landing before reading retry history for pending updates."""
     outcome = regenerate(env, conf, repo, served, notes)
     if outcome:
-        return rows, notes, outcome
+        return outcome
     re_armed = re_arm_drifted(env, conf, served, held, notes)
     if re_armed:
-        return rows, notes, re_armed
+        return re_armed
     landed_pr = land_clean(env, conf, repo, served, notes)
     if landed_pr:
-        return rows, notes, landed_pr
+        return landed_pr
+    return serve_pending(env, conf, repo, served, notes, now, lease)
+
+
+def serve_pending(env, conf, repo, served, notes, now, lease):
+    """Hold unchanged failed retries before checking in-flight heads or updating one."""
+    served, released = (served, None) if lease else hold_retries(env, conf, served, notes, now)
+    if released:
+        notes[released[0]] = released[1]
     holding = [pull["number"] for pull, reason in served if in_flight(pull, reason)]
     if holding:
-        return rows, notes, f"#{holding[0]} is armed and in flight"
+        return f"#{holding[0]} is armed and in flight"
     outcome = refresh(
         served, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull), conf
     )
-    if outcome:
-        return rows, notes, outcome
-    advance(env, conf, repo, served, notes)
-    outcome = (
-        f"the lander holds the landing order until {lease}"
-        if lease
-        else "no pull request at a mergeable state"
-    )
-    return rows, notes, outcome
+    if not outcome:
+        advance(env, conf, repo, served, notes)
+    if released and notes[released[0]] != released[1]:
+        notes[released[0]] += f"; {released[1]}"
+    return outcome or "no pull request at a mergeable state"
 
 
 def report(name, repo, rows, notes, outcome):

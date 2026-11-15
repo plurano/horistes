@@ -374,6 +374,19 @@ class Forge:
         self.artifact_redirect_locations: dict[int, str | None] = {}
         self.refuse_commit = False
         self.messages: list[tuple[str, str, str | None, str | None]] = []
+        self._init_pull_reads()
+        self.merged_pulls: dict[str, list[dict]] = {}
+        self.issue_right = True
+        self.ungranted: set[int] = set()
+        self.jobs: dict[int, list[dict]] = {}
+        self.jobs_calls: list[int] = []
+        # Faults the REST stand-in answers first, per kind ("jobs", "revoke"): a status or DROP.
+        self.rest_faults: dict[str, list[int | str]] = {}
+        self.label_missing = False
+        self.unlabel_status: int | None = None
+        self.install(7, "fleet", app=list(reads))
+
+    def _init_pull_reads(self) -> None:
         self.commits: dict[int, list[tuple[str, int]]] = {}
         self.merge_states: dict[int, str] = {}
         self.commit_counts: dict[int, int] = {}
@@ -385,16 +398,11 @@ class Forge:
         self.rights: dict[str, str] = {}
         self.right_refusals: dict[str, int] = {}
         self.right_calls: list[str] = []
-        self.merged_pulls: dict[str, list[dict]] = {}
-        self.issue_right = True
-        self.ungranted: set[int] = set()
-        self.jobs: dict[int, list[dict]] = {}
-        self.jobs_calls: list[int] = []
-        # Faults the REST stand-in answers first, per kind ("jobs", "revoke"): a status or DROP.
-        self.rest_faults: dict[str, list[int | str]] = {}
-        self.label_missing = False
-        self.unlabel_status: int | None = None
-        self.install(7, "fleet", app=list(reads))
+        self.retry_histories: dict[int, dict] = {}
+        self.retry_refusals: dict[int, str] = {}
+        self.retry_calls: list[int] = []
+        self.comparisons: dict[str, tuple[int, dict]] = {}
+        self.compare_calls: list[str] = []
 
     def set_allowlist(self, repo: str, default_branch: str, paths: list[str]) -> None:
         text = "\n".join(paths)
@@ -581,6 +589,8 @@ class Forge:
         return self._read_graphql(full, query, variables)
 
     def _read_graphql(self, full: str, query: str, variables: dict) -> dict:
+        if "HEAD_REF_FORCE_PUSHED_EVENT" in query:
+            return self.pull_retry_history(full, variables)
         if "mergeStateStatus" in query and "pullRequest(" in query:
             return self.pull_merge_state(full, variables)
         if "reviews(first: 100)" in query:
@@ -591,6 +601,25 @@ class Forge:
             nodes = self.merged_pulls.get(full, [])
             return {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
         return self.pull_page(full, query, variables)
+
+    def pull_retry_history(self, full: str, variables: dict) -> dict:
+        """Read one pull's retry attempts, including discarded heads."""
+        owner, name = full.split("/")
+        number = variables["number"]
+        assert variables == {"owner": owner, "name": name, "number": number}, variables
+        self.retry_calls.append(number)
+        if number in self.retry_refusals:
+            return {"errors": [{"message": self.retry_refusals[number]}]}
+        detail = self.retry_histories.get(number, retry_history(number))
+        return {"data": {"repository": {"pullRequest": detail}}}
+
+    def compare(self, header: str, full: str, refs: str) -> tuple[int, dict]:
+        """The JSON compare endpoint, keyed by head oid with a checked three-dot base."""
+        assert self.repo_of(header)[0] == full
+        base, separator, head = refs.partition("...")
+        assert (base, separator) == ("b" * 40, "..."), refs
+        self.compare_calls.append(head)
+        return self.comparisons.get(head, (200, {"files": [retry_file()]}))
 
     def pull_review_bodies(self, full: str, variables: dict) -> dict:
         owner, name = full.split("/")
@@ -954,26 +983,35 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _get_collaborator(self, path: str) -> None:
+        """Serve a collaborator permission read independently of other REST routes."""
+        forge = self.server.forge
+        full, _, tail = path.removeprefix("/repos/").partition("/collaborators/")
+        assert forge.repo_of(self.headers["Authorization"])[0] == full
+        login = unquote(tail.removesuffix("/permission"))
+        forge.right_calls.append(login)
+        token = self.headers["Authorization"].removeprefix("Bearer ")
+        if forge.tokens[token][3].get("metadata") != "read":
+            self.answer(403, {"message": "Resource not accessible by integration"})
+        elif login in forge.right_refusals:
+            self.answer(forge.right_refusals[login], {"message": "Permission read refused"})
+        elif login in forge.rights:
+            permission = forge.rights[login]
+            self.answer(200, {"permission": permission, "role_name": permission})
+        else:
+            self.answer(404, {"message": "Not Found"})
+
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if self._dispatch_app(path):
             return
+        if "/compare/" in path and path.startswith("/repos/"):
+            full, _, refs = path.removeprefix("/repos/").partition("/compare/")
+            assert self.headers["Accept"] == "application/vnd.github+json"
+            self.answer(*self.server.forge.compare(self.headers["Authorization"], full, refs))
+            return
         if re.fullmatch(r"/repos/[^/]+/[^/]+/collaborators/[^/]+/permission", path):
-            forge = self.server.forge
-            full, _, tail = path.removeprefix("/repos/").partition("/collaborators/")
-            assert forge.repo_of(self.headers["Authorization"])[0] == full
-            login = unquote(tail.removesuffix("/permission"))
-            forge.right_calls.append(login)
-            token = self.headers["Authorization"].removeprefix("Bearer ")
-            if forge.tokens[token][3].get("metadata") != "read":
-                self.answer(403, {"message": "Resource not accessible by integration"})
-            elif login in forge.right_refusals:
-                self.answer(forge.right_refusals[login], {"message": "Permission read refused"})
-            elif login in forge.rights:
-                permission = forge.rights[login]
-                self.answer(200, {"permission": permission, "role_name": permission})
-            else:
-                self.answer(404, {"message": "Not Found"})
+            self._get_collaborator(path)
         elif "/contents/" in path and path.startswith("/repos/"):
             self._get_contents(path)
         elif path.startswith("/repos/") and path.endswith("/actions/artifacts"):
@@ -5537,6 +5575,21 @@ def test_bad_lease_description_refuses_repo_and_serves_next(tmp_path, bad_desc):
     assert "### other/b: landed #2" in summary
 
 
+def test_bad_lease_description_still_disarms_red_scanning(tmp_path):
+    """A malformed lease still lets auto-merge come off a red-scanning pull (record 0068)."""
+    armed = pull(
+        1,
+        "CLEAN",
+        autoMergeRequest={"enabledAt": OLD},
+        suites=["SUCCESS", suite(1001, "FAILURE", 10, None, "github-code-scanning")],
+    )
+    forge = Forge(repository(armed, lease="until=tomorrow"))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode != 0
+    assert forge.writes == [disarmed(1)]
+    assert "lander lease description 'until=tomorrow' is invalid" in summary
+
+
 def test_security_update_lands_under_live_lease(tmp_path):
     future = (datetime.now(UTC) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     plain = pull(1, "CLEAN")
@@ -9217,3 +9270,480 @@ def test_without_the_read_wrapper_the_state_read_refuses(tmp_path):
     done, _ = train(tmp_path, forge, flow)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "HTTP 502" in done.stdout
+
+
+# Retry history is fresh relative to NOW, independent of the older head-suite fixtures.
+def retry_suite(conclusion="FAILURE", *, when=None, workflow=1, number=1):
+    node = suite(number, conclusion, 0, workflow=workflow)
+    node["createdAt"] = (when or NOW - timedelta(hours=1)).isoformat()
+    if workflow:
+        node["workflowRun"]["workflow"]["name"] = f"workflow-{workflow}"
+    return node
+
+
+def retry_attempt(oid="a" * 40, suites=None):
+    return {"oid": oid, "checkSuites": {"nodes": suites or []}}
+
+
+def retry_history(number, *attempts, forced=()):
+    return {
+        "headRefOid": f"{number:040x}",
+        "baseRefOid": "b" * 40,
+        "commits": {"nodes": [{"commit": a} for a in attempts]},
+        "timelineItems": {"nodes": [{"beforeCommit": a} for a in forced]},
+    }
+
+
+def retry_file(**changes):
+    return {
+        "filename": "app.py",
+        "status": "modified",
+        "patch": "@@ -1 +1 @@\n-old\n+new\n context",
+        "sha": "c" * 40,
+        **changes,
+    }
+
+
+def retry_forge(state="BLOCKED", *, follower=True, forced=False, **fields):
+    first = pull(1, state, autoMergeRequest={"enabledAt": OLD}, suites=[None], **fields)
+    followers = [pull(2, "BEHIND", autoMergeRequest={"enabledAt": OLD})] if follower else []
+    forge = Forge(repository(first, *followers))
+    attempt = retry_attempt(suites=[retry_suite()])
+    forge.retry_histories[1] = (
+        retry_history(1, forced=[attempt]) if forced else retry_history(1, attempt)
+    )
+    return forge
+
+
+@pytest.mark.parametrize("forced", [False, True], ids=["commits", "force-push"])
+def test_retry_hold_refreshed_red_in_flight_serves_green_follower(tmp_path, forced):
+    """Without the fix the refreshed oldest head is armed and in flight, blocking #2."""
+    forge = retry_forge(forced=forced)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2)]
+    held = "held for retry: diff unchanged since aaaaaaaaaaaa failed workflow-1;"
+    assert f"| #1 | BLOCKED | {held}" in summary
+    assert forge.retry_calls == [1, 2]
+    assert forge.compare_calls == ["a" * 40, f"{1:040x}"]
+
+
+@pytest.mark.parametrize("forced", [False, True], ids=["commits", "force-push"])
+def test_retry_hold_refreshed_red_behind_serves_green_follower(tmp_path, forced):
+    """Without the fix the oldest BEHIND pull request is updated again."""
+    forge = retry_forge("BEHIND", forced=forced)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2)]
+    held = "held for retry: diff unchanged since aaaaaaaaaaaa failed workflow-1;"
+    assert f"| #1 | BEHIND | {held}" in summary
+
+
+def ordered_lease(*numbers, expired=False):
+    until = NOW + timedelta(hours=-1 if expired else 1)
+    stamp = until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"until={stamp}; order={','.join(str(n) for n in numbers)}"
+
+
+def test_ordered_lease_out_of_order_session_does_not_land(tmp_path):
+    """At cc4167b the ordered description is refused; without a lease #7845 would land."""
+    session = pull(7845, "CLEAN", author={"login": "session"})
+    waiting = pull(7840, "BLOCKED", suites=[None])
+    forge = Forge(repository(session, waiting, lease=ordered_lease(7840, 7845)))
+    done, summary = train(tmp_path, forge, session_authors="session")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "#7840 is next" in summary
+    assert "| #7845 | CLEAN | the lander holds the landing order until" in summary
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"patch": "-old\n+different"},
+        {"filename": "other.py"},
+        {"previous_filename": "before.py"},
+        {"status": "renamed"},
+        {"patch": None, "sha": "d" * 40},
+    ],
+    ids=["content", "filename", "rename", "status", "binary"],
+)
+def test_retry_hold_changed_own_diff_serves_oldest(tmp_path, change):
+    forge = retry_forge("BEHIND")
+    forge.comparisons[f"{1:040x}"] = (200, {"files": [retry_file(**change)]})
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert "held for retry:" not in summary
+
+
+def test_retry_hold_ignores_context_hunk_offsets_and_file_order(tmp_path):
+    forge = retry_forge()
+    a = retry_file(filename="a.py")
+    b = retry_file(filename="b.py", patch=None)
+    moved = {**a, "patch": "@@ -100 +200 @@\n other context\n-old\n+new"}
+    forge.comparisons["a" * 40] = (200, {"files": [a, b]})
+    forge.comparisons[f"{1:040x}"] = (200, {"files": [b, moved]})
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2)]
+    assert "held for retry: diff unchanged" in summary
+
+
+@pytest.mark.parametrize("age", [7, 8])
+def test_retry_hold_old_failure_is_released(tmp_path, age):
+    forge = retry_forge("BEHIND")
+    attempt = retry_attempt(suites=[retry_suite(when=NOW - timedelta(days=age))])
+    forge.retry_histories[1] = retry_history(1, attempt)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert forge.compare_calls == []
+    assert "held for retry:" not in summary
+
+
+def retry_reader(tmp_path, monkeypatch, history):
+    mod = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "read_graphql", lambda *args: {"repository": {"pullRequest": history}})
+    monkeypatch.setattr(mod, "call", lambda *args: {"files": [retry_file()]})
+    conf = {"security": frozenset({"security"})}
+    env = {"GITHUB_REPOSITORY": "fleet/app", "GITHUB_API_URL": "fixture", "TRAIN_TOKEN": "fixture"}
+    return mod, conf, env
+
+
+@pytest.mark.parametrize("seconds,held", [(-1, True), (0, False), (1, False)])
+def test_retry_hold_exact_seven_day_boundary(tmp_path, monkeypatch, seconds, held):
+    stamp = NOW - timedelta(days=7)
+    history = retry_history(1, retry_attempt(suites=[retry_suite(when=stamp)]))
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+    hold = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW + timedelta(seconds=seconds))
+    assert bool(hold) is held
+    if held:
+        assert hold.endswith("until " + NOW.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+@pytest.mark.parametrize("exempt", ["urgent", "security"])
+def test_retry_hold_exempt_pull_has_no_history_reads(tmp_path, exempt):
+    labels = ["merge-train: urgent" if exempt == "urgent" else "security"]
+    forge = retry_forge("BEHIND", labels=labels)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert forge.retry_calls == []
+    assert forge.compare_calls == []
+    assert "held for retry:" not in summary
+
+
+@pytest.mark.parametrize("state", ["BLOCKED", "BEHIND"])
+def test_retry_hold_alone_retries_with_release_note(tmp_path, state):
+    forge = retry_forge(state, follower=False)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == ([updated(1)] if state == "BEHIND" else [])
+    assert "retry hold released: no other pull request to serve (held for retry:" in summary
+    assert forge.retry_calls == [1]
+
+
+@pytest.mark.parametrize("kind", ["green-head", "green-forced", "superseded-failure"])
+def test_retry_hold_latest_completed_green_releases(tmp_path, kind):
+    forge = retry_forge("BEHIND")
+    failed = retry_attempt(suites=[retry_suite()])
+    success = retry_suite("SUCCESS", when=NOW - timedelta(minutes=1), number=2)
+    green = retry_attempt("d" * 40, [success])
+    if kind == "green-forced":
+        history = retry_history(1, failed, forced=[green])
+    elif kind == "superseded-failure":
+        history = retry_history(1, retry_attempt(suites=[retry_suite(), success]))
+    else:
+        history = retry_history(1, green, failed)  # Timestamps, not the list order, decide.
+    forge.retry_histories[1] = history
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert forge.compare_calls == []
+    assert "held for retry:" not in summary
+
+
+def test_retry_hold_incomplete_attempt_does_not_erase_failure(tmp_path):
+    forge = retry_forge()
+    failed = retry_attempt(suites=[retry_suite()])
+    pending = retry_attempt("d" * 40, [retry_suite(None, when=NOW, number=2)])
+    forge.retry_histories[1] = retry_history(1, failed, pending, forced=[None])
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2)]
+    assert "failed workflow-1; until" in summary
+
+
+def set_retry_fault(forge, kind):
+    history = forge.retry_histories[1]
+    if kind == "graphql":
+        forge.retry_refusals[1] = "retry history refused"
+    elif kind == "compare":
+        forge.comparisons["a" * 40] = (403, {"message": "compare refused"})
+    elif kind == "suites":
+        history["commits"]["nodes"][0]["commit"]["checkSuites"]["nodes"] = [retry_suite()] * 30
+    elif kind == "head":
+        history["headRefOid"] = "d" * 40
+    elif kind == "files":
+        forge.comparisons["a" * 40] = (200, {"files": [retry_file()] * 300})
+
+
+@pytest.mark.parametrize(
+    "kind,cause",
+    [
+        ("graphql", "retry history refused"),
+        ("compare", "HTTP 403"),
+        ("suites", "30-suite page"),
+        ("head", "head moved"),
+        ("files", "300 files"),
+    ],
+)
+@pytest.mark.parametrize("follower", [True, False], ids=["with-follower", "alone"])
+def test_retry_hold_unreadable_holds_or_retries_alone(tmp_path, kind, cause, follower):
+    forge = retry_forge("BEHIND", follower=follower)
+    set_retry_fault(forge, kind)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2 if follower else 1)]
+    assert "held for retry: history unreadable:" in summary
+    assert cause in summary
+    assert ("retry hold released:" in summary) is not follower
+
+
+@pytest.mark.parametrize("count", [2, 6])
+def test_retry_hold_all_held_releases_oldest_with_bounded_reads(tmp_path, count):
+    pulls = [pull(n, "BEHIND", autoMergeRequest={"enabledAt": OLD}) for n in range(1, count + 1)]
+    forge = Forge(repository(*pulls))
+    for number in range(1, count + 1):
+        forge.retry_histories[number] = retry_history(number, retry_attempt(suites=[retry_suite()]))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert forge.retry_calls == list(range(1, min(count, 5) + 1))
+    assert "retry hold released: no other pull request to serve" in summary
+
+
+def test_retry_hold_stops_reading_at_first_unheld(tmp_path):
+    forge = retry_forge("BEHIND")
+    forge.retry_histories.clear()
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert forge.retry_calls == [1]
+
+
+def test_retry_hold_landing_run_does_not_read_history(tmp_path):
+    forge = retry_forge()
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"].append(pull(3, "CLEAN"))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(3)]
+    assert forge.retry_calls == []
+    assert forge.compare_calls == []
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+def test_retry_hold_live_lease_does_not_read_history(tmp_path, ordered):
+    forge = retry_forge("BEHIND")
+    lease = ordered_lease(1, 2)
+    forge.reads["fleet/app"][0]["landerLease"] = {
+        "description": lease if ordered else lease.partition(";")[0]
+    }
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.retry_calls == []
+    assert forge.compare_calls == []
+    assert forge.writes == ([updated(1)] if ordered else [])
+
+
+def test_ordered_lease_pending_first_blocks_clean_second(tmp_path):
+    first = pull(7840, "BLOCKED", suites=[None], autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(first, pull(7842, "CLEAN"), lease=ordered_lease(7840, 7842)))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "### fleet/app: #7840 is armed and in flight; the lander holds" in summary
+    assert "#7840 is next" in summary
+
+
+def test_ordered_lease_closed_first_entry_serves_second(tmp_path):
+    forge = Forge(repository(pull(7842, "CLEAN"), lease=ordered_lease(7840, 7842)))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(7842)]
+    assert "#7842 is next" in summary
+
+
+def test_ordered_lease_skips_non_order_clean_pull(tmp_path):
+    forge = Forge(
+        repository(pull(7845, "CLEAN"), pull(7840, "CLEAN"), lease=ordered_lease(7840, 7842))
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(7840)]
+    assert "| #7845 | CLEAN | the lander holds" in summary
+
+
+def test_ordered_lease_security_update_still_lands(tmp_path):
+    forge = Forge(
+        repository(
+            pull(7840, "BLOCKED", suites=[None]),
+            pull(7842, "CLEAN", labels=["security"]),
+            lease=ordered_lease(7840),
+        )
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(7842)]
+    assert forge.retry_calls == []
+
+
+def test_ordered_lease_expired_serves_oldest_clean(tmp_path):
+    forge = Forge(
+        repository(
+            pull(7845, "CLEAN"), pull(7840, "CLEAN"), lease=ordered_lease(7840, expired=True)
+        )
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(7845)]
+
+
+def test_ordered_lease_no_lease_control_oldest_clean_lands(tmp_path):
+    forge = Forge(repository(pull(7845, "CLEAN"), pull(7840, "CLEAN")))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(7845)]
+
+
+@pytest.mark.parametrize("unread", [False, True], ids=["all-read", "unread-pages"])
+def test_ordered_lease_no_known_planned_pull_yields_all(tmp_path, unread):
+    pulls = [pull(n, "CLEAN") for n in range(1, 402 if unread else 2)]
+    lease = ordered_lease(7840, 7842)
+    forge = Forge(repository(*pulls, lease=lease))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    # Past an unread page the order is unknown: the plain lease note, not "none is open".
+    assert ("no planned pull request is open" in summary) is not unread
+    stamp = lease.removeprefix("until=").partition(";")[0]
+    assert f"| #1 | CLEAN | the lander holds the landing order until {stamp}" in summary
+    assert ("Only the 100 oldest" in summary) is unread
+
+
+def test_ordered_lease_unread_first_entry_does_not_serve_later_entry(tmp_path):
+    """#401 may be open past the pages read, so #5 behind it in the order does not land."""
+    pulls = [pull(n, "CLEAN") for n in range(1, 402)]
+    lease = ordered_lease(401, 5)
+    forge = Forge(repository(*pulls, lease=lease))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    stamp = lease.removeprefix("until=").partition(";")[0]
+    assert f"| #5 | CLEAN | the lander holds the landing order until {stamp} |" in summary
+    assert "#5 is next" not in summary
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["", "0", "1,,2", "1,", ",1", ",".join(str(n) for n in range(1, 22)), "1;", "01", "10000000"],
+)
+def test_ordered_lease_malformed_refuses_before_writes(tmp_path, order):
+    lease = ordered_lease(1).partition("; order=")[0] + "; order=" + order
+    forge = Forge(repository(pull(1, "CLEAN"), lease=lease))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "lander lease description" in summary
+
+
+@pytest.mark.parametrize("order", [(1,), tuple(range(1, 21)), (9999999,)])
+def test_ordered_lease_until_keeps_stamp_at_valid_boundaries(tmp_path, order):
+    rules = load_rules(tmp_path)
+    description = ordered_lease(*order)
+    repo = repository(lease=description)
+    assert rules.lease_until(repo, NOW) == description[6:].partition(";")[0]
+
+
+@pytest.mark.parametrize("kind", ["missing", "null", "stamp", "patch", "files"])
+def test_retry_hold_malformed_history_is_held(tmp_path, monkeypatch, kind):
+    history = retry_history(1, retry_attempt(suites=[retry_suite()]))
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+    if kind == "missing":
+        del history["baseRefOid"]
+    elif kind == "null":
+        history["commits"]["nodes"] = None
+    elif kind == "stamp":
+        history["commits"]["nodes"][0]["commit"]["checkSuites"]["nodes"][0]["createdAt"] = "bad"
+    elif kind == "files":
+        # A mapping where the compare answer holds a list: its keys are text, not file objects.
+        monkeypatch.setattr(mod, "call", lambda *args: {"files": {"app.py": retry_file()}})
+    else:
+        monkeypatch.setattr(mod, "call", lambda *args: {"files": [retry_file(patch=123)]})
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    assert reason.startswith("held for retry: history unreadable:")
+
+
+def test_retry_hold_naive_attempt_stamp_is_unreadable(tmp_path, monkeypatch):
+    history = retry_history(1, retry_attempt(suites=[retry_suite(when=NOW.replace(tzinfo=None))]))
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    assert "history unreadable: retry check timestamp has no timezone" in reason
+
+
+def test_retry_hold_non_actions_suite_uses_app_name(tmp_path, monkeypatch):
+    history = retry_history(1, retry_attempt(suites=[retry_suite(workflow=None)]))
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    assert "failed github-actions; until" in reason
+
+
+def test_retry_hold_newer_pending_suite_does_not_extend_failed_stamp(tmp_path, monkeypatch):
+    failed = retry_suite(when=NOW - timedelta(days=7))
+    pending = retry_suite(None, workflow=2, when=NOW, number=2)
+    history = retry_history(1, retry_attempt(suites=[failed, pending]))
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+    assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW) is None
+
+
+def test_retry_hold_empty_non_actions_conclusion_is_completed_green(tmp_path, monkeypatch):
+    old = retry_attempt(suites=[retry_suite()])
+    app = retry_attempt("d" * 40, [retry_suite(None, workflow=None, when=NOW)])
+    history = retry_history(1, old, app)
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+    assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW) is None
+
+
+def test_retry_hold_latest_failure_names_all_failed_workflows(tmp_path, monkeypatch):
+    first = retry_suite()
+    second = retry_suite("TIMED_OUT", workflow=2, when=NOW, number=2)
+    history = retry_history(1, retry_attempt(suites=[first, second]))
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    assert "failed workflow-1, workflow-2; until" in reason
+    assert reason.endswith((NOW + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+def test_retry_hold_compare_file_page_below_limit_is_readable(tmp_path, monkeypatch):
+    history = retry_history(1, retry_attempt(suites=[retry_suite()]))
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+    files = [retry_file(filename=f"file-{n}.py") for n in range(299)]
+    monkeypatch.setattr(mod, "call", lambda *args: {"files": files})
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    assert "diff unchanged since" in reason
+
+
+def test_retry_history_query_selects_bounded_attempts_and_workflow_names():
+    text = script().split('RETRY_HISTORY = """', 1)[1].split('"""', 1)[0]
+    for field in (
+        "headRefOid baseRefOid",
+        "commits(last: 20)",
+        "timelineItems(last: 20, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT])",
+        "beforeCommit { ...Attempt }",
+        "fragment Attempt on Commit",
+        "checkSuites(first: 30)",
+        "databaseId conclusion createdAt app { slug }",
+        "workflowRun { databaseId workflow { databaseId name } }",
+    ):
+        assert field in text

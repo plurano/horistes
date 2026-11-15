@@ -91,3 +91,4 @@ record that supersedes it.
 | [0081](0081-a-person-review-answers-an-app-pull-request.md) | 2026-11-13 | A person's review answers an app pull request | Accepted |
 | [0082](0082-the-train-graphql-documents-leave-the-rules-step.md) | 2026-11-13 | The train's GraphQL documents leave the rules step | Accepted |
 | [0083](0083-a-fenced-example-is-read-by-its-languages-parser.md) | 2026-11-14 | A fenced example is read by its language's parser | Accepted |
+| [0085](0085-the-train-holds-a-retried-red-pull-request.md) | 2026-11-15 | The train holds a retried red pull request | Accepted |
