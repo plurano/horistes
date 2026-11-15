@@ -179,7 +179,10 @@ code-scanning failures, can spend the shared budget during the initial
 scan or advancement and defer later rows. The deferral repeats on each
 sweep while those rows stay skipped or held, so a later row waits until a
 hold ends (after `RETRY_HOLD_DAYS`, on a green attempt or on an own-diff
-change) or a skipped row leaves the queue.
+change) or a skipped row leaves the queue. Five such rows ahead of a
+candidate spend the whole `RETRY_READ_LIMIT` budget on each sweep. An
+unsigned row stays skipped until its commits carry a sign-off, so that
+wait has no bound.
 `test_retry_hold_after_unsigned_skip_checks_next_candidate`,
 `test_retry_hold_after_scanning_skip_checks_next_candidate` and
 `test_retry_hold_after_conflict_shares_read_budget` in the same file cover
