@@ -123,6 +123,13 @@ query($owner: String!, $name: String!, $number: Int!) {
   }
 }
 """
+LANDER_LEASE = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    landerLease: label(name: "merge-train: lander lease") { description }
+  }
+}
+"""
 RETRY_HISTORY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -1620,12 +1627,33 @@ def land_clean(env, conf, repo, served, notes):
     """Land or enqueue the oldest clean pull request, or None."""
     for pull, reason in served:
         if reason == "land" and not late_review_hold(env, conf, pull, notes):
+            hold = late_lander_lease(env, conf, repo, pull)
+            if hold:
+                notes[pull["number"]] = hold
+                return hold
             try:
                 done = notes[pull["number"]] = land(env, conf, pull, repo.get("mergeQueue"))
             except UnsignedBotError as err:
                 notes[pull["number"]] = err.note
                 continue
             return f"{done} #{pull['number']}"
+    return None
+
+
+def late_lander_lease(env, conf, repo, pull):
+    """Refuse this sweep's landings if the lease changed; security remains exempt."""
+    if is_security(pull, conf):
+        return None
+    try:
+        owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+        data = read_graphql(env, LANDER_LEASE, {"owner": owner, "name": name})
+        label = data["repository"]["landerLease"]
+        if label is not None:
+            label["description"]
+        if label != repo.get("landerLease"):
+            return "lander lease changed since the page read"
+    except (RefusedError, KeyError, TypeError) as err:
+        return f"lander lease unreadable: {type(err).__name__}: {err}"
     return None
 
 
@@ -1638,7 +1666,10 @@ def completed_attempt(commit):
         raise ValueError("30-suite page may hide retry checks")
     suites = list(newest_suites(nodes).values())
     failed = [s for s in suites if s["conclusion"] in RED]
-    if not failed and (not suites or any(s["workflowRun"] and not s["conclusion"] for s in suites)):
+    if not failed and (
+        not any(s["conclusion"] for s in suites)
+        or any(s["workflowRun"] and not s["conclusion"] for s in suites)
+    ):
         return None
     stamp = max(datetime.fromisoformat(s["createdAt"]) for s in (failed or suites))
     if stamp.tzinfo is None:
@@ -1661,11 +1692,37 @@ def diff_file(file):
     if patch is not None and not isinstance(patch, str):
         raise ValueError("compare patch is not text")
     changes = (
-        tuple(line for line in patch.splitlines() if line.startswith(("+", "-")))
+        tuple(line for line in patch.split("\n") if line.startswith(("+", "-")))
         if patch is not None
         else file["sha"]
     )
     return file["filename"], file.get("previous_filename", ""), file["status"], changes
+
+
+def same_retry_change(env, base, before, after):
+    """Compare own diffs, then modes for surviving paths; removed paths have no entry."""
+    files = own_diff(env, base, before)
+    if files != own_diff(env, base, after):
+        return False
+    paths = [file[0] for file in files if file[2] != "removed"]
+    if not paths:
+        return True
+    owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+    variables = {"owner": owner, "name": name, "before": before, "after": after}
+    variables.update({f"p{index}": path for index, path in enumerate(paths)})
+    declarations = ", ".join(f"$p{index}: String!" for index in range(len(paths)))
+    fields = " ".join(f"f{index}: file(path: $p{index}) {{ mode }}" for index in range(len(paths)))
+    query = (
+        "query($owner: String!, $name: String!, $before: GitObjectID!, "
+        f"$after: GitObjectID!, {declarations}) {{ "
+        "repository(owner: $owner, name: $name) { "
+        "before: object(oid: $before) { ...M } after: object(oid: $after) { ...M } } } "
+        f"fragment M on Commit {{ {fields} }}"
+    )
+    modes = read_graphql(env, query, variables)["repository"]
+    before_modes = tuple(modes["before"][f"f{index}"]["mode"] for index in range(len(paths)))
+    after_modes = tuple(modes["after"][f"f{index}"]["mode"] for index in range(len(paths)))
+    return before_modes == after_modes
 
 
 def retry_hold(env, conf, pull, now):
@@ -1689,9 +1746,7 @@ def retry_hold(env, conf, pull, now):
         until = stamp + timedelta(days=RETRY_HOLD_DAYS)
         if not failed or now >= until:
             return None
-        if own_diff(env, node["baseRefOid"], oid) != own_diff(
-            env, node["baseRefOid"], pull["headRefOid"]
-        ):
+        if not same_retry_change(env, node["baseRefOid"], oid, pull["headRefOid"]):
             return None
         names = ", ".join(retry_workflow(s) for s in failed)
         expiry = until.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1708,7 +1763,8 @@ def retry_workflow(suite):
 
 def hold_retries(env, conf, served, notes, now):
     """Hold retries before the first unheld candidate, within a scalar read budget."""
-    candidates = [p for p, reason in served if in_flight(p, reason) or reason == "behind"]
+    candidates = [p for p, reason in served if in_flight(p, reason)]
+    candidates += [p for p, reason in served if reason == "behind"]
     holds = {}
     for pull in candidates[:RETRY_READ_LIMIT]:
         hold = retry_hold(env, conf, pull, now)

@@ -41,24 +41,43 @@ The sweep implements retry fairness in
 [tools/merge_train.py](../../tools/merge_train.py), keeping the rules heredoc
 within its field budget
 ([ADR-0082](0082-the-train-graphql-documents-leave-the-rules-step.md)). After
-trying to land a clean pull request, `hold_retries` examines in-flight or
-BEHIND candidates in serving order. It reads at most `RETRY_READ_LIMIT = 5`
+trying to land a clean pull request, `hold_retries` examines in-flight
+candidates first, then BEHIND candidates, preserving serving order within
+each group. `test_retry_hold_in_flight_read_before_older_unarmed_behind` in
+[tests/test_merge_train.py](../../tests/test_merge_train.py) pins this priority.
+It reads at most `RETRY_READ_LIMIT = 5`
 candidates, stopping at the first unheld one. Security updates and the label
 `merge-train: urgent` bypass history reads.
 
 `RETRY_HISTORY` reads the last 20 commits and 20 force-push events. Each
 commit, including an event's previous head, carries up to 30 check suites.
 `completed_attempt` applies `newest_suites` and `RED` from the rules module:
-a failure completes an attempt; otherwise a nonempty set with every Actions
-suite concluded completes it as green. Other attempts are ignored. The
+a failure completes an attempt; otherwise at least one suite must have a
+conclusion and every Actions suite must have concluded to complete it as
+green. A never-run app suite alone cannot erase an older failure;
+`test_retry_hold_pending_app_suite_keeps_failure` and
+`test_retry_hold_concluded_green_and_pending_app_releases` in
+[tests/test_merge_train.py](../../tests/test_merge_train.py) cover both cases.
+Other attempts are ignored. The
 latest completed attempt is selected by the newest failed suite's creation
 time, or the newest suite's creation time for green attempts.
 
 `retry_hold` holds a latest failed attempt for `RETRY_HOLD_DAYS = 7` only
 while its own diff is unchanged. `own_diff` uses the JSON three-dot compare
 against the history read's base oid, normalizing file names, previous names,
-status and added/deleted patch lines. Files without patches use their blob
-sha. Hunk offsets and context do not change this identity. A full 30-suite
+status and added/deleted patch lines. Splitting only at LF preserves CRLF
+and form-feed characters as changed-line content, covered by
+`test_retry_hold_changed_line_preserves_content` in
+[tests/test_merge_train.py](../../tests/test_merge_train.py). Files without
+patches use their blob sha. Hunk offsets and context do not change this
+identity. When these identities match, `same_retry_change` in
+[tools/merge_train.py](../../tools/merge_train.py) also compares tree-entry
+modes at the failed attempt and current head. A mode change releases the
+hold; removed files have no entry to read. Paths are GraphQL variables.
+`test_retry_hold_file_modes_are_part_of_own_diff`,
+`test_retry_hold_removed_files_have_no_mode_reads` and the mode-read error
+tests in [tests/test_merge_train.py](../../tests/test_merge_train.py) cover
+this comparison and unreadable entries. A full 30-suite
 page, 300 or more compare files, a moved head or an unreadable response holds
 with an explanation. `test_retry_hold_*` in
 [tests/test_merge_train.py](../../tests/test_merge_train.py) covers these
@@ -66,7 +85,7 @@ boundaries, green reruns and diff changes.
 
 Held rows before an unheld candidate lose their in-flight/update eligibility
 for that sweep. If all inspected candidates are held, the original serving
-order stays and the oldest receives a release note, permitting retries even
+order stays and the first candidate receives a release note, permitting retries even
 when alone. Notes show the failed commit, workflows and UTC expiry, or the
 unreadable-history cause. `hold_retries` never writes a label, disarms a pull
 request or stores retry state. A live lease and a sweep that lands perform no
@@ -93,6 +112,19 @@ existing `test_*lease*` cases in
 [tests/test_merge_train.py](../../tests/test_merge_train.py) cover the grammar,
 closed entries, security bypass, unread pages and oldest-first controls.
 
+Immediately before each non-security landing attempt, `late_lander_lease`
+in [tools/merge_train.py](../../tools/merge_train.py) re-reads the lease.
+A changed label or description stops landings for the sweep, preventing a
+new lease or reordered plan from being overtaken. An unreadable lease also
+stops landings and names the cause in the pull note and outcome.
+`test_lander_lease_changed_since_page_read_lands_nothing`,
+`test_lander_lease_unreadable_lands_nothing` and
+`test_lander_lease_unchanged_lands_after_one_read` in
+[tests/test_merge_train.py](../../tests/test_merge_train.py) cover these paths.
+Security landings remain exempt under
+[ADR-0065](0065-the-train-yields-to-a-lander-lease.md), as asserted by
+`test_ordered_lease_security_update_still_lands` in the same test file.
+
 ## Consequences
 
 This extends [ADR-0065](0065-the-train-yields-to-a-lander-lease.md), rather
@@ -102,10 +134,15 @@ The sweep's retry memory is bounded forge history, so an older attempt can
 age out of the queried window. The all-held release permits progress when
 history is unavailable; its summary explicitly records that choice.
 
-The additional logical API cost is bounded by 5 × (1 GraphQL + 2 REST) reads
-per repository per sweep, as enforced by `RETRY_READ_LIMIT` and
+The additional logical API cost per candidate is at most 2 GraphQL reads
+(history and modes) plus 2 REST compares: 5 × (2 GraphQL + 2 REST) reads
+per repository per sweep, plus one lease re-read per non-security landing
+attempt. `retry_hold`, `same_retry_change` and `late_lander_lease` in
+[tools/merge_train.py](../../tools/merge_train.py) define these reads;
+`RETRY_READ_LIMIT` and
 `test_retry_hold_all_held_releases_oldest_with_bounded_reads` in
-[tests/test_merge_train.py](../../tests/test_merge_train.py). Existing
+[tests/test_merge_train.py](../../tests/test_merge_train.py) pin the candidate
+bound. Existing
 transport retry limits still apply to each read. No permissions or local
 state are added. Plain leases need no migration; landers opt into ordering
 by adding the bounded order suffix to their existing description.

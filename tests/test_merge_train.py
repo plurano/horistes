@@ -403,6 +403,11 @@ class Forge:
         self.retry_calls: list[int] = []
         self.comparisons: dict[str, tuple[int, dict]] = {}
         self.compare_calls: list[str] = []
+        self.lease_read: dict = {}
+        self.lease_calls = 0
+        self.modes: dict[tuple[str, str], int] = {}
+        self.mode_error: str | None = None
+        self.mode_calls: list[list[str]] = []
 
     def set_allowlist(self, repo: str, default_branch: str, paths: list[str]) -> None:
         text = "\n".join(paths)
@@ -589,6 +594,14 @@ class Forge:
         return self._read_graphql(full, query, variables)
 
     def _read_graphql(self, full: str, query: str, variables: dict) -> dict:
+        if 'label(name: "merge-train: lander lease")' in query and "pullRequests(" not in query:
+            self.lease_calls += 1
+            default = {
+                "data": {"repository": {"landerLease": self.active_reads[full]["landerLease"]}}
+            }
+            return self.lease_read or default
+        if "fragment M on Commit" in query:
+            return self.pull_modes(query, variables)
         if "HEAD_REF_FORCE_PUSHED_EVENT" in query:
             return self.pull_retry_history(full, variables)
         if "mergeStateStatus" in query and "pullRequest(" in query:
@@ -601,6 +614,17 @@ class Forge:
             nodes = self.merged_pulls.get(full, [])
             return {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
         return self.pull_page(full, query, variables)
+
+    def pull_modes(self, query: str, variables: dict) -> dict:
+        paths = [value for key, value in variables.items() if re.fullmatch(r"p\d+", key)]
+        self.mode_calls.append(paths)
+        for index, path in enumerate(paths):
+            assert f"$p{index}: String!" in query
+            assert f"f{index}: file(path: $p{index}) {{ mode }}" in query
+            assert path not in query
+        if self.mode_error:
+            return {"errors": [{"message": self.mode_error}]}
+        return {"data": {"repository": retry_modes(variables, self.modes)}}
 
     def pull_retry_history(self, full: str, variables: dict) -> dict:
         """Read one pull's retry attempts, including discarded heads."""
@@ -5514,7 +5538,10 @@ def test_drifted_rule(tmp_path, conf_method, auto_merge, expected):
 
 
 def test_query_includes_lander_lease():
-    assert 'landerLease: label(name: "merge-train: lander lease") { description }' in module()
+    clause = 'landerLease: label(name: "merge-train: lander lease") { description }'
+    assert clause in module()
+    query = script().split('LANDER_LEASE = """', 1)[1].split('"""', 1)[0]
+    assert clause in query
 
 
 def test_planted_overtake_yields_to_live_lander_lease(tmp_path):
@@ -9273,8 +9300,10 @@ def test_without_the_read_wrapper_the_state_read_refuses(tmp_path):
 
 
 # Retry history is fresh relative to NOW, independent of the older head-suite fixtures.
-def retry_suite(conclusion="FAILURE", *, when=None, workflow=1, number=1):
-    node = suite(number, conclusion, 0, workflow=workflow)
+def retry_suite(conclusion="FAILURE", *, when=None, workflow=1, number=1, app="github-actions"):
+    node = suite(number, conclusion, 0, workflow=workflow, app=app)
+    if app is None:
+        node["app"] = None
     node["createdAt"] = (when or NOW - timedelta(hours=1)).isoformat()
     if workflow:
         node["workflowRun"]["workflow"]["name"] = f"workflow-{workflow}"
@@ -9301,6 +9330,18 @@ def retry_file(**changes):
         "patch": "@@ -1 +1 @@\n-old\n+new\n context",
         "sha": "c" * 40,
         **changes,
+    }
+
+
+def retry_modes(variables, modes=None):
+    modes = modes or {}
+    paths = [value for key, value in variables.items() if re.fullmatch(r"p\d+", key)]
+    return {
+        side: {
+            f"f{index}": {"mode": modes.get((variables[side], path), 33188)}
+            for index, path in enumerate(paths)
+        }
+        for side in ("before", "after")
     }
 
 
@@ -9404,7 +9445,14 @@ def test_retry_hold_old_failure_is_released(tmp_path, age):
 
 def retry_reader(tmp_path, monkeypatch, history):
     mod = load_train(tmp_path, monkeypatch)
-    monkeypatch.setattr(mod, "read_graphql", lambda *args: {"repository": {"pullRequest": history}})
+
+    def read(env, query, variables):
+        node = (
+            retry_modes(variables) if "fragment M on Commit" in query else {"pullRequest": history}
+        )
+        return {"repository": node}
+
+    monkeypatch.setattr(mod, "read_graphql", read)
     monkeypatch.setattr(mod, "call", lambda *args: {"files": [retry_file()]})
     conf = {"security": frozenset({"security"})}
     env = {"GITHUB_REPOSITORY": "fleet/app", "GITHUB_API_URL": "fixture", "TRAIN_TOKEN": "fixture"}
@@ -9597,6 +9645,7 @@ def test_ordered_lease_security_update_still_lands(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(7842)]
     assert forge.retry_calls == []
+    assert forge.lease_calls == 0
 
 
 def test_ordered_lease_expired_serves_oldest_clean(tmp_path):
@@ -9692,11 +9741,12 @@ def test_retry_hold_naive_attempt_stamp_is_unreadable(tmp_path, monkeypatch):
     assert "history unreadable: retry check timestamp has no timezone" in reason
 
 
-def test_retry_hold_non_actions_suite_uses_app_name(tmp_path, monkeypatch):
-    history = retry_history(1, retry_attempt(suites=[retry_suite(workflow=None)]))
+@pytest.mark.parametrize("app,name", [("third-party", "third-party"), (None, "unknown app")])
+def test_retry_hold_non_actions_suite_uses_app_name(tmp_path, monkeypatch, app, name):
+    history = retry_history(1, retry_attempt(suites=[retry_suite(workflow=None, app=app)]))
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
     reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
-    assert "failed github-actions; until" in reason
+    assert f"failed {name}; until" in reason
 
 
 def test_retry_hold_newer_pending_suite_does_not_extend_failed_stamp(tmp_path, monkeypatch):
@@ -9707,12 +9757,13 @@ def test_retry_hold_newer_pending_suite_does_not_extend_failed_stamp(tmp_path, m
     assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW) is None
 
 
-def test_retry_hold_empty_non_actions_conclusion_is_completed_green(tmp_path, monkeypatch):
+def test_retry_hold_pending_app_suite_keeps_failure(tmp_path, monkeypatch):
     old = retry_attempt(suites=[retry_suite()])
     app = retry_attempt("d" * 40, [retry_suite(None, workflow=None, when=NOW)])
     history = retry_history(1, old, app)
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
-    assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW) is None
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    assert reason and "diff unchanged since aaaaaaaaaaaa failed workflow-1; until" in reason
 
 
 def test_retry_hold_latest_failure_names_all_failed_workflows(tmp_path, monkeypatch):
@@ -9736,6 +9787,7 @@ def test_retry_hold_compare_file_page_below_limit_is_readable(tmp_path, monkeypa
 
 def test_retry_history_query_selects_bounded_attempts_and_workflow_names():
     text = script().split('RETRY_HISTORY = """', 1)[1].split('"""', 1)[0]
+    assert "commits(last: 20) { nodes { commit { ...Attempt } } }" in " ".join(text.split())
     for field in (
         "headRefOid baseRefOid",
         "commits(last: 20)",
@@ -9747,3 +9799,143 @@ def test_retry_history_query_selects_bounded_attempts_and_workflow_names():
         "workflowRun { databaseId workflow { databaseId name } }",
     ):
         assert field in text
+
+
+@pytest.mark.parametrize("initial", [_ABSENT, ordered_lease(7840, 7842)], ids=["new", "reordered"])
+def test_lander_lease_changed_since_page_read_lands_nothing(tmp_path, initial):
+    forge = Forge(repository(pull(7840, "CLEAN"), pull(7842, "CLEAN"), lease=initial))
+    forge.lease_read = {
+        "data": {"repository": {"landerLease": {"description": ordered_lease(7842, 7840)}}}
+    }
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "### fleet/app: lander lease changed since the page read" in summary
+    assert "| #7840 | CLEAN | lander lease changed since the page read" in summary
+    assert forge.lease_calls == 1
+
+
+@pytest.mark.parametrize("lease", [_ABSENT, ordered_lease(7840, 7842)], ids=["absent", "ordered"])
+def test_lander_lease_unchanged_lands_after_one_read(tmp_path, lease):
+    forge = Forge(repository(pull(7840, "CLEAN"), lease=lease))
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(7840)]
+    assert forge.lease_calls == 1
+
+
+@pytest.mark.parametrize(
+    "answer,cause",
+    [
+        ({"errors": [{"message": "lease read refused"}]}, "lease read refused"),
+        ({"data": {"repository": {}}}, "landerLease"),
+        ({"data": {"repository": None}}, "NoneType"),
+    ],
+)
+def test_lander_lease_unreadable_lands_nothing(tmp_path, answer, cause):
+    forge = Forge(repository(pull(1, "CLEAN"), pull(2, "CLEAN")))
+    forge.lease_read = answer
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "lander lease unreadable" in summary
+    assert cause in summary
+    assert forge.lease_calls == 1
+
+
+def test_retry_hold_concluded_green_and_pending_app_releases(tmp_path, monkeypatch):
+    old = retry_attempt(suites=[retry_suite()])
+    green = retry_attempt(
+        "d" * 40,
+        [retry_suite("SUCCESS", when=NOW), retry_suite(None, workflow=None, when=NOW)],
+    )
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, retry_history(1, old, green))
+    assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW) is None
+
+
+@pytest.mark.parametrize("mode,held", [(33188, True), (33261, False)], ids=["same", "changed"])
+def test_retry_hold_file_modes_are_part_of_own_diff(tmp_path, mode, held):
+    forge = retry_forge("BEHIND")
+    forge.modes[("a" * 40, "app.py")] = 33188
+    forge.modes[(f"{1:040x}", "app.py")] = mode
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2 if held else 1)]
+    assert ("held for retry:" in summary) is held
+    assert forge.mode_calls == [["app.py"]]
+
+
+@pytest.mark.parametrize("only_removed", [False, True])
+def test_retry_hold_removed_files_have_no_mode_reads(tmp_path, only_removed):
+    forge = retry_forge()
+    files = [retry_file(filename="gone.py", status="removed")]
+    if not only_removed:
+        files.append(retry_file(filename='odd"\\name\n.py'))
+    for head in ("a" * 40, f"{1:040x}"):
+        forge.comparisons[head] = (200, {"files": files})
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2)]
+    assert "diff unchanged since" in summary
+    assert forge.mode_calls == ([] if only_removed else [['odd"\\name\n.py']])
+
+
+def test_retry_hold_mode_read_error_holds_with_cause(tmp_path):
+    forge = retry_forge()
+    forge.mode_error = "tree modes refused"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(2)]
+    assert "held for retry: history unreadable:" in summary
+    assert "tree modes refused" in summary
+
+
+@pytest.mark.parametrize("node", [{}, {"before": None}, {"before": {"f0": {}}, "after": {}}])
+def test_retry_hold_missing_mode_is_unreadable(tmp_path, monkeypatch, node):
+    history = retry_history(1, retry_attempt(suites=[retry_suite()]))
+    mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
+
+    def read(env, query, variables):
+        return {"repository": node if "fragment M on Commit" in query else {"pullRequest": history}}
+
+    monkeypatch.setattr(mod, "read_graphql", read)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    assert reason.startswith("held for retry: history unreadable:")
+
+
+@pytest.mark.parametrize("content", ["new\r", "ne\x0cw"], ids=["crlf", "form-feed"])
+def test_retry_hold_changed_line_preserves_content(tmp_path, content):
+    forge = retry_forge("BEHIND")
+    forge.comparisons["a" * 40] = (
+        200,
+        {"files": [retry_file(patch=f"@@ -1 +1 @@\n-old\n+{content}\n")]},
+    )
+    # splitlines() truncates a changed line at form feed, discarding the rest as context.
+    current = "new" if content == "new\r" else "ne"
+    forge.comparisons[f"{1:040x}"] = (
+        200,
+        {"files": [retry_file(patch=f"@@ -1 +1 @@\n-old\n+{current}\n")]},
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+    assert "held for retry:" not in summary
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["held", "unheld"])
+def test_retry_hold_in_flight_read_before_older_unarmed_behind(tmp_path, held):
+    first = pull(1, "BEHIND")
+    second = pull(2, "BLOCKED", suites=[None], autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(first, second))
+    if held:
+        forge.retry_histories[2] = retry_history(2, retry_attempt(suites=[retry_suite()]))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    if held:
+        assert forge.writes == [armed(1), updated(1)]
+        assert "| #2 | BLOCKED | held for retry:" in summary
+        assert forge.retry_calls == [2, 1]
+    else:
+        assert "### fleet/app: #2 is armed and in flight" in summary
+        assert forge.writes == []
+        assert forge.retry_calls == [2]
