@@ -143,6 +143,60 @@ def test_own_entry_with_every_field_passes(tree):
     assert "0 accepted finding(s) and 1 exception(s)" in done.stdout
 
 
+def test_own_rule_only_entry_passes_without_a_subject_file(tree):
+    """A finding without a file needs no path or subject file."""
+    text = LIST.replace(f"    path: {SUBJECT}\n", "")
+    done = own(tree, text, subject=None)
+    assert done.returncode == 0, done.stderr
+    assert "0 accepted finding(s) and 1 exception(s)" in done.stdout
+
+
+@pytest.mark.parametrize("path", ['""', "3", ""], ids=["empty", "number", "null"])
+def test_own_entry_with_a_present_invalid_path_fails(tree, path):
+    """An optional path must still be non-empty text when present."""
+    done = own(tree, LIST.replace(f"path: {SUBJECT}", f"path: {path}"), subject=None)
+    assert done.returncode == 1, done.stdout
+    assert "entry 1 has no `path` (a text that is not empty)" in done.stderr
+
+
+def test_own_rule_only_entry_does_not_cover_an_inline_suppression(tree):
+    """Only a path entry can cover a suppression in that file."""
+    import exceptions
+
+    rule = "required-check-is-reported"
+    text = LIST.replace(f"    path: {SUBJECT}\n", "")
+    tree.write({OWN: text})
+    found, count, valid_map = exceptions._own(tree.root, datetime.date.fromisoformat(TODAY))
+    assert found == []
+    assert count == 1
+    assert (rule, None) in valid_map
+    assert exceptions._is_covered(rule, SUBJECT, set(valid_map)) is False
+
+    tree.write({OWN: text + ENTRY, SUBJECT: "{}\n"})
+    found, count, valid_map = exceptions._own(tree.root, datetime.date.fromisoformat(TODAY))
+    assert found == []
+    assert count == 2
+    assert (rule, None) in valid_map
+    assert (rule, SUBJECT) in valid_map
+    assert exceptions._is_covered(rule, SUBJECT, set(valid_map)) is True
+
+
+def test_own_duplicate_rule_only_entry_fails(tree):
+    """Two entries naming the same rule alone are duplicates."""
+    entry = ENTRY.replace(f"    path: {SUBJECT}\n", "")
+    done = own(tree, "---\nexceptions:\n" + entry + entry, subject=None)
+    assert done.returncode == 1, done.stdout
+    assert done.stderr.strip() == f"FAIL: {OWN}: entry 2 names rule and path of an entry before it"
+
+
+def test_own_rule_only_entry_beside_a_path_entry_passes(tree):
+    """A rule alone and the same rule in a file have distinct keys."""
+    entry = ENTRY.replace(f"    path: {SUBJECT}\n", "")
+    done = own(tree, "---\nexceptions:\n" + entry + ENTRY)
+    assert done.returncode == 0, done.stderr
+    assert "0 accepted finding(s) and 2 exception(s)" in done.stdout
+
+
 def test_own_entry_passes_on_its_last_day_and_fails_the_day_after(tree):
     assert own(tree, LIST, "2026-10-11").returncode == 0
     done = own(tree, LIST, "2026-10-12")
@@ -157,9 +211,7 @@ def test_own_entry_may_end_ten_days_ahead_for_category_c_and_not_one_more(tree):
     assert "more than 10 days ahead" in done.stderr
 
 
-@pytest.mark.parametrize(
-    "field", ["rule", "path", "issue", "reason", "expires", "category", "entered"]
-)
+@pytest.mark.parametrize("field", ["rule", "issue", "reason", "expires", "category", "entered"])
 def test_own_entry_without_a_field_fails(tree, field):
     lines = [line for line in LIST.splitlines() if not line.lstrip(" -").startswith(field + ":")]
     text = "\n".join(lines).replace("\n    rule:", "\n  - rule:", 1) + "\n"
