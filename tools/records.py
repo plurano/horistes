@@ -48,7 +48,7 @@ CLAIM_SECTIONS = ("Decision", "Consequences")
 UNCOUNTED_SECTIONS = ("References",)
 
 # Against the work tree, so a local run judges uncommitted records too.
-DIFF = ("diff", "--unified=0", "--no-renames", "--no-color", "--no-ext-diff")
+DIFF = ("diff", "--unified=0", "--no-renames", "--no-color", "--no-ext-diff", "--default-prefix")
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$")
@@ -103,11 +103,12 @@ def git(root: Path, *args: str) -> str:
             ["git", "-C", str(root), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
             timeout=DEADLINE_SECONDS,
             env=ciwf.git_env(),
         )
-    except (OSError, subprocess.TimeoutExpired) as err:
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as err:
         raise ciwf.ReadError(f"git {args[0]}: {err}") from err
     if done.returncode != 0:
         raise ciwf.ReadError(f"git {' '.join(args)}: {done.stderr.strip() or done.returncode}")
@@ -124,20 +125,15 @@ def merge_base(root: Path, ref: str) -> str:
         raise ciwf.ReadError(f"no merge base of {ref} and HEAD: {err}") from err
 
 
-def added_lines(diff: str) -> dict[str, set[int]]:
-    """Line numbers, in the new text, of each record line a zero-context diff adds."""
-    added: dict[str, set[int]] = {}
-    current: set[int] | None = None
+def added_lines(diff: str) -> set[int]:
+    """Added line numbers from one literal record's diff, independent of path headers."""
+    added: set[int] = set()
     for line in limited(diff.splitlines(), MAX_LINES * 10, "diff line limit"):
-        if line.startswith("+++ "):
-            name = line[4:].removeprefix("b/")
-            current = added.setdefault(name, set()) if RECORD.fullmatch(name) else None
-            continue
         hunk = HUNK.match(line)
-        if hunk and current is not None:
+        if hunk:
             first, count = int(hunk.group(1)), int(hunk.group(2) or "1")
-            current.update(range(first, first + count))
-    return {name: lines for name, lines in added.items() if lines}
+            added.update(range(first, first + count))
+    return added
 
 
 def read_tree(root: Path) -> Tree:
@@ -348,7 +344,19 @@ def judge(record: str, block: Block, tree: Tree) -> list[str]:
 
 def changed_records(root: Path, base: str) -> dict[str, set[int]]:
     """Changed tracked lines plus local new records, which git diff does not show."""
-    changed = added_lines(git(root, *DIFF, base, "--", "docs/adr"))
+    names = git(root, "diff", "-z", "--name-only", "--no-renames", base, "--", "docs/adr")
+    changed: dict[str, set[int]] = {}
+    diff_lines = 0
+    for name in limited(names.rstrip("\0").split("\0"), MAX_FILES, "changed file limit"):
+        if not RECORD.fullmatch(name):
+            continue
+        diff = git(root, *DIFF, base, "--", f":(literal){name}")
+        diff_lines += len(diff.splitlines())
+        if diff_lines > MAX_LINES * 10:
+            raise ciwf.ReadError(f"diff line limit {MAX_LINES * 10} exceeded")
+        lines = added_lines(diff)
+        if lines:
+            changed[name] = lines
     untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", "docs/adr")
     for name in limited(untracked.rstrip("\0").split("\0"), MAX_FILES, "new file limit"):
         if RECORD.fullmatch(name):

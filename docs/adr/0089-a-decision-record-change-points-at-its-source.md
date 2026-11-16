@@ -18,6 +18,9 @@ source code or make claims without evidence pointers. The replay
 `test_adr_0066_as_landed_replays_red` in `tests/test_records.py` adds
 [ADR-0066](0066-a-train-write-holds-the-landing-order.md) again and reproduces
 both findings without editing the accepted record.
+The replay reads frozen inputs under `tests/fixtures/records/`, independent
+of later train refactors, as `test_planted_adr_0066_replay_ignores_live_tree`
+in `tests/test_records.py` verifies.
 
 ## Decision
 
@@ -28,6 +31,14 @@ block. A changed line binds its whole block; untouched blocks stay unjudged,
 as `test_untouched_blocks_of_an_accepted_record_stay_unjudged` verifies.
 Local new records are judged before staging too, as
 `test_planted_untracked_new_record_is_judged` verifies in `tests/test_records.py`.
+
+`tools/records.py` reads changed names through NUL-delimited Git output and
+reads added line ranges from each literal path's diff with pinned prefixes.
+User prefix settings and quoted Unicode paths cannot hide a changed record;
+`test_planted_user_diff_prefix_cannot_hide_a_record`,
+`test_planted_quoted_unicode_record_is_judged` and
+`test_planted_record_pathspec_is_literal` in `tests/test_records.py` cover
+these inputs without interpreting path headers.
 
 A changed block must not copy tracked source through a code span or fenced
 line. `tools/records.py` compares substantive snippets with tracked source

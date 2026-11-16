@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+# Minimal source spans quoted by 0066-as-landed.md.txt; historical replay only.
+
+CLOCK_SKEW_MINUTES = 5
+WRITE_HOLD_MINUTES = 60
+
+
+def is_candidate(pull):
+    return not (pull["mergeStateStatus"] == "BEHIND")

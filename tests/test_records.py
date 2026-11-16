@@ -129,6 +129,52 @@ def test_fixed_added_record_passes(repo):
     )
 
 
+@pytest.mark.parametrize("setting", ["diff.mnemonicPrefix", "diff.noprefix"])
+def test_planted_user_diff_prefix_cannot_hide_a_record(repo, setting):
+    repo.git("config", setting, "true")
+    done = change(repo, {NEW: NEW_RECORD.replace(POINTED, UNPOINTED)})
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert failures(done) == [f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}"]
+    diff = records.git(repo.root, *records.DIFF, "main", "--", f":(literal){NEW}")
+    assert f"+++ b/{NEW}\n" in diff
+
+
+@pytest.mark.parametrize("pointed", [False, True], ids=["unpointed", "pointed"])
+def test_planted_quoted_unicode_record_is_judged(repo, pointed):
+    name = "docs/adr/0002-café-decision.md"
+    text = NEW_RECORD if pointed else NEW_RECORD.replace(POINTED, UNPOINTED)
+    done = change(repo, {name: text})
+    assert done.returncode == (0 if pointed else 1), done.stdout + done.stderr
+    if pointed:
+        assert "1 decision record(s) changed" in done.stdout
+    else:
+        assert failures(done) == [f"FAIL: {name}:12: claim under 'Decision' {NO_POINTER}"]
+
+
+@pytest.mark.parametrize("pattern", ["[ab]", "*"], ids=["brackets", "asterisk"])
+def test_planted_record_pathspec_is_literal(repo, pattern):
+    name = f"docs/adr/0002-{pattern}-decision.md"
+    sibling = "docs/adr/0002-a-decision.md"
+    try:
+        repo.write({name: OLD_RECORD, sibling: NEW_RECORD})
+    except OSError as err:
+        if pattern == "*" and err.errno == 22:
+            pytest.skip(f"filesystem refuses an asterisk in a record name: {err}")
+        raise
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "old records")
+    # Only the sibling changes a claim; the literal record changes its status alone.
+    done = change(
+        repo,
+        {
+            name: OLD_RECORD.replace("Accepted", "Proposed"),
+            sibling: NEW_RECORD.replace(POINTED, UNPOINTED),
+        },
+    )
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert failures(done) == [f"FAIL: {sibling}:12: claim under 'Decision' {NO_POINTER}"]
+
+
 def test_planted_restated_span_fails_and_a_named_symbol_passes(repo):
     restated = POINTED.replace("`read_with_retries()`", '`DEADLINE_SECONDS = timeout_for("forge")`')
     done = change(repo, {NEW: NEW_RECORD.replace(POINTED, restated)})
@@ -290,21 +336,50 @@ def test_an_unrelated_history_fails_closed(repo):
 
 
 ADR_0066 = "docs/adr/0066-a-train-write-holds-the-landing-order.md"
-ADR_0066_SOURCE = ("tools/merge_train.py", ".github/workflows/merge-train.yml")
+RECORD_FIXTURES = ROOT / "tests/fixtures/records"
 
 
 def test_adr_0066_as_landed_replays_red(tree):
     """The record that restated the train's code, added again on top of the source it quoted."""
-    tree.write({name: (ROOT / name).read_text(encoding="utf-8") for name in ADR_0066_SOURCE})
+    source = (RECORD_FIXTURES / "merge_train.py.txt").read_text(encoding="utf-8")
+    tree.write({"tools/merge_train.py": source})
     tree.git("init", "-q", "-b", "main")
     tree.git("add", "-A")
     tree.git("commit", "-q", "-m", "base")
-    done = change(tree, {ADR_0066: (ROOT / ADR_0066).read_text(encoding="utf-8")})
+    record = (RECORD_FIXTURES / "0066-as-landed.md.txt").read_text(encoding="utf-8")
+    done = change(tree, {ADR_0066: record})
     assert done.returncode == 1
     found = failures(done)
     assert f"FAIL: {ADR_0066}:25: claim under 'Measurement'" in "\n".join(found)
     assert f"FAIL: {ADR_0066}:46: claim under 'Decision'" in "\n".join(found)
     assert f'FAIL: {ADR_0066}:30: {RESTATED} `pull["mergeStateStatus"] == "BEHIND"`' in found
+
+
+def test_planted_adr_0066_replay_ignores_live_tree(tree, monkeypatch, tmp_path_factory):
+    """A later source refactor cannot change the historical replay's inputs."""
+    refactored = Tree(tmp_path_factory.mktemp("refactored-live-tree"))
+    refactored.write(
+        {
+            "tools/merge_train.py": "# The train source no longer holds the quoted span.\n",
+            ".github/workflows/merge-train.yml": "# The train workflow was refactored.\n",
+            ADR_0066: (RECORD_FIXTURES / "0066-as-landed.md.txt").read_text(encoding="utf-8"),
+        }
+    )
+    monkeypatch.setitem(globals(), "ROOT", refactored.root)
+    test_adr_0066_as_landed_replays_red(tree)
+
+
+def test_planted_git_output_with_invalid_utf8_fails_closed(repo, monkeypatch):
+    run = subprocess.run
+
+    def undecodable(command, **kwargs):
+        if command[:3] == ["git", "-C", str(repo.root)]:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid filename")
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(records.subprocess, "run", undecodable)
+    with pytest.raises(records.ciwf.ReadError, match="git diff.*utf-8"):
+        records.git(repo.root, "diff", "-z", "--name-only", "main")
 
 
 @pytest.mark.parametrize(
@@ -379,13 +454,15 @@ def test_planted_untracked_new_record_is_judged(repo):
 def test_boundary_diff_hunk_counts(new_count):
     suffix = "," + new_count if new_count else ""
     diff = f"+++ b/{OLD}\n@@ -12,2 +12{suffix} @@\n"
-    expected = {} if new_count == "0" else {OLD: {12}}
+    expected = set() if new_count == "0" else {12}
     assert records.added_lines(diff) == expected
 
 
 def test_boundary_diff_dev_null_clears_the_record():
-    diff = f"+++ b/{OLD}\n@@ -1 +1 @@\n+++ /dev/null\n@@ -1,3 +4,2 @@\n"
-    assert records.added_lines(diff) == {OLD: {1}}
+    added = f"+++ b/{OLD}\n@@ -1 +1 @@\n"
+    diff = f"--- a/{OLD}\n+++ /dev/null\n@@ -1,3 +0,0 @@\n"
+    assert records.added_lines(added) == {1}
+    assert records.added_lines(diff) == set()
 
 
 def test_deleted_record_has_no_added_lines(repo):
@@ -479,6 +556,25 @@ def test_planted_diff_beyond_the_line_limit_fails_closed(monkeypatch):
     diff = "\n" * 11 + f"+++ b/{NEW}\n@@ -0,0 +1 @@\n"
     with pytest.raises(records.ciwf.ReadError, match="diff line limit"):
         records.added_lines(diff)
+
+
+def test_planted_changed_names_beyond_the_file_limit_fails_closed(repo, monkeypatch):
+    monkeypatch.setattr(records, "MAX_FILES", 1)
+    monkeypatch.setattr(records, "git", lambda *args: f"{OLD}\0{NEW}\0")
+    with pytest.raises(records.ciwf.ReadError, match="changed file limit"):
+        records.changed_records(repo.root, "main")
+
+
+def test_planted_combined_diffs_beyond_the_line_limit_fails_closed(repo, monkeypatch):
+    def diff_output(root, *args):
+        if "--name-only" in args:
+            return f"{OLD}\0{NEW}\0"
+        return "@@ -0,0 +1 @@\n" + "\n" * 5
+
+    monkeypatch.setattr(records, "MAX_LINES", 1)
+    monkeypatch.setattr(records, "git", diff_output)
+    with pytest.raises(records.ciwf.ReadError, match="diff line limit"):
+        records.changed_records(repo.root, "main")
 
 
 def test_planted_tracked_tree_beyond_the_file_limit_fails_closed(repo, monkeypatch):
