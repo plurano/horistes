@@ -95,3 +95,4 @@ record that supersedes it.
 | [0086](0086-an-exception-for-a-finding-without-a-file-names-no-path.md) | 2026-11-15 | An exception for a finding without a file names no path | Accepted |
 | [0087](0087-the-regenerate-commit-message-fits-commitlint.md) | 2026-11-16 | The regenerate commit message fits commitlint | Accepted |
 | [0089](0089-a-decision-record-change-points-at-its-source.md) | 2026-11-16 | A decision record change points at its source | Accepted |
+| [0090](0090-the-train-holds-on-an-incomplete-review.md) | 2026-11-16 | The train holds on an incomplete review | Accepted |
