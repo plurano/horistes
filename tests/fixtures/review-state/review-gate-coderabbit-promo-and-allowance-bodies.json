@@ -1,0 +1,102 @@
+{
+  "note": "Source bodies from 205bce43f; scope tokens redacted. Ordering timestamps normalized for fixtures. PR 1958 analysis scripts trimmed; real run request retained separately as negative case.",
+  "promo": {
+    "source": "cordanaLLM/praetor#1958 r4575652296",
+    "pr": {
+      "number": 1958,
+      "url": "https://github.com/cordanaLLM/praetor/pull/1958",
+      "author": {
+        "login": "lusoris"
+      },
+      "reviewThreads": {
+        "nodes": [
+          {
+            "isResolved": true,
+            "resolvedBy": {
+              "login": "coderabbitai"
+            },
+            "path": "internal/hiss/shell_continuations.go",
+            "line": 30,
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "coderabbitai",
+                    "__typename": "Bot"
+                  },
+                  "createdAt": "2026-11-14T21:00:00Z",
+                  "body": "Please check the delimiter."
+                },
+                {
+                  "author": {
+                    "login": "lusoris"
+                  },
+                  "createdAt": "2026-11-14T21:05:00Z",
+                  "body": "Fixed."
+                },
+                {
+                  "url": "https://github.com/cordanaLLM/praetor/pull/1958#discussion_r4575652296",
+                  "author": {
+                    "login": "coderabbitai",
+                    "__typename": "Bot"
+                  },
+                  "createdAt": "2026-11-14T21:10:00Z",
+                  "body": "`@lusoris` The source and regression tests in `d9f0e06c5` cover the reported split-delimiter case.\n\n<details>\n<summary>Learnings added</summary>\n<dl>\n<dd>\n<br>\n\n```\nLearnt from: lusoris\nRepo: cordanaLLM/praetor PR: 1958\nFile: internal/hiss/shell_continuations.go:30-33\nTimestamp: 2026-11-14T21:07:37.335Z\nLearning: Within repository \"cordanaLLM/praetor\", only for files matching one of [\"internal/hiss/shell_continuations.go\"]: When reviewing heredoc handling in internal/hiss/shell_continuations.go, preserve the shared lexer's distinction between quoted and unquoted delimiter words. Compare unquoted delimiters after joining active backslash-newline continuations in heredoc bodies, but compare quoted delimiters against physical lines. A split unquoted end delimiter must not hide a following command from admission or hold inspection.\n```\n\n> Note: Learnings are effective only in the context of similar code segments. To apply general coding guidelines, please configure [review instructions](https://docs.coderabbit.ai/guides/review-instructions). You can manage existing learnings in the [app](https://app.coderabbit.ai/learnings).\n\n</dd>\n</dl>\n</details>\n\n---\n\n<!-- This is an auto-generated comment: tweet message by coderabbit.ai -->\n\nIf you found this review helpful, would you consider giving us a shout-out on [X](https://twitter.com/intent/tweet?related=CodeRabbitAI&text=%40coderabbitai%20caught%20a%20subtle%20authorization%20bypass%3A%20split%20heredoc%20delimiters%20could%20hide%20commands%20from%20admission%20checks.%20The%20fix%20mirrors%20Bash%E2%80%99s%20quoting%20and%20continuation%20rules%2C%20keeping%20hidden%20commands%20visible%20and%20unclassifiable%20input%20fail-closed.%20Try%20CodeRabbit%20for%20security%20reviews%20%F0%9F%94%92&url=https%3A%2F%2Fgithub.com%2FcordanaLLM%2Fpraetor%2Fpull%2F1958%23discussion_r4574790045)?\n\nThank you for using CodeRabbit!\n\n<!-- end of auto-generated comment: tweet message by coderabbit.ai -->\n\n<sub><i>You are interacting with an AI system.</i></sub>\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "comments": {
+        "nodes": []
+      },
+      "commits": {
+        "nodes": []
+      },
+      "reviews": {
+        "nodes": []
+      }
+    },
+    "outside_request": "I could not run the required `make verify-all` check in this sandbox. Please run it for the current commit. I am not marking the finding as addressed until that check is verified.\n\n\n\n---"
+  },
+  "allowance": {
+    "source": "golusoris/sveltesentio#576 issuecomment 6883973879",
+    "pr": {
+      "number": 576,
+      "url": "https://github.com/golusoris/sveltesentio/pull/576",
+      "headRefOid": "2383bc753c610357c930b741acc01e588cc69bc9",
+      "author": {
+        "login": "lusoris"
+      },
+      "reviewThreads": {
+        "nodes": []
+      },
+      "comments": {
+        "nodes": [
+          {
+            "url": "https://github.com/golusoris/sveltesentio/pull/576#issuecomment-6883973879",
+            "author": {
+              "login": "coderabbitai"
+            },
+            "createdAt": "2026-11-14T20:47:00Z",
+            "body": "<!-- coderabbit-ai-generated:v1 -->\n\n<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- review_stack_entry_start -->\n\n<a href=\"https://app.coderabbit.ai/change-stack/golusoris/sveltesentio/pull/576?scope=REDACTED&amp;cs_source=review_comment\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-stack-buttons-v1/explain-change-dark.svg\"><source media=\"(prefers-color-scheme: light)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-stack-buttons-v1/explain-change.svg\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-stack-buttons-v1/explain-change.svg\" alt=\"Explain Change →\" height=\"32\"></picture></a>\n\n<!-- review_stack_entry_end -->\n<!-- recent_review_status_start -->\n\nNo actionable comments were generated in the recent review.\n\n<!-- recent_review_status_end -->\n<!-- walkthrough_start -->\n\n<details>\n<summary><strong>Walkthrough</strong></summary>\n<dl>\n<dd>\n<br>\n\nThe pull request adds browser-mode soak tests for hydration-clock timestamps and asynchronous tests for request-local clock isolation. The tests cover repeated reads, concurrent requests, rejection, gate interleaving, nested handles, and clock restoration.\n\n**Changes: Hydration clock**\n\n|Layer / File(s)|Summary|\n|:---|:---|\n|**Hydration clock offset checks** <br> `packages/core/test/clock.soak.browser.test.ts`|Adds tests for elapsed-time offsets and nondecreasing timestamps across 10,000 reads, separate origins for two clocks, the 30-day offset, and an unchanged performance clock.|\n\n**Request clock isolation**\n\n|Layer / File(s)|Summary|\n|:---|:---|\n|**Request clock sampling and assertions** <br> `packages/core/test/clock.soak.test.ts`|Adds helpers to run requests, record clock identity and time at checkpoints, and check fulfilled or rejected outcomes.|\n|**Concurrent request isolation** <br> `packages/core/test/clock.soak.test.ts`|Tests clock observations across 256 concurrent requests, including mixed fulfilled and rejected requests. Checks that `getClock()` returns `systemClock` after settlement.|\n|**Interleaved and nested requests** <br> `packages/core/test/clock.soak.test.ts`|Tests clock observations while requests interleave at a gate and across a nested `withClock` call. Checks restoration of the outer clock and `systemClock`.|\n\n<!-- change_assessment_start -->\n\n\n**Estimated code review effort:** 3 (Moderate) | ~20 minutes\n\n<!-- change_assessment_commit:\"2383bc753c610357c930b741acc01e588cc69bc9\" -->\n<!-- change_assessment_priority:{\"version\":1,\"urgency\":\"p3\",\"manual\":false} -->\n**Change:** Other\n<!-- change_assessment_end -->\n\n**Possibly related issues**\n\n- Issue 538 requests long-running integration tests for the core clock abstraction. This PR adds long-running tests for concurrent `withClock` requests and repeated hydration-clock reads, but does not test timer leaks.\n- Issue 500 includes a request for clock drift stability or timer-leak soak testing. This PR tests drift and offset behavior over repeated reads, but does not include a timer-leak case.\n\n</dd>\n</dl>\n</details>\n\n<!-- walkthrough_end -->\n<details>\n<summary><strong>Merge Risk:</strong> <strong><picture><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/risk-unassessed-16.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Minimal</strong> · up to <code>2383b</code></summary>\n<dl>\n<dd>\n<br>\n\n<!-- final_review_risk_start -->\n<!-- final_review_risk_label\n**Merge Risk:** **⚪ Minimal** · up to `2383b`\n-->\n<!-- final_review_risk_coverage:{\"sourceCommitId\":\"2383bc753c610357c930b741acc01e588cc69bc9\",\"coveredCommitId\":\"2383bc753c610357c930b741acc01e588cc69bc9\",\"kind\":\"reviewed\"} -->\n\nThis change only adds clock soak tests and does not alter runtime package behavior, so it poses little risk to users or production. It is ready to merge once the normal CI checks pass.\n<!-- final_review_risk_end -->\n\n</dd>\n</dl>\n</details>\n<!-- pre_merge_checks_walkthrough_start -->\n\n<details>\n<summary><strong>Pre-merge checks: <sup><picture><img src=\"https://storage.googleapis.com/coderabbit_public_assets/pre-merge-checks-counter-passed-14-v2.svg\" width=\"14\" height=\"14\" align=\"middle\" alt=\"Passed\" title=\"Passed\"></picture></sup> 4</strong></summary>\n<dl>\n<dd>\n<br>\n\n|         Check name         |                                             Status                                             | Explanation                                                                                                                                                                                               |\n| :------------------------ | :--------------------------------------------------------------------------------------------: | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |\n|         Title check        | ![Passed](https://storage.googleapis.com/coderabbit_public_assets/pre-merge-checks-passed.svg) | The title follows the conventional commit format and names the main change: adding soak tests for request clock isolation and drift in core. The changeset adds two soak test files (server withClock is… |\n|     Linked Issues check    | ![Passed](https://storage.googleapis.com/coderabbit_public_assets/pre-merge-checks-passed.svg) | Check skipped because no linked issues were found for this pull request.                                                                                                                                  |\n| Out of Scope Changes check | ![Passed](https://storage.googleapis.com/coderabbit_public_assets/pre-merge-checks-passed.svg) | Check skipped because no linked issues were found for this pull request.                                                                                                                                  |\n|      Description Check     | ![Passed](https://storage.googleapis.com/coderabbit_public_assets/pre-merge-checks-passed.svg) | Check skipped - CodeRabbit’s high-level summary is enabled.                                                                                                                                               |\n\n<details>\n<summary><strong>Full details: Title check</strong></summary>\n<dl>\n<dd>\n<br>\n\n**Explanation**\n\nThe title follows the conventional commit format and names the main change: adding soak tests for request clock isolation and drift in core. The changeset adds two soak test files (server withClock isolation and browser createHydrationClock drift), so the title matches the primary change. It does not mention the browser-only aspect, but it is specific enough for a teammate scanning history.\n\n</dd>\n</dl>\n</details>\n\n</dd>\n</dl>\n</details>\n\n<!-- pre_merge_checks_walkthrough_end -->\n<!-- finishing_touch_checkbox_start -->\n\n<details>\n<summary><strong>Finishing Touches</strong></summary>\n<dl>\n<dd>\n<br>\n\n<details open>\n<summary><strong>Generate unit tests (beta)</strong></summary>\n<dl>\n<dd>\n<br>\n\n- [ ] <!-- {\"checkboxId\": \"6ba7b810-9dad-11d1-80b4-00c04fd430c8\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} --> Commit to this branch\n- [ ] <!-- {\"checkboxId\": \"f47ac10b-58cc-4372-a567-0e02b2c3d479\", \"radioGroupId\": \"utg-output-choice-group-unknown_comment_id\"} --> Create a new PR\n\n</dd>\n</dl>\n</details>\n\n</dd>\n</dl>\n</details>\n\n<!-- finishing_touch_checkbox_end -->\n\n<!-- autopilot:start -->\n- [ ] <!-- {\"checkboxId\":\"2708ad07-9f24-4260-9c11-7dc76a49f2e3\"} --> <strong title=\"Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\">Autofix</strong> · Keep fixing CodeRabbit findings and required CI, and resolving merge conflicts\n<!-- autopilot:end -->\n<!-- operational_warnings_start -->\n\n<!-- This is an auto-generated comment: all tool run failures by coderabbit.ai -->\n\n> [!WARNING]\n> Some tools did not complete. Review the errors below.\n> \n> <details>\n> <summary><strong><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/wrench-dark.svg\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/wrench.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> ESLint</strong></summary>\n> <dl>\n> <dd>\n> <br>\n> \n> > If the error stems from missing dependencies, add them to the package.json file. For unrecoverable errors (e.g., due to private dependencies), disable the tool in the CodeRabbit configuration.\n> \n> <details>\n> <summary><strong>packages/core/test/clock.soak.browser.test.ts</strong></summary>\n> <dl>\n> <dd>\n> <br>\n> \n> ESLint skipped: missing config or dependency (missing-dependency). The ESLint configuration references a package that is not available in the sandbox.\n> \n> </dd>\n> </dl>\n> </details>\n> \n> <details>\n> <summary><strong>packages/core/test/clock.soak.test.ts</strong></summary>\n> <dl>\n> <dd>\n> <br>\n> \n> ESLint skipped: the matched ESLint configuration already failed (missing-dependency).\n> \n> </dd>\n> </dl>\n> </details>\n> \n> </dd>\n> </dl>\n> </details>\n\n<!-- end of auto-generated comment: all tool run failures by coderabbit.ai -->\n\n<!-- operational_warnings_end -->\n<!-- tips_start -->\n\n\n\nThanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=golusoris/sveltesentio&utm_content=576)! It's free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.\n\n<details>\n<summary><strong>Share</strong></summary>\n<dl>\n<dd>\n<br>\n\n- [X](https://twitter.com/intent/tweet?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A&url=https%3A//coderabbit.ai)\n- [Mastodon](https://mastodon.social/share?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A%20https%3A%2F%2Fcoderabbit.ai)\n- [Reddit](https://www.reddit.com/submit?title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&text=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code.%20Check%20it%20out%3A%20https%3A//coderabbit.ai)\n- [LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fcoderabbit.ai&mini=true&title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&summary=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code)\n\n</dd>\n</dl>\n</details>\n\n<!-- tips_end -->\n<!-- recent_review_start -->\n\n<h6>\n<details>\n<summary><strong><picture><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/info.svg\" width=\"12\" height=\"12\" align=\"absmiddle\" alt=\"\"></picture> Recent review info</strong></summary>\n<dl>\n<dd>\n<br>\n\n<!-- review_info_content -->\n<details>\n<summary><strong><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/cog-dark.svg\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/cog.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Run configuration</strong></summary>\n<dl>\n<dd>\n<br>\n\n- **Source mode**: Auto\n- **Repository**: [golusoris/sveltesentio](<https://github.com/golusoris/sveltesentio>)\n- **Branch**: [main](<https://github.com/golusoris/sveltesentio/tree/main>)\n- **File**: [.coderabbit.yaml](<https://github.com/golusoris/sveltesentio/blob/74b98f51ee1751b688c2e39a3b6ec66a920b60e6/.coderabbit.yaml>)\n- **Commit**: [74b98f5](<https://github.com/golusoris/sveltesentio/commit/74b98f51ee1751b688c2e39a3b6ec66a920b60e6>)\n- **Layers**: Repository YAML\n- **Review profile**: CHILL\n- **Plan**: Advanced\n- **Run ID**: `342faa01-e461-42ec-b238-cd235e0441cd`\n\n</dd>\n</dl>\n</details>\n\n<details>\n<summary><strong><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/git-commit-horizontal-dark.svg\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/git-commit-horizontal.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Commits</strong></summary>\n<dl>\n<dd>\n<br>\n\nReviewing files that changed from the base of the PR and between 74b98f51ee1751b688c2e39a3b6ec66a920b60e6 and 2383bc753c610357c930b741acc01e588cc69bc9.\n\n</dd>\n</dl>\n</details>\n\n<details>\n<summary><strong><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/file-plus-corner-dark.svg\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/file-plus-corner.svg\" width=\"16\" height=\"16\" align=\"absmiddle\" alt=\"\"></picture> Files selected for processing: 2</strong></summary>\n<dl>\n<dd>\n<br>\n\n* `packages/core/test/clock.soak.browser.test.ts`\n* `packages/core/test/clock.soak.test.ts`\n\n</dd>\n</dl>\n</details>\n\n**Included review availability:** This review used your included allowance. Your plan provides up to 1 included review per hour; 0 remain after this review.\n\n</dd>\n</dl>\n</details>\n</h6>\n\n<!-- recent_review_end -->\n"
+          }
+        ]
+      },
+      "commits": {
+        "nodes": [
+          {
+            "commit": {
+              "oid": "2383bc753c610357c930b741acc01e588cc69bc9",
+              "committedDate": "2026-11-14T20:40:00Z"
+            }
+          }
+        ]
+      },
+      "reviews": {
+        "nodes": []
+      }
+    }
+  }
+}
