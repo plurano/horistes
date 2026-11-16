@@ -31,6 +31,11 @@ PR_TEMPLATE = (ROOT / ".github/pull_request_template.md").read_text(encoding="ut
 PR_HEADINGS = re.findall(r"^## .+$", PR_TEMPLATE, re.MULTILINE)
 PR_CHECKBOX = re.compile(r"^- \[ \] [^\n]+(?:\n[ \t]+[^\n]+)*", re.MULTILINE)
 PR_CHECKLIST = PR_CHECKBOX.findall(PR_TEMPLATE)
+# The section CodeRabbit's Description check reads.
+DESCRIPTION = "## Description"
+MD_HEADING = re.compile(r"^#{1,6}\s")
+# Markdown hides a comment left open to the end of the text as well.
+HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
 PLANTED_PRESET = "tests/fixtures/update-bot/planted-preset.json"
 SYNCED = json.loads((ROOT / "settings-sync.json").read_text(encoding="utf-8"))
 PLANTED_SYNCED = "tests/fixtures/update-bot/planted-settings-sync.json"
@@ -570,12 +575,25 @@ def test_this_repository_extends_the_preset_and_nothing_else():
     assert (ROOT / "default.json").is_file()
 
 
+def empty_sections(header: str) -> list[str]:
+    """Template headings with nothing up to the next heading but blanks and HTML comments."""
+    lines = header.splitlines()
+    bounds = [index for index, line in enumerate(lines) if MD_HEADING.match(line)] + [len(lines)]
+    empty = []
+    for start in (index for index, line in enumerate(lines) if line in PR_HEADINGS):
+        end = next(bound for bound in bounds if bound > start)
+        if not HTML_COMMENT.sub("", "\n".join(lines[start + 1 : end])).strip():
+            empty.append(f"{lines[start]}: no text")
+    return empty
+
+
 def pr_header_problems(preset: dict) -> list[str]:
-    """Missing template sections or claims of verification made by the bot."""
+    """Missing template sections, sections without text, or verification claimed by the bot."""
     header = preset.get("prHeader")
     if not isinstance(header, str) or not header.strip():
         return ["prHeader"]
     problems = [heading for heading in PR_HEADINGS if heading not in header.splitlines()]
+    problems.extend(empty_sections(header))
     checklist = PR_CHECKBOX.findall(header)
     items = {" ".join(item.split()) for item in checklist}
     problems.extend(item for item in PR_CHECKLIST if " ".join(item.split()) not in items)
@@ -596,19 +614,62 @@ def test_planted_preset_without_a_pr_header_is_refused():
 
 @pytest.mark.parametrize("mark", ["x", "X"])
 def test_planted_ticked_pr_header_is_refused(mark):
-    header = PR_TEMPLATE + f"\n- [{mark}] Verification claimed by the bot\n"
+    header = PRESET["prHeader"] + f"\n- [{mark}] Verification claimed by the bot\n"
     assert pr_header_problems({**PRESET, "prHeader": header}) == ["ticked box"]
 
 
 @pytest.mark.parametrize("missing", PR_HEADINGS + PR_CHECKLIST)
 def test_planted_incomplete_pr_header_is_refused(missing):
-    header = PR_TEMPLATE.replace(missing, "")
+    header = PRESET["prHeader"].replace(missing, "")
     assert pr_header_problems({**PRESET, "prHeader": header}) == [missing]
 
 
 def test_pr_header_accepts_a_folded_checklist_item():
-    header = re.sub(r"\n[ \t]+", " ", PR_TEMPLATE)
+    header = re.sub(r"\n[ \t]+", " ", PRESET["prHeader"])
     assert pr_header_problems({**PRESET, "prHeader": header}) == []
+
+
+def with_description(text: str) -> dict:
+    """The preset with the text under its Description heading swapped for `text`."""
+    pattern = re.compile(rf"(?<=^{DESCRIPTION}\n).*?(?=^## )", re.DOTALL | re.MULTILINE)
+    header, count = pattern.subn(lambda _: text, PRESET["prHeader"], count=1)
+    assert count == 1
+    return {**PRESET, "prHeader": header}
+
+
+def test_planted_header_copied_from_the_template_is_refused():
+    # The template leaves the Description to the author: a comment and no text.
+    assert DESCRIPTION in PR_HEADINGS
+    assert pr_header_problems({**PRESET, "prHeader": PR_TEMPLATE}) == [f"{DESCRIPTION}: no text"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\n",
+        "\n  \t\n\n",
+        "\n<!-- Summarize the changes and their architectural rationale. -->\n\n",
+        "\n<!-- one -->\n<!-- two -->\n\n",
+        "\n<!-- left open to the next heading\n\n",
+        "\n### Notes\n\nText under a lower heading belongs to that heading.\n\n",
+    ],
+    ids=["blank", "whitespace", "comment", "two-comments", "open-comment", "lower-heading"],
+)
+def test_planted_description_without_text_is_refused(text):
+    assert pr_header_problems(with_description(text)) == [f"{DESCRIPTION}: no text"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\nOne line.\n",
+        "\n<!-- a note for maintainers -->\nRenovate proposes this update.\n\n",
+        "\nText <!-- inline --> goes on.\n\n",
+    ],
+    ids=["one-line", "comment-then-text", "inline-comment"],
+)
+def test_description_with_text_is_accepted(text):
+    assert pr_header_problems(with_description(text)) == []
 
 
 def test_preset_holds_only_what_is_the_same_in_every_repository():
