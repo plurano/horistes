@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+"""Check what a change adds to the decision records: no restated code, every claim points somewhere.
+
+Only blocks holding a line added or changed since the merge base of --base-ref and HEAD
+are judged (ADR-0089). An accepted record stays as written (docs/adr/README.md), so the
+rules bind it again whenever a line of it changes, and never through an exception list.
+A block is a paragraph, a top-level list item with its nested lines, or a fenced block.
+
+- restated code: a code span or fenced line of MIN_RESTATED_CHARS or more that is not a
+  bare path, identifier or command, and that a tracked file outside docs/ and Markdown
+  holds verbatim;
+- claim without a pointer: a block under `## Decision` or `## Consequences`, or a block
+  outside `## References` that states a number, with no code span naming a tracked file,
+  a command in COMMANDS or a test function, and no link to a tracked file or a web page.
+
+    records.py [check] [--root DIR] [--base-ref REF]
+
+Exit codes: 0 pass, 1 finding, 3 file or git error; a base with no merge base is an error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import posixpath
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import ciwf
+
+RECORD = re.compile(r"docs/adr/\d{4}-[^/]+\.md")
+NULL_IDS = frozenset({"0" * 40, "0" * 64})
+DEADLINE_SECONDS = 30
+# Records held 88 files and the tree 640 tracked files on 2026-11-16.
+MAX_FILES = 20_000
+MAX_LINES = 20_000
+MAX_SOURCE_BYTES = 1_000_000
+# The shortest span the reviewed record restated (`CLOCK_SKEW_MINUTES = 5`) has 22 characters.
+MIN_RESTATED_CHARS = 20
+# The command surfaces the agent instructions name as verification commands.
+COMMANDS = ("make", "praetorctl")
+CLAIM_SECTIONS = ("Decision", "Consequences")
+UNCOUNTED_SECTIONS = ("References",)
+
+# Against the work tree, so a local run judges uncommitted records too.
+DIFF = ("diff", "--unified=0", "--no-renames", "--no-color", "--no-ext-diff")
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$")
+TOP_ITEM = re.compile(r"^(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
+LINK = re.compile(r"\]\(<?([^)<>\s]+)>?(?:\s+[^)]*)?\)")
+# A bare path, identifier, flag or call names code; it does not restate it.
+POINTER_SHAPE = re.compile(r"[\w.:/@+\[\]-]+(?:\(\))?")
+CODE_SHAPE = re.compile(r"[=\{\}\"']|\w\(.+\)|\s")
+TEST_NAME = re.compile(r"test_\w+")
+TEST_DEFINITION = re.compile(r"^\s*(?:async\s+)?def\s+(test_\w+)", re.MULTILINE)
+UNCOUNTED_NUMBERS = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:T[\d:.]+Z?)?|ADR-\d{4}|^\s*(?:[-*+]\s+)?\d{1,9}[.)]\s", re.MULTILINE
+)
+DIGIT = re.compile(r"\d")
+
+
+@dataclass
+class Block:
+    """Lines of one record that the rules judge together."""
+
+    section: str
+    start: int
+    lines: list[str] = field(default_factory=list)
+    fenced: bool = False
+
+    @property
+    def end(self) -> int:
+        return self.start + len(self.lines) - 1
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+@dataclass
+class Tree:
+    """What the rules read besides the record: tracked paths, source text and test names."""
+
+    paths: frozenset[str]
+    source: str
+    tests: frozenset[str]
+
+
+def git(root: Path, *args: str) -> str:
+    """Run git in root under the deadline; a failure is a ReadError naming the command."""
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=DEADLINE_SECONDS,
+            env=ciwf.git_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise ciwf.ReadError(f"git {args[0]}: {err}") from err
+    if done.returncode != 0:
+        raise ciwf.ReadError(f"git {' '.join(args)}: {done.stderr.strip() or done.returncode}")
+    return done.stdout
+
+
+def merge_base(root: Path, ref: str) -> str:
+    """The commit HEAD and ref share; without one the check cannot tell what changed."""
+    if ref in NULL_IDS:
+        raise ciwf.ReadError(f"base {ref} is the null commit: no merge base to compare with")
+    try:
+        return git(root, "merge-base", ref, "HEAD").strip()
+    except ciwf.ReadError as err:
+        raise ciwf.ReadError(f"no merge base of {ref} and HEAD: {err}") from err
+
+
+def added_lines(diff: str) -> dict[str, set[int]]:
+    """Line numbers, in the new text, of each record line a zero-context diff adds."""
+    added: dict[str, set[int]] = {}
+    current: set[int] | None = None
+    for line in diff.splitlines()[: MAX_LINES * 10]:
+        if line.startswith("+++ "):
+            name = line[4:].removeprefix("b/")
+            current = added.setdefault(name, set()) if RECORD.fullmatch(name) else None
+            continue
+        hunk = HUNK.match(line)
+        if hunk and current is not None:
+            first, count = int(hunk.group(1)), int(hunk.group(2) or "1")
+            current.update(range(first, first + count))
+    return {name: lines for name, lines in added.items() if lines}
+
+
+def read_tree(root: Path) -> Tree:
+    """Tracked paths, the text of tracked source outside docs/ and Markdown, and test names."""
+    paths = [p for p in git(root, "ls-files", "-z").split("\0") if p][:MAX_FILES]
+    texts, tests = [], set()
+    for name in paths:
+        if name.startswith("docs/") or name.endswith(".md"):
+            continue
+        text = _source_text(root / name)
+        texts.append(text)
+        if name.startswith("tests/") and name.endswith(".py"):
+            tests.update(TEST_DEFINITION.findall(text))
+    return Tree(frozenset(paths), "\n".join(texts), frozenset(tests))
+
+
+def _source_text(path: Path) -> str:
+    """A tracked file's text; binary, missing or oversized files hold no source."""
+    try:
+        data = path.read_bytes()
+    except (FileNotFoundError, IsADirectoryError):
+        return ""
+    if len(data) > MAX_SOURCE_BYTES:
+        return ""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def _breaks_block(line: str) -> bool:
+    """A blank line, heading or top-level list item ends the block before it."""
+    return not line.strip() or bool(HEADING.match(line)) or bool(TOP_ITEM.match(line))
+
+
+def _closes(line: str, fence: str) -> bool:
+    """A closing fence: the opening character, at least as many, then only blanks."""
+    return bool(re.match(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$", line))
+
+
+def _section(line: str, section: str) -> str:
+    """The `## ` heading a line opens, else the section it stays in."""
+    heading = HEADING.match(line)
+    if heading and len(heading.group(1)) == 2:
+        return (heading.group(2) or "").strip()
+    return section
+
+
+def blocks(text: str) -> list[Block]:
+    """Split a record into blocks, each with its `## ` section and first line number."""
+    found: list[Block] = []
+    section, current, fence = "", None, ""
+    for number, line in enumerate(text.splitlines()[:MAX_LINES], start=1):
+        if fence:
+            current.lines.append(line)
+            if _closes(line, fence):
+                fence, current = "", None
+            continue
+        opened = FENCE.match(line)
+        if opened:
+            fence, current = opened.group(1), Block(section, number, [line], fenced=True)
+            found.append(current)
+            continue
+        section = _section(line, section)
+        if _breaks_block(line):
+            current = None
+        if not line.strip() or HEADING.match(line):
+            continue
+        if current is None:
+            current = Block(section, number)
+            found.append(current)
+        current.lines.append(line)
+    return found
+
+
+def code_spans(text: str) -> list[str]:
+    """Code span contents, one surrounding space stripped as CommonMark does, newlines as spaces."""
+    spans = []
+    for match in CODE_SPAN.finditer(text):
+        body = match.group(2).replace("\n", " ")
+        if len(body) > 2 and body.startswith(" ") and body.endswith(" ") and body.strip():
+            body = body[1:-1]
+        spans.append(body)
+    return spans
+
+
+def names_code(span: str, tree: Tree) -> bool:
+    """A span that only names code: a bare path, identifier, flag, call or a command."""
+    words = span.split()
+    if not words or POINTER_SHAPE.fullmatch(span) or not CODE_SHAPE.search(span):
+        return True
+    return words[0] in COMMANDS or _tracked(words[0], tree)
+
+
+def _tracked(name: str, tree: Tree) -> bool:
+    """A tracked file or directory, with an optional `:line`, `::name` or `#anchor` suffix."""
+    path = re.split(r"::|:(?=\d)|#", name, maxsplit=1)[0].rstrip("/")
+    if not path:
+        return False
+    return path in tree.paths or any(p.startswith(path + "/") for p in tree.paths)
+
+
+def points_somewhere(block: Block, record: str, tree: Tree) -> bool:
+    """The block names a tracked file, a command, a test function, or links a file or page."""
+    for span in code_spans(block.text):
+        head = span.split()[0] if span.split() else ""
+        if head in COMMANDS or _tracked(head, tree):
+            return True
+        if TEST_NAME.fullmatch(head) and head in tree.tests:
+            return True
+    for destination in LINK.findall(CODE_SPAN.sub("", block.text)):
+        if destination.startswith(("https://", "http://")):
+            return True
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(record), destination))
+        if destination.split("#")[0] and _tracked(target, tree):
+            return True
+    return False
+
+
+def states_number(block: Block) -> bool:
+    """A digit outside code spans and links, once dates, record names and list numbers are out."""
+    prose = LINK.sub("]", CODE_SPAN.sub("", block.text))
+    return bool(DIGIT.search(UNCOUNTED_NUMBERS.sub("", prose)))
+
+
+def restated(block: Block, tree: Tree) -> list[str]:
+    """Spans or fenced lines of the block that tracked source holds verbatim."""
+    if block.fenced:
+        candidates = [line.strip() for line in block.lines[1:]]
+    else:
+        candidates = code_spans(block.text)
+    return [
+        text
+        for text in candidates
+        if len(text) >= MIN_RESTATED_CHARS and not names_code(text, tree) and text in tree.source
+    ]
+
+
+def judge(record: str, block: Block, tree: Tree) -> list[str]:
+    """Findings for one changed block of a record."""
+    problems = [
+        f"{record}:{block.start}: restated code, cite the file instead: `{text[:80]}`"
+        for text in restated(block, tree)
+    ]
+    if block.fenced or not block.section or block.text.lstrip().startswith("<!--"):
+        return problems
+    claim = block.section in CLAIM_SECTIONS or (
+        block.section not in UNCOUNTED_SECTIONS and states_number(block)
+    )
+    if claim and not points_somewhere(block, record, tree):
+        problems.append(
+            f"{record}:{block.start}: claim under '{block.section}' names no tracked file,"
+            " command, test function or link"
+        )
+    return problems
+
+
+def check_records(root: Path, base_ref: str) -> tuple[list[str], int, int]:
+    """Findings, changed record count and judged block count against the merge base of base_ref."""
+    base = merge_base(root, base_ref)
+    diff = git(root, *DIFF, base, "--", "docs/adr")
+    changed = added_lines(diff)
+    tree = read_tree(root) if changed else Tree(frozenset(), "", frozenset())
+    problems, judged = [], 0
+    for record, lines in sorted(changed.items())[:MAX_FILES]:
+        try:
+            text = (root / record).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as err:
+            raise ciwf.ReadError(f"{record}: {err}") from err
+        for block in blocks(text):
+            if any(block.start <= number <= block.end for number in lines):
+                judged += 1
+                problems.extend(judge(record, block, tree))
+    return problems, len(changed), judged
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Check the changed decision records and return the documented exit status."""
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("command", nargs="?", default="check", choices=("check",))
+    parser.add_argument("--root", type=Path, default=Path("."))
+    parser.add_argument("--base-ref", default="origin/main")
+    args = parser.parse_args(argv)
+    try:
+        problems, changed, judged = check_records(args.root, args.base_ref)
+    except ciwf.ReadError as err:
+        ciwf.complain(f"ERROR: {err}")
+        return 3
+    for line in problems:
+        ciwf.complain(f"FAIL: {line}")
+    if problems:
+        return 1
+    ciwf.say(
+        f"PASS: {changed} decision record(s) changed against {args.base_ref},"
+        f" {judged} changed block(s) judged"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
