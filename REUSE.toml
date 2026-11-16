@@ -12,10 +12,6 @@ version = 1
 [[annotations]]
 path = [
     "README.md",
-    "tests/fixtures/review-state/cr1976-summary-allowance-6900214744.md",
-    "tests/fixtures/review-state/pr3507-coderabbit-6922706444.md",
-    "tests/fixtures/review-state/pr3507-review-state.json",
-    "tests/fixtures/review-state/review-gate-coderabbit-promo-and-allowance-bodies.json",
     "CHANGELOG.md",
     ".bestpractices.json",
     ".gitignore",
