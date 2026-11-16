@@ -17,6 +17,10 @@ from pathlib import Path
 
 import yaml
 
+# The forge sends the null commit as the state before a push that creates the
+# branch, as on the first push to a new repository; SHA-1 and SHA-256 forms.
+NULL_IDS = frozenset({"0" * 40, "0" * 64})
+
 BOOL_TAG = "tag:yaml.org,2002:bool"
 
 

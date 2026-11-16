@@ -330,3 +330,203 @@ def test_boundary_blocks_follow_fences_and_headings():
         ("Decision", 7, 8, False),
         ("Decision", 9, 9, False),
     ]
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        """<!--
+
+## Decision
+
+```python
+for attempt in range(RETRY_LIMIT):
+```
+
+Hidden 42 claims.
+-->""",
+        '<!-- `DEADLINE_SECONDS = timeout_for("forge")` -->',
+    ],
+    ids=["hidden-blocks", "hidden-span"],
+)
+def test_planted_code_and_claims_inside_html_comments_are_ignored(repo, comment):
+    done = change(repo, {NEW: NEW_RECORD + "\n" + comment + "\n"})
+    assert done.returncode == 0, done.stderr
+
+
+def test_planted_comment_cannot_hide_a_visible_claim(repo):
+    text = NEW_RECORD.replace(POINTED, "<!-- explanation --> " + UNPOINTED)
+    done = change(repo, {NEW: text})
+    assert done.returncode == 1, done.stdout
+    assert failures(done) == [f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}"]
+
+
+def test_planted_hidden_pointer_does_not_support_visible_claim(repo):
+    text = NEW_RECORD.replace(POINTED, UNPOINTED + " <!-- `tools/app.py` -->")
+    done = change(repo, {NEW: text})
+    assert done.returncode == 1, done.stdout
+    assert failures(done) == [f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}"]
+
+
+def test_planted_untracked_new_record_is_judged(repo):
+    repo.write({NEW: NEW_RECORD.replace(POINTED, UNPOINTED)})
+    done = repo.tool("records.py", "check", "--base-ref", "main")
+    assert done.returncode == 1, done.stdout
+    assert failures(done) == [f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}"]
+
+
+@pytest.mark.parametrize("new_count", ["0", "1", ""])
+def test_boundary_diff_hunk_counts(new_count):
+    suffix = "," + new_count if new_count else ""
+    diff = f"+++ b/{OLD}\n@@ -12,2 +12{suffix} @@\n"
+    expected = {} if new_count == "0" else {OLD: {12}}
+    assert records.added_lines(diff) == expected
+
+
+def test_boundary_diff_dev_null_clears_the_record():
+    diff = f"+++ b/{OLD}\n@@ -1 +1 @@\n+++ /dev/null\n@@ -1,3 +4,2 @@\n"
+    assert records.added_lines(diff) == {OLD: {1}}
+
+
+def test_deleted_record_has_no_added_lines(repo):
+    (repo.root / OLD).unlink()
+    done = change(repo, {})
+    assert done.returncode == 0, done.stderr
+    assert "0 decision record(s) changed" in done.stdout
+
+
+def test_renamed_record_is_judged_as_an_addition(repo):
+    (repo.root / OLD).rename(repo.root / NEW)
+    done = change(repo, {})
+    assert done.returncode == 1, done.stdout
+    assert failures(done) == [
+        f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}",
+        f"FAIL: {NEW}:16: claim under 'Consequences' {NO_POINTER}",
+    ]
+
+
+def test_crlf_record_with_a_fence_info_string_is_judged(repo):
+    text = NEW_RECORD + "\n```python title=retry\nfor attempt in range(RETRY_LIMIT):\n```\n"
+    repo.write({NEW: text.replace("\n", "\r\n")})
+    done = change(repo, {})
+    assert done.returncode == 1, done.stdout
+    assert failures(done) == [f"FAIL: {NEW}:18: {RESTATED} `for attempt in range(RETRY_LIMIT):`"]
+
+
+def test_doubled_backtick_span_restating_source_fails(repo):
+    span = '`` DEADLINE_SECONDS = timeout_for("forge") ``'
+    done = change(repo, {NEW: NEW_RECORD.replace(POINTED, POINTED + " " + span)})
+    assert done.returncode == 1, done.stdout
+    assert failures(done) == [
+        f'FAIL: {NEW}:12: {RESTATED} `DEADLINE_SECONDS = timeout_for("forge")`'
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "number"),
+    [
+        ("[42 reads](https://example.invalid/reads)", True),
+        ("[reads](https://example.invalid/42)", False),
+    ],
+    ids=["label-counts", "url-does-not"],
+)
+def test_boundary_numbers_in_link_labels_and_destinations(text, number):
+    assert records.states_number(records.Block("Context", 1, [text])) is number
+
+
+def test_changed_line_binds_restated_span_on_unchanged_line(repo):
+    text = OLD_RECORD.replace(
+        "The app retries a failed read three times.",
+        'The app retries.\n`DEADLINE_SECONDS = timeout_for("forge")`',
+    )
+    repo.write({OLD: text})
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "old restatement")
+    edited = text.replace("The app retries.", "The app waits before retrying.")
+    done = change(repo, {OLD: edited})
+    assert done.returncode == 1, done.stdout
+    assert any(RESTATED in line for line in failures(done))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "`<!-- literal -->`",
+        "`` <!-- literal ` marker --> ``",
+        "```python\n<!-- literal -->\n```",
+    ],
+    ids=["span", "doubled-span", "fence"],
+)
+def test_comment_markers_inside_code_stay_literal(text):
+    assert records.visible_text(text) == text
+
+
+def test_planted_numeric_claim_before_a_section_needs_a_pointer(repo):
+    text = NEW_RECORD.replace("## Context", "The check retries 42 times.\n\n## Context")
+    done = change(repo, {NEW: text})
+    assert done.returncode == 1, done.stdout
+    assert any(NO_POINTER in line for line in failures(done))
+
+
+def test_planted_record_beyond_the_line_limit_fails_closed(repo, monkeypatch):
+    monkeypatch.setattr(records, "MAX_LINES", 5)
+    with pytest.raises(records.ciwf.ReadError, match="line limit"):
+        records.blocks(NEW_RECORD)
+
+
+def test_planted_diff_beyond_the_line_limit_fails_closed(monkeypatch):
+    monkeypatch.setattr(records, "MAX_LINES", 1)
+    diff = "\n" * 11 + f"+++ b/{NEW}\n@@ -0,0 +1 @@\n"
+    with pytest.raises(records.ciwf.ReadError, match="diff line limit"):
+        records.added_lines(diff)
+
+
+def test_planted_tracked_tree_beyond_the_file_limit_fails_closed(repo, monkeypatch):
+    monkeypatch.setattr(records, "MAX_FILES", 1)
+    with pytest.raises(records.ciwf.ReadError, match="file limit"):
+        records.read_tree(repo.root)
+
+
+def test_untracked_record_with_invalid_utf8_fails_closed(repo):
+    (repo.root / NEW).write_bytes(b"\xff")
+    done = repo.tool("records.py", "check", "--base-ref", "main")
+    assert done.returncode == 3, done.stderr
+    assert "ERROR:" in done.stderr
+    assert "Traceback" not in done.stderr
+
+
+def test_planted_oversized_source_fails_closed(repo, monkeypatch):
+    monkeypatch.setattr(records, "MAX_SOURCE_BYTES", 5)
+    with pytest.raises(records.ciwf.ReadError, match="source byte limit"):
+        records._source_text(repo.root / "tools/app.py")
+
+
+def test_planted_link_destination_without_a_label_is_no_pointer(repo):
+    text = NEW_RECORD.replace(POINTED, UNPOINTED + " ](https://example.invalid/reads)")
+    done = change(repo, {NEW: text})
+    assert done.returncode == 1, done.stdout
+    assert failures(done) == [f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}"]
+
+
+def test_a_defined_test_function_call_is_a_pointer(repo):
+    text = NEW_RECORD.replace(POINTED, UNPOINTED + " See `test_app_retries()`.")
+    done = change(repo, {NEW: text})
+    assert done.returncode == 0, done.stderr
+
+
+def test_existing_untracked_file_is_no_pointer(repo):
+    text = NEW_RECORD.replace(POINTED, UNPOINTED + " See `tools/local.py`.")
+    repo.write({NEW: text, "tools/local.py": "# Local draft, not tracked.\n"})
+    done = repo.tool("records.py", "check", "--base-ref", "main")
+    assert done.returncode == 1, done.stdout
+    assert failures(done) == [f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}"]
+
+
+def test_a_diverged_base_is_compared_through_its_merge_base(repo):
+    repo.write({OLD: OLD_RECORD.replace("three times", "five times")})
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "base moves")
+    repo.git("checkout", "-q", "-b", "topic", "HEAD~1")
+    done = change(repo, {NEW: NEW_RECORD})
+    assert done.returncode == 0, done.stderr
+    assert "1 decision record(s) changed against main, 5 changed block(s) judged" in done.stdout

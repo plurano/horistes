@@ -31,9 +31,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import ciwf
+from ciwf import NULL_IDS
+from links import INLINE_LINK
 
 RECORD = re.compile(r"docs/adr/\d{4}-[^/]+\.md")
-NULL_IDS = frozenset({"0" * 40, "0" * 64})
 DEADLINE_SECONDS = 30
 # Records held 88 files and the tree 640 tracked files on 2026-11-16.
 MAX_FILES = 20_000
@@ -52,8 +53,11 @@ HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$")
 TOP_ITEM = re.compile(r"^(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
-CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
-LINK = re.compile(r"\]\(<?([^)<>\s]+)>?(?:\s+[^)]*)?\)")
+CODE_SPAN = re.compile(r"(?<!`)(?P<ticks>`+)(?!`)(?P<code>.+?)(?<!`)(?P=ticks)(?!`)", re.DOTALL)
+MARKDOWN_TOKEN = re.compile(
+    r"(?P<fence>^ {0,3}(?:`{3,}|~{3,}))[^\n]*$|" + CODE_SPAN.pattern + r"|<!--",
+    re.MULTILINE | re.DOTALL,
+)
 # A bare path, identifier, flag or call names code; it does not restate it.
 POINTER_SHAPE = re.compile(r"[\w.:/@+\[\]-]+(?:\(\))?")
 CODE_SHAPE = re.compile(r"[=\{\}\"']|\w\(.+\)|\s")
@@ -124,7 +128,7 @@ def added_lines(diff: str) -> dict[str, set[int]]:
     """Line numbers, in the new text, of each record line a zero-context diff adds."""
     added: dict[str, set[int]] = {}
     current: set[int] | None = None
-    for line in diff.splitlines()[: MAX_LINES * 10]:
+    for line in limited(diff.splitlines(), MAX_LINES * 10, "diff line limit"):
         if line.startswith("+++ "):
             name = line[4:].removeprefix("b/")
             current = added.setdefault(name, set()) if RECORD.fullmatch(name) else None
@@ -138,7 +142,9 @@ def added_lines(diff: str) -> dict[str, set[int]]:
 
 def read_tree(root: Path) -> Tree:
     """Tracked paths, the text of tracked source outside docs/ and Markdown, and test names."""
-    paths = [p for p in git(root, "ls-files", "-z").split("\0") if p][:MAX_FILES]
+    paths = limited(
+        [p for p in git(root, "ls-files", "-z").split("\0") if p], MAX_FILES, "tracked file limit"
+    )
     texts, tests = [], set()
     for name in paths:
         if name.startswith("docs/") or name.endswith(".md"):
@@ -151,17 +157,34 @@ def read_tree(root: Path) -> Tree:
 
 
 def _source_text(path: Path) -> str:
-    """A tracked file's text; binary, missing or oversized files hold no source."""
+    """A tracked file's text; binary and missing files hold no source, oversize is an error."""
     try:
         data = path.read_bytes()
     except (FileNotFoundError, IsADirectoryError):
         return ""
     if len(data) > MAX_SOURCE_BYTES:
-        return ""
+        raise ciwf.ReadError(f"{path}: source byte limit {MAX_SOURCE_BYTES} exceeded")
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return ""
+
+
+def limited(items: list[str], bound: int, label: str) -> list[str]:
+    """Refuse a partial judgment instead of silently truncating the input."""
+    if len(items) > bound:
+        raise ciwf.ReadError(f"{label} {bound} exceeded")
+    return items
+
+
+def record_text(path: Path) -> str:
+    """Read one record under the line limit, with a contextual input error."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as err:
+        raise ciwf.ReadError(f"{path}: {err}") from err
+    limited(text.splitlines(), MAX_LINES, "record line limit")
+    return text
 
 
 def _breaks_block(line: str) -> bool:
@@ -169,9 +192,14 @@ def _breaks_block(line: str) -> bool:
     return not line.strip() or bool(HEADING.match(line)) or bool(TOP_ITEM.match(line))
 
 
+def _closing_fence(fence: str) -> re.Pattern[str]:
+    """The opening character, at least as many, then only blanks, at a line boundary."""
+    return re.compile(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$", re.MULTILINE)
+
+
 def _closes(line: str, fence: str) -> bool:
     """A closing fence: the opening character, at least as many, then only blanks."""
-    return bool(re.match(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$", line))
+    return bool(_closing_fence(fence).fullmatch(line))
 
 
 def _section(line: str, section: str) -> str:
@@ -182,11 +210,31 @@ def _section(line: str, section: str) -> str:
     return section
 
 
+def visible_text(text: str) -> str:
+    """Mask HTML comments, preserving positions and literal comment markers inside code."""
+    masked, position = list(text), 0
+    for _ in range(len(text) + 1):
+        token = MARKDOWN_TOKEN.search(text, position)
+        if token is None:
+            break
+        position = token.end()
+        if token.group("fence"):
+            closing = _closing_fence(token.group("fence").strip()).search(text, position)
+            position = closing.end() if closing else len(text)
+        elif token.group() == "<!--":
+            closing = text.find("-->", position)
+            position = closing + 3 if closing >= 0 else len(text)
+            start = token.start()
+            masked[start:position] = ["\n" if c == "\n" else " " for c in text[start:position]]
+    return "".join(masked)
+
+
 def blocks(text: str) -> list[Block]:
     """Split a record into blocks, each with its `## ` section and first line number."""
     found: list[Block] = []
     section, current, fence = "", None, ""
-    for number, line in enumerate(text.splitlines()[:MAX_LINES], start=1):
+    lines = limited(text.splitlines(), MAX_LINES, "record line limit")
+    for number, line in enumerate(visible_text("\n".join(lines)).splitlines(), start=1):
         if fence:
             current.lines.append(line)
             if _closes(line, fence):
@@ -213,7 +261,7 @@ def code_spans(text: str) -> list[str]:
     """Code span contents, one surrounding space stripped as CommonMark does, newlines as spaces."""
     spans = []
     for match in CODE_SPAN.finditer(text):
-        body = match.group(2).replace("\n", " ")
+        body = match.group("code").replace("\n", " ")
         if len(body) > 2 and body.startswith(" ") and body.endswith(" ") and body.strip():
             body = body[1:-1]
         spans.append(body)
@@ -242,9 +290,11 @@ def points_somewhere(block: Block, record: str, tree: Tree) -> bool:
         head = span.split()[0] if span.split() else ""
         if head in COMMANDS or _tracked(head, tree):
             return True
-        if TEST_NAME.fullmatch(head) and head in tree.tests:
+        test = head.removesuffix("()")
+        if TEST_NAME.fullmatch(test) and test in tree.tests:
             return True
-    for destination in LINK.findall(CODE_SPAN.sub("", block.text)):
+    for link in INLINE_LINK.finditer(CODE_SPAN.sub("", block.text)):
+        destination = link.group(1) or link.group(2)
         if destination.startswith(("https://", "http://")):
             return True
         target = posixpath.normpath(posixpath.join(posixpath.dirname(record), destination))
@@ -253,9 +303,14 @@ def points_somewhere(block: Block, record: str, tree: Tree) -> bool:
     return False
 
 
+def _link_label(match: re.Match[str]) -> str:
+    """Keep numeric prose in a label while removing its link destination."""
+    return match.group().split("](", 1)[0]
+
+
 def states_number(block: Block) -> bool:
     """A digit outside code spans and links, once dates, record names and list numbers are out."""
-    prose = LINK.sub("]", CODE_SPAN.sub("", block.text))
+    prose = INLINE_LINK.sub(_link_label, CODE_SPAN.sub("", block.text))
     return bool(DIGIT.search(UNCOUNTED_NUMBERS.sub("", prose)))
 
 
@@ -278,7 +333,7 @@ def judge(record: str, block: Block, tree: Tree) -> list[str]:
         f"{record}:{block.start}: restated code, cite the file instead: `{text[:80]}`"
         for text in restated(block, tree)
     ]
-    if block.fenced or not block.section or block.text.lstrip().startswith("<!--"):
+    if block.fenced:
         return problems
     claim = block.section in CLAIM_SECTIONS or (
         block.section not in UNCOUNTED_SECTIONS and states_number(block)
@@ -291,18 +346,26 @@ def judge(record: str, block: Block, tree: Tree) -> list[str]:
     return problems
 
 
+def changed_records(root: Path, base: str) -> dict[str, set[int]]:
+    """Changed tracked lines plus local new records, which git diff does not show."""
+    changed = added_lines(git(root, *DIFF, base, "--", "docs/adr"))
+    untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", "docs/adr")
+    for name in limited(untracked.rstrip("\0").split("\0"), MAX_FILES, "new file limit"):
+        if RECORD.fullmatch(name):
+            count = len(record_text(root / name).splitlines())
+            changed[name] = set(range(1, count + 1))
+    return changed
+
+
 def check_records(root: Path, base_ref: str) -> tuple[list[str], int, int]:
     """Findings, changed record count and judged block count against the merge base of base_ref."""
     base = merge_base(root, base_ref)
-    diff = git(root, *DIFF, base, "--", "docs/adr")
-    changed = added_lines(diff)
+    changed = changed_records(root, base)
     tree = read_tree(root) if changed else Tree(frozenset(), "", frozenset())
     problems, judged = [], 0
-    for record, lines in sorted(changed.items())[:MAX_FILES]:
-        try:
-            text = (root / record).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as err:
-            raise ciwf.ReadError(f"{record}: {err}") from err
+    for record in limited(sorted(changed), MAX_FILES, "changed file limit"):
+        lines = changed[record]
+        text = record_text(root / record)
         for block in blocks(text):
             if any(block.start <= number <= block.end for number in lines):
                 judged += 1
