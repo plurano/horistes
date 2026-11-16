@@ -1489,6 +1489,8 @@ def re_arm_forced(env, conf, repo, served, held, notes):
         detail = forced_arm_history(env, pull, notes)
         if not detail or not forced_disarm(pull, detail["timelineItems"]["nodes"], conf):
             continue
+        if late_review_hold(env, conf, pull, notes):
+            continue
         try:
             arm(env, conf, pull)
         except RefusedError as err:

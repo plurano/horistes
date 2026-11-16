@@ -43,6 +43,12 @@ order: unarmed rows outside `held`, with exactly `merge state BLOCKED` or
 reasons are ineligible. The recovery path must also honor unanswered review
 bodies and incomplete reviews under
 [ADR-0090](0090-the-train-holds-on-an-incomplete-review.md).
+The step reads review bodies just before arming and holds as landing does
+(`test_forced_rearm_review_hold_stays_off[findings]`,
+`test_forced_rearm_review_hold_stays_off[incomplete]`,
+`test_forced_rearm_review_hold_continues_to_second_candidate` and
+`test_forced_rearm_review_read_failure_holds`); dependency bot pull requests
+retain the existing `late_review_hold` exemption.
 
 A history head differing from the page head waits for another sweep. Otherwise
 `arm` sends the page's head oid as the expected head and rebuilds the signed
@@ -60,8 +66,11 @@ No permission or credential configuration changes are needed.
 ## Consequences
 
 At most `REARM_READS = 5` candidates have their arm history read per repository
-per sweep. One arm attempt ends the sweep, preserving the train's one-write
-scheduling policy; a failed attempt may also post its diagnostic comment.
+per sweep, with at most one review-body read for each qualifying candidate:
+at most ten history and review-body reads in the recovery step
+(`test_forced_rearm_review_read_budget`). One arm attempt ends the sweep,
+preserving the train's one-write scheduling policy; a failed attempt may also
+post its diagnostic comment.
 The bounded timeline requires positive evidence inside its window, and comment
 deduplication applies to the last 20 comments. A later push provides a new head
 and a new failure marker.

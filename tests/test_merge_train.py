@@ -10526,6 +10526,47 @@ def test_forced_rearm_review_hold_stays_off(tmp_path, incomplete):
         assert INCOMPLETE_3507 in summary
 
 
+def test_forced_rearm_review_hold_continues_to_second_candidate(tmp_path):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 7))))
+    forge.arm_histories = {n: arm_history(n) for n in range(1, 7)}
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(101, "coderabbitai", "Nitpick comments: 1")]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(2)]
+    assert forge.arm_history_calls == [1, 2]
+    assert forge.review_body_calls == [1, 2]
+    assert "| #1 | BLOCKED | review body: coderabbitai review 101 has findings" in summary
+    assert "| #2 | BLOCKED | re-armed: auto-merge came off after a bot force push" in summary
+
+
+def test_forced_rearm_review_read_failure_holds(tmp_path):
+    forge = forced_forge()
+    forge.review_refusals[1] = "Review unavailable"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.arm_history_calls == [1]
+    assert forge.review_body_calls == [1]
+    assert "| #1 | BLOCKED | review body: cannot read:" in summary
+    assert "Review unavailable" in summary
+
+
+def test_forced_rearm_review_read_budget(tmp_path):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 7))))
+    forge.arm_histories = {n: arm_history(n) for n in range(1, 7)}
+    detail = _detail(reviews=[_bot_review(101, "coderabbitai", "Nitpick comments: 1")])
+    forge.review_details = dict.fromkeys(range(1, 7), detail)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.arm_history_calls == [1, 2, 3, 4, 5]
+    assert forge.review_body_calls == [1, 2, 3, 4, 5]
+    assert "| #5 | BLOCKED | review body: coderabbitai review 101 has findings" in summary
+    assert "| #6 | BLOCKED | merge state BLOCKED |" in summary
+
+
 @pytest.mark.parametrize(
     "items",
     [
