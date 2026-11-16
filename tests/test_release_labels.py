@@ -1526,11 +1526,111 @@ def test_workflow_files_read_repository_once(tmp_path, forge):
     assert forge.repo_reads == 1
 
 
+REVIEW_FILTER_CASES = [
+    pytest.param('"branches": [main]', True, id="double-quoted-branch"),
+    pytest.param("branches : [main]", True, id="spaced-branch"),
+    pytest.param("'branches': [main]", True, id="single-quoted-branch"),
+    pytest.param("types: [x]", True, id="unknown-key"),
+    pytest.param("not-a-mapping", True, id="unparsed-child"),
+    pytest.param("\"branches': [main]", True, id="mismatched-key-quotes"),
+    pytest.param('"branches": [dev]', False, id="quoted-other-branch"),
+    pytest.param("paths: [src/**]", False, id="paths-with-tags-only"),
+    pytest.param("'paths-ignore' : [src/**]", False, id="quoted-paths-with-tags-only"),
+]
+
+
+@pytest.mark.parametrize(("filters", "skip"), REVIEW_FILTER_CASES)
+def test_review_push_filter_keys(tmp_path, forge, filters, skip):
+    """Every child key is understood or keeps the push counting as unknown."""
+    forge.config = {}
+    forge.workflows = {
+        "release.yml": push_workflow(f"on:\n  push:\n    {filters}\n    tags: ['v*']")
+    }
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip={str(skip).lower()}\npending=[]\nfrozen=false\n"
+
+
+def window_push_workflow(closed: bool, compact: bool = False) -> str:
+    """Place the release job before on: and the branch admission at the window boundary."""
+    prefix = "name: Release\njobs:\n" + PLANTED_WORKFLOW.split("jobs:\n", 1)[1]
+    item_indent = "    " if compact else "      "
+    prefix += f"on:\n  push:\n    branches:\n{item_indent}- dev\n"
+    if closed:
+        prefix += "permissions: {}\n"
+    padding = 5000 - len(prefix.splitlines())
+    suffix = "# after window\n" if closed else f"{item_indent}- main\n"
+    return prefix + "      # padding\n" * padding + suffix
+
+
+@pytest.mark.parametrize("closed", [False, True], ids=["cut", "closed"])
+@pytest.mark.parametrize("compact", [False, True], ids=["ordinary", "compact"])
+def test_review_push_filter_window(tmp_path, forge, closed, compact):
+    """A cut push is unknown; an already closed push still excludes the default branch."""
+    forge.config = {}
+    workflow = window_push_workflow(closed, compact)
+    assert workflow.splitlines()[5000].strip() == ("# after window" if closed else "- main")
+    forge.workflows = {"release.yml": workflow}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip={str(not closed).lower()}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "workflow"),
+    [
+        pytest.param(
+            (
+                (
+                    'if key not in ("branches", "branches-ignore", "tags", "tags-ignore"):\n'
+                    "            return None"
+                ),
+                (
+                    'if key not in ("branches", "branches-ignore", "tags", "tags-ignore"):\n'
+                    "            continue"
+                ),
+            ),
+            push_workflow("on:\n  push:\n    types: [x]\n    tags: ['v*']"),
+            id="unknown-key-refusal",
+        ),
+        pytest.param(
+            ("return None if truncated else events", "return events"),
+            window_push_workflow(False),
+            id="window-cut-refusal",
+        ),
+    ],
+)
+@pytest.mark.parametrize("mutated", [False, True])
+def test_review_push_filter_mutations_flip_planted_oracle(
+    tmp_path, forge, mutation, workflow, mutated
+):
+    """Removing either refusal flips a new planted case away from its fixed oracle."""
+    source = module()
+    assert source.count(mutation[0]) == 1
+    if mutated:
+        source = source.replace(*mutation)
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"release.yml": workflow}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = "skip=true\npending=[]\nfrozen=false\n"
+    if mutated:
+        with pytest.raises(AssertionError):
+            assert outputs == expected
+        assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    else:
+        assert outputs == expected
+
+
 @pytest.mark.parametrize(
     ("mutation", "branch", "filters", "skip"),
     [
         pytest.param(
-            ("return push_runs_on_branch(following, indent, default_branch)", "return True"),
+            (
+                "return push_runs_on_branch(following, indent, default_branch, truncated)",
+                "return True",
+            ),
             "main",
             "branches: [release]",
             False,

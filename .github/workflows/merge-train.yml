@@ -1328,22 +1328,16 @@ jobs:
               return names
 
 
-          def push_lines(lines, push_indent):
-              """Non-comment children of one push event, with their indentation."""
-              block = []
-              for line in lines[:5000]:
-                  clean = re.sub(r"\s+#.*$", "", line).strip()
-                  if not clean or clean.startswith("#"):
-                      continue
-                  indent = len(line) - len(line.lstrip(" "))
+          def push_lines(events, push_indent, truncated):
+              """Push children; None when the window cuts them."""
+              for position, (indent, _) in enumerate(events[:5000]):
                   if indent <= push_indent:
-                      break
-                  block.append((indent, clean))
-              return block
+                      return events[:position]
+              return None if truncated else events
 
 
           def literal_pattern(value, key):
-              """Accept only literal names and stars; YAML indirection stays undecidable."""
+              """A literal name or star pattern, else None."""
               value = value.strip()
               if value.startswith(("&", "*", "!!")):
                   return None
@@ -1356,7 +1350,7 @@ jobs:
 
 
           def sequence_values(following, indent):
-              """Read scalar items until the next filter, accepting compact sequence indentation."""
+              """Block sequence items up to the next filter."""
               values = []
               for level, clean in following[:5000]:
                   if level < indent or (level == indent and not clean.startswith("- ")):
@@ -1368,7 +1362,7 @@ jobs:
 
 
           def filter_patterns(value, following, indent, key):
-              """Read a scalar, flow list or ordinary/compact block sequence, bounded at 200."""
+              """Scalar, flow or block patterns, at most 200."""
               if not value:
                   values = sequence_values(following, indent)
               elif value == "[]":
@@ -1383,20 +1377,26 @@ jobs:
               return None if None in patterns else patterns
 
 
-          def push_filters(lines, indent):
-              """Read only branch/tag filter keys directly beneath this push event."""
-              block = push_lines(lines, indent)
+          def push_filters(events, indent, truncated):
+              """Allow-listed push filters, else None."""
+              block = push_lines(events, indent, truncated)
+              if block is None:
+                  return None
               filters = {}
-              if not block:
-                  return filters
-              child_indent = block[0][0]
+              child_indent = block[0][0] if block else 0
+              sequence = False
               for index, (level, clean) in enumerate(block[:5000]):
-                  if level != child_indent:
+                  if level != child_indent or (sequence and clean.startswith("- ")):
                       continue
-                  match = re.fullmatch(r"(branches|branches-ignore|tags|tags-ignore):\s*(.*)", clean)
+                  match = re.fullmatch(r"""(['"]?)([A-Za-z0-9_-]+)\1\s*:\s*(.*)""", clean)
                   if not match:
+                      return None
+                  key, value = match[2], match[3]
+                  sequence = not value
+                  if key in ("paths", "paths-ignore"):
                       continue
-                  key, value = match.groups()
+                  if key not in ("branches", "branches-ignore", "tags", "tags-ignore"):
+                      return None
                   patterns = filter_patterns(value, block[index + 1 :], child_indent, key)
                   if patterns is None or key in filters:
                       return None
@@ -1405,14 +1405,14 @@ jobs:
 
 
           def branch_matches(pattern, default_branch):
-              """An anchored match: a star stops at slash, a double star crosses it."""
+              """Anchored glob: * stops at a slash, ** crosses it."""
               regex = re.escape(pattern).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
               return re.fullmatch(regex, default_branch) is not None
 
 
-          def push_runs_on_branch(lines, indent, default_branch):
-              """Unknown filters keep counting; decidable filters must admit the default branch."""
-              filters = push_filters(lines, indent)
+          def push_runs_on_branch(events, indent, default_branch, truncated):
+              """Whether push admits the default branch; unknown filters count."""
+              filters = push_filters(events, indent, truncated)
               if filters is None or {"branches", "branches-ignore"} <= filters.keys():
                   return True
               if "branches" in filters:
@@ -1426,22 +1426,22 @@ jobs:
               return not ({"tags", "tags-ignore"} & filters.keys())
 
 
-          def allowed_event(clean, following, indent, default_branch):
-              """Read a block event key or compact event list, leaving inline values undecided."""
+          def allowed_event(clean, following, indent, default_branch, truncated):
+              """Whether one event entry admits the default branch."""
               key_m = re.match(r"^([a-zA-Z0-9_-]+):\s*(.*)", clean)
               if key_m:
                   name, value = key_m.groups()
                   if name == "push" and not value:
-                      return push_runs_on_branch(following, indent, default_branch)
+                      return push_runs_on_branch(following, indent, default_branch, truncated)
                   return name in ALLOWED_TRIGGERS
               seq_m = re.match(r"^-\s*([a-zA-Z0-9_-]+)", clean)
               return bool(seq_m and seq_m.group(1) in ALLOWED_TRIGGERS)
 
 
           def trigger_lines(lines):
-              """Yield event candidates outside comments and YAML block scalar bodies."""
+              """Event candidates outside comments and block scalars."""
               block_indent = None
-              for index, line in enumerate(lines[:5000]):
+              for line in lines[:5000]:
                   clean = line.strip()
                   if not clean:
                       continue
@@ -1453,33 +1453,33 @@ jobs:
                       continue
                   if BLOCK_SCALAR_RE.search(line):
                       block_indent = indent
-                  yield index, indent, re.sub(r"\s+#.*$", "", clean).strip()
+                  yield indent, re.sub(r"\s+#.*$", "", clean).strip()
 
 
-          def block_has_allowed_trigger(events, lines, default_branch):
-              """Check direct event keys until the next top-level workflow section."""
-              on_indent = None
-              for index, indent, clean in events[:5000]:
+          def block_has_allowed_trigger(events, default_branch, truncated):
+              """Direct event keys until the next top-level key."""
+              on_indent = events[0][0] if events else 0
+              for position, (indent, clean) in enumerate(events[:5000]):
                   if indent == 0:
                       return False
-                  if on_indent is None:
-                      on_indent = indent
-                  if indent == on_indent and allowed_event(clean, lines[index + 1 :], indent, default_branch):
+                  if indent == on_indent and allowed_event(
+                      clean, events[position + 1 :], indent, default_branch, truncated
+                  ):
                       return True
               return False
 
 
           def workflow_has_allowed_trigger(content, default_branch):
-              """Whether top-level on: includes an event admitting the default branch."""
-              lines = content.splitlines()[:5000]
+              """Whether top-level on: admits the default branch."""
+              lines = content.splitlines()
               events = list(trigger_lines(lines))
-              for position, (_, indent, clean) in enumerate(events[:5000]):
+              for position, (indent, clean) in enumerate(events[:5000]):
                   if indent != 0 or not re.match(r"^on:\s*(.*)$", clean):
                       continue
                   rest = clean.split(":", 1)[1].strip()
                   if rest:
                       return any(t in ALLOWED_TRIGGERS for t in inline_triggers(rest))
-                  return block_has_allowed_trigger(events[position + 1 :], lines, default_branch)
+                  return block_has_allowed_trigger(events[position + 1 :], default_branch, len(lines) > 5000)
               return False
 
 
@@ -1620,24 +1620,12 @@ jobs:
 
 
           def read_default_branch(api_url, repo, token):
-              """Read repository metadata once; missing branch data is a call error."""
+              """The default branch; missing data is a call error."""
               _, repository = call(f"{api_url}/repos/{repo}", token, method="GET")
               default_branch = repository.get("default_branch") if isinstance(repository, dict) else None
               if not isinstance(default_branch, str) or not default_branch:
                   raise CallError("repository default_branch must be a non-empty string")
               return default_branch
-
-
-          def read_workflow_content(api_url, repo, token, entry):
-              """Read and decode one workflow through the existing bounded contents request."""
-              name = entry["name"]
-              url = f"{api_url}/repos/{repo}/contents/.github/workflows/{name}"
-              _, data = call(entry.get("url") or url, token, method="GET")
-              raw = data.get("content", "") if isinstance(data, dict) else ""
-              try:
-                  return base64.b64decode(raw).decode("utf-8")
-              except ValueError as err:
-                  raise CallError(f"decode {name}: {err}") from err
 
 
           def reads_own_release(api_url, repo, token):
@@ -1667,7 +1655,12 @@ jobs:
               contents = {}
               for entry in workflows[:100]:
                   name = entry["name"]
-                  contents[name] = read_workflow_content(api_url, repo, token, entry)
+                  _, data = call(entry.get("url") or f"{url}/{name}", token, method="GET")
+                  raw = data.get("content", "") if isinstance(data, dict) else ""
+                  try:
+                      contents[name] = base64.b64decode(raw).decode("utf-8")
+                  except ValueError as err:
+                      raise CallError(f"decode {name}: {err}") from err
               local = local_release_workflows(contents)
               for name, content in contents.items():
                   if workflow_runs_release(content, local, default_branch):
