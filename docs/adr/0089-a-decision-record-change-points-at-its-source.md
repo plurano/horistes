@@ -27,13 +27,21 @@ in `tests/test_records.py` verifies.
 `tools/records.py` judges blocks containing added or changed lines against the
 merge base of HEAD and `BASE_REF`, which defaults to `origin/main`. A block is
 a paragraph, a top-level list item with its continuation lines, or a fenced
-block. A changed line binds its whole block; untouched blocks stay unjudged,
+block. Indented paragraphs and subitems after blank lines stay in their list
+item, as `test_planted_list_item_holds_nested_paragraph` verifies in
+`tests/test_records.py`. A changed line binds its whole block; untouched blocks stay unjudged,
 as `test_untouched_blocks_of_an_accepted_record_stay_unjudged` verifies.
 Local new records are judged before staging too, as
 `test_planted_untracked_new_record_is_judged` verifies in `tests/test_records.py`.
 
 `tools/records.py` reads changed names through NUL-delimited Git output and
-reads added line ranges from each literal path's diff with pinned prefixes.
+counts added lines in each literal path's diff with pinned prefixes. Text
+conversion is disabled so the diff uses the record's line coordinates;
+`test_planted_textconv_cannot_shift_record_lines` verifies this boundary.
+Inter-hunk context is disabled too, and context lines never count as added,
+as `test_planted_interhunk_context_judges_only_edits` and
+`test_planted_hunk_body_excludes_context_and_deleted_lines` verify in
+`tests/test_records.py`.
 User prefix settings and quoted Unicode paths cannot hide a changed record;
 `test_planted_user_diff_prefix_cannot_hide_a_record`,
 `test_planted_quoted_unicode_record_is_judged` and
@@ -45,6 +53,19 @@ line. `tools/records.py` compares substantive snippets with tracked source
 outside Markdown and `docs/`; bare paths, identifiers and commands name the
 source instead. The span and fence cases in `tests/test_records.py` hold this
 rule; HTML comments contribute neither claims nor pointers.
+
+`tools/records.py` reads only regular files, with a byte bound shared by
+sources and records before decoding. Missing or non-text sources contribute
+no text; non-regular records are input errors. The bounded-child symlink cases
+in `test_planted_device_symlinks_are_not_read`, the read-size spy in
+`test_planted_reader_caps_each_read` and the size boundaries in
+`test_planted_reader_byte_limit` and `test_reader_byte_limit_boundary` verify
+these guarantees in `tests/test_records.py`.
+
+`tools/records.py` forces textual diffs for records, refuses binary summaries
+and treats invalid UTF-8 as an input error. Attributes cannot silently hide a
+changed record; `test_planted_binary_attribute_cannot_hide_record` and
+`test_planted_binary_summary_fails_closed` verify this in `tests/test_records.py`.
 
 Claim paragraphs under Decision or Consequences require a pointer. Numeric
 claims outside References require one too; dates, ADR identifiers, list

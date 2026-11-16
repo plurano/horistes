@@ -23,8 +23,10 @@ Exit codes: 0 pass, 1 finding, 3 file or git error; a base with no merge base is
 from __future__ import annotations
 
 import argparse
+import os
 import posixpath
 import re
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -39,7 +41,7 @@ DEADLINE_SECONDS = 30
 # Records held 88 files and the tree 640 tracked files on 2026-11-16.
 MAX_FILES = 20_000
 MAX_LINES = 20_000
-MAX_SOURCE_BYTES = 1_000_000
+MAX_SOURCE_BYTES = 1_000_000  # Also bounds records before decoding or counting their lines.
 # The shortest span the reviewed record restated (`CLOCK_SKEW_MINUTES = 5`) has 22 characters.
 MIN_RESTATED_CHARS = 20
 # The command surfaces the agent instructions name as verification commands.
@@ -48,7 +50,17 @@ CLAIM_SECTIONS = ("Decision", "Consequences")
 UNCOUNTED_SECTIONS = ("References",)
 
 # Against the work tree, so a local run judges uncommitted records too.
-DIFF = ("diff", "--unified=0", "--no-renames", "--no-color", "--no-ext-diff", "--default-prefix")
+DIFF = (
+    "diff",
+    "--unified=0",
+    "--inter-hunk-context=0",
+    "--no-renames",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--text",
+    "--default-prefix",
+)
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$")
@@ -128,11 +140,16 @@ def merge_base(root: Path, ref: str) -> str:
 def added_lines(diff: str) -> set[int]:
     """Added line numbers from one literal record's diff, independent of path headers."""
     added: set[int] = set()
+    number = None
     for line in limited(diff.splitlines(), MAX_LINES * 10, "diff line limit"):
         hunk = HUNK.match(line)
         if hunk:
-            first, count = int(hunk.group(1)), int(hunk.group(2) or "1")
-            added.update(range(first, first + count))
+            number = int(hunk.group(1))
+        elif number is not None and line.startswith("+"):
+            added.add(number)
+            number += 1
+        elif number is not None and line.startswith(" "):
+            number += 1
     return added
 
 
@@ -153,17 +170,34 @@ def read_tree(root: Path) -> Tree:
 
 
 def _source_text(path: Path) -> str:
-    """A tracked file's text; binary and missing files hold no source, oversize is an error."""
+    """Regular tracked text only; missing, binary and non-regular files hold no source."""
+    return _bounded_text(path, source=True)
+
+
+def _bounded_text(path: Path, *, source: bool = False) -> str:
+    """Read regular UTF-8 files under a byte limit; only sources may hold no text."""
     try:
-        data = path.read_bytes()
-    except (FileNotFoundError, IsADirectoryError):
-        return ""
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            if source:
+                return ""
+            raise ciwf.ReadError(f"{path}: record is not a regular file")
+        with path.open("rb") as stream:
+            data = stream.read(MAX_SOURCE_BYTES + 1)
+    except FileNotFoundError as err:
+        if source:
+            return ""
+        raise ciwf.ReadError(f"{path}: {err}") from err
+    except OSError as err:
+        raise ciwf.ReadError(f"{path}: {err}") from err
+    kind = "source" if source else "record"
     if len(data) > MAX_SOURCE_BYTES:
-        raise ciwf.ReadError(f"{path}: source byte limit {MAX_SOURCE_BYTES} exceeded")
+        raise ciwf.ReadError(f"{path}: {kind} byte limit {MAX_SOURCE_BYTES} exceeded")
     try:
         return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return ""
+    except UnicodeDecodeError as err:
+        if source:
+            return ""
+        raise ciwf.ReadError(f"{path}: {err}") from err
 
 
 def limited(items: list[str], bound: int, label: str) -> list[str]:
@@ -174,18 +208,19 @@ def limited(items: list[str], bound: int, label: str) -> list[str]:
 
 
 def record_text(path: Path) -> str:
-    """Read one record under the line limit, with a contextual input error."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as err:
-        raise ciwf.ReadError(f"{path}: {err}") from err
+    """Read one regular record under byte and line limits, with contextual input errors."""
+    text = _bounded_text(path)
     limited(text.splitlines(), MAX_LINES, "record line limit")
     return text
 
 
-def _breaks_block(line: str) -> bool:
-    """A blank line, heading or top-level list item ends the block before it."""
-    return not line.strip() or bool(HEADING.match(line)) or bool(TOP_ITEM.match(line))
+def _breaks_block(line: str, current: Block | None, number: int) -> bool:
+    """Headings and items start blocks; after blanks only indented item lines continue."""
+    if HEADING.match(line) or TOP_ITEM.match(line):
+        return True
+    if current is None or number == current.end + 1:
+        return False
+    return not (TOP_ITEM.match(current.lines[0]) and line.startswith((" ", "\t")))
 
 
 def _closing_fence(fence: str) -> re.Pattern[str]:
@@ -196,6 +231,14 @@ def _closing_fence(fence: str) -> re.Pattern[str]:
 def _closes(line: str, fence: str) -> bool:
     """A closing fence: the opening character, at least as many, then only blanks."""
     return bool(_closing_fence(fence).fullmatch(line))
+
+
+def _fenced_line(current: Block, line: str, fence: str) -> tuple[str, Block | None]:
+    """Append a literal fenced line and clear the active block at its closing fence."""
+    current.lines.append(line)
+    if _closes(line, fence):
+        return "", None
+    return fence, current
 
 
 def _section(line: str, section: str) -> str:
@@ -230,11 +273,10 @@ def blocks(text: str) -> list[Block]:
     found: list[Block] = []
     section, current, fence = "", None, ""
     lines = limited(text.splitlines(), MAX_LINES, "record line limit")
-    for number, line in enumerate(visible_text("\n".join(lines)).splitlines(), start=1):
+    lines = visible_text("\n".join(lines)).splitlines()
+    for number, line in enumerate(lines, start=1):
         if fence:
-            current.lines.append(line)
-            if _closes(line, fence):
-                fence, current = "", None
+            fence, current = _fenced_line(current, line, fence)
             continue
         opened = FENCE.match(line)
         if opened:
@@ -242,14 +284,16 @@ def blocks(text: str) -> list[Block]:
             found.append(current)
             continue
         section = _section(line, section)
-        if _breaks_block(line):
+        if not line.strip():
+            continue
+        if _breaks_block(line, current, number):
             current = None
-        if not line.strip() or HEADING.match(line):
+        if HEADING.match(line):
             continue
         if current is None:
             current = Block(section, number)
             found.append(current)
-        current.lines.append(line)
+        current.lines.extend(lines[current.end : number])
     return found
 
 
@@ -354,6 +398,10 @@ def changed_records(root: Path, base: str) -> dict[str, set[int]]:
         diff_lines += len(diff.splitlines())
         if diff_lines > MAX_LINES * 10:
             raise ciwf.ReadError(f"diff line limit {MAX_LINES * 10} exceeded")
+        if any(
+            line.startswith(("Binary files ", "GIT binary patch")) for line in diff.splitlines()
+        ):
+            raise ciwf.ReadError(f"{name}: binary record diff")
         lines = added_lines(diff)
         if lines:
             changed[name] = lines

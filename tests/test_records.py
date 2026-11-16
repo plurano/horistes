@@ -8,7 +8,12 @@ would, and runs the check against the base, as CI does with BASE_REF.
 
 from __future__ import annotations
 
+import importlib.util
+import io
+import shlex
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import records
@@ -453,14 +458,15 @@ def test_planted_untracked_new_record_is_judged(repo):
 @pytest.mark.parametrize("new_count", ["0", "1", ""])
 def test_boundary_diff_hunk_counts(new_count):
     suffix = "," + new_count if new_count else ""
-    diff = f"+++ b/{OLD}\n@@ -12,2 +12{suffix} @@\n"
+    body = "-old\n-other\n" + ("" if new_count == "0" else "+new\n")
+    diff = f"+++ b/{OLD}\n@@ -12,2 +12{suffix} @@\n{body}"
     expected = set() if new_count == "0" else {12}
     assert records.added_lines(diff) == expected
 
 
 def test_boundary_diff_dev_null_clears_the_record():
-    added = f"+++ b/{OLD}\n@@ -1 +1 @@\n"
-    diff = f"--- a/{OLD}\n+++ /dev/null\n@@ -1,3 +0,0 @@\n"
+    added = f"+++ b/{OLD}\n@@ -1 +1 @@\n-old\n+new\n"
+    diff = f"--- a/{OLD}\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-one\n-two\n-three\n"
     assert records.added_lines(added) == {1}
     assert records.added_lines(diff) == set()
 
@@ -626,3 +632,182 @@ def test_a_diverged_base_is_compared_through_its_merge_base(repo):
     done = change(repo, {NEW: NEW_RECORD})
     assert done.returncode == 0, done.stderr
     assert "1 decision record(s) changed against main, 5 changed block(s) judged" in done.stdout
+
+
+def test_planted_textconv_cannot_shift_record_lines(repo):
+    script = (
+        "import pathlib,sys; sys.stdout.write(''.join("
+        "pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines(True)[10:]))"
+    )
+    repo.git("config", "diff.strip.textconv", shlex.join([sys.executable, "-c", script]))
+    repo.write({".gitattributes": "docs/adr/*.md diff=strip\n"})
+    done = change(repo, {OLD: OLD_RECORD.replace("three times", "four times")})
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert failures(done) == [f"FAIL: {OLD}:12: claim under 'Decision' {NO_POINTER}"]
+
+
+@pytest.mark.parametrize("edit_claim", [False, True], ids=["untouched", "edited"])
+def test_planted_interhunk_context_judges_only_edits(repo, edit_claim):
+    repo.git("config", "diff.interHunkContext", "100")
+    text = OLD_RECORD.replace("Accepted", "Proposed") + f"\n{POINTED}\n"
+    if edit_claim:
+        text = text.replace("three times", "four times")
+    done = change(repo, {OLD: text})
+    assert done.returncode == (1 if edit_claim else 0), done.stdout + done.stderr
+    if edit_claim:
+        assert failures(done) == [f"FAIL: {OLD}:12: claim under 'Decision' {NO_POINTER}"]
+    else:
+        assert "2 changed block(s) judged" in done.stdout
+
+
+def test_planted_hunk_body_excludes_context_and_deleted_lines():
+    diff = (
+        "--- a/record\n+++ b/record\n@@ -10,3 +10,5 @@\n"
+        "-removed\n+added\n unchanged\n+another\n\\ No newline at end of file\n"
+        " unchanged too\n+last\n@@ -20 +21,0 @@\n-deleted\n"
+    )
+    assert records.added_lines(diff) == {10, 12, 14}
+
+
+def limited_record_check(repo):
+    """Run potentially endless reads only in a time- and address-space-limited child."""
+    if not Path("/dev/zero").exists() or importlib.util.find_spec("resource") is None:
+        pytest.skip("requires /dev/zero and the resource module for a bounded child")
+    script = (
+        "import resource,sys; "
+        "resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024)); "
+        "sys.path.insert(0, sys.argv[1]); import records; "
+        "sys.exit(records.main(['check', '--root', sys.argv[2], '--base-ref', 'main']))"
+    )
+    return subprocess.run(
+        [sys.executable, "-B", "-c", script, str(ROOT / "tools"), str(repo.root)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("kind", ["source", "record"])
+def test_planted_device_symlinks_are_not_read(repo, kind):
+    if not Path("/dev/zero").exists() or importlib.util.find_spec("resource") is None:
+        pytest.skip("requires /dev/zero and the resource module for a bounded child")
+    repo.git("checkout", "-q", "-b", "topic")
+    repo.write({NEW: NEW_RECORD})
+    name = "tools/zero" if kind == "source" else NEW
+    path = repo.root / name
+    if path.exists():
+        path.unlink()
+    path.symlink_to("/dev/zero")
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "device symlink")
+    done = limited_record_check(repo)
+    assert done.returncode == (0 if kind == "source" else 3), done.stdout + done.stderr
+    assert ("PASS: 1 decision record(s) changed" if kind == "source" else "ERROR:") in (
+        done.stdout + done.stderr
+    )
+    assert "Traceback" not in done.stderr
+
+
+@pytest.mark.parametrize("reader", ["_source_text", "record_text"])
+def test_planted_reader_caps_each_read(tmp_path, monkeypatch, reader):
+    path = tmp_path / "regular"
+    path.write_bytes(b"text")
+    requested = []
+
+    class ReadSpy(io.BytesIO):
+        def read(self, size=-1):
+            requested.append(size)
+            assert 0 <= size <= records.MAX_SOURCE_BYTES + 1
+            return super().read(size)
+
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: ReadSpy(b"text"))
+    assert getattr(records, reader)(path) == "text"
+    assert requested == [records.MAX_SOURCE_BYTES + 1]
+
+
+@pytest.mark.parametrize("reader", ["_source_text", "record_text"])
+def test_planted_reader_byte_limit(tmp_path, reader):
+    path = tmp_path / "regular"
+    path.write_bytes(b"x" * (records.MAX_SOURCE_BYTES + 1))
+    with pytest.raises(records.ciwf.ReadError, match=f"byte limit {records.MAX_SOURCE_BYTES}"):
+        getattr(records, reader)(path)
+
+
+@pytest.mark.parametrize("reader", ["_source_text", "record_text"])
+def test_reader_byte_limit_boundary(tmp_path, reader):
+    path = tmp_path / "regular"
+    path.write_bytes(b"x" * records.MAX_SOURCE_BYTES)
+    assert len(getattr(records, reader)(path)) == records.MAX_SOURCE_BYTES
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "binary"])
+def test_reader_unsupported_source_is_empty_and_record_errors(tmp_path, kind):
+    path = tmp_path / "input"
+    if kind == "directory":
+        path.mkdir()
+    elif kind == "binary":
+        path.write_bytes(b"\xff")
+    assert records._source_text(path) == ""
+    with pytest.raises(records.ciwf.ReadError):
+        records.record_text(path)
+
+
+@pytest.mark.parametrize(
+    "nested", ["  See `tools/app.py`.", "  - See `tools/app.py`.", "\tSee `tools/app.py`."]
+)
+def test_planted_list_item_holds_nested_paragraph(repo, nested):
+    text = NEW_RECORD.replace(POINTED, "- The app waits.\n\n" + nested)
+    done = change(repo, {NEW: text})
+    assert done.returncode == 0, done.stdout + done.stderr
+    item = next(block for block in records.blocks(text) if block.start == 12)
+    assert item.lines == ["- The app waits.", "", nested]
+    assert item.end == 14
+
+
+def test_list_item_blank_before_unindented_claim_starts_new_block(repo):
+    text = NEW_RECORD.replace(POINTED, "- See `tools/app.py`.\n\nThe app waits.")
+    done = change(repo, {NEW: text})
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert failures(done) == [f"FAIL: {NEW}:14: claim under 'Decision' {NO_POINTER}"]
+
+
+@pytest.mark.parametrize("next_line", ["plain", "- next", "## Context", "  ## Context", "  ```"])
+def test_list_item_does_not_hold_trailing_blanks(next_line):
+    found = records.blocks("## Decision\n\n- item\n\n\n" + next_line + "\n")
+    assert found[0].lines == ["- item"]
+    assert found[0].end == 3
+    assert found[1].start == 6 if len(found) > 1 else next_line.lstrip().startswith("##")
+
+
+def test_paragraph_blank_still_starts_new_block():
+    found = records.blocks("## Decision\n\nplain\n\n  nested\n\n")
+    assert [(block.start, block.end) for block in found] == [(3, 3), (5, 5)]
+
+
+@pytest.mark.parametrize("binary_attribute", [False, True], ids=["normal", "minus-diff"])
+@pytest.mark.parametrize("invalid", [False, True], ids=["claim", "invalid-utf8"])
+def test_planted_binary_attribute_cannot_hide_record(repo, binary_attribute, invalid):
+    if binary_attribute:
+        repo.write({".gitattributes": "docs/adr/*.md -diff\n"})
+    path = repo.root / NEW
+    path.write_bytes(b"\xff" if invalid else NEW_RECORD.replace(POINTED, UNPOINTED).encode())
+    done = change(repo, {})
+    assert done.returncode == (3 if invalid else 1), done.stdout + done.stderr
+    if invalid:
+        assert "ERROR:" in done.stderr
+        assert "Traceback" not in done.stderr
+    else:
+        assert failures(done) == [f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}"]
+
+
+@pytest.mark.parametrize(
+    "summary", ["Binary files a/record and b/record differ", "GIT binary patch"]
+)
+def test_planted_binary_summary_fails_closed(repo, monkeypatch, summary):
+    def binary_diff(root, *args):
+        return f"{NEW}\0" if "--name-only" in args else summary + "\n"
+
+    monkeypatch.setattr(records, "git", binary_diff)
+    with pytest.raises(records.ciwf.ReadError, match="binary record diff"):
+        records.changed_records(repo.root, "main")
