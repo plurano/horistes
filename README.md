@@ -162,6 +162,8 @@ release creation and has its labels moved once the tag is on the merge commit,
 while a pre-existing release is verified
 ([ADR-0031](docs/adr/0031-the-merge-train-app-runs-release-please.md),
 [ADR-0040](docs/adr/0040-the-merge-train-leaves-a-release-to-its-writer.md)).
+A push trigger counts only when its branch and tag filters admit the default
+branch ([ADR-0088](docs/adr/0088-a-push-trigger-counts-only-for-the-default-branch.md)).
 The app is one public app installed on every account
 of the fleet; its rights are in `apps/merge-train.json`, and a test holds them
 equal to what the train asks the forge for.

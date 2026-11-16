@@ -1328,48 +1328,158 @@ jobs:
               return names
 
 
-          def workflow_has_allowed_trigger(content):
-              """Whether top-level on: includes at least one allowed trigger."""
-              lines = content.splitlines()[:5000]
-              in_on = False
-              on_indent = None
-              block_indent = None
-              for line in lines:
-                  stripped = line.strip()
-                  if not stripped:
+          def push_lines(lines, push_indent):
+              """Non-comment children of one push event, with their indentation."""
+              block = []
+              for line in lines[:5000]:
+                  clean = re.sub(r"\s+#.*$", "", line).strip()
+                  if not clean or clean.startswith("#"):
                       continue
                   indent = len(line) - len(line.lstrip(" "))
-                  if block_indent is not None:
-                      if indent > block_indent:
-                          continue
-                      block_indent = None
-                  if stripped.startswith("#"):
+                  if indent <= push_indent:
+                      break
+                  block.append((indent, clean))
+              return block
+
+
+          def literal_pattern(value, key):
+              """Accept only literal names and stars; YAML indirection stays undecidable."""
+              value = value.strip()
+              if value.startswith(("&", "*", "!!")):
+                  return None
+              if value[:1] in ("'", '"') and value[-1:] == value[:1]:
+                  value = value[1:-1]
+              pattern = value.removeprefix("!") if key == "branches" else value
+              if pattern.startswith("refs/") or not re.fullmatch(r"[A-Za-z0-9._/*-]+", pattern):
+                  return None
+              return value
+
+
+          def sequence_values(following, indent):
+              """Read scalar items until the next filter, accepting compact sequence indentation."""
+              values = []
+              for level, clean in following[:5000]:
+                  if level < indent or (level == indent and not clean.startswith("- ")):
+                      break
+                  if not clean.startswith("- "):
+                      return None
+                  values.append(clean[2:])
+              return values
+
+
+          def filter_patterns(value, following, indent, key):
+              """Read a scalar, flow list or ordinary/compact block sequence, bounded at 200."""
+              if not value:
+                  values = sequence_values(following, indent)
+              elif value == "[]":
+                  values = []
+              elif value.startswith("[") and value.endswith("]"):
+                  values = value[1:-1].split(",")
+              else:
+                  values = [value]
+              if values is None or len(values) > 200:
+                  return None
+              patterns = [literal_pattern(v, key) for v in values[:200]]
+              return None if None in patterns else patterns
+
+
+          def push_filters(lines, indent):
+              """Read only branch/tag filter keys directly beneath this push event."""
+              block = push_lines(lines, indent)
+              filters = {}
+              if not block:
+                  return filters
+              child_indent = block[0][0]
+              for index, (level, clean) in enumerate(block[:5000]):
+                  if level != child_indent:
+                      continue
+                  match = re.fullmatch(r"(branches|branches-ignore|tags|tags-ignore):\s*(.*)", clean)
+                  if not match:
+                      continue
+                  key, value = match.groups()
+                  patterns = filter_patterns(value, block[index + 1 :], child_indent, key)
+                  if patterns is None or key in filters:
+                      return None
+                  filters[key] = patterns
+              return filters
+
+
+          def branch_matches(pattern, default_branch):
+              """An anchored match: a star stops at slash, a double star crosses it."""
+              regex = re.escape(pattern).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+              return re.fullmatch(regex, default_branch) is not None
+
+
+          def push_runs_on_branch(lines, indent, default_branch):
+              """Unknown filters keep counting; decidable filters must admit the default branch."""
+              filters = push_filters(lines, indent)
+              if filters is None or {"branches", "branches-ignore"} <= filters.keys():
+                  return True
+              if "branches" in filters:
+                  included = False
+                  for pattern in filters["branches"][:200]:
+                      if branch_matches(pattern.removeprefix("!"), default_branch):
+                          included = not pattern.startswith("!")
+                  return included
+              if "branches-ignore" in filters:
+                  return not any(branch_matches(p, default_branch) for p in filters["branches-ignore"][:200])
+              return not ({"tags", "tags-ignore"} & filters.keys())
+
+
+          def allowed_event(clean, following, indent, default_branch):
+              """Read a block event key or compact event list, leaving inline values undecided."""
+              key_m = re.match(r"^([a-zA-Z0-9_-]+):\s*(.*)", clean)
+              if key_m:
+                  name, value = key_m.groups()
+                  if name == "push" and not value:
+                      return push_runs_on_branch(following, indent, default_branch)
+                  return name in ALLOWED_TRIGGERS
+              seq_m = re.match(r"^-\s*([a-zA-Z0-9_-]+)", clean)
+              return bool(seq_m and seq_m.group(1) in ALLOWED_TRIGGERS)
+
+
+          def trigger_lines(lines):
+              """Yield event candidates outside comments and YAML block scalar bodies."""
+              block_indent = None
+              for index, line in enumerate(lines[:5000]):
+                  clean = line.strip()
+                  if not clean:
+                      continue
+                  indent = len(line) - len(line.lstrip(" "))
+                  if block_indent is not None and indent > block_indent:
+                      continue
+                  block_indent = None
+                  if clean.startswith("#"):
                       continue
                   if BLOCK_SCALAR_RE.search(line):
                       block_indent = indent
+                  yield index, indent, re.sub(r"\s+#.*$", "", clean).strip()
+
+
+          def block_has_allowed_trigger(events, lines, default_branch):
+              """Check direct event keys until the next top-level workflow section."""
+              on_indent = None
+              for index, indent, clean in events[:5000]:
                   if indent == 0:
-                      if in_on:
-                          return False
-                      if re.match(r"^on:\s*(.*)$", stripped):
-                          rest = stripped.split(":", 1)[1].strip()
-                          rest = re.sub(r"\s+#.*$", "", rest).strip()
-                          if rest:
-                              return any(t in ALLOWED_TRIGGERS for t in inline_triggers(rest))
-                          in_on = True
-                          on_indent = None
-                      continue
-                  if not in_on:
-                      continue
+                      return False
                   if on_indent is None:
                       on_indent = indent
-                  if indent == on_indent:
-                      clean = re.sub(r"\s+#.*$", "", stripped)
-                      key_m = re.match(r"^([a-zA-Z0-9_-]+):", clean)
-                      if key_m and key_m.group(1) in ALLOWED_TRIGGERS:
-                          return True
-                      seq_m = re.match(r"^-\s*([a-zA-Z0-9_-]+)", clean)
-                      if seq_m and seq_m.group(1) in ALLOWED_TRIGGERS:
-                          return True
+                  if indent == on_indent and allowed_event(clean, lines[index + 1 :], indent, default_branch):
+                      return True
+              return False
+
+
+          def workflow_has_allowed_trigger(content, default_branch):
+              """Whether top-level on: includes an event admitting the default branch."""
+              lines = content.splitlines()[:5000]
+              events = list(trigger_lines(lines))
+              for position, (_, indent, clean) in enumerate(events[:5000]):
+                  if indent != 0 or not re.match(r"^on:\s*(.*)$", clean):
+                      continue
+                  rest = clean.split(":", 1)[1].strip()
+                  if rest:
+                      return any(t in ALLOWED_TRIGGERS for t in inline_triggers(rest))
+                  return block_has_allowed_trigger(events[position + 1 :], lines, default_branch)
               return False
 
 
@@ -1443,9 +1553,9 @@ jobs:
               return bool(reusable_call and not custom_config)
 
 
-          def workflow_runs_release(content, local=frozenset()):
+          def workflow_runs_release(content, local, default_branch):
               """Whether workflow triggers and jobs structure run release-please."""
-              if not workflow_has_allowed_trigger(content):
+              if not workflow_has_allowed_trigger(content, default_branch):
                   return False
               return jobs_run_release(content, local)
 
@@ -1509,6 +1619,27 @@ jobs:
               return local
 
 
+          def read_default_branch(api_url, repo, token):
+              """Read repository metadata once; missing branch data is a call error."""
+              _, repository = call(f"{api_url}/repos/{repo}", token, method="GET")
+              default_branch = repository.get("default_branch") if isinstance(repository, dict) else None
+              if not isinstance(default_branch, str) or not default_branch:
+                  raise CallError("repository default_branch must be a non-empty string")
+              return default_branch
+
+
+          def read_workflow_content(api_url, repo, token, entry):
+              """Read and decode one workflow through the existing bounded contents request."""
+              name = entry["name"]
+              url = f"{api_url}/repos/{repo}/contents/.github/workflows/{name}"
+              _, data = call(entry.get("url") or url, token, method="GET")
+              raw = data.get("content", "") if isinstance(data, dict) else ""
+              try:
+                  return base64.b64decode(raw).decode("utf-8")
+              except ValueError as err:
+                  raise CallError(f"decode {name}: {err}") from err
+
+
           def reads_own_release(api_url, repo, token):
               """The workflow file name running release-please in this repository, or False."""
               url = f"{api_url}/repos/{repo}/contents/.github/workflows"
@@ -1530,21 +1661,16 @@ jobs:
               ]
               if len(workflows) > 100:
                   raise CallError(f"workflow count {len(workflows)} exceeds bound of 100")
+              if not workflows:
+                  return False
+              default_branch = read_default_branch(api_url, repo, token)
               contents = {}
               for entry in workflows[:100]:
                   name = entry["name"]
-                  u = f"{api_url}/repos/{repo}/contents/.github/workflows/{name}"
-                  file_url = entry.get("url") or u
-                  _, data = call(file_url, token, method="GET")
-                  raw = data.get("content", "") if isinstance(data, dict) else ""
-                  try:
-                      content = base64.b64decode(raw).decode("utf-8")
-                  except ValueError as err:
-                      raise CallError(f"decode {name}: {err}") from err
-                  contents[name] = content
+                  contents[name] = read_workflow_content(api_url, repo, token, entry)
               local = local_release_workflows(contents)
               for name, content in contents.items():
-                  if workflow_runs_release(content, local):
+                  if workflow_runs_release(content, local, default_branch):
                       return name
               return False
 
