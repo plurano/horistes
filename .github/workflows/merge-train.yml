@@ -1020,9 +1020,9 @@ jobs:
               return STATUS_QUERY if conf.get("required_status") else QUERY
           PY
 
-      # The sweep script is tools/merge_train.py of this workflow's own commit,
-      # not of the caller's repository: a caller pinned to a commit runs that
-      # commit's script. Inline, the script would exceed the engine's cap of 4096
+      # The sweep uses tools/merge_train.py and tools/review_state.py from this
+      # workflow's own commit: a caller pinned to a commit runs that commit's
+      # script and reader. Inline, the script would exceed the engine's cap of 4096
       # fields per run script. The job's token has no permission; the repository
       # is public, so the checkout needs none.
       - name: Check out the train script
@@ -1032,7 +1032,9 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: merge-train-source
           persist-credentials: false
-          sparse-checkout: tools/merge_train.py
+          sparse-checkout: |
+            tools/merge_train.py
+            tools/review_state.py
           sparse-checkout-cone-mode: false
 
       # Merge train of every repository the app is installed on.

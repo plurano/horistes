@@ -102,7 +102,9 @@ LAUNCH = """\
 import importlib.util
 import os
 import sys
+from pathlib import Path
 
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parent))
 spec = importlib.util.spec_from_file_location("merge_train", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 sys.modules["merge_train"] = module
@@ -659,6 +661,8 @@ class Forge:
         if detail is None:
             return {"data": {"repository": {"pullRequest": None}}}
         pr = {
+            "headRefOid": detail.get("headRefOid", ""),
+            "author": detail.get("author"),
             "reviews": detail.get("reviews", empty),
             "comments": detail.get("comments", empty),
             "commits": detail.get("commits", empty),
@@ -1154,6 +1158,7 @@ def train(
         source = source.replace("READ_BACKOFF_SECONDS = 5", "READ_BACKOFF_SECONDS = 0")
         path = tmp_path / "train.py"
         path.write_text(source, encoding="utf-8")
+        shutil.copyfile(ROOT / "tools/review_state.py", tmp_path / "review_state.py")
         command = [sys.executable, "-I", "-B", str(path)]
     summary, output = tmp_path / "summary.md", tmp_path / "output"
     forge.workdir = tmp_path
@@ -1229,7 +1234,7 @@ CHECKOUT = {
     "ref": "${{ job.workflow_sha }}",
     "path": "merge-train-source",
     "persist-credentials": False,
-    "sparse-checkout": "tools/merge_train.py",
+    "sparse-checkout": "tools/merge_train.py\ntools/review_state.py\n",
 }
 
 
@@ -7873,10 +7878,15 @@ def test_review_bodies_query_fields(tmp_path, monkeypatch):
         "body",
         "author { login __typename }",
         "comments(first: 100)",
-        "nodes { databaseId state body authorAssociation author { login __typename } }",
-        "nodes { body authorAssociation author { login __typename } }",
+        (
+            "nodes {\n"
+            "          databaseId state body submittedAt url authorAssociation "
+            "author { login __typename }\n"
+            "        }"
+        ),
+        "nodes { body createdAt url authorAssociation author { login __typename } }",
         "commits(first: 100)",
-        "commit { message }",
+        "commit { message committedDate }",
     ):
         assert token in q
     assert q.count("totalCount") == 3
@@ -10232,3 +10242,149 @@ def test_retry_hold_deferral_ends_advancement_before_later_urgent(tmp_path):
     assert forge.retry_calls == [1, 2, 3, 4, 5]
     assert "| #6 | BEHIND | retry history deferred: read budget spent this sweep |" in summary
     assert "| #7 | BEHIND | updated from the default branch" not in summary
+
+
+# ADR-0090: a skipped review holds even when no review body has findings.
+REVIEW_STATE_FIXTURES = ROOT / "tests/fixtures/review-state"
+INCOMPLETE_3507 = "review incomplete: coderabbitai limit reached at 2026-11-16T16:40:51Z"
+
+
+def _incomplete_review_pull(*, armed=False):
+    """Replay PR 3507 through the train's existing forge and detail builders."""
+    payload = json.loads((REVIEW_STATE_FIXTURES / "pr3507-review-state.json").read_text())
+    node = payload["data"]["repository"]["pullRequest"]
+    detail = _detail(reviews=[], comments=node["comments"]["nodes"])
+    detail.update({key: node[key] for key in ("headRefOid", "author", "commits")})
+    p = pull(
+        1,
+        "CLEAN",
+        author=node["author"],
+        headRefOid=node["headRefOid"],
+        committedDate="2026-11-16T16:10:16Z",
+        autoMergeRequest={"enabledAt": OLD} if armed else None,
+    )
+    return p, detail
+
+
+def _completed_review_summary(when):
+    """A completed CodeRabbit summary with a pre-merge table and no findings."""
+    return {
+        "author": {"login": "coderabbitai", "__typename": "Bot"},
+        "createdAt": when,
+        "body": "Pre-merge checks\n| Title check | ![Passed](passed.svg) | Title is clear |",
+    }
+
+
+def test_planted_incomplete_review_body_hold(tmp_path, monkeypatch):
+    """No formal reviews: the current-head limit comment alone must hold admission."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    p, detail = _incomplete_review_pull()
+    # The primary pull query's author is authoritative, even if detail has a bot author.
+    detail["author"] = {"login": "coderabbitai"}
+    reason = merge_train.review_body_hold(p, detail)
+    assert reason is not None
+    assert reason == merge_train.REVIEW_BODY + INCOMPLETE_3507
+
+
+@pytest.mark.parametrize("armed", [False, True], ids=["unarmed", "armed"])
+def test_planted_incomplete_review_train_holds(tmp_path, armed):
+    """CLEAN PR 3507 lands nothing; an armed copy is disarmed with the same hold."""
+    p, detail = _incomplete_review_pull(armed=armed)
+    forge = Forge(repository(p))
+    forge.review_details[1] = detail
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == ([disarmed(1)] if armed else []), forge.writes
+    assert f"review body: {INCOMPLETE_3507}" in summary
+    assert ("disarmed: review body:" in summary) is armed
+
+
+@pytest.mark.parametrize("old_notice", [False, True], ids=["newer-summary", "old-notice"])
+def test_completed_review_clears_incomplete_hold(tmp_path, monkeypatch, old_notice):
+    """A later completed summary clears the limit notice, including before-commit notices."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    p, detail = _incomplete_review_pull()
+    if old_notice:
+        detail["comments"]["nodes"] = [
+            {
+                "author": {"login": "coderabbitai", "__typename": "Bot"},
+                "createdAt": "2026-11-16T16:00:00Z",
+                "body": "Review limit reached.",
+            }
+        ]
+    detail["comments"]["nodes"].append(_completed_review_summary("2026-11-16T17:00:00Z"))
+    detail["comments"]["totalCount"] = len(detail["comments"]["nodes"])
+    assert merge_train.review_body_hold(p, detail) is None
+    forge = Forge(repository(p))
+    forge.review_details[1] = detail
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("merge", "PR_1", p["headRefOid"], "SQUASH")]
+    assert "### fleet/app: landed #1" in summary
+
+
+@pytest.mark.parametrize(
+    ("section", "fields"),
+    [
+        pytest.param("pullRequest", ("headRefOid", "author { login }"), id="head-and-author"),
+        pytest.param("reviews", ("submittedAt", "url"), id="review-times"),
+        pytest.param("comments", ("createdAt", "url"), id="comment-times"),
+        pytest.param("commits", ("committedDate",), id="commit-times"),
+    ],
+)
+def test_review_bodies_query_supplies_incomplete_reader(tmp_path, monkeypatch, section, fields):
+    """The actual query retains every timestamp the new reader needs."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    query = merge_train.REVIEW_BODIES
+    if section == "pullRequest":
+        selected = query.split("reviews(first:", 1)[0]
+    else:
+        selected = query.split(f"{section}(first: 100)", 1)[1]
+        selected = selected.split("(first: 100)", 1)[0].rsplit("\n      }", 1)[0]
+        assert "totalCount" in selected
+    for field in fields[:2]:
+        assert field in selected, (section, field)
+
+
+def test_sparse_checkout_missing_review_state_is_refused():
+    """A checkout omitting the reader cannot satisfy the train's source contract."""
+    doc = ciwf.load(TRAIN)
+    step = next(s for s in doc["jobs"]["train"]["steps"] if is_checkout(s))
+    step["with"]["sparse-checkout"] = "tools/merge_train.py"
+    assert checkout_problems(doc) == ["sparse-checkout: 'tools/merge_train.py'"]
+
+
+def test_review_state_sparse_checkout_includes_reader():
+    """The served workflow checks out the train and its reader together."""
+    doc = ciwf.load(TRAIN)
+    assert checkout_problems(doc) == []
+    step = next(s for s in doc["jobs"]["train"]["steps"] if is_checkout(s))
+    assert step["with"]["sparse-checkout-cone-mode"] is False
+
+
+@pytest.mark.parametrize("armed", [False, True], ids=["unarmed", "armed"])
+def test_incomplete_review_posted_at_landing_holds(tmp_path, armed):
+    """A notice arriving after admission still prevents landing and disarms auto-merge."""
+    p, detail = _incomplete_review_pull(armed=armed)
+    forge = Forge(repository(p))
+    forge.review_details[1] = [_detail(), detail]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == ([disarmed(1)] if armed else [])
+    assert forge.review_body_calls == [1, 1]
+    assert f"review body: {INCOMPLETE_3507}" in summary
+
+
+def test_incomplete_review_priority_and_connection_guard(tmp_path, monkeypatch):
+    """Count guards precede incomplete review; incomplete review precedes body findings."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    p, detail = _incomplete_review_pull()
+    detail["reviews"] = {
+        "totalCount": 1,
+        "nodes": [_bot_review(101, "coderabbitai", "Nitpick comments: 1")],
+    }
+    assert merge_train.review_body_hold(p, detail) == merge_train.REVIEW_BODY + INCOMPLETE_3507
+    detail["reviews"]["totalCount"] = 101
+    assert merge_train.review_body_hold(p, detail) == (
+        merge_train.REVIEW_BODY + "more than 100 reviews, cannot read every answer"
+    )

@@ -30,6 +30,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
+from review_state import review_incomplete
 from train_rules import (
     RED,
     REFRESH_LABEL,
@@ -284,17 +285,21 @@ REVIEW_BODIES = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
+      headRefOid
+      author { login }
       reviews(first: 100) {
         totalCount
-        nodes { databaseId state body authorAssociation author { login __typename } }
+        nodes {
+          databaseId state body submittedAt url authorAssociation author { login __typename }
+        }
       }
       comments(first: 100) {
         totalCount
-        nodes { body authorAssociation author { login __typename } }
+        nodes { body createdAt url authorAssociation author { login __typename } }
       }
       commits(first: 100) {
         totalCount
-        nodes { commit { message } }
+        nodes { commit { message committedDate } }
       }
     }
   }
@@ -1540,11 +1545,22 @@ def _maintainer_unanswered(pr_author, detail, unanswered, right):
     return [finding for finding in unanswered if finding in remaining]
 
 
-def review_body_hold(pull, detail, right=None):
-    """Why a pull request waits for an unanswered bot review body finding, or None."""
+def _review_connection_hold(detail):
+    """Refuse a truncated connection before either review reader uses it."""
     for kind in ("reviews", "comments", "commits"):
         if ((detail.get(kind) or {}).get("totalCount") or 0) > 100:
             return f"{REVIEW_BODY}more than 100 {kind}, cannot read every answer"
+    return None
+
+
+def review_body_hold(pull, detail, right=None):
+    """Why a pull request waits for an incomplete review or unanswered body finding, or None."""
+    if connection_hold := _review_connection_hold(detail):
+        return connection_hold
+    detail_with_author = {**detail, "author": pull.get("author")}
+    incomplete = review_incomplete(detail_with_author)
+    if incomplete:
+        return f"{REVIEW_BODY}{incomplete}"
     author_field = pull.get("author")
     pr_author = (author_field.get("login") or "") if isinstance(author_field, dict) else ""
     texts = _answer_texts(pr_author, detail)
