@@ -403,6 +403,11 @@ class Forge:
         self.retry_histories: dict[int, dict] = {}
         self.retry_refusals: dict[int, str] = {}
         self.retry_calls: list[int] = []
+        self.arm_histories: dict[int, dict] = {}
+        self.arm_refusals: dict[int, str] = {}
+        self.arm_history_calls: list[int] = []
+        self.posted_comments: list[tuple[int, str]] = []
+        self.comment_refusal = False
         self.comparisons: dict[str, tuple[int, dict]] = {}
         self.compare_calls: list[str] = []
         self.lease_read: dict = {}
@@ -604,6 +609,8 @@ class Forge:
             return self.lease_read or default
         if "fragment M on Commit" in query:
             return self.pull_modes(query, variables)
+        if "AUTO_MERGE_DISABLED_EVENT" in query:
+            return self.pull_arm_history(full, variables)
         if "HEAD_REF_FORCE_PUSHED_EVENT" in query:
             return self.pull_retry_history(full, variables)
         if "mergeStateStatus" in query and "pullRequest(" in query:
@@ -627,6 +634,17 @@ class Forge:
         if self.mode_error:
             return {"errors": [{"message": self.mode_error}]}
         return {"data": {"repository": retry_modes(variables, self.modes)}}
+
+    def pull_arm_history(self, full: str, variables: dict) -> dict:
+        """The bounded arm timeline and recent failure comments for one head."""
+        owner, name = full.split("/")
+        number = variables["number"]
+        assert variables == {"owner": owner, "name": name, "number": number}, variables
+        self.arm_history_calls.append(number)
+        if number in self.arm_refusals:
+            return {"errors": [{"message": self.arm_refusals[number]}]}
+        detail = self.arm_histories.get(number, arm_history(number, items=[]))
+        return {"data": {"repository": {"pullRequest": detail}}}
 
     def pull_retry_history(self, full: str, variables: dict) -> dict:
         """Read one pull's retry attempts, including discarded heads."""
@@ -848,6 +866,12 @@ class Forge:
 
     def issue_write(self, header: str, full: str, write: tuple) -> tuple[int, dict]:
         token_repo, rights = self.repo_of(header)
+        if write[0] == "comment" and rights in (WRITE, {**WRITE, **STATUSES}):
+            assert token_repo == full
+            if self.comment_refusal:
+                return 403, {"message": "Comment refused"}
+            self.posted_comments.append((write[1], write[2]))
+            return 201, {}
         assert (token_repo, rights) == (full, ISSUES), (token_repo, rights, full)
         self.write(full, write)
         return 200, {}
@@ -10388,3 +10412,296 @@ def test_incomplete_review_priority_and_connection_guard(tmp_path, monkeypatch):
     assert merge_train.review_body_hold(p, detail) == (
         merge_train.REVIEW_BODY + "more than 100 reviews, cannot read every answer"
     )
+
+
+def arm_event(kind, actor=None):
+    """An arm timeline item; fixtures list events in chronological order."""
+    return {"__typename": kind, "createdAt": OLD, "actor": actor}
+
+
+def arm_history(number=1, *, items=None, comments=()):
+    """An enabled head followed by a bot force push and a forge auto-merge drop."""
+    if items is None:
+        items = [
+            arm_event("AutoMergeEnabledEvent", APP),
+            arm_event("HeadRefForcePushedEvent", APP),
+            arm_event("AutoMergeDisabledEvent"),
+        ]
+    return {
+        "headRefOid": f"{number:040x}",
+        "timelineItems": {"nodes": items},
+        "comments": {"nodes": [{"body": body} for body in comments]},
+    }
+
+
+def forced_forge(state="BLOCKED", **fields):
+    """An unarmed, pending head with a recoverable force-push timeline."""
+    p = pull(1, state, suites=[None], **fields)
+    forge = Forge(repository(p))
+    forge.arm_histories[1] = arm_history()
+    return forge
+
+
+def test_planted_force_push_rearms_new_head(tmp_path):
+    forge = forced_forge()
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(1)], forge.writes
+    assert "re-armed: auto-merge came off after a bot force push" in summary
+    assert "re-armed #1 after a bot force push" in summary
+
+
+@pytest.mark.parametrize("state", ["BLOCKED", "UNSTABLE"])
+def test_forced_rearm_pending_states(tmp_path, state):
+    forge = forced_forge(state)
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(1)]
+
+
+@pytest.mark.parametrize(
+    "actor",
+    [{"login": BOT, "__typename": "Bot"}, {"login": "maintainer", "__typename": "User"}],
+    ids=["train", "person"],
+)
+def test_forced_rearm_deliberate_disarm_stays_off(tmp_path, actor):
+    forge = forced_forge()
+    forge.arm_histories[1]["timelineItems"]["nodes"][-1]["actor"] = actor
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.arm_history_calls == [1]
+    assert forge.writes == []
+
+
+def test_forced_rearm_required_status_stays_off(tmp_path):
+    forge = forced_forge(status=ctx("lanes/booked", "SUCCESS"))
+    done, _ = train(tmp_path, forge, required_status="lanes/booked")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.arm_history_calls == []
+    assert forge.writes == []
+
+
+@pytest.mark.parametrize(
+    "fields", [{"isDraft": True}, {"labels": ("hold",)}], ids=["draft", "hold-label"]
+)
+def test_forced_rearm_verdict_holds_stay_off(tmp_path, fields):
+    forge = forced_forge(**fields)
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.arm_history_calls == []
+    assert forge.writes == []
+
+
+def test_forced_rearm_red_scanning_stays_off(tmp_path):
+    forge = forced_forge()
+    p = forge.reads["fleet/app"][0]["pullRequests"]["nodes"][0]
+    p["latest"]["nodes"][0]["commit"]["checkSuites"] = build_commit_node(
+        1, [suite(1001, "FAILURE", 10, None, "github-code-scanning")]
+    )["checkSuites"]
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.arm_history_calls == []
+    assert forge.writes == []
+
+
+@pytest.mark.parametrize("incomplete", [False, True], ids=["findings", "incomplete"])
+def test_forced_rearm_review_hold_stays_off(tmp_path, incomplete):
+    forge = forced_forge()
+    if incomplete:
+        p, detail = _incomplete_review_pull()
+        p["mergeStateStatus"] = "BLOCKED"
+        p["latest"]["nodes"][0]["commit"]["checkSuites"] = build_commit_node(1, [None])[
+            "checkSuites"
+        ]
+        forge = Forge(repository(p))
+        forge.arm_histories[1] = {**arm_history(), "headRefOid": p["headRefOid"]}
+    else:
+        detail = _detail(reviews=[_bot_review(101, "coderabbitai", "Nitpick comments: 1")])
+    forge.review_details[1] = detail
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review body: " in summary
+    if incomplete:
+        assert INCOMPLETE_3507 in summary
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [arm_event("HeadRefForcePushedEvent", APP)],
+        [arm_event("AutoMergeEnabledEvent", APP)],
+        [arm_event("AutoMergeEnabledEvent"), arm_event("HeadRefForcePushedEvent")],
+        [
+            arm_event("AutoMergeEnabledEvent", APP),
+            arm_event("HeadRefForcePushedEvent", {"login": "author-1", "__typename": "User"}),
+        ],
+        [*arm_history()["timelineItems"]["nodes"], arm_event("AutoSquashEnabledEvent", APP)],
+    ],
+    ids=["never-enabled", "never-pushed", "unknown-pusher", "person-push", "enabled-again"],
+)
+def test_forced_rearm_without_qualifying_history_stays_off(tmp_path, items):
+    forge = forced_forge()
+    forge.arm_histories[1] = arm_history(items=items)
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+
+
+@pytest.mark.parametrize(
+    "enable", ["AutoMergeEnabledEvent", "AutoSquashEnabledEvent", "AutoRebaseEnabledEvent"]
+)
+@pytest.mark.parametrize("disabler", [None, APP, {"login": "other-app", "__typename": "Bot"}])
+def test_forced_disarm_enable_methods_and_bot_disablers(tmp_path, monkeypatch, enable, disabler):
+    mod = load_train(tmp_path, monkeypatch)
+    items = [
+        arm_event(enable, APP),
+        arm_event("HeadRefForcePushedEvent", APP),
+        arm_event("AutoMergeDisabledEvent", disabler),
+    ]
+    assert mod.forced_disarm(pull(1, "BLOCKED"), items, {"bot_login": BOT, "dependency": ()})
+
+
+def test_forced_rearm_dependency_author_using_person_token(tmp_path):
+    actor = {"login": "renovate", "__typename": "User"}
+    forge = forced_forge(author={"login": "renovate[bot]"}, headRefName="renovate/package")
+    forge.arm_histories[1] = arm_history(
+        items=[
+            arm_event("AutoMergeEnabledEvent", actor),
+            arm_event("HeadRefForcePushedEvent", actor),
+            arm_event("AutoMergeDisabledEvent", actor),
+        ]
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(1)]
+
+
+def test_forced_rearm_history_read_budget(tmp_path):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 7))))
+    forge.arm_histories[6] = arm_history(6)
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.arm_history_calls == [1, 2, 3, 4, 5]
+    assert forge.writes == []
+
+
+def test_forced_rearm_clean_landing_has_priority(tmp_path):
+    forge = Forge(repository(pull(1, "BLOCKED", suites=[None]), pull(2, "CLEAN")))
+    forge.arm_histories[1] = arm_history()
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(2)]
+    assert forge.arm_history_calls == []
+
+
+def test_forced_rearm_moved_head_waits(tmp_path):
+    forge = forced_forge()
+    forge.arm_histories[1]["headRefOid"] = "f" * 40
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "head moved since the page read: re-arm waits" in summary
+
+
+@pytest.mark.parametrize("dedupe", [False, True], ids=["first-failure", "already-said"])
+def test_forced_rearm_refusal_comment_once(tmp_path, dedupe):
+    forge = forced_forge()
+    marker = f"<!-- merge-train:re-arm-failed {1:040x} -->"
+    if dedupe:
+        forge.arm_histories[1]["comments"]["nodes"] = [{"body": marker + "\nAlready said."}]
+    forge.mutation_statuses["enablePullRequestAutoMerge"] = [403]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(1)]
+    assert "not re-armed after a bot force push:" in summary
+    assert "re-arm failed #1:" in summary
+    assert len(forge.posted_comments) == (0 if dedupe else 1)
+    if not dedupe:
+        number, body = forge.posted_comments[0]
+        assert number == 1
+        assert body.startswith(marker + "\n")
+        assert "HTTP 403" in body
+        assert "a person" in body and "push" in body
+
+
+def test_forced_rearm_comment_refusal_is_a_note(tmp_path):
+    forge = forced_forge()
+    forge.mutation_statuses["enablePullRequestAutoMerge"] = [403]
+    forge.comment_refusal = True
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "; comment not posted:" in summary
+    assert "re-arm failed #1:" in summary
+    assert forge.posted_comments == []
+
+
+def test_forced_rearm_unsigned_bot_keeps_note(tmp_path):
+    forge = forced_forge(author=APP)
+    forge.commits[1] = [("unsigned change", 1)]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "skipped: bot pull request without Signed-off-by, its producer signs it" in summary
+
+
+@pytest.mark.parametrize("auto_merge,switch", [(False, "on"), (True, "off")])
+def test_forced_rearm_disabled_modes_read_nothing(tmp_path, auto_merge, switch):
+    forge = forced_forge()
+    forge.reads["fleet/app"][0]["autoMergeAllowed"] = auto_merge
+    done, _ = train(tmp_path, forge, switch=switch)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.arm_history_calls == []
+    assert forge.writes == []
+
+
+def test_forced_rearm_history_unreadable_is_a_note(tmp_path):
+    forge = forced_forge()
+    forge.arm_refusals[1] = "History unavailable"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "arm history unreadable:" in summary
+    assert "History unavailable" in summary
+
+
+def test_arm_history_query_shape(tmp_path, monkeypatch):
+    mod = load_train(tmp_path, monkeypatch)
+    for event in (
+        "AUTO_MERGE_ENABLED_EVENT",
+        "AUTO_SQUASH_ENABLED_EVENT",
+        "AUTO_REBASE_ENABLED_EVENT",
+        "AUTO_MERGE_DISABLED_EVENT",
+        "HEAD_REF_FORCE_PUSHED_EVENT",
+    ):
+        assert event in mod.ARM_HISTORY
+    assert "timelineItems(last: 20" in mod.ARM_HISTORY
+    assert "comments(last: 20) { nodes { body } }" in mod.ARM_HISTORY
+    assert "headRefOid" in mod.ARM_HISTORY
+    assert mod.ARM_HISTORY.count("actor { __typename login }") == 5
+
+
+@pytest.mark.parametrize(
+    "reason,held,fields",
+    [
+        ("review body: unanswered findings", {}, {}),
+        ("review body: review incomplete: limit reached", {}, {}),
+        ("merge state BLOCKED", {1: "hold"}, {}),
+        ("merge state BLOCKED", {}, {"autoMergeRequest": {"enabledAt": OLD}}),
+        ("merge state BLOCKED", {}, {"suites": ["FAILURE"]}),
+    ],
+    ids=["review-body", "review-incomplete", "held-number", "already-armed", "red-checks"],
+)
+def test_forced_rearm_candidate_filter_needs_no_io(tmp_path, monkeypatch, reason, held, fields):
+    mod = load_train(tmp_path, monkeypatch)
+    p = pull(1, "BLOCKED", **fields)
+    assert mod.re_arm_forced({}, {}, repository(p), [(p, reason)], held, {}) is None
+
+
+def test_forced_rearm_one_arm_per_sweep(tmp_path):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in (1, 2))))
+    forge.arm_histories.update({n: arm_history(n) for n in (1, 2)})
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(1)]
+    assert forge.arm_history_calls == [1]
