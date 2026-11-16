@@ -93,3 +93,4 @@ record that supersedes it.
 | [0083](0083-a-fenced-example-is-read-by-its-languages-parser.md) | 2026-11-14 | A fenced example is read by its language's parser | Accepted |
 | [0085](0085-the-train-holds-a-retried-red-pull-request.md) | 2026-11-15 | The train holds a retried red pull request | Accepted |
 | [0086](0086-an-exception-for-a-finding-without-a-file-names-no-path.md) | 2026-11-15 | An exception for a finding without a file names no path | Accepted |
+| [0087](0087-the-regenerate-commit-message-fits-commitlint.md) | 2026-11-16 | The regenerate commit message fits commitlint | Accepted |

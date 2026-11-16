@@ -5,7 +5,7 @@ SPDX-License-Identifier: EUPL-1.2
 
 # ADR-0032: The merge train commits generated files for dependency updates
 
-- **Status**: Accepted
+- **Status**: Accepted; [ADR-0087](0087-the-regenerate-commit-message-fits-commitlint.md) supersedes the commit message body clause
 - **Date**: 2026-10-15
 - **Authors**: Lusoris
 
