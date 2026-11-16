@@ -33,7 +33,9 @@ PR_CHECKBOX = re.compile(r"^- \[ \] [^\n]+(?:\n[ \t]+[^\n]+)*", re.MULTILINE)
 PR_CHECKLIST = PR_CHECKBOX.findall(PR_TEMPLATE)
 # The section CodeRabbit's Description check reads.
 DESCRIPTION = "## Description"
-MD_HEADING = re.compile(r"^#{1,6}\s")
+# CommonMark 0.31.2 section 4.2: up to three spaces of indentation, then 1-6 `#`
+# followed by a space, a tab or the end of the line.
+MD_HEADING = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
 # Markdown hides a comment left open to the end of the text as well.
 HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
 PLANTED_PRESET = "tests/fixtures/update-bot/planted-preset.json"
@@ -576,13 +578,16 @@ def test_this_repository_extends_the_preset_and_nothing_else():
 
 
 def empty_sections(header: str) -> list[str]:
-    """Template headings with nothing up to the next heading but blanks and HTML comments."""
-    lines = header.splitlines()
+    """Template headings with only blanks up to the next heading once HTML comments are out.
+
+    Comments go before the headings are found: a heading inside a comment is not a heading.
+    """
+    lines = HTML_COMMENT.sub("", header).splitlines()
     bounds = [index for index, line in enumerate(lines) if MD_HEADING.match(line)] + [len(lines)]
     empty = []
     for start in (index for index, line in enumerate(lines) if line in PR_HEADINGS):
         end = next(bound for bound in bounds if bound > start)
-        if not HTML_COMMENT.sub("", "\n".join(lines[start + 1 : end])).strip():
+        if not "\n".join(lines[start + 1 : end]).strip():
             empty.append(f"{lines[start]}: no text")
     return empty
 
@@ -652,8 +657,19 @@ def test_planted_header_copied_from_the_template_is_refused():
         "\n<!-- one -->\n<!-- two -->\n\n",
         "\n<!-- left open to the next heading\n\n",
         "\n### Notes\n\nText under a lower heading belongs to that heading.\n\n",
+        "\n ### Notes\n\nOnly subsection text.\n\n",
+        "\n###\n\nText under an empty heading belongs to that heading.\n\n",
     ],
-    ids=["blank", "whitespace", "comment", "two-comments", "open-comment", "lower-heading"],
+    ids=[
+        "blank",
+        "whitespace",
+        "comment",
+        "two-comments",
+        "open-comment",
+        "lower-heading",
+        "indented-heading",
+        "empty-heading",
+    ],
 )
 def test_planted_description_without_text_is_refused(text):
     assert pr_header_problems(with_description(text)) == [f"{DESCRIPTION}: no text"]
@@ -665,8 +681,10 @@ def test_planted_description_without_text_is_refused(text):
         "\nOne line.\n",
         "\n<!-- a note for maintainers -->\nRenovate proposes this update.\n\n",
         "\nText <!-- inline --> goes on.\n\n",
+        "\n<!--\n### Maintainer instructions\n-->\n\nVisible description.\n\n",
+        "\n    ### Four spaces make a code block, not a heading.\n\n",
     ],
-    ids=["one-line", "comment-then-text", "inline-comment"],
+    ids=["one-line", "comment-then-text", "inline-comment", "commented-heading", "code-block"],
 )
 def test_description_with_text_is_accepted(text):
     assert pr_header_problems(with_description(text)) == []
