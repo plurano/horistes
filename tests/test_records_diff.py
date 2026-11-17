@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import shlex
 import sys
-from subprocess import CompletedProcess
 from subprocess import run as subprocess_run
+from types import SimpleNamespace
 
 import pytest
 import records
@@ -412,7 +412,7 @@ def test_planted_git_byte_output_decode_errors(tree, monkeypatch, returncode):
 
     def byte_output(command, **kwargs):
         if command[:3] == ["git", "-C", str(repo.root)]:
-            return CompletedProcess(command, returncode, b"\xff", b"\xff")
+            return SimpleNamespace(returncode=returncode, stdout=b"\xff", stderr=b"\xff")
         return run(command, **kwargs)
 
     monkeypatch.setattr(records.subprocess, "run", byte_output)
