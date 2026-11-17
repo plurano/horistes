@@ -1586,7 +1586,7 @@ def _connection_hold(conn, kind):
     if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
         return unread
     count = conn.get("totalCount", len(conn["nodes"]))
-    if type(count) is not int or count < 0:
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         return unread
     if count > 100 or len(conn["nodes"]) > 100:
         return f"{REVIEW_BODY}more than 100 {kind}, cannot read every answer"

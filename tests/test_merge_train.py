@@ -10742,6 +10742,13 @@ def adr92_mutations():
 def adr92_followup_mutations():
     return [
         (
+            "C3-bool",
+            "merge_train",
+            "if isinstance(count, bool) or not isinstance(count, int) or count < 0:",
+            "if not isinstance(count, int) or count < 0:",
+            "test_adr92_unreadable_connection_counts and bool-equals-count",
+        ),
+        (
             "R1-disarm",
             "merge_train",
             '(conf.get("required_status") or conf.get("review_bots")) and pull["autoMergeRequest"]',
@@ -10825,12 +10832,21 @@ def test_adr92_mutations_reject_defects(tmp_path, section, module_name, old, new
         {"nodes": [], "totalCount": True},
         {"nodes": [], "totalCount": 1},
         {"nodes": [None], "totalCount": 1},
+        pytest.param({"nodes": [{}], "totalCount": True}, id="bool-equals-count"),
+        pytest.param({"nodes": [{}], "totalCount": 1.0}, id="float-equals-count"),
     ],
 )
 def test_adr92_unreadable_connection_counts(tmp_path, monkeypatch, connection):
     mod = adr92_train(tmp_path, monkeypatch)
     detail = _detail() | {"comments": connection}
     assert mod.review_body_hold(pull(1, "CLEAN"), detail) == "review body: cannot read comments"
+
+
+def test_adr92_readable_connection_count(tmp_path, monkeypatch):
+    mod = adr92_train(tmp_path, monkeypatch)
+    detail = _detail(comments=[{}])
+    assert detail["comments"]["totalCount"] == 1
+    assert mod.review_body_hold(pull(1, "CLEAN"), detail) is None
 
 
 def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
