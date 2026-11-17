@@ -23,6 +23,7 @@ import importlib.util
 import io
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -10607,8 +10608,19 @@ def test_forced_rearm_review_read_budget(tmp_path):
             arm_event("HeadRefForcePushedEvent", {"login": "author-1", "__typename": "User"}),
         ],
         [*arm_history()["timelineItems"]["nodes"], arm_event("AutoSquashEnabledEvent", APP)],
+        [
+            *arm_history()["timelineItems"]["nodes"],
+            arm_event("HeadRefForcePushedEvent", {"login": "author-1", "__typename": "User"}),
+        ],
     ],
-    ids=["never-enabled", "never-pushed", "unknown-pusher", "person-push", "enabled-again"],
+    ids=[
+        "never-enabled",
+        "never-pushed",
+        "unknown-pusher",
+        "person-push",
+        "enabled-again",
+        "person-push-after-disable",
+    ],
 )
 def test_forced_rearm_without_qualifying_history_stays_off(tmp_path, items):
     forge = forced_forge()
@@ -10640,6 +10652,33 @@ def test_forced_disarm_person_disarm_before_push_stays_off(tmp_path, monkeypatch
         arm_event("HeadRefForcePushedEvent", APP),
     ]
     assert not mod.forced_disarm(pull(1, "BLOCKED"), items, {"bot_login": BOT, "dependency": ()})
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        ([("AutoMergeDisabledEvent", None), ("HeadRefForcePushedEvent", "person")], False),
+        ([("HeadRefForcePushedEvent", "person"), ("AutoMergeDisabledEvent", None)], False),
+        ([("AutoMergeDisabledEvent", None), ("HeadRefForcePushedEvent", APP)], True),
+    ],
+    ids=[
+        "person-push-after-forge-disable",
+        "person-push-while-enabled",
+        "bot-push-after-forge-disable",
+    ],
+)
+def test_forced_disarm_later_force_push(tmp_path, monkeypatch, events, expected):
+    mod = load_train(tmp_path, monkeypatch)
+    person = {"login": "author-1", "__typename": "User"}
+    items = [
+        arm_event("AutoMergeEnabledEvent", APP),
+        arm_event("HeadRefForcePushedEvent", APP),
+        *(arm_event(kind, person if actor == "person" else actor) for kind, actor in events),
+    ]
+    assert (
+        mod.forced_disarm(pull(1, "BLOCKED"), items, {"bot_login": BOT, "dependency": ()})
+        is expected
+    )
 
 
 def test_forced_rearm_dependency_author_using_person_token(tmp_path):
@@ -10696,6 +10735,26 @@ def test_forced_rearm_history_window_preserves_serving_order(tmp_path, monkeypat
     mod = load_train(tmp_path, monkeypatch)
     candidates = list(range(count))
     assert mod.rearm_window({"GITHUB_RUN_NUMBER": "1"}, candidates) == candidates
+
+
+@pytest.mark.parametrize("count", [25, 10, 7], ids=["n-25", "n-10", "n-7"])
+def test_rearm_turn_covers_marked_windows(tmp_path, monkeypatch, count):
+    mod = load_train(tmp_path, monkeypatch)
+    cycle = count // math.gcd(count, mod.REARM_READS)
+    picked = set()
+    for run in range(cycle * mod.REARM_READS):
+        env = {"GITHUB_RUN_NUMBER": str(run)}
+        window = mod.rearm_window(env, list(range(count)))
+        picked.add(window[mod.rearm_turn(env, count) % mod.REARM_READS])
+    assert picked == set(range(count))
+
+
+@pytest.mark.parametrize("count", [0, 1, 5], ids=["empty", "one", "budget"])
+def test_rearm_turn_small_lists_use_run_number(tmp_path, monkeypatch, count):
+    mod = load_train(tmp_path, monkeypatch)
+    for number in (None, "invalid", "-1", "0", "1", "7"):
+        env = {} if number is None else {"GITHUB_RUN_NUMBER": number}
+        assert mod.rearm_turn(env, count) == mod.rearm_run_number(env)
 
 
 def test_forced_rearm_clean_landing_has_priority(tmp_path):
@@ -10773,6 +10832,24 @@ def test_forced_rearm_marked_heads_rotate(tmp_path, run_number):
         f"| #{3 - picked} | BLOCKED | re-arm refused on this head before: "
         "unrefused candidates go first |" in summary
     )
+
+
+@pytest.mark.parametrize(
+    ("run_number", "picked"),
+    [("0", 1), ("2", 2), ("4", 1), ("6", 2), ("1", None)],
+    ids=["run-0", "run-2", "run-4", "run-6", "run-1"],
+)
+def test_forced_rearm_marked_heads_rotate_across_windows(tmp_path, run_number, picked):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 11))))
+    forge.arm_histories = {
+        n: arm_history(n, comments=[f"<!-- merge-train:re-arm-failed {n:040x} -->"])
+        for n in range(1, 3)
+    }
+    done, _ = train(tmp_path, forge, run_number=run_number)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == ([] if picked is None else [armed(picked)])
+    assert forge.arm_history_calls == (list(range(6, 11)) if picked is None else list(range(1, 6)))
+    assert forge.review_body_calls == ([] if picked is None else [1, 2, picked])
 
 
 def test_forced_rearm_marked_head_late_review_hold(tmp_path):

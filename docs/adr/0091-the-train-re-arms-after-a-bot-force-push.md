@@ -38,10 +38,16 @@ person's disable prevents recovery.
 Every disable clears the enable, including a disable before any force push.
 A person's disable followed by a bot push therefore stays off: that push needs
 a new enable event to qualify. A forge or bot disable after the qualifying
-push preserves recovery evidence
+push preserves recovery evidence. A later force push by a person clears that
+evidence, whether auto-merge is still enabled or already off. A later bot force
+push while auto-merge is off preserves the evidence of the earlier qualifying push
 (`test_forced_disarm_person_disarm_before_push_stays_off`,
-`test_forced_rearm_person_disarm_before_push_stays_off` and
-`test_forced_disarm_enable_methods_and_bot_disablers`).
+`test_forced_rearm_person_disarm_before_push_stays_off`,
+`test_forced_disarm_enable_methods_and_bot_disablers`,
+`test_forced_disarm_later_force_push[person-push-after-forge-disable]`,
+`test_forced_disarm_later_force_push[person-push-while-enabled]`,
+`test_forced_disarm_later_force_push[bot-push-after-forge-disable]` and
+`test_forced_rearm_without_qualifying_history_stays_off[person-push-after-disable]`).
 
 `serve_cycle` tries `re_arm_forced` after `land_clean` and before `serve_pending`,
 keeping a clean landing ahead of a recovery arm. Candidates retain serving
@@ -71,8 +77,12 @@ refusals retain their existing skip note.
 
 Within the read window, qualifying heads without their current head's refusal
 marker go first. When no unmarked candidate qualifies, marked qualifying heads
-take turns by run number: `marked[run % len(marked)]`, in window order. The
-picked marked head's review hold is read again right before its arm.
+take turns in window order: `marked[rearm_turn(env, n) % len(marked)]`, where
+`n` is the candidate count. For `n > REARM_READS`, the windows repeat every
+`n // gcd(n, REARM_READS)` sweeps; otherwise the cycle is one sweep.
+The turn is the nonnegative run number divided by that cycle length using
+integer division, so it advances once per full window cycle. The picked marked
+head's review hold is read again right before its arm.
 
 The step uses the existing train token's `pull_requests: write` permission for
 comments. Reads and writes retain the transport deadline in `request_once`.
@@ -94,10 +104,13 @@ the windows cover later candidates within `ceil(n / REARM_READS)` successive
 sweeps for candidates whose arm is not refused. Non-qualifying histories cannot
 permanently consume every slot. A refusal marker on the current head makes later
 sweeps try unmarked qualifying candidates in that window first. When no unmarked
-candidate qualifies, marked qualifying heads take turns by run number. With a
-stable window, each marked qualifying head is retried at least once every
-`len(marked)` sweeps while no unmarked candidate qualifies. This preserves one
-arm attempt per sweep and lets a transient refusal on any marked head heal.
+candidate qualifies, marked qualifying heads take turns once per window cycle.
+With a stable candidate list, each marked qualifying head in a window holding
+`m` marked qualifying heads is tried at least once every `m` cycles while no
+unmarked candidate in that window qualifies. The turn stays constant within a
+cycle, preventing read-window rotation from repeatedly selecting the same marked
+head. This preserves one arm attempt per sweep and lets a transient refusal on
+any marked head heal.
 The picked marked head's review hold is read again right before its arm; a new
 hold prevents the arm for that sweep
 (`test_forced_rearm_refused_head_yields_to_unmarked[run-0]`,
@@ -105,7 +118,11 @@ hold prevents the arm for that sweep
 `test_forced_rearm_marked_head_retries_refusal`,
 `test_forced_rearm_marked_head_heals`,
 `test_forced_rearm_marked_heads_rotate[run-0]`,
-`test_forced_rearm_marked_heads_rotate[run-1]` and
+`test_forced_rearm_marked_heads_rotate[run-1]`,
+`test_forced_rearm_marked_heads_rotate_across_windows[run-0]`, `[run-2]`,
+`[run-4]`, `[run-6]`, `[run-1]`,
+`test_rearm_turn_covers_marked_windows[n-25]`, `[n-10]`, `[n-7]`,
+`test_rearm_turn_small_lists_use_run_number[empty]`, `[one]`, `[budget]` and
 `test_forced_rearm_marked_head_late_review_hold`).
 A re-run uses the same run number and reads the same window. Candidates that
 fit the budget keep their serving order

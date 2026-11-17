@@ -14,6 +14,7 @@ import hashlib
 import http.client
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1417,8 +1418,11 @@ def forced_disarm(pull, items, conf):
         actor = item.get("actor") or {}
         if kind in ARM_ENABLE_EVENTS:
             enabled, pusher = True, None
-        elif kind == "HeadRefForcePushedEvent" and enabled and bot_force_pusher(pull, actor, conf):
-            pusher = actor
+        elif kind == "HeadRefForcePushedEvent":
+            if not bot_force_pusher(pull, actor, conf):
+                pusher = None
+            elif enabled:
+                pusher = actor
         elif kind == "AutoMergeDisabledEvent":
             enabled = False
             if pusher and not force_disabler_allowed(actor, pusher, conf):
@@ -1491,7 +1495,15 @@ def rearm_window(env, candidates):
     return (candidates[start:] + candidates[:start])[:REARM_READS]
 
 
-def forced_rearm_target(env, conf, window, notes):
+def rearm_turn(env, count):
+    """Advance marked-head turns once per full history-window cycle."""
+    run = rearm_run_number(env)
+    if count <= REARM_READS:
+        return run
+    return run // (count // math.gcd(count, REARM_READS))
+
+
+def forced_rearm_target(env, conf, window, count, notes):
     """Prefer unrefused qualifying heads, rotating marked heads with a fresh hold read."""
     marked = []
     for pull in window[:REARM_READS]:
@@ -1508,7 +1520,7 @@ def forced_rearm_target(env, conf, window, notes):
         notes[pull["number"]] = "re-arm refused on this head before: unrefused candidates go first"
     if not marked:
         return None
-    pick = marked[rearm_run_number(env) % len(marked)]
+    pick = marked[rearm_turn(env, count) % len(marked)]
     if late_review_hold(env, conf, pick[0], notes):
         return None
     return pick
@@ -1529,7 +1541,7 @@ def re_arm_forced(env, conf, repo, served, held, notes):
         and not is_red(pull)
         and not has_red_code_scanning(pull)
     ]
-    target = forced_rearm_target(env, conf, rearm_window(env, candidates), notes)
+    target = forced_rearm_target(env, conf, rearm_window(env, candidates), len(candidates), notes)
     if target is None:
         return None
     pull, detail = target
