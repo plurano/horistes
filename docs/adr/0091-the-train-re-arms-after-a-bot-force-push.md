@@ -70,8 +70,9 @@ comment becomes a summary note and does not escape the step. Unsigned bot
 refusals retain their existing skip note.
 
 Within the read window, qualifying heads without their current head's refusal
-marker go first; the first marked qualifying head is retried only when no
-unmarked candidate qualifies, after the same history and review-hold checks.
+marker go first. When no unmarked candidate qualifies, marked qualifying heads
+take turns by run number: `marked[run % len(marked)]`, in window order. The
+picked marked head's review hold is read again right before its arm.
 
 The step uses the existing train token's `pull_requests: write` permission for
 comments. Reads and writes retain the transport deadline in `request_once`.
@@ -80,8 +81,9 @@ No permission or credential configuration changes are needed.
 ## Consequences
 
 At most `REARM_READS = 5` candidates have their arm history read per repository
-per sweep, with at most one review-body read for each qualifying candidate:
-at most ten history and review-body reads in the recovery step
+per sweep, with at most one review-body read for each qualifying candidate plus
+one more for the picked marked head: at most eleven history and review-body
+reads in the recovery step. Held unmarked heads retain the ten-read bound
 (`test_forced_rearm_review_read_budget`). One arm attempt ends the sweep,
 preserving the train's one-write scheduling policy; a failed attempt may also
 post its diagnostic comment.
@@ -91,15 +93,20 @@ Missing, invalid or negative run numbers use zero. For a stable candidate list,
 the windows cover later candidates within `ceil(n / REARM_READS)` successive
 sweeps for candidates whose arm is not refused. Non-qualifying histories cannot
 permanently consume every slot. A refusal marker on the current head makes later
-sweeps try unmarked qualifying candidates in that window first; the first marked
-head is retried when no unmarked candidate qualifies. This preserves one arm
-attempt per sweep and lets a transient refusal on that head heal. A later marked
-head in the same window waits while an earlier marked head still qualifies: until
-that head is armed, gets a new push or stops qualifying
+sweeps try unmarked qualifying candidates in that window first. When no unmarked
+candidate qualifies, marked qualifying heads take turns by run number. With a
+stable window, each marked qualifying head is retried at least once every
+`len(marked)` sweeps while no unmarked candidate qualifies. This preserves one
+arm attempt per sweep and lets a transient refusal on any marked head heal.
+The picked marked head's review hold is read again right before its arm; a new
+hold prevents the arm for that sweep
 (`test_forced_rearm_refused_head_yields_to_unmarked[run-0]`,
 `test_forced_rearm_refused_head_yields_to_unmarked[run-2]`,
-`test_forced_rearm_marked_head_retries_refusal` and
-`test_forced_rearm_marked_head_heals`).
+`test_forced_rearm_marked_head_retries_refusal`,
+`test_forced_rearm_marked_head_heals`,
+`test_forced_rearm_marked_heads_rotate[run-0]`,
+`test_forced_rearm_marked_heads_rotate[run-1]` and
+`test_forced_rearm_marked_head_late_review_hold`).
 A re-run uses the same run number and reads the same window. Candidates that
 fit the budget keep their serving order
 (`test_forced_rearm_history_window_rotates` and

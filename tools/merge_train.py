@@ -1475,21 +1475,25 @@ def forced_arm_failure(env, pull, detail, err, notes):
     return f"re-arm failed #{number}: {reason}"
 
 
+def rearm_run_number(env):
+    """Use a nonnegative sweep number, defaulting to zero when missing or invalid."""
+    try:
+        return max(0, int(env.get("GITHUB_RUN_NUMBER", "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
 def rearm_window(env, candidates):
     """Rotate a bounded history-read window without changing small serving lists."""
     if len(candidates) <= REARM_READS:
         return candidates
-    try:
-        number = max(0, int(env.get("GITHUB_RUN_NUMBER", "0")))
-    except (TypeError, ValueError):
-        number = 0
-    start = (number * REARM_READS) % len(candidates)
+    start = (rearm_run_number(env) * REARM_READS) % len(candidates)
     return (candidates[start:] + candidates[:start])[:REARM_READS]
 
 
 def forced_rearm_target(env, conf, window, notes):
-    """Prefer an unrefused qualifying head, retrying the first refused head otherwise."""
-    deferred = None
+    """Prefer unrefused qualifying heads, rotating marked heads with a fresh hold read."""
+    marked = []
     for pull in window[:REARM_READS]:
         detail = forced_arm_history(env, pull, notes)
         if not detail or not forced_disarm(pull, detail["timelineItems"]["nodes"], conf):
@@ -1500,10 +1504,14 @@ def forced_rearm_target(env, conf, window, notes):
         comments = (detail.get("comments") or {}).get("nodes") or []
         if not any(marker in (comment.get("body") or "") for comment in comments[:20]):
             return pull, detail
-        if deferred is None:
-            deferred = pull, detail
+        marked.append((pull, detail))
         notes[pull["number"]] = "re-arm refused on this head before: unrefused candidates go first"
-    return deferred
+    if not marked:
+        return None
+    pick = marked[rearm_run_number(env) % len(marked)]
+    if late_review_hold(env, conf, pick[0], notes):
+        return None
+    return pick
 
 
 def re_arm_forced(env, conf, repo, served, held, notes):

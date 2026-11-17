@@ -10756,6 +10756,38 @@ def test_forced_rearm_refused_head_yields_to_unmarked(tmp_path, run_number):
     )
 
 
+@pytest.mark.parametrize("run_number", ["0", "1"], ids=["run-0", "run-1"])
+def test_forced_rearm_marked_heads_rotate(tmp_path, run_number):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 4))))
+    forge.arm_histories = {
+        n: arm_history(n, comments=[f"<!-- merge-train:re-arm-failed {n:040x} -->"])
+        for n in range(1, 3)
+    }
+    forge.arm_histories[3] = arm_history(3, items=[])
+    done, summary = train(tmp_path, forge, run_number=run_number)
+    assert done.returncode == 0, done.stdout + done.stderr
+    picked = int(run_number) + 1
+    assert forge.writes == [armed(picked)]
+    assert forge.arm_history_calls == [1, 2, 3]
+    assert (
+        f"| #{3 - picked} | BLOCKED | re-arm refused on this head before: "
+        "unrefused candidates go first |" in summary
+    )
+
+
+def test_forced_rearm_marked_head_late_review_hold(tmp_path):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 4))))
+    forge.arm_histories = {n: arm_history(n, items=[]) for n in range(1, 4)}
+    marker = f"<!-- merge-train:re-arm-failed {2:040x} -->"
+    forge.arm_histories[2] = arm_history(2, comments=[marker])
+    forge.review_details[2] = [_detail(), _finding(1201)]
+    done, summary = train(tmp_path, forge, run_number="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.review_body_calls == [2, 2]
+    assert "| #2 | BLOCKED | review body: coderabbitai review 1201 has findings" in summary
+
+
 def test_forced_rearm_marked_head_retries_refusal(tmp_path):
     forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 11))))
     marker = f"<!-- merge-train:re-arm-failed {2:040x} -->"
@@ -10764,7 +10796,7 @@ def test_forced_rearm_marked_head_retries_refusal(tmp_path):
     done, summary = train(tmp_path, forge, run_number="0")
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [armed(2)]
-    assert forge.review_body_calls == [2]
+    assert forge.review_body_calls == [2, 2]
     assert forge.posted_comments == []
     assert "re-arm failed #2:" in summary
 
@@ -10776,7 +10808,7 @@ def test_forced_rearm_marked_head_heals(tmp_path):
     done, summary = train(tmp_path, forge, run_number="0")
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [armed(2)]
-    assert forge.review_body_calls == [2]
+    assert forge.review_body_calls == [2, 2]
     assert forge.posted_comments == []
     assert "re-armed #2 after a bot force push" in summary
     assert "re-arm refused on this head before" not in summary
