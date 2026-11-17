@@ -1419,12 +1419,10 @@ def forced_disarm(pull, items, conf):
             enabled, pusher = True, None
         elif kind == "HeadRefForcePushedEvent" and enabled and bot_force_pusher(pull, actor, conf):
             pusher = actor
-        elif (
-            kind == "AutoMergeDisabledEvent"
-            and pusher
-            and not force_disabler_allowed(actor, pusher, conf)
-        ):
-            pusher = None
+        elif kind == "AutoMergeDisabledEvent":
+            enabled = False
+            if pusher and not force_disabler_allowed(actor, pusher, conf):
+                pusher = None
     return pusher is not None
 
 
@@ -1472,9 +1470,23 @@ def forced_arm_failure(env, pull, detail, err, notes):
     return f"re-arm failed #{number}: {reason}"
 
 
+def rearm_window(env, candidates):
+    """Rotate a bounded history-read window without changing small serving lists."""
+    if len(candidates) <= REARM_READS:
+        return candidates
+    try:
+        number = max(0, int(env.get("GITHUB_RUN_NUMBER", "0")))
+    except (TypeError, ValueError):
+        number = 0
+    start = (number * REARM_READS) % len(candidates)
+    return (candidates[start:] + candidates[:start])[:REARM_READS]
+
+
 def re_arm_forced(env, conf, repo, served, held, notes):
     """Recover one unheld auto-merge request dropped after a bot force push."""
     if conf.get("required_status") or not repo["autoMergeAllowed"]:
+        return None
+    if any(in_flight(pull, reason) for pull, reason in served):
         return None
     candidates = [
         pull
@@ -1485,7 +1497,7 @@ def re_arm_forced(env, conf, repo, served, held, notes):
         and not is_red(pull)
         and not has_red_code_scanning(pull)
     ]
-    for pull in candidates[:REARM_READS]:
+    for pull in rearm_window(env, candidates):
         detail = forced_arm_history(env, pull, notes)
         if not detail or not forced_disarm(pull, detail["timelineItems"]["nodes"], conf):
             continue

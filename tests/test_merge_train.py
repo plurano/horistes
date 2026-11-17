@@ -1170,6 +1170,7 @@ def train(
     forge: Forge,
     text: str | None = None,
     helper: str | None = None,
+    run_number: str | None = None,
     **settings: str,
 ):
     """Run the step's script against the stand-in forge; the result and the summary written."""
@@ -1200,6 +1201,8 @@ def train(
             **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
         }
     )
+    if run_number is not None:
+        env["GITHUB_RUN_NUMBER"] = run_number
     try:
         done = subprocess.run(
             command,
@@ -10473,6 +10476,32 @@ def test_forced_rearm_deliberate_disarm_stays_off(tmp_path, actor):
     assert forge.writes == []
 
 
+def test_forced_rearm_person_disarm_before_push_stays_off(tmp_path):
+    forge = forced_forge()
+    forge.arm_histories[1] = arm_history(
+        items=[
+            arm_event("AutoMergeEnabledEvent", APP),
+            arm_event("AutoMergeDisabledEvent", {"login": "maintainer-1", "__typename": "User"}),
+            arm_event("HeadRefForcePushedEvent", APP),
+        ]
+    )
+    done, _ = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.arm_history_calls == [1]
+    assert forge.writes == []
+
+
+def test_forced_rearm_armed_in_flight_stays_off(tmp_path):
+    flying = pull(1, "BLOCKED", autoMergeRequest={"enabledAt": OLD}, suites=[None])
+    forge = Forge(repository(flying, pull(2, "BLOCKED", suites=[None])))
+    forge.arm_histories[2] = arm_history(2)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.arm_history_calls == []
+    assert "#1 is armed and in flight" in summary
+
+
 def test_forced_rearm_required_status_stays_off(tmp_path):
     forge = forced_forge(status=ctx("lanes/booked", "SUCCESS"))
     done, _ = train(tmp_path, forge, required_status="lanes/booked")
@@ -10603,6 +10632,16 @@ def test_forced_disarm_enable_methods_and_bot_disablers(tmp_path, monkeypatch, e
     assert mod.forced_disarm(pull(1, "BLOCKED"), items, {"bot_login": BOT, "dependency": ()})
 
 
+def test_forced_disarm_person_disarm_before_push_stays_off(tmp_path, monkeypatch):
+    mod = load_train(tmp_path, monkeypatch)
+    items = [
+        arm_event("AutoMergeEnabledEvent", APP),
+        arm_event("AutoMergeDisabledEvent", {"login": "maintainer-1", "__typename": "User"}),
+        arm_event("HeadRefForcePushedEvent", APP),
+    ]
+    assert not mod.forced_disarm(pull(1, "BLOCKED"), items, {"bot_login": BOT, "dependency": ()})
+
+
 def test_forced_rearm_dependency_author_using_person_token(tmp_path):
     actor = {"login": "renovate", "__typename": "User"}
     forge = forced_forge(author={"login": "renovate[bot]"}, headRefName="renovate/package")
@@ -10625,6 +10664,38 @@ def test_forced_rearm_history_read_budget(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.arm_history_calls == [1, 2, 3, 4, 5]
     assert forge.writes == []
+
+
+def test_forced_rearm_history_window_rotates(tmp_path, monkeypatch):
+    mod = load_train(tmp_path, monkeypatch)
+    monkeypatch.setenv("GITHUB_RUN_NUMBER", "1")
+    cases = [
+        ("1", [6, 7, 1, 2, 3]),
+        (None, [1, 2, 3, 4, 5]),
+        ("invalid", [1, 2, 3, 4, 5]),
+        ("-1", [1, 2, 3, 4, 5]),
+        ("0", [1, 2, 3, 4, 5]),
+        ("1", [6, 7, 1, 2, 3]),
+    ]
+    for index, (number, window) in enumerate(cases):
+        workdir = tmp_path / str(index)
+        workdir.mkdir()
+        forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 8))))
+        forge.arm_histories = {n: arm_history(n, items=[]) for n in range(1, 8)}
+        forge.arm_histories[6] = arm_history(6)
+        done, _ = train(workdir, forge, run_number=number)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert forge.writes == ([armed(6)] if number == "1" else [])
+        env = {} if number is None else {"GITHUB_RUN_NUMBER": number}
+        assert mod.rearm_window(env, list(range(1, 8))) == window
+        assert forge.arm_history_calls == (window[:1] if number == "1" else window)
+
+
+@pytest.mark.parametrize("count", [0, 1, 5], ids=["empty", "one", "budget"])
+def test_forced_rearm_history_window_preserves_serving_order(tmp_path, monkeypatch, count):
+    mod = load_train(tmp_path, monkeypatch)
+    candidates = list(range(count))
+    assert mod.rearm_window({"GITHUB_RUN_NUMBER": "1"}, candidates) == candidates
 
 
 def test_forced_rearm_clean_landing_has_priority(tmp_path):

@@ -35,6 +35,13 @@ and no later enable. A dependency bot identified by `is_bot_dependency` may
 push as its author using a person's token. Every subsequent disable must have
 no actor, the force-push actor, or another bot actor. A train disable or another
 person's disable prevents recovery.
+Every disable clears the enable, including a disable before any force push.
+A person's disable followed by a bot push therefore stays off: that push needs
+a new enable event to qualify. A forge or bot disable after the qualifying
+push preserves recovery evidence
+(`test_forced_disarm_person_disarm_before_push_stays_off`,
+`test_forced_rearm_person_disarm_before_push_stays_off` and
+`test_forced_disarm_enable_methods_and_bot_disablers`).
 
 `serve_cycle` tries `re_arm_forced` after `land_clean` and before `serve_pending`,
 keeping a clean landing ahead of a recovery arm. Candidates retain serving
@@ -49,6 +56,9 @@ The step reads review bodies just before arming and holds as landing does
 `test_forced_rearm_review_hold_continues_to_second_candidate` and
 `test_forced_rearm_review_read_failure_holds`); dependency bot pull requests
 retain the existing `late_review_hold` exemption.
+Recovery waits without reading arm histories while any armed pull request is
+in flight, using the same `in_flight` rule as `serve_pending`
+(`test_forced_rearm_armed_in_flight_stays_off`).
 
 A history head differing from the page head waits for another sweep. Otherwise
 `arm` sends the page's head oid as the expected head and rebuilds the signed
@@ -71,6 +81,16 @@ at most ten history and review-body reads in the recovery step
 (`test_forced_rearm_review_read_budget`). One arm attempt ends the sweep,
 preserving the train's one-write scheduling policy; a failed attempt may also
 post its diagnostic comment.
+When candidates exceed that budget, the read window rotates by
+`(GITHUB_RUN_NUMBER * REARM_READS) % len(candidates)`, wrapping at the end.
+Missing, invalid or negative run numbers use zero. For a stable candidate list,
+the windows cover later candidates within `ceil(n / REARM_READS)` successive
+sweeps, so non-qualifying histories cannot permanently consume every slot.
+A re-run uses the same run number and reads the same window. Candidates that
+fit the budget keep their serving order
+(`test_forced_rearm_history_window_rotates` and
+`test_forced_rearm_history_window_preserves_serving_order[empty]`, `[one]`,
+`[budget]`).
 The bounded timeline requires positive evidence inside its window, and comment
 deduplication applies to the last 20 comments. A later push provides a new head
 and a new failure marker.
