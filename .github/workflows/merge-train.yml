@@ -1360,7 +1360,7 @@ jobs:
                   if not clean.startswith("- "):
                       return None
                   values.append(clean[2:])
-              return values
+              return values or None
 
 
           def filter_patterns(value, following, indent, key):
@@ -1444,7 +1444,7 @@ jobs:
               """Event candidates outside comments and block scalars."""
               block_indent = None
               for line in lines[:5000]:
-                  clean = line.strip()
+                  clean = re.sub(r"\s+#.*$", "", line.strip()).strip()
                   if not clean:
                       continue
                   indent = len(line) - len(line.lstrip(" "))
@@ -1453,9 +1453,9 @@ jobs:
                   block_indent = None
                   if clean.startswith("#"):
                       continue
-                  if BLOCK_SCALAR_RE.search(line):
+                  if BLOCK_SCALAR_RE.search(clean):
                       block_indent = indent
-                  yield indent, re.sub(r"\s+#.*$", "", clean).strip()
+                  yield indent, clean
 
 
           def block_has_allowed_trigger(events, default_branch, truncated):
@@ -1468,7 +1468,7 @@ jobs:
                       clean, events[position + 1 :], indent, default_branch, truncated
                   ):
                       return True
-              return False
+              return truncated
 
 
           def workflow_has_allowed_trigger(content, default_branch):
@@ -1482,7 +1482,7 @@ jobs:
                   if rest:
                       return any(t in ALLOWED_TRIGGERS for t in inline_triggers(rest))
                   return block_has_allowed_trigger(events[position + 1 :], default_branch, len(lines) > 5000)
-              return False
+              return len(lines) > 5000
 
 
           def job_direct_indent(job_lines):

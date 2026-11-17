@@ -12,6 +12,7 @@ answers the closed and open pull requests with the fields the checks read.
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
 import subprocess
@@ -1536,6 +1537,10 @@ REVIEW_FILTER_CASES = [
     pytest.param('"branches": [dev]', False, id="quoted-other-branch"),
     pytest.param("paths: [src/**]", False, id="paths-with-tags-only"),
     pytest.param("'paths-ignore' : [src/**]", False, id="quoted-paths-with-tags-only"),
+    pytest.param("branches: # note: |\n      - main", True, id="literal-comment"),
+    pytest.param("branches: # note: >\n      - main", True, id="folded-comment"),
+    pytest.param("branches:", True, id="null-branches-with-tags"),
+    pytest.param("branches: []", False, id="empty-branches-with-tags"),
 ]
 
 
@@ -1549,6 +1554,40 @@ def test_review_push_filter_keys(tmp_path, forge, filters, skip):
     done, outputs = settings(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert outputs == f"skip={str(skip).lower()}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        pytest.param("on: # note: >\n  push:", id="on-folded-comment"),
+        pytest.param("on: # note: |\n  push:", id="on-literal-comment"),
+        pytest.param("on:\n  push:\n    branches:", id="null-branches-without-tags"),
+    ],
+)
+def test_review_trigger_shapes(tmp_path, forge, trigger):
+    """Comment text and null filters cannot prove that a push excludes the branch."""
+    forge.config = {}
+    forge.workflows = {"release.yml": push_workflow(trigger)}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=true\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize("header", ["run: |", "run: |  # c", "run: >  # c"])
+def test_review_trigger_lines_hide_scalar_body(tmp_path, header):
+    """Real scalar headers still hide event-like text after comment removal."""
+    path = tmp_path / "release_labels.py"
+    path.write_text(module(), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("release_labels", path)
+    assert spec is not None and spec.loader is not None
+    labels = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(labels)
+    lines = [header, "  push:", "    branches: [main]", "on:", "  pull_request:"]
+    assert list(labels.trigger_lines(lines)) == [
+        (0, header.split("  #", 1)[0]),
+        (0, "on:"),
+        (2, "pull_request:"),
+    ]
 
 
 def window_push_workflow(closed: bool, compact: bool = False) -> str:
@@ -1576,6 +1615,34 @@ def test_review_push_filter_window(tmp_path, forge, closed, compact):
     assert outputs == f"skip={str(not closed).lower()}\npending=[]\nfrozen=false\n"
 
 
+def window_event_workflow(late_on: bool, truncated: bool) -> str:
+    """Close push before the window ends, or place the entire on: beyond it."""
+    prefix = "name: Release\njobs:\n" + PLANTED_WORKFLOW.split("jobs:\n", 1)[1]
+    if not late_on:
+        prefix += "on:\n  push:\n    branches: [dev]\n  pull_request:\n"
+    suffix = "on:\n  pull_request:\n" if late_on else "  workflow_dispatch:\n"
+    if not truncated and not late_on:
+        suffix = ""
+    padding = 5000 - len(prefix.splitlines()) - (0 if truncated else len(suffix.splitlines()))
+    return prefix + "# padding\n" * padding + suffix
+
+
+@pytest.mark.parametrize("truncated", [False, True], ids=["complete", "cut"])
+@pytest.mark.parametrize("late_on", [False, True], ids=["closed-push", "late-on"])
+def test_review_event_window(tmp_path, forge, late_on, truncated):
+    """An open on: or an unseen on: stays unknown only when the file exceeds the window."""
+    workflow = window_event_workflow(late_on, truncated)
+    assert (len(workflow.splitlines()) > 5000) is truncated
+    assert truncated or len(workflow.splitlines()) == 5000
+    if truncated:
+        assert workflow.splitlines()[5000] == ("on:" if late_on else "  workflow_dispatch:")
+    forge.config = {}
+    forge.workflows = {"release.yml": workflow}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip={str(truncated).lower()}\npending=[]\nfrozen=false\n"
+
+
 @pytest.mark.parametrize(
     ("mutation", "workflow"),
     [
@@ -1598,14 +1665,40 @@ def test_review_push_filter_window(tmp_path, forge, closed, compact):
             window_push_workflow(False),
             id="window-cut-refusal",
         ),
+        pytest.param(
+            ("BLOCK_SCALAR_RE.search(clean)", "BLOCK_SCALAR_RE.search(line)"),
+            push_workflow("on: # note: >\n  push:"),
+            id="comment-scalar-refusal",
+        ),
+        pytest.param(
+            (
+                "return values or None\n\n\ndef filter_patterns",
+                "return values\n\n\ndef filter_patterns",
+            ),
+            push_workflow("on:\n  push:\n    branches:\n    tags: ['v*']"),
+            id="null-sequence-refusal",
+        ),
+        pytest.param(
+            (
+                "return truncated\n\n\ndef workflow_has_allowed_trigger",
+                "return False\n\n\ndef workflow_has_allowed_trigger",
+            ),
+            window_event_workflow(False, True),
+            id="open-event-window-refusal",
+        ),
     ],
 )
 @pytest.mark.parametrize("mutated", [False, True])
 def test_review_push_filter_mutations_flip_planted_oracle(
     tmp_path, forge, mutation, workflow, mutated
 ):
-    """Removing either refusal flips a new planted case away from its fixed oracle."""
+    """Removing each refusal flips a planted case away from its fixed oracle."""
     source = module()
+    if mutation[0] == "return None if truncated else events":
+        # Isolate the push guard from the new, independently tested on: window fallback.
+        fallback = "return truncated\n\n\ndef workflow_has_allowed_trigger"
+        assert source.count(fallback) == 1
+        source = source.replace(fallback, "return False\n\n\ndef workflow_has_allowed_trigger")
     assert source.count(mutation[0]) == 1
     if mutated:
         source = source.replace(*mutation)
