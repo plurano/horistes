@@ -1,0 +1,13 @@
+# Moving code in an anchored file can break .bestpractices.json anchors;
+# tools/anchors.py check catches drift before the dispatcher's gate.
+# The lane launcher's reader allows required, required_by_stage, credential_stub_tests.
+# Stage comes from the first task: line in the first 20 lines, mapped through the router.
+# Required strings match brief text by plain substring.
+# Reader rc: 0 = present; 1 = missing lines on stdout; 2 = invalid config or unresolved stage.
+# tests/test_lane_brief_config.py checks shape and replays planted briefs.
+---
+required_by_stage:
+  impl:
+    - "tools/anchors.py check"
+  fix:
+    - "tools/anchors.py check"
