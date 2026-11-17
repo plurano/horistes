@@ -60,6 +60,211 @@ def test_stdlib_check_detects_non_stdlib_import():
     assert any("yaml" in f for f in findings)
 
 
+@pytest.mark.parametrize(
+    ("value", "accepted"),
+    [
+        ("a <b@c>", True),
+        ("<b@c>", False),
+        ("a  <b@c>", False),
+        ("a <b>", False),
+        ("a <b@c@d>", False),
+        ("a\nb <b@c>", False),
+    ],
+)
+def test_sign_off_value_language(value, accepted):
+    assert bool(commit_message.SIGN_OFF_VALUE.fullmatch(value)) is accepted
+
+
+@pytest.mark.parametrize(
+    ("author", "name", "value", "findings"),
+    [
+        ("a@x", "N", "N <a@x>", []),
+        (" A@X ", " STRASSE ", " Straße <a@x> ", []),
+        ("a@x", "N", "Other <a@x>", ["sign-off Other <a@x> is not the author N <a@x>"]),
+        ("a@x", "N", "N <b@y>", ["sign-off N <b@y> is not the author N <a@x>"]),
+        ("a@x", None, "Other <a@x>", []),
+        (" A@X ", None, "N <a@x>", ["sign-off a@x is not the author  A@X "]),
+        ("123+app[bot]@users.noreply.github.com", "app[bot]", "N <a@x>", []),
+        ("a@x", "N", "N <bad>", ["malformed sign-off 'N <bad>'"]),
+        (
+            "a@x",
+            "N",
+            "A <a@x>\nSigned-off-by: B <b@y>",
+            ["sign-off A <a@x>, B <b@y> is not the author N <a@x>"],
+        ),
+        ("a@x", "N", "Other <b@y>\nSigned-off-by: N <a@x>", []),
+        (
+            "a@x",
+            "N",
+            "N <a@x>\nSigned-off-by: N <bad>",
+            ["malformed sign-off 'N <bad>'"],
+        ),
+    ],
+    ids=[
+        "exact",
+        "casefold-strip",
+        "other-name",
+        "other-email",
+        "email-only",
+        "email-only-no-strip",
+        "bot",
+        "malformed",
+        "multiple",
+        "one-matches",
+        "matching-and-malformed",
+    ],
+)
+def test_author_ident_sign_off(author, name, value, findings):
+    message = f"fix: example\n\nSigned-off-by: {value}\n"
+    assert commit_message.foreign_sign_off(author, message, name=name) == findings
+
+
+def tree_commit(repo, message=CLEAN, parents=(), **identity):
+    tree = commit_message.git(repo, "mktree", text="", env=commit_message.ALONE).strip()
+    options = [arg for parent in parents for arg in ("-p", parent)]
+    return commit_message.git(
+        repo,
+        "commit-tree",
+        tree,
+        *options,
+        text=message,
+        env={**commit_message.ALONE, **identity},
+    ).strip()
+
+
+def sign_off_range(tmp_path):
+    repo = git_repo(tmp_path)
+    base = tree_commit(repo)
+    good = tree_commit(repo, CLEAN + CO_AUTHOR + "\n", (base,))
+    bad = tree_commit(repo, CLEAN.replace("A Person <", "Other Person <"), (good,))
+    head = tree_commit(repo, CLEAN, (bad,))
+    commit_message.git(repo, "update-ref", "HEAD", head, env=commit_message.ALONE)
+    return repo, base, good, bad, head
+
+
+def test_sign_off_range_only_refuses_planted_commit(tmp_path):
+    repo, base, _, bad, head = sign_off_range(tmp_path)
+    assert commit_message.sign_offs_refused(repo, base, head) == {
+        bad: [
+            (
+                "sign-off Other Person <person@example.org> is not the author "
+                "A Person <person@example.org>"
+            )
+        ]
+    }
+
+
+def test_sign_off_range_explicit_head_without_checkout(tmp_path):
+    repo, base, good, _, head = sign_off_range(tmp_path)
+    assert commit_message.sign_offs_refused(repo, base, good) == {}
+    assert commit_message.git(repo, "rev-parse", "HEAD").strip() == head
+
+
+def test_sign_off_range_matches_author_only(tmp_path):
+    repo = git_repo(tmp_path)
+    base = tree_commit(repo)
+    head = tree_commit(repo, parents=(base,), GIT_AUTHOR_NAME="Other Person")
+    assert commit_message.sign_offs_refused(repo, base, head) == {
+        head: [
+            (
+                "sign-off A Person <person@example.org> is not the author "
+                "Other Person <person@example.org>"
+            )
+        ]
+    }
+
+
+@pytest.mark.parametrize("extra", [0, 1], ids=["at-message-bound", "over-message-bound"])
+def test_sign_off_range_message_bound(tmp_path, extra):
+    repo = git_repo(tmp_path)
+    base = tree_commit(repo)
+    size = MAX_MESSAGE + extra
+    message = "x" * (size - len(CLEAN)) + CLEAN
+    head = tree_commit(repo, message, (base,))
+    expected = {head: [f"message of {size} characters, over {MAX_MESSAGE}"]} if extra else {}
+    assert commit_message.sign_offs_refused(repo, base, head) == expected
+
+
+def test_sign_off_range_clean_merge_exempt(tmp_path):
+    repo = git_repo(tmp_path)
+    base = tree_commit(repo)
+    left = tree_commit(repo, CLEAN.replace("thing", "left"), (base,))
+    right = tree_commit(repo, CLEAN.replace("thing", "right"), (base,))
+    head = tree_commit(repo, "Merge branches\n", (left, right))
+    assert commit_message.sign_offs_refused(repo, base, head) == {}
+
+
+@pytest.mark.parametrize("judge", ["refused", "sign_offs_refused"])
+def test_commit_range_bound(tmp_path, judge):
+    repo = git_repo(tmp_path)
+    base = tree_commit(repo)
+    head = base
+    for _ in range(commit_message.MAX_COMMITS):
+        head = tree_commit(repo, parents=(head,))
+    assert len(commit_message.bounded_commits(repo, base, head)) == commit_message.MAX_COMMITS
+    head = tree_commit(repo, parents=(head,))
+    commit_message.git(repo, "update-ref", "HEAD", head, env=commit_message.ALONE)
+    args = (repo, base) if judge == "refused" else (repo, base, head)
+    with pytest.raises(commit_message.JudgeError, match="more than 500 commits"):
+        getattr(commit_message, judge)(*args)
+
+
+@pytest.mark.parametrize(
+    ("which", "rc"), [("good", 0), ("head", 1), ("unknown", 2), ("unknown-head", 2)]
+)
+def test_cli_sign_off_range(tmp_path, which, rc):
+    repo, base, good, bad, head = sign_off_range(tmp_path)
+    done = run_tool(
+        repo,
+        [
+            "range",
+            "--base",
+            "unknown" if which == "unknown" else base,
+            "--head",
+            {"good": good, "unknown-head": "unknown"}.get(which, head),
+        ],
+    )
+    assert done.returncode == rc, done.stdout + done.stderr
+    if rc == 1:
+        assert done.stdout.startswith(f"{bad} sign-off ")
+        assert done.stderr == ""
+    elif rc == 2:
+        assert done.stdout == ""
+        assert "unknown" in done.stderr
+    else:
+        assert done.stdout == done.stderr == ""
+
+
+def test_cli_sign_off_self_test(tmp_path):
+    done = run_tool(tmp_path, ["self-test"])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert len(done.stdout.splitlines()) == 8
+    assert all(line.startswith("ok ") for line in done.stdout.splitlines())
+
+
+@pytest.mark.parametrize("arguments", [["range", "--base", "x", "--head", "y"], ["self-test"]])
+def test_sign_off_commands_cannot_run_git(tmp_path, arguments):
+    empty = tmp_path / "no-git"
+    empty.mkdir()
+    done = run_tool(tmp_path, arguments, env={"PATH": str(empty)})
+    assert done.returncode == 2
+    assert "the sign-off judge could not run" in done.stderr
+
+
+def test_self_test_cases_judge_one_commit_each(monkeypatch, capsys):
+    real = commit_message.sign_offs_refused
+    sizes = []
+
+    def recording_range(repo, base, head):
+        sizes.append(len(commit_message.bounded_commits(repo, base, head)))
+        return real(repo, base, head)
+
+    monkeypatch.setattr(commit_message, "sign_offs_refused", recording_range)
+    assert commit_message.self_test() == 0
+    assert sizes == [1] * 8
+    assert "FAIL" not in capsys.readouterr().out
+
+
 def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()

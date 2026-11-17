@@ -1,0 +1,73 @@
+<%- /*
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+
+Caller of the shared sign-off judge, as a consumer keeps it in
+.github/workflows/sign-off-check.yml. Required check: "Sign-off".
+The forge reports the call as "Sign-off / Sign-off"; result reports "Sign-off"
+and fails unless the call passed (decision record 0095).
+The shared repository, commit and version come from .Shared; the runner
+comes from .RunnerTag. The consumer's own licence header comes from .Licence.
+Concurrency belongs to the caller, so separate consumers do not collide.
+*/ -%>
+# SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>
+---
+# Sign-off: judge each pull-request commit's author name and email.
+# The job is the shared workflow of <% .Shared.Repository %>, named by commit.
+name: Sign-off check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: sign-off-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # On a draft the sign-off call is skipped and spends no runner; the result job
+  # still takes one runner briefly to report the draft; the check turns red
+  # again when a ready pull request is converted to a draft.
+  sign-off:
+    name: Sign-off
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.draft == false
+    permissions:
+      contents: read
+    uses: <% .Shared.Repository %>/.github/workflows/sign-off.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      runner: <% .RunnerTag %>
+
+  # The forge reports the calling job above only as "Sign-off / Sign-off",
+  # never as "Sign-off", so a rule set that requires "Sign-off" waits forever.
+  # This job reports "Sign-off" and fails unless the sign-off check passed; it
+  # runs under always() so a failed, cancelled or skipped check still reports
+  # here.
+  result:
+    name: Sign-off
+    needs: sign-off
+    if: always()
+    runs-on: <% .RunnerTag %>
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Report the draft
+        if: needs.sign-off.result == 'skipped'
+        shell: bash
+        run: >
+          echo "::error title=Gate not run on a draft::The gate did not run
+          because the pull request is a draft.
+          It runs when the pull request is marked ready for review."
+
+          exit 1
+      - name: Fail unless the sign-off check passed
+        if: needs.sign-off.result != 'success'
+        shell: bash
+        run: |
+          echo "The sign-off check did not pass or was skipped on a draft."
+          exit 1

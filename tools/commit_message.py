@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Judge commit messages against sign-off and tool-credit rules (ADR-0074).
+"""Judge hook messages and PR sign-offs (ADR-0074, ADR-0095).
 
 This module uses Python standard library modules only and runs under
 `python3 -I -B` so that a fresh checkout without `.venv` or installed tools
@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -27,7 +28,7 @@ MERGE_HEAD_BYTES = 65 * MAX_COMMITS  # one SHA-256 name and a newline per head
 TRAILERS = {"signed-off-by", "migration"}
 FOOTER = re.compile(r"^\W*(generated with\b|co-authored-by\s*:)", re.IGNORECASE)
 FORGE_BOT = re.compile(r"\d+\+[a-z0-9-]+\[bot\]@users\.noreply\.github\.com", re.IGNORECASE)
-SIGN_OFF_VALUE = re.compile(r"[^<>\n]*[^<>\s] <([^<>\s@]+@[^<>\s@]+)>")
+SIGN_OFF_VALUE = re.compile(r"(?P<name>[^<>\n]*[^<>\s]) <(?P<email>[^<>\s@]+@[^<>\s@]+)>")
 ALONE = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -95,27 +96,41 @@ def trailer_keys(message: str, repo: Path | None = None) -> list[str]:
     return [key for key, _ in trailers(message, repo=repo)]
 
 
-def foreign_sign_off(author: str, message: str, repo: Path | None = None) -> list[str]:
+def foreign_sign_off(
+    author: str, message: str, repo: Path | None = None, name: str | None = None
+) -> list[str]:
     """Findings on malformed sign-offs, and when none names the author (a bot's: or a person)."""
     values = [v for k, v in trailers(message, repo=repo) if k.lower() == "signed-off-by"]
     if not values:
         return []
     findings: list[str] = []
     emails: list[str] = []
+    idents: list[tuple[str, str]] = []
     for value in values:
         match = SIGN_OFF_VALUE.fullmatch(value)
         if match:
-            emails.append(match.group(1))
+            emails.append(match.group("email"))
+            idents.append((match.group("name"), match.group("email")))
         else:
             findings.append(f"malformed sign-off {value!r}")
     if not emails:
         return findings
-    if any(email.lower() == author.lower() for email in emails):
+    if author_signed(author, name, idents):
         return findings
     if FORGE_BOT.fullmatch(author) and any(not FORGE_BOT.fullmatch(e) for e in emails):
         return findings
-    findings.append(f"sign-off {', '.join(emails)} is not the author {author}")
+    expected = author if name is None else f"{name} <{author}>"
+    actual = emails if name is None else [f"{n} <{e}>" for n, e in idents]
+    findings.append(f"sign-off {', '.join(actual)} is not the author {expected}")
     return findings
+
+
+def author_signed(author: str, name: str | None, idents: list[tuple[str, str]]) -> bool:
+    """Whether a sign-off matches the email, or the full author ident in PR mode."""
+    if name is None:
+        return any(email.lower() == author.lower() for _, email in idents)
+    expected = (name.strip().casefold(), author.strip().casefold())
+    return any((n.strip().casefold(), e.strip().casefold()) == expected for n, e in idents)
 
 
 def credited(message: str, repo: Path | None = None) -> list[str]:
@@ -141,7 +156,9 @@ def oversize(message: str) -> list[str]:
     return []
 
 
-def signed_off(repo: Path, tree: str, author: str, parents: str, message: str) -> list[str]:
+def signed_off(
+    repo: Path, tree: str, author: str, parents: str, message: str, name: str | None = None
+) -> list[str]:
     """Sign-off findings of one commit; a clean 2-parent merge without a trailer is exempt.
 
     `tree` names the commit's tree: the commit itself, or the tree written from the
@@ -154,7 +171,7 @@ def signed_off(repo: Path, tree: str, author: str, parents: str, message: str) -
         target = git(repo, "rev-parse", "--verify", f"{tree}^{{tree}}", env=ALONE).strip()
         if merged is not None and merged == target:
             return []
-    return unsigned(message, repo=repo) + foreign_sign_off(author, message, repo=repo)
+    return unsigned(message, repo=repo) + foreign_sign_off(author, message, repo=repo, name=name)
 
 
 def judged(repo: Path, tree: str, author: str, parents: str, message: str) -> list[str]:
@@ -273,21 +290,97 @@ def message_text(path: str | Path) -> str:
     return bounded_text(path, MESSAGE_BYTES, "utf-8")
 
 
-def refused(repo: Path, base: str) -> dict[str, list[str]]:
-    """Commits between the base and HEAD, merges included, that break a sign-off or credit rule."""
-    git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
-    listed = git(repo, "rev-list", f"--max-count={MAX_COMMITS + 1}", f"{base}..HEAD")
+def bounded_commits(repo: Path, base: str, head: str) -> list[str]:
+    """At most MAX_COMMITS commits between two verified commit revisions."""
+    start = git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}").strip()
+    end = git(repo, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}").strip()
+    listed = git(repo, "rev-list", f"--max-count={MAX_COMMITS + 1}", f"{start}..{end}")
     commits = listed.split()
     if len(commits) > MAX_COMMITS:
         raise JudgeError(f"more than {MAX_COMMITS} commits since {base}")
+    return commits
+
+
+def refused(repo: Path, base: str) -> dict[str, list[str]]:
+    """Commits between the base and HEAD, merges included, that break a sign-off or credit rule."""
     found: dict[str, list[str]] = {}
-    for sha in commits:
+    for sha in bounded_commits(repo, base, "HEAD"):
         read = git(repo, "log", "-1", "--format=format:%ae%x00%P%x00%B", sha)
         author, parents, message = read.split("\x00", 2)
         lines = judged(repo, sha, author, parents, message)
         if lines:
             found[sha] = lines
     return found
+
+
+def sign_offs_refused(repo: Path, base: str, head: str) -> dict[str, list[str]]:
+    """PR commits whose sign-offs fail the full author ident rule; no credit rules."""
+    found: dict[str, list[str]] = {}
+    for sha in bounded_commits(repo, base, head):
+        read = git(repo, "log", "-1", "--format=format:%an%x00%ae%x00%P%x00%B", sha)
+        name, author, parents, message = read.split("\x00", 3)
+        lines = oversize(message) or signed_off(repo, sha, author, parents, message, name=name)
+        if lines:
+            found[sha] = lines
+    return found
+
+
+def self_test_cases() -> tuple[tuple[str, str, str, str, bool], ...]:
+    """Fixed positive, negative and boundary cases for the PR sign-off judge."""
+    bot = "123+app[bot]@users.noreply.github.com"
+    return (
+        ("exact ident", "A Person", "person@example.org", "A Person <person@example.org>", True),
+        (
+            "case and spaces",
+            "A PERSON",
+            "PERSON@EXAMPLE.ORG",
+            " a person <person@example.org> ",
+            True,
+        ),
+        ("other email", "A Person", "person@example.org", "A Person <other@example.org>", False),
+        ("other name", "A Person", "person@example.org", "Other <person@example.org>", False),
+        ("no sign-off", "A Person", "person@example.org", "", False),
+        ("malformed sign-off", "A Person", "person@example.org", "A Person <bad>", False),
+        ("bot author", "app[bot]", bot, "A Person <person@example.org>", True),
+        ("clean merge", "A Person", "person@example.org", "", True),
+    )
+
+
+def self_test() -> int:
+    """Judge planted commits in a disposable repository, one commit per range."""
+    with tempfile.TemporaryDirectory(prefix="sign-off-") as directory:
+        repo = Path(directory)
+        git(repo, "init", "-q", env=ALONE)
+        tree = git(repo, "mktree", text="", env=ALONE).strip()
+        root = git(repo, "commit-tree", tree, text="root\n", env=ALONE).strip()
+        base = git(repo, "commit-tree", tree, "-p", root, text="base\n", env=ALONE).strip()
+        passed = True
+        for label, name, email, value, expected in self_test_cases():
+            message = f"test: {label}\n"
+            if value:
+                message += f"\nSigned-off-by: {value}\n"
+            parents = ["-p", base, "-p", root] if label == "clean merge" else ["-p", base]
+            head = git(
+                repo,
+                "commit-tree",
+                tree,
+                *parents,
+                text=message,
+                env={**ALONE, "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email},
+            ).strip()
+            matches = (not sign_offs_refused(repo, base, head)) == expected
+            sys.stdout.write(f"{'ok' if matches else 'FAIL'} {label}\n")
+            passed = passed and matches
+    return 0 if passed else 1
+
+
+def check_range(base: str, head: str) -> int:
+    """Report each PR sign-off finding with its commit; rc 0 clean or 1 findings."""
+    found = sign_offs_refused(Path.cwd(), base, head)
+    for sha, findings in found.items():
+        for finding in findings:
+            sys.stdout.write(f"{sha} {finding}\n")
+    return 1 if found else 0
 
 
 def below_floor(version: tuple[int, ...]) -> str | None:
@@ -334,16 +427,27 @@ def _check_message(message_file: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for commit message judging."""
     parser = argparse.ArgumentParser(
-        description="Judge commit messages by sign-off and tool-credit rules (ADR-0074)."
+        description="Judge hook messages and PR sign-offs (ADR-0074, ADR-0095)."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     check_parser = subparsers.add_parser("check", help="Judge a single message file")
     check_parser.add_argument("message_file", help="Path to commit message file")
+    range_parser = subparsers.add_parser("range", help="Judge PR author sign-offs")
+    range_parser.add_argument("--base", required=True, help="Excluded base commit")
+    range_parser.add_argument("--head", required=True, help="Included head commit")
+    subparsers.add_parser("self-test", help="Prove the PR judge on planted commits")
 
     args = parser.parse_args(argv)
     if args.command == "check":
         return _check_message(args.message_file)
-    return 2
+    try:
+        refusal = below_floor(tuple(sys.version_info))
+        if refusal is not None:
+            raise JudgeError(refusal)
+        return self_test() if args.command == "self-test" else check_range(args.base, args.head)
+    except (JudgeError, OSError, subprocess.TimeoutExpired) as err:
+        sys.stderr.write(f"the sign-off judge could not run: {err}\n")
+        return 2
 
 
 if __name__ == "__main__":

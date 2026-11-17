@@ -18,6 +18,7 @@ CALL_USES = re.compile(r"^    uses: \S+(?: # \S+)?$")
 CALLERS = [
     ("templates/callers/licence.yml.tmpl", ".github/workflows/licence-check.yml"),
     ("templates/callers/scorecard.yml.tmpl", ".github/workflows/scorecard-check.yml"),
+    ("templates/callers/sign-off.yml.tmpl", ".github/workflows/sign-off-check.yml"),
 ]
 
 BASE_INLINE = """\
@@ -74,7 +75,7 @@ def comparable(text: str) -> list[str]:
 @pytest.mark.parametrize(
     ("template_path", "own_path"),
     CALLERS,
-    ids=["licence", "scorecard"],
+    ids=["licence", "scorecard", "sign-off"],
 )
 def test_own_caller_equals_rendered_template(template_path: str, own_path: str) -> None:
     """The repository's own caller matches the rendered template except allow-listed parts."""
