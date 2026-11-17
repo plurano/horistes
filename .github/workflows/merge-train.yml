@@ -192,6 +192,11 @@ on:
         type: string
         required: false
         default: security
+      review_bots:
+        description: Completed head review required from one listed login, comma-separated; empty disables.
+        type: string
+        required: false
+        default: ""
       session_authors:
         description: Session pull request authors to wait for, comma-separated; empty disables the hold.
         type: string
@@ -667,9 +672,9 @@ jobs:
               request goes first: it already waits for the forge to merge it.
               Only an armed pull request is updated, and none where the default branch
               demands linear history (decision record 0044); `notes` says why one is skipped.
-              While `required_status` is set none is armed: `advance` disarms an armed one
-              before its update, and the train lands it directly once it is CLEAN
-              (decision record 0076).
+              While `required_status` or `review_bots` is set none is armed: `advance`
+              disarms an armed one before its update, and the train lands it directly
+              once it is CLEAN (decision records 0076 and 0092).
               """
               behind = [pull for pull, reason in rows if reason == "behind"]
               if linear_history(repo):
@@ -678,7 +683,7 @@ jobs:
                   return []
               behind.sort(key=lambda pull: (not is_security(pull, conf), not pull["autoMergeRequest"]))
               picked = []
-              arms = not conf.get("required_status")
+              arms = not conf.get("required_status") and not conf.get("review_bots")
               for pull in behind:
                   if pull["autoMergeRequest"] or repo["autoMergeAllowed"]:
                       picked.append((pull, arms and not pull["autoMergeRequest"]))
@@ -1065,6 +1070,7 @@ jobs:
           TRAIN_RELEASE_OFF: ${{ inputs.release_off }}
           TRAIN_RELEASE_MAX_PARALLEL: ${{ inputs.release_max_parallel }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
+          TRAIN_REVIEW_BOTS: ${{ inputs.review_bots }}
           TRAIN_SESSION_AUTHORS: ${{ inputs.session_authors }}
           TRAIN_SESSION_HOLD_HOURS: ${{ inputs.session_hold_hours }}
           TRAIN_REQUIRED_STATUS: ${{ inputs.required_status }}
