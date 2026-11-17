@@ -95,3 +95,5 @@ record that supersedes it.
 | [0086](0086-an-exception-for-a-finding-without-a-file-names-no-path.md) | 2026-11-15 | An exception for a finding without a file names no path | Accepted |
 | [0087](0087-the-regenerate-commit-message-fits-commitlint.md) | 2026-11-16 | The regenerate commit message fits commitlint | Accepted |
 | [0090](0090-the-train-holds-on-an-incomplete-review.md) | 2026-11-16 | The train holds on an incomplete review | Accepted |
+| [0093](0093-a-person-commit-ends-the-dependency-exemption.md) | 2026-11-17 | A person commit ends the dependency exemption | Accepted |
+| [0094](0094-the-review-settle-rule-leaves-the-rules-step.md) | 2026-11-17 | The review-settle rule leaves the rules step | Accepted |

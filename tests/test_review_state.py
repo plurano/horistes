@@ -570,6 +570,9 @@ def adr92_reader_cases():
         updatedAt="2026-11-16T17:00:00Z",
     )
     cases.append(("C-edited-notice", adr92_pull(sticky), True))
+    cases.append(
+        ("C-edited-ordinary-notice", adr92_pull({**sticky, "body": "Review limit reached."}), True)
+    )
     table = adr92_comment(ADR92_TABLE, "2026-11-15T19:45:04Z", updatedAt="2026-11-16T17:00:00Z")
     cases.append(("C-edited-evidence", adr92_pull(notice, table), False))
     for name, login in [("author", "person"), ("other-login", "copilot")][:2]:
@@ -720,3 +723,51 @@ def test_adr92_unfinished_allowance_review_keeps_notice(state):
         ),
     }
     assert adr92_reader().review_incomplete(adr92_pull(reviews=[review]))
+
+
+def adr93_paused_cases():
+    """A persistent pause needs same-reviewer head evidence after a later push."""
+    pr = _fixture("dependency-person-commits-paused.json")
+    cases = [_case("edited-after-push", pr, True)]
+    notice = pr["comments"]["nodes"][0]
+    notice["updatedAt"] = "2026-11-17T02:21:00Z"
+    cases.append(_case("stale", pr, True))
+    formal = {
+        "author": {"login": "coderabbitai"},
+        "state": "COMMENTED",
+        "submittedAt": "2026-11-17T03:00:00Z",
+        "body": "",
+        "commit": {"oid": pr["headRefOid"]},
+    }
+    pr["reviews"] = {"totalCount": 1, "nodes": [formal]}
+    cases.append(_case("head-review", pr, False))
+    formal["commit"]["oid"] = "1" * 40
+    cases.append(_case("old-review", pr, True))
+    formal["commit"]["oid"] = pr["headRefOid"]
+    formal["author"]["login"] = "other-reviewer"
+    cases.append(_case("other-reviewer", pr, True))
+    pr["reviews"] = {"totalCount": 0, "nodes": []}
+    summary = {
+        "author": {"login": "coderabbitai"},
+        "createdAt": "2026-11-17T03:00:00Z",
+        "body": PASSED_TABLE,
+    }
+    pr["comments"]["nodes"].append(summary)
+    cases.append(_case("later-table", pr, True))
+    summary["body"] += (
+        "\nReviewing files that changed from the base of the PR and between "
+        + "1" * 40
+        + " and "
+        + pr["headRefOid"]
+        + "."
+    )
+    cases.append(_case("head-range", pr, False))
+    pr["comments"]["nodes"] = [notice]
+    notice["body"] = notice["body"].replace("1" * 40, pr["headRefOid"])
+    cases.append(_case("pause-names-head", pr, False))
+    return cases
+
+
+@pytest.mark.parametrize(("pr", "me", "expected"), adr93_paused_cases())
+def test_adr93_paused_notice(pr, me, expected):
+    assert bool(adr92_reader().review_incomplete(pr, me)) is expected
