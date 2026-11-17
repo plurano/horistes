@@ -10737,6 +10737,65 @@ def test_forced_rearm_refusal_comment_once(tmp_path, dedupe):
         assert "a person" in body and "push" in body
 
 
+@pytest.mark.parametrize("run_number", ["0", "2"], ids=["run-0", "run-2"])
+def test_forced_rearm_refused_head_yields_to_unmarked(tmp_path, run_number):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 11))))
+    forge.arm_histories[1] = arm_history(1, items=[])
+    marker = f"<!-- merge-train:re-arm-failed {2:040x} -->"
+    forge.arm_histories[2] = arm_history(2, comments=[marker])
+    forge.arm_histories[3] = arm_history(3)
+    done, summary = train(tmp_path, forge, run_number=run_number)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(3)]
+    assert forge.arm_history_calls == [1, 2, 3]
+    assert forge.review_body_calls == [2, 3]
+    assert "re-armed #3 after a bot force push" in summary
+    assert (
+        "| #2 | BLOCKED | re-arm refused on this head before: unrefused candidates go first |"
+        in summary
+    )
+
+
+def test_forced_rearm_marked_head_retries_refusal(tmp_path):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 11))))
+    marker = f"<!-- merge-train:re-arm-failed {2:040x} -->"
+    forge.arm_histories[2] = arm_history(2, comments=[marker])
+    forge.mutation_statuses["enablePullRequestAutoMerge"] = [403]
+    done, summary = train(tmp_path, forge, run_number="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(2)]
+    assert forge.review_body_calls == [2]
+    assert forge.posted_comments == []
+    assert "re-arm failed #2:" in summary
+
+
+def test_forced_rearm_marked_head_heals(tmp_path):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 11))))
+    marker = f"<!-- merge-train:re-arm-failed {2:040x} -->"
+    forge.arm_histories[2] = arm_history(2, comments=[marker])
+    done, summary = train(tmp_path, forge, run_number="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(2)]
+    assert forge.review_body_calls == [2]
+    assert forge.posted_comments == []
+    assert "re-armed #2 after a bot force push" in summary
+    assert "re-arm refused on this head before" not in summary
+
+
+def test_forced_rearm_other_head_marker_does_not_defer(tmp_path):
+    forge = Forge(repository(*(pull(n, "BLOCKED", suites=[None]) for n in range(1, 11))))
+    forge.arm_histories[1] = arm_history(1, items=[])
+    marker = f"<!-- merge-train:re-arm-failed {9:040x} -->"
+    forge.arm_histories[2] = arm_history(2, comments=[marker])
+    forge.arm_histories[3] = arm_history(3)
+    done, summary = train(tmp_path, forge, run_number="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(2)]
+    assert forge.arm_history_calls == [1, 2]
+    assert forge.review_body_calls == [2]
+    assert "re-armed #2 after a bot force push" in summary
+
+
 def test_forced_rearm_comment_refusal_is_a_note(tmp_path):
     forge = forced_forge()
     forge.mutation_statuses["enablePullRequestAutoMerge"] = [403]

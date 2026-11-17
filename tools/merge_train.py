@@ -1443,6 +1443,11 @@ def forced_arm_history(env, pull, notes):
         return None
 
 
+def forced_arm_failure_marker(oid):
+    """The per-head refusal marker shared by scheduling and comment deduplication."""
+    return f"<!-- merge-train:re-arm-failed {oid} -->"
+
+
 def forced_arm_failure(env, pull, detail, err, notes):
     """Say an arm refusal once per head; a refused comment remains a bounded summary note."""
     number = pull["number"]
@@ -1450,7 +1455,7 @@ def forced_arm_failure(env, pull, detail, err, notes):
     note = f"not re-armed after a bot force push: {reason}"
     if isinstance(err, UnsignedBotError):
         note = err.note
-    marker = f"<!-- merge-train:re-arm-failed {pull['headRefOid']} -->"
+    marker = forced_arm_failure_marker(pull["headRefOid"])
     comments = (detail.get("comments") or {}).get("nodes") or []
     if not any(marker in (comment.get("body") or "") for comment in comments[:20]):
         text = (
@@ -1482,6 +1487,25 @@ def rearm_window(env, candidates):
     return (candidates[start:] + candidates[:start])[:REARM_READS]
 
 
+def forced_rearm_target(env, conf, window, notes):
+    """Prefer an unrefused qualifying head, retrying the first refused head otherwise."""
+    deferred = None
+    for pull in window[:REARM_READS]:
+        detail = forced_arm_history(env, pull, notes)
+        if not detail or not forced_disarm(pull, detail["timelineItems"]["nodes"], conf):
+            continue
+        if late_review_hold(env, conf, pull, notes):
+            continue
+        marker = forced_arm_failure_marker(pull["headRefOid"])
+        comments = (detail.get("comments") or {}).get("nodes") or []
+        if not any(marker in (comment.get("body") or "") for comment in comments[:20]):
+            return pull, detail
+        if deferred is None:
+            deferred = pull, detail
+        notes[pull["number"]] = "re-arm refused on this head before: unrefused candidates go first"
+    return deferred
+
+
 def re_arm_forced(env, conf, repo, served, held, notes):
     """Recover one unheld auto-merge request dropped after a bot force push."""
     if conf.get("required_status") or not repo["autoMergeAllowed"]:
@@ -1497,19 +1521,16 @@ def re_arm_forced(env, conf, repo, served, held, notes):
         and not is_red(pull)
         and not has_red_code_scanning(pull)
     ]
-    for pull in rearm_window(env, candidates):
-        detail = forced_arm_history(env, pull, notes)
-        if not detail or not forced_disarm(pull, detail["timelineItems"]["nodes"], conf):
-            continue
-        if late_review_hold(env, conf, pull, notes):
-            continue
-        try:
-            arm(env, conf, pull)
-        except RefusedError as err:
-            return forced_arm_failure(env, pull, detail, err, notes)
-        notes[pull["number"]] = "re-armed: auto-merge came off after a bot force push"
-        return f"re-armed #{pull['number']} after a bot force push"
-    return None
+    target = forced_rearm_target(env, conf, rearm_window(env, candidates), notes)
+    if target is None:
+        return None
+    pull, detail = target
+    try:
+        arm(env, conf, pull)
+    except RefusedError as err:
+        return forced_arm_failure(env, pull, detail, err, notes)
+    notes[pull["number"]] = "re-armed: auto-merge came off after a bot force push"
+    return f"re-armed #{pull['number']} after a bot force push"
 
 
 def disarm_red_scanning(env, rows, notes, conf):

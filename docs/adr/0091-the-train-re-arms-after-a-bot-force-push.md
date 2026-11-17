@@ -69,6 +69,10 @@ in the queried comments suppresses another post for that head. A refused
 comment becomes a summary note and does not escape the step. Unsigned bot
 refusals retain their existing skip note.
 
+Within the read window, qualifying heads without their current head's refusal
+marker go first; the first marked qualifying head is retried only when no
+unmarked candidate qualifies, after the same history and review-hold checks.
+
 The step uses the existing train token's `pull_requests: write` permission for
 comments. Reads and writes retain the transport deadline in `request_once`.
 No permission or credential configuration changes are needed.
@@ -85,15 +89,28 @@ When candidates exceed that budget, the read window rotates by
 `(GITHUB_RUN_NUMBER * REARM_READS) % len(candidates)`, wrapping at the end.
 Missing, invalid or negative run numbers use zero. For a stable candidate list,
 the windows cover later candidates within `ceil(n / REARM_READS)` successive
-sweeps, so non-qualifying histories cannot permanently consume every slot.
+sweeps for candidates whose arm is not refused. Non-qualifying histories cannot
+permanently consume every slot. A refusal marker on the current head makes later
+sweeps try unmarked qualifying candidates in that window first; the first marked
+head is retried when no unmarked candidate qualifies. This preserves one arm
+attempt per sweep and lets a transient refusal on that head heal. A later marked
+head in the same window waits while an earlier marked head still qualifies: until
+that head is armed, gets a new push or stops qualifying
+(`test_forced_rearm_refused_head_yields_to_unmarked[run-0]`,
+`test_forced_rearm_refused_head_yields_to_unmarked[run-2]`,
+`test_forced_rearm_marked_head_retries_refusal` and
+`test_forced_rearm_marked_head_heals`).
 A re-run uses the same run number and reads the same window. Candidates that
 fit the budget keep their serving order
 (`test_forced_rearm_history_window_rotates` and
 `test_forced_rearm_history_window_preserves_serving_order[empty]`, `[one]`,
 `[budget]`).
 The bounded timeline requires positive evidence inside its window, and comment
-deduplication applies to the last 20 comments. A later push provides a new head
-and a new failure marker.
+deduplication applies to the last 20 comments. A push provides a new head without
+the old head's marker (`test_forced_rearm_other_head_marker_does_not_defer`).
+If the marker comment cannot be posted or leaves the last 20 comments, the
+refused head counts as unmarked and is tried first again; its next refusal posts
+the marker, if the comment write succeeds.
 
 Repository auto-merge disabled and `required_status` mode perform no recovery
 reads or arms. The train continues to land required-status pull requests
