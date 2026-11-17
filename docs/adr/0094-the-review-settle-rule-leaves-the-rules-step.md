@@ -58,8 +58,8 @@ the rules through the workflow. Mutation replays select a temporary copy of
 the moved reader; an explicit older source tree selects its own reader and
 workflow together.
 
-The new conservative count is 3417 fields for train step 1, leaving 583 fields
-below the local 4000 limit and at least 679 below the engine cap. Release step
+The new conservative count is 3424 fields for train step 1, leaving 576 fields
+below the local 4000 limit and at least 672 below the engine cap. Release step
 2 counts 3530. These are conservative counts, not a new engine audit result.
 [tests/test_run_script_fields.py](../../tests/test_run_script_fields.py)
 checks every workflow run step before the engine gate. It retains comments and
