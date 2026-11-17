@@ -30,7 +30,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
-from review_state import review_incomplete
+from review_state import review_evidence, review_incomplete
 from train_rules import (
     RED,
     REFRESH_LABEL,
@@ -269,6 +269,8 @@ SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its produc
 REVIEW_BODY = "review body: "
 # Pull requests whose review bodies one run reads in one repository (ADR-0070).
 REVIEW_READS = 10
+# advance arms at most one pull per sweep; a small allowance covers held candidates before it.
+ARMING_READS = 3
 # Distinct maintainer logins whose rights one pull request checks (ADR-0077).
 ANSWER_RIGHTS = 5
 # Association only orders the permission reads; it never decides an answer, because an
@@ -290,12 +292,13 @@ query($owner: String!, $name: String!, $number: Int!) {
       reviews(first: 100) {
         totalCount
         nodes {
-          databaseId state body submittedAt url authorAssociation author { login __typename }
+          databaseId state body submittedAt updatedAt url authorAssociation
+          author { login __typename } commit { oid }
         }
       }
       comments(first: 100) {
         totalCount
-        nodes { body createdAt url authorAssociation author { login __typename } }
+        nodes { body createdAt updatedAt url authorAssociation author { login __typename } }
       }
       commits(first: 100) {
         totalCount
@@ -564,6 +567,22 @@ def check_app_key(key):
         )
 
 
+def check_review_bots(value):
+    """Allow only comma-separated forge logins, normalizing optional bot suffixes."""
+    names = value.split(",")
+    if len(names) > 100:
+        raise InvalidSettingError("review_bots has more than 100 logins")
+    logins = set()
+    for name in names[:100]:
+        login = name.strip()
+        if not login:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?", login):
+            raise InvalidSettingError(f"review_bots has invalid login {login!r}")
+        logins.add(login.lower().removesuffix("[bot]"))
+    return frozenset(logins)
+
+
 def settings(env):
     """The inputs of the workflow, each checked against an allow-list."""
     switch = env["TRAIN_SWITCH"]
@@ -599,6 +618,7 @@ def settings(env):
         "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
         "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
         "required_status": required_status,
+        "review_bots": check_review_bots(env.get("TRAIN_REVIEW_BOTS", "")),
         "session_authors": frozenset(
             name.strip() for name in env.get("TRAIN_SESSION_AUTHORS", "").split(",") if name.strip()
         ),
@@ -894,7 +914,7 @@ def prepare_update(env, conf, pull, notes, arming):
             notes[pull["number"]] = err.note
             return False
         notes[pull["number"]] = "armed, updated from the default branch"
-    elif conf.get("required_status") and pull["autoMergeRequest"]:
+    elif (conf.get("required_status") or conf.get("review_bots")) and pull["autoMergeRequest"]:
         graphql(env, DISARM, {"id": pull["id"]})
         notes[pull["number"]] = "disarmed, updated from the default branch"
     else:
@@ -905,11 +925,11 @@ def prepare_update(env, conf, pull, notes, arming):
 def advance(env, conf, repo, rows, notes, check_retry=None):
     """Update the first pull request `updatable` names, arming it first where it says.
 
-    While `required_status` is set an armed pull request is disarmed before its update:
-    auto-merge would otherwise land the new head before the train reads its status
-    (decision record 0076).
+    While `required_status` or `review_bots` is set an armed pull request is disarmed
+    before its update: auto-merge would otherwise land the new head before the train
+    reads its status or listed review (decision records 0076 and 0092).
     """
-    for pull, arming in updatable(repo, rows, notes, conf):
+    for pull, arming in updatable(repo, rows, notes, conf)[: PULL_PAGES * 100]:
         if arming and has_red_code_scanning(pull):
             notes[pull["number"]] = "not armed: code-scanning check failed"
             continue
@@ -919,6 +939,8 @@ def advance(env, conf, repo, rows, notes, check_retry=None):
             return
         if hold:
             notes[pull["number"]] = hold
+            continue
+        if arming and late_review_hold(env, conf, pull, notes, arming=True):
             continue
         if not prepare_update(env, conf, pull, notes, arming):
             continue
@@ -1332,33 +1354,46 @@ def regenerate(env, conf, repo, rows, notes):
     return None
 
 
+def re_arm_after_review(env, conf, pull, notes):
+    """Read reviews before disarming and re-arming a drifted headline; unread stays armed."""
+    if late_review_hold(env, conf, pull, notes, arming=True):
+        if notes[pull["number"]].startswith("disarmed: "):
+            return f"disarmed #{pull['number']}"
+        return None
+    graphql(env, DISARM, {"id": pull["id"]})
+    try:
+        arm(env, conf, pull)
+    except UnsignedBotError as err:
+        notes[pull["number"]] = err.note
+        return f"disarmed #{pull['number']}: its commits carry no Signed-off-by"
+    notes[pull["number"]] = "re-armed: title changed after arming"
+    return f"re-armed #{pull['number']}"
+
+
 def re_arm_drifted(env, conf, served, held, notes):
     """Re-arm an armed squash pull request whose headline drifted from its title.
 
-    A pull request a review body holds was disarmed this run and stays disarmed.
-    A pull request left disarmed for lack of sign-off ends the run, so later steps
-    do not read it as armed.
+    With required_status or review_bots, disarm for direct landing by the train.
+    Otherwise read reviews again before disarming and re-arming; a held review or
+    lack of sign-off ends the run disarmed, so later steps do not read it as armed.
     """
-    for pull, reason in served:
+    for pull, reason in served[: PULL_PAGES * 100]:
         if reason.startswith(REVIEW_BODY) or required_status_hold(pull, conf):
             continue
-        if pull["number"] not in held and drifted(pull, conf):
-            if has_red_code_scanning(pull):
-                notes[pull["number"]] = "not re-armed: code-scanning check failed"
-                continue
+        if pull["number"] in held or not drifted(pull, conf):
+            continue
+        if has_red_code_scanning(pull):
+            notes[pull["number"]] = "not re-armed: code-scanning check failed"
+            continue
+        if conf.get("required_status") or conf.get("review_bots"):
             graphql(env, DISARM, {"id": pull["id"]})
-            if conf.get("required_status"):
-                notes[pull["number"]] = (
-                    "disarmed: title changed after arming, the train lands it directly"
-                )
-                return f"disarmed #{pull['number']}"
-            try:
-                arm(env, conf, pull)
-            except UnsignedBotError as err:
-                notes[pull["number"]] = err.note
-                return f"disarmed #{pull['number']}: its commits carry no Signed-off-by"
-            notes[pull["number"]] = "re-armed: title changed after arming"
-            return f"re-armed #{pull['number']}"
+            notes[pull["number"]] = (
+                "disarmed: title changed after arming, the train lands it directly"
+            )
+            return f"disarmed #{pull['number']}"
+        outcome = re_arm_after_review(env, conf, pull, notes)
+        if outcome:
+            return outcome
     return None
 
 
@@ -1545,27 +1580,69 @@ def _maintainer_unanswered(pr_author, detail, unanswered, right):
     return [finding for finding in unanswered if finding in remaining]
 
 
-def _review_connection_hold(detail):
-    """Refuse a truncated connection before either review reader uses it."""
-    for kind in ("reviews", "comments", "commits"):
-        if ((detail.get(kind) or {}).get("totalCount") or 0) > 100:
-            return f"{REVIEW_BODY}more than 100 {kind}, cannot read every answer"
+def _connection_hold(conn, kind):
+    """Validate one bounded connection, including counts and node shapes."""
+    unread = f"{REVIEW_BODY}cannot read {kind}"
+    if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+        return unread
+    count = conn.get("totalCount", len(conn["nodes"]))
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return unread
+    if count > 100 or len(conn["nodes"]) > 100:
+        return f"{REVIEW_BODY}more than 100 {kind}, cannot read every answer"
+    if count != len(conn["nodes"]):
+        return unread
+    if any(not isinstance(node, dict) for node in conn["nodes"][:100]):
+        return unread
     return None
 
 
-def review_body_hold(pull, detail, right=None):
+def _review_connection_hold(detail):
+    """Refuse unreadable or truncated connections before either review reader uses them."""
+    if not isinstance(detail, dict):
+        return f"{REVIEW_BODY}cannot read pull request"
+    for kind in ("reviews", "comments", "commits"):
+        if hold := _connection_hold(detail.get(kind), kind):
+            return hold
+    return None
+
+
+def _head_review_hold(detail, review_bots):
+    """An explicit reviewer allow-list requires at least one readable completed head review."""
+    if not review_bots:
+        return None
+    evidence = review_evidence(detail)
+    if any(
+        login in review_bots and when is not None and on_head
+        for login, when, on_head in evidence[:200]
+    ):
+        return None
+    names = ", ".join(sorted(review_bots))
+    head = str(detail.get("headRefOid") or "")[:7]
+    return f"{REVIEW_BODY}review incomplete: no completed review by {names} on head {head}"
+
+
+def review_body_hold(pull, detail, right=None, review_bots=frozenset()):
     """Why a pull request waits for an incomplete review or unanswered body finding, or None."""
     if connection_hold := _review_connection_hold(detail):
         return connection_hold
-    detail_with_author = {**detail, "author": pull.get("author")}
+    head = detail.get("headRefOid") or pull.get("headRefOid")
+    if detail.get("headRefOid") and pull.get("headRefOid") != detail["headRefOid"]:
+        return f"{REVIEW_BODY}head moved while reading reviews"
+    detail_with_author = {**detail, "author": pull.get("author"), "headRefOid": head}
+    if head_hold := _head_review_hold(detail_with_author, review_bots):
+        return head_hold
     incomplete = review_incomplete(detail_with_author)
     if incomplete:
         return f"{REVIEW_BODY}{incomplete}"
-    author_field = pull.get("author")
-    pr_author = (author_field.get("login") or "") if isinstance(author_field, dict) else ""
+    return _unanswered_body_hold(pull, detail, right)
+
+
+def _unanswered_reviews(pr_author, detail):
+    """Collect bot findings whose review ids have no answer in this pull request."""
     texts = _answer_texts(pr_author, detail)
     unanswered = []
-    for review in (detail.get("reviews") or {}).get("nodes") or []:
+    for review in detail["reviews"]["nodes"][:100]:
         author = review.get("author") or {}
         if author.get("__typename") != "Bot" or review.get("state") not in _BODY_REVIEW_STATES:
             continue
@@ -1575,6 +1652,14 @@ def review_body_hold(pull, detail, right=None):
             review_id, texts
         ):
             unanswered.append((login, review_id))
+    return unanswered
+
+
+def _unanswered_body_hold(pull, detail, right):
+    """Preserve the unanswered finding barrier after review coverage checks."""
+    author_field = pull.get("author")
+    pr_author = (author_field.get("login") or "") if isinstance(author_field, dict) else ""
+    unanswered = _unanswered_reviews(pr_author, detail)
     if unanswered and is_bot(pull) and right is not None:
         try:
             unanswered = _maintainer_unanswered(pr_author, detail, unanswered, right)
@@ -1614,7 +1699,7 @@ def collaborator_right(env, login):
     return answer.get("permission") in ("admin", "write")
 
 
-def read_review_hold(env, pull):
+def read_review_hold(env, pull, review_bots=frozenset()):
     """The review-body hold of one pull request, or None; a failed read holds it."""
     try:
         detail = pull_review_bodies(env, pull["number"])
@@ -1622,7 +1707,9 @@ def read_review_hold(env, pull):
         return f"{REVIEW_BODY}cannot read: {err}"[:200]
     if not detail:
         return f"{REVIEW_BODY}cannot read: the forge returned no pull request"
-    return review_body_hold(pull, detail, right=lambda login: collaborator_right(env, login))
+    return review_body_hold(
+        pull, detail, right=lambda login: collaborator_right(env, login), review_bots=review_bots
+    )
 
 
 def review_body_eligible(pull, reason, conf):
@@ -1639,24 +1726,33 @@ def hold_review_bodies(env, conf, rows):
     """
     eligible = [
         pull
-        for pull, reason in serving_order(rows, conf)
+        for pull, reason in serving_order(rows, conf)[: PULL_PAGES * 100]
         if review_body_eligible(pull, reason, conf)
     ]
-    holds = {pull["number"]: read_review_hold(env, pull) for pull in eligible[:REVIEW_READS]}
-    unread = frozenset(pull["number"] for pull in eligible[REVIEW_READS:])
+    holds = {
+        pull["number"]: read_review_hold(env, pull, conf.get("review_bots", frozenset()))
+        for pull in eligible[:REVIEW_READS]
+    }
+    conf["review_reads"] = len(holds)
+    unread = frozenset(pull["number"] for pull in eligible[REVIEW_READS : PULL_PAGES * 100])
     over = f"{REVIEW_BODY}not read: more than {REVIEW_READS} pull requests to read in one run"
     updated = []
-    for pull, reason in rows:
+    for pull, reason in rows[: PULL_PAGES * 100]:
         number = pull["number"]
         updated.append((pull, over if number in unread else holds.get(number) or reason))
     return updated
 
 
-def late_review_hold(env, conf, pull, notes):
-    """Read the review bodies again just before landing; True holds, disarmed if armed."""
+def late_review_hold(env, conf, pull, notes, *, arming=False):
+    """Re-read before landing or arming; True holds, disarmed if already armed."""
     if is_bot_dependency(pull, conf):
         return False
-    hold = read_review_hold(env, pull)
+    counter = "arming_reads" if arming else "review_reads"
+    if arming and conf.get(counter, 0) >= ARMING_READS:
+        notes[pull["number"]] = f"{REVIEW_BODY}not armed: review read budget spent this sweep"
+        return True
+    conf[counter] = conf.get(counter, 0) + 1
+    hold = read_review_hold(env, pull, conf.get("review_bots", frozenset()))
     if not hold:
         return False
     if pull.get("autoMergeRequest"):
@@ -2227,10 +2323,22 @@ def append(path, text):
         handle.write(text)
 
 
+def review_bots_note(env):
+    """Name the parsed opt-in policy once, including whitespace-only empty lists."""
+    logins = check_review_bots(env.get("TRAIN_REVIEW_BOTS", ""))
+    return (
+        "review bots: " + ", ".join(sorted(logins))
+        if logins
+        else "review bots: none set, zero-review hold off"
+    )
+
+
 def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots):
     """Render the sweep report to standard output and the job step summary."""
     lines = [
         "## Merge train sweep",
+        "",
+        review_bots_note(env),
         "",
         "| Account | Repositories | Landed | Updated | Refused |",
         "|---|---|---|---|---|",
