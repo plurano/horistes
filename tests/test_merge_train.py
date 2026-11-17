@@ -10594,8 +10594,8 @@ def test_adr92_arming_read_budget(tmp_path, monkeypatch):
     assert mod.REVIEW_READS == 10
 
 
+# Each row restores one admitted defect, with an exact replacement anchor.
 def adr92_mutations():
-    """Each row restores one admitted defect, with an exact replacement anchor."""
     return [
         (
             "A",
@@ -10625,6 +10625,13 @@ def adr92_mutations():
             "return allowance or names_head or when >= last_commit",
             "return allowance or names_head or when > last_commit",
             "E-equal-notice",
+        ),
+        (
+            "E-head-evidence",
+            "review_state",
+            "(on_head or not head_only)",
+            "(not head_only)",
+            "allowance-later-review-on-head-clears",
         ),
         (
             "F-nodes",
@@ -10665,7 +10672,7 @@ def adr92_mutation_run(root, selector, log):
         selector,
     ]
     done = subprocess.run(
-        command, env=env, capture_output=True, text=True, timeout=120, check=False
+        command, env=env, capture_output=True, text=True, timeout=120, check=False, cwd=ROOT
     )
     log.write_text(done.stdout + done.stderr)
     return done

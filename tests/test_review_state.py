@@ -206,7 +206,7 @@ def _limit_notice_order_cases():
     cases.append(_case("limit-notice-old-names-head", pr, True))
     table["createdAt"] = "2026-11-14T04:02:00Z"
     pr["comments"]["nodes"].append(table)
-    cases.append(_case("limit-notice-newer-table-supersedes", pr, True))
+    cases.append(_case("limit-notice-head-named-newer-table-holds", pr, True))
     table["createdAt"] = comment["createdAt"]
     cases.append(_case("limit-notice-same-time-table-keeps-notice", pr, True))
     comment["author"]["login"] = "lusoris"
@@ -382,7 +382,13 @@ def _allowance_cases():
         "body": "",
     }
     pr["reviews"]["nodes"] = [reviewed]
-    cases.append(_case("allowance-later-review-covers-push", pr, True))
+    cases.append(_case("allowance-later-review-without-head-oid-holds", pr, True))
+    reviewed["commit"] = {"oid": pr["headRefOid"]}
+    cases.append(_case("allowance-later-review-on-head-clears", pr, False))
+    reviewed.pop("commit")
+    reviewed["commit"] = {"oid": "c" * 40}
+    cases.append(_case("allowance-later-review-old-oid-holds", pr, True))
+    reviewed.pop("commit")
     reviewed["state"] = "PENDING"
     cases.append(_case("allowance-pending-review-insufficient", pr, True))
     reviewed["state"] = "COMMENTED"
@@ -397,11 +403,11 @@ def _allowance_cases():
     pr["reviews"]["nodes"] = []
     later = dict(comment, createdAt="2026-11-14T20:49:00Z")
     pr["comments"]["nodes"].append(later)
-    cases.append(_case("allowance-later-summary-covers-push", pr, True))
+    cases.append(_case("allowance-later-summary-old-range-holds", pr, True))
     later["createdAt"] = "2026-11-14T20:47:30Z"
     cases.append(_case("allowance-later-table-before-push-insufficient", pr, True))
     later["createdAt"] = commit["committedDate"]
-    cases.append(_case("allowance-table-at-push-covers", pr, True))
+    cases.append(_case("allowance-table-at-push-old-range-holds", pr, True))
     pr["comments"]["nodes"].pop()
     comment["body"] = "Rate limit exceeded. Review skipped."
     commit["committedDate"] = "2026-11-14T20:40:00Z"
@@ -496,7 +502,7 @@ def _thread_and_limit_cases():
     + _thread_and_limit_cases(),
 )
 def test_review_incomplete_gate_cases(pr, me, expected):
-    assert bool(review_incomplete(pr, me)) is expected
+    assert bool(adr92_reader().review_incomplete(pr, me)) is expected
 
 
 @pytest.mark.parametrize("envelope", [False, True], ids=["node", "data-repository-envelope"])
