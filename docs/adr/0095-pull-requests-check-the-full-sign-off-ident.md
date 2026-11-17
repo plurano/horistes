@@ -25,8 +25,11 @@ commits. The existing hook and gate behavior must therefore stay email-only.
 ## Decision
 
 [sign-off.yml](../../.github/workflows/sign-off.yml) provides the reusable
-`Sign-off` job. On a pull request it judges every commit in the event's
-`base.sha..head.sha` range, using full history from the caller's merge ref. On
+`Sign-off` job. On a pull request it judges parent 1..parent 2 of the checked-out
+merge ref: the base branch tip excludes base-branch commits merged into the
+pull-request head, even when the event records a stale base. An event's
+`base.sha..head.sha` range can include those squash commits, whose author name
+is the forge profile name while their sign-off carries the git identity name. On
 other events it reports a notice that sign-offs are judged on the pull request.
 The repository's [caller](../../.github/workflows/sign-off-check.yml) runs on pull
 requests and merge groups; its `result` job reports the required `Sign-off` check,
@@ -51,11 +54,14 @@ Before judging the caller, the workflow runs `self-test` in an isolated temporar
 repository. The fixed cases prove acceptance and refusal through real git commit
 objects. [test_commit_message_tool.py](../../tests/test_commit_message_tool.py)
 covers identity matching, unchanged trailer syntax, explicit heads, the range
-bound, clean merges and CLI exit codes. The Python 3.12 floor stays unchanged.
+bound, clean merges, stale-base, refused-branch and expected-head cases, and CLI
+exit codes. The Python 3.12 floor stays unchanged.
 
 ## Consequences
 
 - Consumers gain a forge-side check without installing the commit-msg hook.
+- A checkout whose parent 2 is not the event head cannot be judged and fails
+  with exit code 2.
 - Contributor commits need the author's full ident; matching the committer alone
   does not pass. At least one matching sign-off suffices, but malformed additional
   sign-offs still fail.

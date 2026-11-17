@@ -325,6 +325,72 @@ def sign_offs_refused(repo: Path, base: str, head: str) -> dict[str, list[str]]:
     return found
 
 
+def merge_parents(repo: Path, revision: str, expect_head: str) -> tuple[str, str]:
+    """Verified merge parents; refuse a checkout that is not this event's merge."""
+    merge = git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip()
+    parents = git(repo, "rev-list", "--parents", "-n1", merge).split()[1:]
+    if len(parents) != 2:
+        raise JudgeError(f"{revision}: expected exactly 2 parents, found {len(parents)}")
+    head = git(repo, "rev-parse", "--verify", f"{expect_head}^{{commit}}").strip()
+    if parents[1] != head:
+        raise JudgeError(f"{revision}: parent 2 does not match the expected head {head}")
+    return parents[0], parents[1]
+
+
+def self_test_commit(
+    repo: Path, tree: str, message: str, parents: tuple[str, ...] = (), **identity: str
+) -> str:
+    """One planted commit, with explicit parents and optional author identity."""
+    options = [arg for parent in parents for arg in ("-p", parent)]
+    return git(repo, "commit-tree", tree, *options, text=message, env={**ALONE, **identity}).strip()
+
+
+def self_test_merge(repo: Path, tree: str, root: str, main: str, name: str) -> tuple[str, str, str]:
+    """Branch commit signed off as name, main merged into it, and the PR merge."""
+    branch = self_test_commit(
+        repo,
+        tree,
+        f"branch\n\nSigned-off-by: {name} <fixture@example.invalid>\n",
+        (root,),
+        GIT_AUTHOR_NAME="Fixture",
+        GIT_AUTHOR_EMAIL="fixture@example.invalid",
+    )
+    head = self_test_commit(repo, tree, "Merge main\n", (branch, main))
+    return branch, head, self_test_commit(repo, tree, "Merge pull request\n", (main, head))
+
+
+def self_test_merge_cases(repo: Path, tree: str) -> bool:
+    """Stale event base, refused branch commit, wrong event head and non-merge cases."""
+    root = self_test_commit(repo, tree, "old base\n")
+    main = self_test_commit(
+        repo,
+        tree,
+        "main squash\n\nSigned-off-by: Fixture <fixture@example.invalid>\n",
+        (root,),
+        GIT_AUTHOR_NAME="Forge Fixture",
+        GIT_AUTHOR_EMAIL="fixture@example.invalid",
+    )
+    branch, head, merge = self_test_merge(repo, tree, root, main, "Fixture")
+    _, bad_head, bad_merge = self_test_merge(repo, tree, root, main, "Other Fixture")
+    cases = (
+        ("stale base merge", merge, head, True),
+        ("refused branch commit in merge", bad_merge, bad_head, False),
+        ("expected head mismatch", merge, branch, None),
+        ("one-parent checkout", branch, branch, None),
+    )
+    passed = True
+    for label, revision, expected_head, expected in cases:
+        try:
+            base, tip = merge_parents(repo, revision, expected_head)
+            verdict = not sign_offs_refused(repo, base, tip)
+        except JudgeError:
+            verdict = None
+        matches = verdict == expected
+        sys.stdout.write(f"{'ok' if matches else 'FAIL'} {label}\n")
+        passed = passed and matches
+    return passed
+
+
 def self_test_cases() -> tuple[tuple[str, str, str, str, bool], ...]:
     """Fixed positive, negative and boundary cases for the PR sign-off judge."""
     bot = "123+app[bot]@users.noreply.github.com"
@@ -347,31 +413,27 @@ def self_test_cases() -> tuple[tuple[str, str, str, str, bool], ...]:
 
 
 def self_test() -> int:
-    """Judge planted commits in a disposable repository, one commit per range."""
+    """Judge fixed sign-off and merge-ref cases in a disposable repository."""
     with tempfile.TemporaryDirectory(prefix="sign-off-") as directory:
         repo = Path(directory)
         git(repo, "init", "-q", env=ALONE)
         tree = git(repo, "mktree", text="", env=ALONE).strip()
-        root = git(repo, "commit-tree", tree, text="root\n", env=ALONE).strip()
-        base = git(repo, "commit-tree", tree, "-p", root, text="base\n", env=ALONE).strip()
+        root = self_test_commit(repo, tree, "root\n")
+        base = self_test_commit(repo, tree, "base\n", (root,))
         passed = True
         for label, name, email, value, expected in self_test_cases():
             message = f"test: {label}\n"
             if value:
                 message += f"\nSigned-off-by: {value}\n"
-            parents = ["-p", base, "-p", root] if label == "clean merge" else ["-p", base]
-            head = git(
-                repo,
-                "commit-tree",
-                tree,
-                *parents,
-                text=message,
-                env={**ALONE, "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email},
-            ).strip()
+            parents = (base, root) if label == "clean merge" else (base,)
+            head = self_test_commit(
+                repo, tree, message, parents, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email
+            )
             matches = (not sign_offs_refused(repo, base, head)) == expected
             sys.stdout.write(f"{'ok' if matches else 'FAIL'} {label}\n")
             passed = passed and matches
-    return 0 if passed else 1
+        merges_passed = self_test_merge_cases(repo, tree)
+    return 0 if passed and merges_passed else 1
 
 
 def check_range(base: str, head: str) -> int:
@@ -433,18 +495,31 @@ def main(argv: list[str] | None = None) -> int:
     check_parser = subparsers.add_parser("check", help="Judge a single message file")
     check_parser.add_argument("message_file", help="Path to commit message file")
     range_parser = subparsers.add_parser("range", help="Judge PR author sign-offs")
-    range_parser.add_argument("--base", required=True, help="Excluded base commit")
-    range_parser.add_argument("--head", required=True, help="Included head commit")
+    start = range_parser.add_mutually_exclusive_group(required=True)
+    start.add_argument("--base", help="Excluded base commit")
+    start.add_argument("--merge", help="Pull-request merge commit")
+    end = range_parser.add_mutually_exclusive_group(required=True)
+    end.add_argument("--head", help="Included head commit")
+    end.add_argument("--expect-head", help="Expected second parent of the merge")
     subparsers.add_parser("self-test", help="Prove the PR judge on planted commits")
 
     args = parser.parse_args(argv)
+    if args.command == "range" and (args.merge is None) != (args.expect_head is None):
+        range_parser.error("use --base with --head, or --merge with --expect-head")
     if args.command == "check":
         return _check_message(args.message_file)
     try:
         refusal = below_floor(tuple(sys.version_info))
         if refusal is not None:
             raise JudgeError(refusal)
-        return self_test() if args.command == "self-test" else check_range(args.base, args.head)
+        if args.command == "self-test":
+            return self_test()
+        base, head = (
+            merge_parents(Path.cwd(), args.merge, args.expect_head)
+            if args.merge is not None
+            else (args.base, args.head)
+        )
+        return check_range(base, head)
     except (JudgeError, OSError, subprocess.TimeoutExpired) as err:
         sys.stderr.write(f"the sign-off judge could not run: {err}\n")
         return 2

@@ -44,7 +44,7 @@ COPIES = [
 ]
 
 
-def test_sign_off_workflow_judges_event_head_after_self_test():
+def test_sign_off_workflow_judges_merge_parents_after_self_test():
     doc = ciwf.load(ROOT / ".github/workflows/sign-off.yml")
     assert doc["name"] == "Sign-off"
     assert doc["permissions"] == {}
@@ -65,7 +65,6 @@ def test_sign_off_workflow_judges_event_head_after_self_test():
     assert steps[3]["run"] == "python3 -I -B sign-off-source/tools/commit_message.py self-test"
     judge = steps[4]
     assert judge["env"] == {
-        "BASE": "${{ github.event.pull_request.base.sha }}",
         "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
     }
     assert judge["if"] == (
@@ -73,10 +72,11 @@ def test_sign_off_workflow_judges_event_head_after_self_test():
     )
     assert judge["run"] == (
         "python3 -I -B sign-off-source/tools/commit_message.py "
-        'range --base "$BASE" --head "$HEAD_SHA"'
+        'range --merge HEAD --expect-head "$HEAD_SHA"'
     )
     assert steps[5]["if"] == "github.event_name != 'pull_request'"
     assert "::notice::" in steps[5]["run"]
+    assert all("${{" not in step.get("run", "") for step in steps)
 
 
 def test_sign_off_caller_reports_required_check_even_on_draft():

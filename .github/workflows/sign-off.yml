@@ -62,16 +62,17 @@ jobs:
         if: github.event.pull_request.draft != true
         run: python3 -I -B sign-off-source/tools/commit_message.py self-test
 
-      # Full history of the checked-out PR merge ref includes the PR head as
-      # its second parent, so both event SHAs are available without another fetch.
+      # The checked-out merge has the base branch tip as parent 1 and the PR
+      # head as parent 2. Parent 1..parent 2 excludes base-branch commits taken
+      # by a merge, whatever base the event recorded. The expected-head check
+      # refuses a checkout that is not this event's merge.
       - name: Judge pull-request sign-offs
         if: github.event_name == 'pull_request' && github.event.pull_request.draft != true
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: >-
           python3 -I -B sign-off-source/tools/commit_message.py
-          range --base "$BASE" --head "$HEAD_SHA"
+          range --merge HEAD --expect-head "$HEAD_SHA"
 
       - name: Report sign-offs are judged on the pull request
         if: github.event_name != 'pull_request'

@@ -235,11 +235,94 @@ def test_cli_sign_off_range(tmp_path, which, rc):
         assert done.stdout == done.stderr == ""
 
 
+def stale_base_merge(tmp_path, bad_branch=False):
+    """Old base O, squash A, branch B, branch merge B2, synthetic merge M."""
+    repo = git_repo(tmp_path)
+    root = tree_commit(repo, "old base\n")
+    signed = "Signed-off-by: Fixture <fixture@example.invalid>\n"
+    main = tree_commit(
+        repo,
+        f"main squash\n\n{signed}",
+        (root,),
+        GIT_AUTHOR_NAME="Forge Fixture",
+        GIT_AUTHOR_EMAIL="fixture@example.invalid",
+    )
+    branch = tree_commit(
+        repo,
+        "branch\n\n" + (signed.replace("Fixture <", "Other Fixture <") if bad_branch else signed),
+        (root,),
+        GIT_AUTHOR_NAME="Fixture",
+        GIT_AUTHOR_EMAIL="fixture@example.invalid",
+    )
+    head = tree_commit(repo, "Merge main\n", (branch, main))
+    merge = tree_commit(repo, "Merge pull request\n", (main, head))
+    return repo, root, main, branch, head, merge
+
+
+def test_cli_merge_stale_base_excludes_main_squash(tmp_path):
+    repo, root, main, _, head, merge = stale_base_merge(tmp_path)
+    done = run_tool(repo, ["range", "--merge", merge, "--expect-head", head])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout == done.stderr == ""
+    old = run_tool(repo, ["range", "--base", root, "--head", head])
+    assert old.returncode == 1, old.stdout + old.stderr
+    assert old.stderr == ""
+    assert len(old.stdout.splitlines()) == 1
+    assert old.stdout.startswith(f"{main} sign-off ")
+
+
+def test_cli_merge_expected_head_mismatch(tmp_path):
+    repo, _, _, branch, _, merge = stale_base_merge(tmp_path)
+    done = run_tool(repo, ["range", "--merge", merge, "--expect-head", branch])
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert done.stdout == ""
+    assert "parent 2" in done.stderr
+
+
+def test_cli_merge_one_parent_refused(tmp_path):
+    repo, _, _, branch, _, _ = stale_base_merge(tmp_path)
+    done = run_tool(repo, ["range", "--merge", branch, "--expect-head", branch])
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert done.stdout == ""
+    assert "exactly 2 parents, found 1" in done.stderr
+
+
+def test_cli_merge_bad_branch_only(tmp_path):
+    repo, _, _, branch, head, merge = stale_base_merge(tmp_path, bad_branch=True)
+    done = run_tool(repo, ["range", "--merge", merge, "--expect-head", head])
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert done.stderr == ""
+    assert len(done.stdout.splitlines()) == 1
+    assert done.stdout.startswith(f"{branch} sign-off ")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--merge", "HEAD"],
+        ["--merge", "HEAD", "--base", "HEAD", "--expect-head", "HEAD"],
+        ["--merge", "HEAD", "--head", "HEAD"],
+        ["--base", "HEAD", "--expect-head", "HEAD"],
+    ],
+)
+def test_cli_merge_arguments_must_pair(tmp_path, arguments):
+    done = run_tool(tmp_path, ["range", *arguments])
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert done.stdout == ""
+    assert "error:" in done.stderr
+
+
 def test_cli_sign_off_self_test(tmp_path):
     done = run_tool(tmp_path, ["self-test"])
     assert done.returncode == 0, done.stdout + done.stderr
-    assert len(done.stdout.splitlines()) == 8
+    assert len(done.stdout.splitlines()) == 12
     assert all(line.startswith("ok ") for line in done.stdout.splitlines())
+    assert done.stdout.splitlines()[-4:] == [
+        "ok stale base merge",
+        "ok refused branch commit in merge",
+        "ok expected head mismatch",
+        "ok one-parent checkout",
+    ]
 
 
 @pytest.mark.parametrize("arguments", [["range", "--base", "x", "--head", "y"], ["self-test"]])
@@ -251,7 +334,7 @@ def test_sign_off_commands_cannot_run_git(tmp_path, arguments):
     assert "the sign-off judge could not run" in done.stderr
 
 
-def test_self_test_cases_judge_one_commit_each(monkeypatch, capsys):
+def test_self_test_case_ranges_include_branch_merge(monkeypatch, capsys):
     real = commit_message.sign_offs_refused
     sizes = []
 
@@ -261,7 +344,7 @@ def test_self_test_cases_judge_one_commit_each(monkeypatch, capsys):
 
     monkeypatch.setattr(commit_message, "sign_offs_refused", recording_range)
     assert commit_message.self_test() == 0
-    assert sizes == [1] * 8
+    assert sizes == [1] * 8 + [2, 2]
     assert "FAIL" not in capsys.readouterr().out
 
 
