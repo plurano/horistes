@@ -164,6 +164,11 @@
           "required": false,
           "type": "string"
         },
+        "review_bots": {
+          "default": "",
+          "required": false,
+          "type": "string"
+        },
         "runner": {
           "default": null,
           "required": true,
