@@ -5501,20 +5501,20 @@ def test_unsigned_person_retitled_armed_pull_request_is_disarmed_and_refused(tmp
 
 
 def test_planted_re_arm_drifted_without_unsigned_bot_error_refuses_bot(tmp_path):
-    """Planted mutant: unhandled UnsignedBotError in re_arm_drifted refuses the run."""
+    """Planted mutant: unhandled UnsignedBotError in re_arm_after_review refuses the run."""
     target = (
-        "            try:\n"
-        "                arm(env, conf, pull)\n"
-        "            except UnsignedBotError as err:\n"
-        '                notes[pull["number"]] = err.note\n'
-        "                return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
+        "    try:\n"
+        "        arm(env, conf, pull)\n"
+        "    except UnsignedBotError as err:\n"
+        '        notes[pull["number"]] = err.note\n'
+        "        return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
     )
     mutant = (
-        "            try:\n"
-        "                arm(env, conf, pull)\n"
-        "            except KeyError as err:\n"
-        '                notes[pull["number"]] = err.note\n'
-        "                return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
+        "    try:\n"
+        "        arm(env, conf, pull)\n"
+        "    except KeyError as err:\n"
+        '        notes[pull["number"]] = err.note\n'
+        "        return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
     )
     assert script().count(target) == 1
     flow = script().replace(target, mutant)
@@ -7908,11 +7908,11 @@ def test_review_bodies_query_fields(tmp_path, monkeypatch):
         "comments(first: 100)",
         (
             "nodes {\n"
-            "          databaseId state body submittedAt url authorAssociation "
-            "author { login __typename }\n"
+            "          databaseId state body submittedAt updatedAt url authorAssociation\n"
+            "          author { login __typename } commit { oid }\n"
             "        }"
         ),
-        "nodes { body createdAt url authorAssociation author { login __typename } }",
+        "nodes { body createdAt updatedAt url authorAssociation author { login __typename } }",
         "commits(first: 100)",
         "commit { message committedDate }",
     ):
@@ -10327,20 +10327,22 @@ def test_planted_incomplete_review_train_holds(tmp_path, armed):
     assert ("disarmed: review body:" in summary) is armed
 
 
-@pytest.mark.parametrize("old_notice", [False, True], ids=["newer-summary", "old-notice"])
-def test_completed_review_clears_incomplete_hold(tmp_path, monkeypatch, old_notice):
-    """A later completed summary clears the limit notice, including before-commit notices."""
+def test_completed_review_clears_incomplete_hold(tmp_path, monkeypatch):
+    """The same captured detail holds before, and clears only after scoped head evidence."""
     merge_train = load_train(tmp_path, monkeypatch)
     p, detail = _incomplete_review_pull()
-    if old_notice:
-        detail["comments"]["nodes"] = [
-            {
-                "author": {"login": "coderabbitai", "__typename": "Bot"},
-                "createdAt": "2026-11-16T16:00:00Z",
-                "body": "Review limit reached.",
-            }
-        ]
-    detail["comments"]["nodes"].append(_completed_review_summary("2026-11-16T17:00:00Z"))
+    assert merge_train.review_body_hold(p, detail) is not None
+    for login in ("coderabbitai", "sourcery-ai"):
+        summary = _completed_review_summary("2026-11-16T17:00:00Z")
+        summary["author"]["login"] = login
+        summary["body"] += (
+            "\nReviewing files that changed from the base of the PR and between "
+            + "a" * 40
+            + " and "
+            + p["headRefOid"]
+            + "."
+        )
+        detail["comments"]["nodes"].append(summary)
     detail["comments"]["totalCount"] = len(detail["comments"]["nodes"])
     assert merge_train.review_body_hold(p, detail) is None
     forge = Forge(repository(p))
@@ -10355,8 +10357,10 @@ def test_completed_review_clears_incomplete_hold(tmp_path, monkeypatch, old_noti
     ("section", "fields"),
     [
         pytest.param("pullRequest", ("headRefOid", "author { login }"), id="head-and-author"),
-        pytest.param("reviews", ("submittedAt", "url"), id="review-times"),
-        pytest.param("comments", ("createdAt", "url"), id="comment-times"),
+        pytest.param(
+            "reviews", ("submittedAt", "updatedAt", "commit { oid }", "url"), id="review-times"
+        ),
+        pytest.param("comments", ("createdAt", "updatedAt", "url"), id="comment-times"),
         pytest.param("commits", ("committedDate",), id="commit-times"),
     ],
 )
@@ -10370,7 +10374,7 @@ def test_review_bodies_query_supplies_incomplete_reader(tmp_path, monkeypatch, s
         selected = query.split(f"{section}(first: 100)", 1)[1]
         selected = selected.split("(first: 100)", 1)[0].rsplit("\n      }", 1)[0]
         assert "totalCount" in selected
-    for field in fields[:2]:
+    for field in fields[:4]:
         assert field in selected, (section, field)
 
 
@@ -10985,3 +10989,469 @@ def test_forced_rearm_one_arm_per_sweep(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [armed(1)]
     assert forge.arm_history_calls == [1]
+
+
+def adr92_train(tmp_path, monkeypatch):
+    """Load either live modules or the explicit offline baseline for regression replay."""
+    from test_review_state import adr92_reader
+
+    reader = adr92_reader()
+    monkeypatch.setitem(sys.modules, "review_state", reader)
+    root = Path(os.environ.get("HORISTES_READER_SOURCE", ROOT))
+    monkeypatch.setattr(sys.modules[__name__], "SCRIPT", root / "tools/merge_train.py")
+    return load_train(tmp_path, monkeypatch)
+
+
+def adr92_head_detail(p, state="COMMENTED", login="coderabbitai", oid=None):
+    review = {
+        "author": {"login": login},
+        "state": state,
+        "body": "",
+        "submittedAt": "2026-11-16T17:00:00Z",
+        "commit": {"oid": p["headRefOid"] if oid is None else oid},
+    }
+    return {**_detail(reviews=[review]), "headRefOid": p["headRefOid"]}
+
+
+@pytest.mark.parametrize(
+    ("state", "login", "oid", "holds"),
+    [
+        ("COMMENTED", "coderabbitai", "a" * 40, True),
+        ("COMMENTED", "coderabbitai", None, False),
+        ("APPROVED", "coderabbitai", None, False),
+        ("CHANGES_REQUESTED", "coderabbitai", None, False),
+        ("DISMISSED", "coderabbitai", None, True),
+        ("PENDING", "coderabbitai", None, True),
+        ("COMMENTED", "other", None, True),
+    ],
+    ids=["A-old", "A-head", "A-approved", "A-changes", "A-dismissed", "A-pending", "A-other"],
+)
+def test_adr92_head_evidence(tmp_path, monkeypatch, state, login, oid, holds):
+    mod = adr92_train(tmp_path, monkeypatch)
+    p = pull(1, "CLEAN", author={"login": "person"})
+    detail = adr92_head_detail(p, state, login, oid)
+    reason = adr92_body_hold(mod, p, detail, frozenset({"coderabbitai"}))
+    assert bool(reason) is holds
+    if holds:
+        assert reason == (
+            "review body: review incomplete: no completed review by coderabbitai "
+            "on head " + p["headRefOid"][:7]
+        )
+
+
+def test_adr92_zero_review(tmp_path, monkeypatch):
+    mod = adr92_train(tmp_path, monkeypatch)
+    p = pull(1, "CLEAN", author={"login": "person"})
+    reason = adr92_body_hold(mod, p, _detail(), frozenset({"coderabbitai"}))
+    assert reason is not None
+    assert "no completed review" in reason
+
+
+def test_adr92_allowance_head_evidence(tmp_path, monkeypatch):
+    mod = adr92_train(tmp_path, monkeypatch)
+    p = pull(1, "CLEAN", author={"login": "person"})
+    body = (
+        "Reviewing files that changed from the base of the PR and between "
+        + "a" * 40
+        + " and "
+        + p["headRefOid"]
+        + ".\n0 remain after this review"
+    )
+    summary = _completed_review_summary("2026-11-16T17:00:00Z") | {"body": body}
+    detail = _detail(comments=[summary])
+    detail["commits"]["nodes"] = [{"commit": {"committedDate": "2026-11-16T16:10:16Z"}}]
+    detail["commits"]["totalCount"] = 1
+    assert adr92_body_hold(mod, p, detail, frozenset({"coderabbitai"})) is None
+
+
+@pytest.mark.parametrize("kind", ["reviews", "comments", "commits"])
+@pytest.mark.parametrize("raw", [{"a": 1}, 1, "str"])
+def test_adr92_malformed_connections(tmp_path, monkeypatch, kind, raw):
+    mod = adr92_train(tmp_path, monkeypatch)
+    detail = _detail() | {kind: {"nodes": raw}}
+    assert mod.review_body_hold(pull(1, "CLEAN"), detail) == "review body: cannot read " + kind
+
+
+def test_adr92_moved_head(tmp_path, monkeypatch):
+    mod = adr92_train(tmp_path, monkeypatch)
+    detail = _detail() | {"headRefOid": "a" * 40}
+    assert mod.review_body_hold(pull(1, "CLEAN"), detail) == (
+        "review body: head moved while reading reviews"
+    )
+
+
+def test_adr92_missing_detail_head(tmp_path, monkeypatch):
+    mod = adr92_train(tmp_path, monkeypatch)
+    p, detail = _incomplete_review_pull()
+    detail.pop("headRefOid")
+    detail["comments"]["nodes"] = [
+        {
+            "author": {"login": "coderabbitai"},
+            "createdAt": "2026-11-16T16:00:00Z",
+            "body": "Review limit reached for commit " + p["headRefOid"] + ".",
+        }
+    ]
+    detail["comments"]["totalCount"] = 1
+    reason = mod.review_body_hold(p, detail)
+    assert reason is not None
+    assert "review incomplete" in reason
+
+
+@pytest.mark.parametrize("completed", [False, True], ids=["A-hold", "A-clear"])
+def test_adr92_zero_review_train(tmp_path, completed):
+    p = pull(1, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p) if completed else _detail()
+    done, summary = train(tmp_path, forge, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == ([landed(1)] if completed else [])
+    assert ("no completed review by coderabbitai" in summary) is not completed
+
+
+def test_adr92_zero_review_off_summary(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert summary.count("review bots: none set, zero-review hold off") == 1
+
+
+@pytest.mark.parametrize("value", ["bad_name", "-bad", "a" * 40, "bot[other]", "bot user"])
+def test_adr92_invalid_review_bots(tmp_path, value):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, review_bots=value)
+    assert done.returncode == 3
+    assert "review_bots" in done.stdout
+    assert forge.writes == []
+
+
+@pytest.mark.parametrize("late_notice", [True, False], ids=["I-hold", "I-clear"])
+def test_adr92_arming_rereads(tmp_path, late_notice):
+    p, detail = _incomplete_review_pull()
+    p["mergeStateStatus"] = "BEHIND"
+    forge = Forge(repository(p))
+    forge.review_details[1] = [_detail(), detail if late_notice else _detail()]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = [("arm", "PR_1", p["headRefOid"], "SQUASH"), ("update", 1, p["headRefOid"])]
+    assert forge.writes == ([] if late_notice else expected)
+    if late_notice:
+        assert forge.review_body_calls == [1, 1]
+    assert ("review body: review incomplete" in summary) is late_notice
+
+
+def test_adr92_review_bots_updates_without_arming(tmp_path):
+    p = pull(1, "BEHIND", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p)
+    done, _ = train(tmp_path, forge, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+
+    forge_unset = Forge(repository(p))
+    forge_unset.review_details[1] = adr92_head_detail(p)
+    done_unset, _ = train(tmp_path, forge_unset)
+    assert done_unset.returncode == 0, done_unset.stdout + done_unset.stderr
+    assert forge_unset.writes == [("arm", "PR_1", p["headRefOid"], "SQUASH"), updated(1)]
+
+
+def test_adr92_review_bots_disarms_before_update(tmp_path):
+    p = pull(1, "BEHIND", author={"login": "person"}, autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p)
+    done, summary = train(tmp_path, forge, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1), updated(1)]
+    assert "| #1 | BEHIND | disarmed, updated from the default branch |" in summary
+
+
+def test_adr92_review_bots_drifted_not_re_armed(tmp_path):
+    p = pull(1, "BLOCKED", author={"login": "person"}, autoMergeRequest=armed_squash())
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p)
+    done, summary = train(tmp_path, forge, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)]
+    assert "disarmed: title changed after arming, the train lands it directly" in summary
+
+
+@pytest.mark.parametrize("late_notice", [False, True], ids=["R3-clear", "R3-hold"])
+def test_adr92_re_arm_rereads(tmp_path, late_notice):
+    p, detail = _incomplete_review_pull(armed=True)
+    p.update(mergeStateStatus="BLOCKED", autoMergeRequest=armed_squash())
+    forge = Forge(repository(p))
+    forge.review_details[1] = [_detail(), detail if late_notice else _detail()]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = [disarmed(1), ("arm", "PR_1", p["headRefOid"], "SQUASH")]
+    assert forge.writes == ([disarmed(1)] if late_notice else expected)
+    assert forge.review_body_calls == [1, 1]
+    assert ("disarmed: review body: review incomplete" in summary) is late_notice
+    assert ("re-armed: title changed after arming" in summary) is not late_notice
+
+
+def test_adr92_arming_allowance_beside_admission(tmp_path):
+    pulls = [pull(number, "BEHIND", author={"login": "person"}) for number in range(1, 11)]
+    forge = Forge(repository(*pulls))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.review_body_calls == [*range(1, 11), 1]
+    assert forge.writes == [("arm", "PR_1", pulls[0]["headRefOid"], "SQUASH"), updated(1)]
+    assert "budget spent" not in summary
+
+
+def test_adr92_review_bots_arming_mutant_arms(tmp_path):
+    mutant = module().replace(
+        'arms = not conf.get("required_status") and not conf.get("review_bots")',
+        'arms = not conf.get("required_status")',
+    )
+    assert mutant != module()
+    p = pull(1, "BEHIND", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p)
+    done, _ = train(tmp_path, forge, helper=mutant, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("arm", "PR_1", p["headRefOid"], "SQUASH"), updated(1)]
+
+
+@pytest.fixture(autouse=True)
+def adr92_offline_source(monkeypatch):
+    """An explicit baseline root redirects only module loading, never repository state."""
+    source = os.environ.get("HORISTES_READER_SOURCE")
+    if source:
+        monkeypatch.setattr(sys.modules[__name__], "SCRIPT", Path(source) / "tools/merge_train.py")
+
+
+def adr92_body_hold(mod, p, detail, review_bots):
+    """Replay the old signature explicitly so baseline failures assert behavior, not API shape."""
+    import inspect
+
+    if "review_bots" not in inspect.signature(mod.review_body_hold).parameters:
+        return mod.review_body_hold(p, detail)
+    return mod.review_body_hold(p, detail, review_bots=review_bots)
+
+
+@pytest.mark.parametrize(
+    "when, holds",
+    [
+        ("2026-11-16T16:10:16Z", True),
+        ("2026-11-16T16:10:15Z", False),
+    ],
+    ids=["H-equal", "H-before"],
+)
+def test_adr92_notice_boundary_without_evidence(tmp_path, monkeypatch, when, holds):
+    mod = adr92_train(tmp_path, monkeypatch)
+    p, detail = _incomplete_review_pull()
+    detail["comments"]["nodes"] = [
+        {"author": {"login": "coderabbitai"}, "createdAt": when, "body": "Review limit reached."}
+    ]
+    detail["comments"]["totalCount"] = 1
+    assert bool(mod.review_body_hold(p, detail)) is holds
+
+
+def test_adr92_arming_read_budget(tmp_path, monkeypatch):
+    mod = adr92_train(tmp_path, monkeypatch)
+    p, detail = _incomplete_review_pull()
+    p["mergeStateStatus"] = "BEHIND"
+    second = pull(2, "BEHIND", author={"login": "person"})
+    forge = Forge(repository(p, second))
+    forge.review_details[1] = [_detail(), detail]
+    forge.retry_histories[1] = retry_history(1) | {"headRefOid": p["headRefOid"]}
+    source = SCRIPT.read_text()
+    assert source.count("ARMING_READS = 3") == 1
+    done, summary = train(
+        tmp_path, forge, text=source.replace("ARMING_READS = 3", "ARMING_READS = 1")
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert forge.review_body_calls == [1, 2, 1]
+    assert "review body: review incomplete" in summary
+    assert (
+        "| #2 | BEHIND | review body: not armed: review read budget spent this sweep |" in summary
+    )
+    assert mod.ARMING_READS == 3
+    assert mod.REVIEW_READS == 10
+
+
+# Each row restores one admitted defect, with an exact replacement anchor.
+def adr92_mutations():
+    return [
+        (
+            "A",
+            "merge_train",
+            "if not review_bots:",
+            "if review_bots:",
+            "test_adr92_zero_review_train[A-hold]",
+        ),
+        ("B", "review_state", "|Sorry @", "|UnavailableSorry @", "B-sourcery"),
+        (
+            "C",
+            "review_state",
+            'updated = _instant(comment["updatedAt"])',
+            "updated = created",
+            "C-edited-notice",
+        ),
+        (
+            "D",
+            "review_state",
+            "if who != login or when is None:",
+            "if when is None:",
+            "D-other-login",
+        ),
+        (
+            "E",
+            "review_state",
+            "return allowance or names_head or when >= last_commit",
+            "return allowance or names_head or when > last_commit",
+            "E-equal-notice",
+        ),
+        (
+            "E-head-evidence",
+            "review_state",
+            "(on_head or not head_only)",
+            "(not head_only)",
+            "allowance-later-review-on-head-clears",
+        ),
+        (
+            "F-nodes",
+            "review_state",
+            " if isinstance(raw, list) else []",
+            "",
+            "test_adr92_nodes_malformed[raw0]",
+        ),
+        (
+            "F-head",
+            "merge_train",
+            'if detail.get("headRefOid") and pull.get("headRefOid")',
+            'if not detail.get("headRefOid") and pull.get("headRefOid")',
+            "test_adr92_moved_head",
+        ),
+        (
+            "I",
+            "merge_train",
+            "if arming and late_review_hold(env, conf, pull, notes, arming=True):",
+            "if arming and False:",
+            "test_adr92_arming_rereads[I-hold]",
+        ),
+    ] + adr92_followup_mutations()
+
+
+def adr92_followup_mutations():
+    return [
+        (
+            "C3-bool",
+            "merge_train",
+            "if isinstance(count, bool) or not isinstance(count, int) or count < 0:",
+            "if not isinstance(count, int) or count < 0:",
+            "test_adr92_unreadable_connection_counts and bool-equals-count",
+        ),
+        (
+            "R1-disarm",
+            "merge_train",
+            '(conf.get("required_status") or conf.get("review_bots")) and pull["autoMergeRequest"]',
+            'conf.get("required_status") and pull["autoMergeRequest"]',
+            "test_adr92_review_bots_disarms_before_update",
+        ),
+        (
+            "R1-drift",
+            "merge_train",
+            'if conf.get("required_status") or conf.get("review_bots"):',
+            'if conf.get("required_status"):',
+            "test_adr92_review_bots_drifted_not_re_armed",
+        ),
+        (
+            "R3",
+            "merge_train",
+            "if late_review_hold(env, conf, pull, notes, arming=True):",
+            "if False:",
+            "test_adr92_re_arm_rereads[R3-hold]",
+        ),
+        (
+            "R2",
+            "merge_train",
+            'counter = "arming_reads" if arming else "review_reads"',
+            'counter = "review_reads"',
+            "test_adr92_arming_allowance_beside_admission",
+        ),
+    ]
+
+
+def adr92_mutation_run(root, selector, log):
+    """Run only the named regression files; writes bytecode nowhere."""
+    env = {**os.environ, "HORISTES_READER_SOURCE": str(root), "PYTHONDONTWRITEBYTECODE": "1"}
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-p",
+        "no:cacheprovider",
+        "tests/test_review_state.py",
+        "tests/test_merge_train.py",
+        "-k",
+        selector,
+    ]
+    done = subprocess.run(
+        command, env=env, capture_output=True, text=True, timeout=120, check=False, cwd=ROOT
+    )
+    log.write_text(done.stdout + done.stderr)
+    return done
+
+
+@pytest.mark.parametrize(
+    ("section", "module_name", "old", "new", "selector"),
+    adr92_mutations(),
+    ids=[row[0] for row in adr92_mutations()[:20]],
+)
+def test_adr92_mutations_reject_defects(tmp_path, section, module_name, old, new, selector):
+    root = tmp_path / "mutation"
+    (root / "tools").mkdir(parents=True)
+    for name in ("review_state", "merge_train"):
+        source = (ROOT / "tools" / f"{name}.py").read_text()
+        (root / "tools" / f"{name}.py").write_text(source)
+    path = root / "tools" / f"{module_name}.py"
+    source = path.read_text()
+    assert source.count(old) == 1, (section, old)
+    control = adr92_mutation_run(root, selector, tmp_path / "control.log")
+    assert control.returncode == 0, control.stdout + control.stderr
+    path.write_text(source.replace(old, new))
+    mutated = adr92_mutation_run(root, selector, tmp_path / "mutated.log")
+    assert mutated.returncode == 1, mutated.stdout + mutated.stderr
+    assert "1 failed" in mutated.stdout, mutated.stdout
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        None,
+        [],
+        {"nodes": [], "totalCount": "0"},
+        {"nodes": [], "totalCount": -1},
+        {"nodes": [], "totalCount": True},
+        {"nodes": [], "totalCount": 1},
+        {"nodes": [None], "totalCount": 1},
+        pytest.param({"nodes": [{}], "totalCount": True}, id="bool-equals-count"),
+        pytest.param({"nodes": [{}], "totalCount": 1.0}, id="float-equals-count"),
+    ],
+)
+def test_adr92_unreadable_connection_counts(tmp_path, monkeypatch, connection):
+    mod = adr92_train(tmp_path, monkeypatch)
+    detail = _detail() | {"comments": connection}
+    assert mod.review_body_hold(pull(1, "CLEAN"), detail) == "review body: cannot read comments"
+
+
+def test_adr92_readable_connection_count(tmp_path, monkeypatch):
+    mod = adr92_train(tmp_path, monkeypatch)
+    detail = _detail(comments=[{}])
+    assert detail["comments"]["totalCount"] == 1
+    assert mod.review_body_hold(pull(1, "CLEAN"), detail) is None
+
+
+def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
+    mod = adr92_train(tmp_path, monkeypatch)
+    env = {
+        "TRAIN_REVIEW_BOTS": " , \t\n",
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+        "GITHUB_OUTPUT": str(tmp_path / "output"),
+    }
+    mod.summary(env, {}, [], [], [], [], [], [])
+    assert capsys.readouterr().out.count("review bots: none set, zero-review hold off") == 1
