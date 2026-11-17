@@ -523,9 +523,9 @@ jobs:
               request goes first: it already waits for the forge to merge it.
               Only an armed pull request is updated, and none where the default branch
               demands linear history (decision record 0044); `notes` says why one is skipped.
-              While `required_status` is set none is armed: `advance` disarms an armed one
-              before its update, and the train lands it directly once it is CLEAN
-              (decision record 0076).
+              While `required_status` or `review_bots` is set none is armed: `advance`
+              disarms an armed one before its update, and the train lands it directly
+              once it is CLEAN (decision records 0076 and 0092).
               """
               behind = [pull for pull, reason in rows if reason == "behind"]
               if linear_history(repo):
@@ -534,7 +534,7 @@ jobs:
                   return []
               behind.sort(key=lambda pull: (not is_security(pull, conf), not pull["autoMergeRequest"]))
               picked = []
-              arms = not conf.get("required_status")
+              arms = not conf.get("required_status") and not conf.get("review_bots")
               for pull in behind:
                   if pull["autoMergeRequest"] or repo["autoMergeAllowed"]:
                       picked.append((pull, arms and not pull["autoMergeRequest"]))

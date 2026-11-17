@@ -269,6 +269,8 @@ SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its produc
 REVIEW_BODY = "review body: "
 # Pull requests whose review bodies one run reads in one repository (ADR-0070).
 REVIEW_READS = 10
+# advance arms at most one pull per sweep; a small allowance covers held candidates before it.
+ARMING_READS = 3
 # Distinct maintainer logins whose rights one pull request checks (ADR-0077).
 ANSWER_RIGHTS = 5
 # Association only orders the permission reads; it never decides an answer, because an
@@ -912,7 +914,7 @@ def prepare_update(env, conf, pull, notes, arming):
             notes[pull["number"]] = err.note
             return False
         notes[pull["number"]] = "armed, updated from the default branch"
-    elif conf.get("required_status") and pull["autoMergeRequest"]:
+    elif (conf.get("required_status") or conf.get("review_bots")) and pull["autoMergeRequest"]:
         graphql(env, DISARM, {"id": pull["id"]})
         notes[pull["number"]] = "disarmed, updated from the default branch"
     else:
@@ -923,9 +925,9 @@ def prepare_update(env, conf, pull, notes, arming):
 def advance(env, conf, repo, rows, notes, check_retry=None):
     """Update the first pull request `updatable` names, arming it first where it says.
 
-    While `required_status` is set an armed pull request is disarmed before its update:
-    auto-merge would otherwise land the new head before the train reads its status
-    (decision record 0076).
+    While `required_status` or `review_bots` is set an armed pull request is disarmed
+    before its update: auto-merge would otherwise land the new head before the train
+    reads its status or listed review (decision records 0076 and 0092).
     """
     for pull, arming in updatable(repo, rows, notes, conf)[: PULL_PAGES * 100]:
         if arming and has_red_code_scanning(pull):
@@ -1352,33 +1354,46 @@ def regenerate(env, conf, repo, rows, notes):
     return None
 
 
+def re_arm_after_review(env, conf, pull, notes):
+    """Read reviews before disarming and re-arming a drifted headline; unread stays armed."""
+    if late_review_hold(env, conf, pull, notes, arming=True):
+        if notes[pull["number"]].startswith("disarmed: "):
+            return f"disarmed #{pull['number']}"
+        return None
+    graphql(env, DISARM, {"id": pull["id"]})
+    try:
+        arm(env, conf, pull)
+    except UnsignedBotError as err:
+        notes[pull["number"]] = err.note
+        return f"disarmed #{pull['number']}: its commits carry no Signed-off-by"
+    notes[pull["number"]] = "re-armed: title changed after arming"
+    return f"re-armed #{pull['number']}"
+
+
 def re_arm_drifted(env, conf, served, held, notes):
     """Re-arm an armed squash pull request whose headline drifted from its title.
 
-    A pull request a review body holds was disarmed this run and stays disarmed.
-    A pull request left disarmed for lack of sign-off ends the run, so later steps
-    do not read it as armed.
+    With required_status or review_bots, disarm for direct landing by the train.
+    Otherwise read reviews again before disarming and re-arming; a held review or
+    lack of sign-off ends the run disarmed, so later steps do not read it as armed.
     """
-    for pull, reason in served:
+    for pull, reason in served[: PULL_PAGES * 100]:
         if reason.startswith(REVIEW_BODY) or required_status_hold(pull, conf):
             continue
-        if pull["number"] not in held and drifted(pull, conf):
-            if has_red_code_scanning(pull):
-                notes[pull["number"]] = "not re-armed: code-scanning check failed"
-                continue
+        if pull["number"] in held or not drifted(pull, conf):
+            continue
+        if has_red_code_scanning(pull):
+            notes[pull["number"]] = "not re-armed: code-scanning check failed"
+            continue
+        if conf.get("required_status") or conf.get("review_bots"):
             graphql(env, DISARM, {"id": pull["id"]})
-            if conf.get("required_status"):
-                notes[pull["number"]] = (
-                    "disarmed: title changed after arming, the train lands it directly"
-                )
-                return f"disarmed #{pull['number']}"
-            try:
-                arm(env, conf, pull)
-            except UnsignedBotError as err:
-                notes[pull["number"]] = err.note
-                return f"disarmed #{pull['number']}: its commits carry no Signed-off-by"
-            notes[pull["number"]] = "re-armed: title changed after arming"
-            return f"re-armed #{pull['number']}"
+            notes[pull["number"]] = (
+                "disarmed: title changed after arming, the train lands it directly"
+            )
+            return f"disarmed #{pull['number']}"
+        outcome = re_arm_after_review(env, conf, pull, notes)
+        if outcome:
+            return outcome
     return None
 
 
@@ -1732,10 +1747,11 @@ def late_review_hold(env, conf, pull, notes, *, arming=False):
     """Re-read before landing or arming; True holds, disarmed if already armed."""
     if is_bot_dependency(pull, conf):
         return False
-    if arming and conf.get("review_reads", 0) >= REVIEW_READS:
+    counter = "arming_reads" if arming else "review_reads"
+    if arming and conf.get(counter, 0) >= ARMING_READS:
         notes[pull["number"]] = f"{REVIEW_BODY}not armed: review read budget spent this sweep"
         return True
-    conf["review_reads"] = conf.get("review_reads", 0) + 1
+    conf[counter] = conf.get(counter, 0) + 1
     hold = read_review_hold(env, pull, conf.get("review_bots", frozenset()))
     if not hold:
         return False
