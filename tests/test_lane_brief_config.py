@@ -5,18 +5,17 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import os
-import subprocess
-import sys
 from pathlib import Path
 
+import anchors
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / ".config/lane-brief.yaml"
 ANCHORS_CHECK = "tools/anchors.py check"
-TIMEOUT = 30
 STAGES = {"impl", "fix", "review", "audit", "research"}
 KEYS = {"required", "required_by_stage", "credential_stub_tests"}
 
@@ -69,19 +68,21 @@ def test_shape_boundary():
     validate_shape(config)
 
 
-def test_anchors_check_subcommand():
-    anchors = ROOT / "tools/anchors.py"
-    assert anchors.is_file(), "required anchors tool must exist"
-    done = subprocess.run(
-        [sys.executable, "-B", str(anchors), "--help"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=TIMEOUT,
-    )
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert "check" in done.stdout, done.stdout
+def test_anchors_check_subcommand(capsys):
+    assert (ROOT / "tools/anchors.py").is_file(), "required anchors tool must exist"
+    with pytest.raises(SystemExit) as exit_info:
+        anchors.main(["--help"])
+    assert exit_info.value.code == 0
+    stdout = capsys.readouterr().out
+    assert "check" in stdout, stdout
+
+
+def test_anchors_invalid_subcommand(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        anchors.main(["bogus"])
+    assert exit_info.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "invalid choice" in stderr, stderr
 
 
 @pytest.fixture
@@ -98,7 +99,11 @@ def reader():
             "shape cases + host replay in the PR evidence"
         )
     assert path.is_file(), "configured lane launcher's reader must be an existing file"
-    return path.resolve()
+    spec = importlib.util.spec_from_file_location("lane_brief_reader", path.resolve())
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.mark.parametrize(
@@ -112,7 +117,7 @@ def reader():
     ],
     ids=["impl-missing", "fix-missing", "impl-present", "fix-present", "review"],
 )
-def test_reader_replay(tmp_path, reader, task, with_check, expected):
+def test_reader_replay(tmp_path, reader, task, with_check, expected, monkeypatch, capsys):
     worktree = tmp_path / "worktree"
     config = worktree / ".config/lane-brief.yaml"
     config.parent.mkdir(parents=True)
@@ -127,14 +132,9 @@ def test_reader_replay(tmp_path, reader, task, with_check, expected):
         f"task: {task}\n" + (f"self-check: {ANCHORS_CHECK}\n" if with_check else ""),
         encoding="utf-8",
     )
-    done = subprocess.run(
-        [sys.executable, "-B", str(reader), "required", str(brief), str(worktree)],
-        env={**os.environ, "LANE_ROUTER_CONFIG": str(router)},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=TIMEOUT,
-    )
-    assert done.returncode == expected, done.stdout + done.stderr
+    monkeypatch.setenv("LANE_ROUTER_CONFIG", str(router))
+    rc = reader.main([str(reader.__file__), "required", str(brief), str(worktree)])
+    captured = capsys.readouterr()
+    assert rc == expected, captured.out + captured.err
     if expected == 1:
-        assert ANCHORS_CHECK in done.stdout.splitlines(), done.stdout
+        assert ANCHORS_CHECK in captured.out.splitlines(), captured.out
