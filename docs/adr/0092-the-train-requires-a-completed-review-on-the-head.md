@@ -40,6 +40,13 @@ once, checked by `test_adr92_zero_review_off_summary`. Existing incomplete-revie
 and unanswered-finding holds still apply. Revisit when every repository on the
 fleet train has a review bot: default to that reviewer then.
 
+While `review_bots` is non-empty, the train arms nothing and disarms an armed
+pull request before updating it, extending the `required_status` rule in
+[ADR-0076](0076-train-holds-on-a-required-status.md). A drifted squash headline
+also leaves the pull request disarmed for direct landing by the train. Each
+update therefore needs a listed review on the new head before the train lands
+it. Revisit when a listed bot skips the train's update merges.
+
 B. Notice recognition remains anchored to notice lines. It includes Sourcery's
 own-budget notice, headings with at most four symbols before the notice, and the
 explicit repository, organization, and commit qualifiers. Ordinary prose and
@@ -84,10 +91,16 @@ boundaries without adding evidence.
 
 I. Immediately before arming an eligible BEHIND pull request, the train re-reads
 its reviews. A late notice holds without arming or updating. Admission reads
-and arming reads share `REVIEW_READS`; a spent budget holds arming unread.
+use `REVIEW_READS`; arming reads have a separate `ARMING_READS = 3` allowance.
+`advance` arms at most one pull request per sweep, so this small allowance covers
+held candidates before it. A spent arming allowance holds arming unread. The
+drift re-arm path also reads reviews before disarming and re-arming; a late hold
+disarms once, while a spent allowance leaves the pull request armed.
 The existing final landing read remains separately bounded by the landing path.
 Bot dependency updates retain their exemption. `test_adr92_arming_rereads` and
-`test_adr92_arming_read_budget` cover late notices, clean reads, and exhaustion.
+`test_adr92_re_arm_rereads` cover late notices and clean reads;
+`test_adr92_arming_read_budget` and `test_adr92_arming_allowance_beside_admission`
+cover exhaustion and independence from admission.
 
 ## Consequences
 
@@ -95,6 +108,17 @@ Configured repositories hold zero-review heads with `review body: review incompl
 no completed review by <logins> on head <head>`. Unknown input holds instead of
 proving completion. A bot's later review cannot clear another bot's notice.
 A current-head review may still hold for unanswered findings under ADR-0070.
+
+`test_adr92_review_bots_updates_without_arming`,
+`test_adr92_review_bots_disarms_before_update`, and
+`test_adr92_review_bots_drifted_not_re_armed` cover the direct-landing rule.
+`test_adr92_review_bots_arming_mutant_arms` plants the rules-heredoc R1-arm defect
+and proves that restoring arming permits an arm write with `review_bots` set.
+`test_adr92_re_arm_rereads`, `test_adr92_arming_allowance_beside_admission`, and
+`test_adr92_arming_read_budget` cover the drift read, separate allowance, and
+one-read boundary. Mutation rows `R1-disarm`, `R1-drift`, `R3`, and `R2` in
+`test_adr92_mutations_reject_defects` restore each corresponding defect and require
+exactly one failing regression case after an unmutated pass.
 
 `test_adr92_mutations_reject_defects` restores each A–F and I defect in isolated
 module copies and requires a planted failure after an unmutated pass.

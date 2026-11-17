@@ -5473,20 +5473,20 @@ def test_unsigned_person_retitled_armed_pull_request_is_disarmed_and_refused(tmp
 
 
 def test_planted_re_arm_drifted_without_unsigned_bot_error_refuses_bot(tmp_path):
-    """Planted mutant: unhandled UnsignedBotError in re_arm_drifted refuses the run."""
+    """Planted mutant: unhandled UnsignedBotError in re_arm_after_review refuses the run."""
     target = (
-        "            try:\n"
-        "                arm(env, conf, pull)\n"
-        "            except UnsignedBotError as err:\n"
-        '                notes[pull["number"]] = err.note\n'
-        "                return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
+        "    try:\n"
+        "        arm(env, conf, pull)\n"
+        "    except UnsignedBotError as err:\n"
+        '        notes[pull["number"]] = err.note\n'
+        "        return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
     )
     mutant = (
-        "            try:\n"
-        "                arm(env, conf, pull)\n"
-        "            except KeyError as err:\n"
-        '                notes[pull["number"]] = err.note\n'
-        "                return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
+        "    try:\n"
+        "        arm(env, conf, pull)\n"
+        "    except KeyError as err:\n"
+        '        notes[pull["number"]] = err.note\n'
+        "        return f\"disarmed #{pull['number']}: its commits carry no Signed-off-by\""
     )
     assert script().count(target) == 1
     flow = script().replace(target, mutant)
@@ -10543,6 +10543,80 @@ def test_adr92_arming_rereads(tmp_path, late_notice):
     assert ("review body: review incomplete" in summary) is late_notice
 
 
+def test_adr92_review_bots_updates_without_arming(tmp_path):
+    p = pull(1, "BEHIND", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p)
+    done, _ = train(tmp_path, forge, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [updated(1)]
+
+    forge_unset = Forge(repository(p))
+    forge_unset.review_details[1] = adr92_head_detail(p)
+    done_unset, _ = train(tmp_path, forge_unset)
+    assert done_unset.returncode == 0, done_unset.stdout + done_unset.stderr
+    assert forge_unset.writes == [("arm", "PR_1", p["headRefOid"], "SQUASH"), updated(1)]
+
+
+def test_adr92_review_bots_disarms_before_update(tmp_path):
+    p = pull(1, "BEHIND", author={"login": "person"}, autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p)
+    done, summary = train(tmp_path, forge, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1), updated(1)]
+    assert "| #1 | BEHIND | disarmed, updated from the default branch |" in summary
+
+
+def test_adr92_review_bots_drifted_not_re_armed(tmp_path):
+    p = pull(1, "BLOCKED", author={"login": "person"}, autoMergeRequest=armed_squash())
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p)
+    done, summary = train(tmp_path, forge, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [disarmed(1)]
+    assert "disarmed: title changed after arming, the train lands it directly" in summary
+
+
+@pytest.mark.parametrize("late_notice", [False, True], ids=["R3-clear", "R3-hold"])
+def test_adr92_re_arm_rereads(tmp_path, late_notice):
+    p, detail = _incomplete_review_pull(armed=True)
+    p.update(mergeStateStatus="BLOCKED", autoMergeRequest=armed_squash())
+    forge = Forge(repository(p))
+    forge.review_details[1] = [_detail(), detail if late_notice else _detail()]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = [disarmed(1), ("arm", "PR_1", p["headRefOid"], "SQUASH")]
+    assert forge.writes == ([disarmed(1)] if late_notice else expected)
+    assert forge.review_body_calls == [1, 1]
+    assert ("disarmed: review body: review incomplete" in summary) is late_notice
+    assert ("re-armed: title changed after arming" in summary) is not late_notice
+
+
+def test_adr92_arming_allowance_beside_admission(tmp_path):
+    pulls = [pull(number, "BEHIND", author={"login": "person"}) for number in range(1, 11)]
+    forge = Forge(repository(*pulls))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.review_body_calls == [*range(1, 11), 1]
+    assert forge.writes == [("arm", "PR_1", pulls[0]["headRefOid"], "SQUASH"), updated(1)]
+    assert "budget spent" not in summary
+
+
+def test_adr92_review_bots_arming_mutant_arms(tmp_path):
+    mutant = module().replace(
+        'arms = not conf.get("required_status") and not conf.get("review_bots")',
+        'arms = not conf.get("required_status")',
+    )
+    assert mutant != module()
+    p = pull(1, "BEHIND", author={"login": "person"})
+    forge = Forge(repository(p))
+    forge.review_details[1] = adr92_head_detail(p)
+    done, _ = train(tmp_path, forge, helper=mutant, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("arm", "PR_1", p["headRefOid"], "SQUASH"), updated(1)]
+
+
 @pytest.fixture(autouse=True)
 def adr92_offline_source(monkeypatch):
     """An explicit baseline root redirects only module loading, never repository state."""
@@ -10580,17 +10654,25 @@ def test_adr92_notice_boundary_without_evidence(tmp_path, monkeypatch, when, hol
 
 def test_adr92_arming_read_budget(tmp_path, monkeypatch):
     mod = adr92_train(tmp_path, monkeypatch)
-    p = pull(1, "BEHIND", author={"login": "person"})
-    forge = Forge(repository(p))
+    p, detail = _incomplete_review_pull()
+    p["mergeStateStatus"] = "BEHIND"
+    second = pull(2, "BEHIND", author={"login": "person"})
+    forge = Forge(repository(p, second))
+    forge.review_details[1] = [_detail(), detail]
+    forge.retry_histories[1] = retry_history(1) | {"headRefOid": p["headRefOid"]}
     source = SCRIPT.read_text()
-    assert source.count("REVIEW_READS = 10") == 1
+    assert source.count("ARMING_READS = 3") == 1
     done, summary = train(
-        tmp_path, forge, text=source.replace("REVIEW_READS = 10", "REVIEW_READS = 1")
+        tmp_path, forge, text=source.replace("ARMING_READS = 3", "ARMING_READS = 1")
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
-    assert forge.review_body_calls == [1]
-    assert "not armed: review read budget spent this sweep" in summary
+    assert forge.review_body_calls == [1, 2, 1]
+    assert "review body: review incomplete" in summary
+    assert (
+        "| #2 | BEHIND | review body: not armed: review read budget spent this sweep |" in summary
+    )
+    assert mod.ARMING_READS == 3
     assert mod.REVIEW_READS == 10
 
 
@@ -10653,6 +10735,39 @@ def adr92_mutations():
             "if arming and late_review_hold(env, conf, pull, notes, arming=True):",
             "if arming and False:",
             "test_adr92_arming_rereads[I-hold]",
+        ),
+    ] + adr92_followup_mutations()
+
+
+def adr92_followup_mutations():
+    return [
+        (
+            "R1-disarm",
+            "merge_train",
+            '(conf.get("required_status") or conf.get("review_bots")) and pull["autoMergeRequest"]',
+            'conf.get("required_status") and pull["autoMergeRequest"]',
+            "test_adr92_review_bots_disarms_before_update",
+        ),
+        (
+            "R1-drift",
+            "merge_train",
+            'if conf.get("required_status") or conf.get("review_bots"):',
+            'if conf.get("required_status"):',
+            "test_adr92_review_bots_drifted_not_re_armed",
+        ),
+        (
+            "R3",
+            "merge_train",
+            "if late_review_hold(env, conf, pull, notes, arming=True):",
+            "if False:",
+            "test_adr92_re_arm_rereads[R3-hold]",
+        ),
+        (
+            "R2",
+            "merge_train",
+            'counter = "arming_reads" if arming else "review_reads"',
+            'counter = "review_reads"',
+            "test_adr92_arming_allowance_beside_admission",
         ),
     ]
 
