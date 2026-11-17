@@ -192,6 +192,11 @@ on:
         type: string
         required: false
         default: security
+      review_bots:
+        description: Completed head review required from one listed login, comma-separated; empty disables.
+        type: string
+        required: false
+        default: ""
       session_authors:
         description: Session pull request authors to wait for, comma-separated; empty disables the hold.
         type: string
@@ -1065,6 +1070,7 @@ jobs:
           TRAIN_RELEASE_OFF: ${{ inputs.release_off }}
           TRAIN_RELEASE_MAX_PARALLEL: ${{ inputs.release_max_parallel }}
           TRAIN_SECURITY_LABELS: ${{ inputs.security_labels }}
+          TRAIN_REVIEW_BOTS: ${{ inputs.review_bots }}
           TRAIN_SESSION_AUTHORS: ${{ inputs.session_authors }}
           TRAIN_SESSION_HOLD_HOURS: ${{ inputs.session_hold_hours }}
           TRAIN_REQUIRED_STATUS: ${{ inputs.required_status }}

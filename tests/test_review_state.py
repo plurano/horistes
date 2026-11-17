@@ -142,7 +142,7 @@ LIMIT_BODIES = [
     ("review-exceeded", "Review limit was exceeded.", True),
     ("rate-hit", "Rate-limit hit.", True),
     ("reviews-paused", "reviews paused", True),
-    ("zero-allowance", "0 remain after this review", False),
+    ("zero-allowance", "0 remain after this review", True),
     (
         "coderabbit-header",
         (
@@ -157,7 +157,7 @@ LIMIT_BODIES = [
             "Included review availability: Your plan provides up to 1 "
             "included review per hour; 0 remain after this review."
         ),
-        False,
+        True,
     ),
     ("bold-notice", "**Review limit reached**. Please wait.", True),
     ("crlf-header", "> ## Rate limit exceeded\r\n> Please wait 10 minutes.", True),
@@ -206,7 +206,7 @@ def _limit_notice_order_cases():
     cases.append(_case("limit-notice-old-names-head", pr, True))
     table["createdAt"] = "2026-11-14T04:02:00Z"
     pr["comments"]["nodes"].append(table)
-    cases.append(_case("limit-notice-newer-table-supersedes", pr, False))
+    cases.append(_case("limit-notice-newer-table-supersedes", pr, True))
     table["createdAt"] = comment["createdAt"]
     cases.append(_case("limit-notice-same-time-table-keeps-notice", pr, True))
     comment["author"]["login"] = "lusoris"
@@ -382,7 +382,7 @@ def _allowance_cases():
         "body": "",
     }
     pr["reviews"]["nodes"] = [reviewed]
-    cases.append(_case("allowance-later-review-covers-push", pr, False))
+    cases.append(_case("allowance-later-review-covers-push", pr, True))
     reviewed["state"] = "PENDING"
     cases.append(_case("allowance-pending-review-insufficient", pr, True))
     reviewed["state"] = "COMMENTED"
@@ -397,11 +397,11 @@ def _allowance_cases():
     pr["reviews"]["nodes"] = []
     later = dict(comment, createdAt="2026-11-14T20:49:00Z")
     pr["comments"]["nodes"].append(later)
-    cases.append(_case("allowance-later-summary-covers-push", pr, False))
+    cases.append(_case("allowance-later-summary-covers-push", pr, True))
     later["createdAt"] = "2026-11-14T20:47:30Z"
     cases.append(_case("allowance-later-table-before-push-insufficient", pr, True))
     later["createdAt"] = commit["committedDate"]
-    cases.append(_case("allowance-table-at-push-covers", pr, False))
+    cases.append(_case("allowance-table-at-push-covers", pr, True))
     pr["comments"]["nodes"].pop()
     comment["body"] = "Rate limit exceeded. Review skipped."
     commit["committedDate"] = "2026-11-14T20:40:00Z"
@@ -520,3 +520,197 @@ def test_review_incomplete_pr3507_body_replay():
     assert review_incomplete(node) == (
         "review incomplete: coderabbitai limit reached at 2026-11-16T16:40:51Z"
     )
+
+
+# ADR-0092: replayable inputs shared with the baseline and mutation checks.
+ADR92_HEAD = "b" * 40
+ADR92_COMMIT = "2026-11-16T16:10:16Z"
+ADR92_NOTICE = "2026-11-16T16:40:51Z"
+ADR92_TABLE = "Pre-merge checks\n| c | ![Passed](x) | ok |"
+
+
+def adr92_comment(body, when=ADR92_NOTICE, login="coderabbitai", **fields):
+    return {"author": {"login": login}, "createdAt": when, "body": body, **fields}
+
+
+def adr92_pull(*comments, commits=None, reviews=()):
+    return {
+        "headRefOid": ADR92_HEAD,
+        "author": {"login": "person"},
+        "commits": {
+            "nodes": commits
+            if commits is not None
+            else [{"commit": {"committedDate": ADR92_COMMIT}}]
+        },
+        "comments": {"nodes": list(comments)},
+        "reviews": {"nodes": list(reviews)},
+    }
+
+
+def adr92_reader_cases():
+    notice = adr92_comment("Review limit reached.")
+    cases = []
+    for name, body in [
+        ("sourcery", "Sorry @person, you've used your own review budget of 250,000 characters."),
+        ("icon", "> ## ⚠️ Review limit reached"),
+        ("repository", "Review limit reached for this repository."),
+        ("organization", "Review limit exceeded for this organization."),
+        ("commit", "Review limit hit for commit " + ADR92_HEAD + "."),
+    ][:10]:
+        cases.append(("B-" + name, adr92_pull(adr92_comment(body)), True))
+    sticky = adr92_comment(
+        "## Reviews paused\nLast reviewed commit: " + "a" * 40,
+        "2026-11-15T19:45:04Z",
+        updatedAt="2026-11-16T17:00:00Z",
+    )
+    cases.append(("C-edited-notice", adr92_pull(sticky), True))
+    table = adr92_comment(ADR92_TABLE, "2026-11-15T19:45:04Z", updatedAt="2026-11-16T17:00:00Z")
+    cases.append(("C-edited-evidence", adr92_pull(notice, table), False))
+    for name, login in [("author", "person"), ("other-login", "copilot")][:2]:
+        table = adr92_comment(ADR92_TABLE, "2026-11-16T17:00:00Z", login)
+        cases.append(("D-" + name, adr92_pull(notice, table), True))
+    head_notice = adr92_comment(
+        "Review limit reached for commit " + ADR92_HEAD + ".", "2026-11-16T16:00:00Z"
+    )
+    table = adr92_comment(ADR92_TABLE, "2026-11-16T16:05:00Z")
+    cases.append(("D-old-table-head-notice", adr92_pull(head_notice, table), True))
+    formal = {
+        "author": {"login": "copilot"},
+        "state": "APPROVED",
+        "body": "Approved.",
+        "submittedAt": "2026-11-16T17:00:00Z",
+    }
+    quota = adr92_comment(
+        "Copilot was unable to review this pull request because the user "
+        "who requested the review has insufficient remaining quota.",
+        login="copilot",
+    )
+    cases.append(("D-formal-clears", adr92_pull(quota, reviews=[formal]), False))
+    for state in ("DISMISSED", "PENDING"):
+        dismissed = {
+            **formal,
+            "author": {"login": "coderabbitai"},
+            "state": state,
+            "body": ADR92_TABLE,
+        }
+        cases.append(("D-" + state, adr92_pull(notice, reviews=[dismissed]), True))
+    return cases + adr92_time_cases()
+
+
+def adr92_time_cases():
+    cases = []
+    allowance = (
+        "Reviewing files that changed from the base of the PR and between "
+        + "0" * 40
+        + " and "
+        + "a" * 40
+        + ".\n0 remain after this review"
+    )
+    for name, commits, when in [
+        ("equal-allowance", None, ADR92_COMMIT),
+        ("empty-commits", [], ADR92_COMMIT),
+        ("empty-notice-time", None, ""),
+    ][:3]:
+        cases.append(
+            ("E-" + name, adr92_pull(adr92_comment(allowance, when), commits=commits), True)
+        )
+    for name, commit, when in [
+        ("offset", "2026-11-16T17:10:16+01:00", ADR92_NOTICE),
+        ("fraction", ADR92_COMMIT, "2026-11-16T16:10:16.500Z"),
+        ("invalid", "invalid", ADR92_NOTICE),
+        ("naive", "2026-11-16T16:10:16", ADR92_NOTICE),
+        ("unknown-notice", ADR92_COMMIT, "invalid"),
+        ("equal-notice", ADR92_COMMIT, ADR92_COMMIT),
+        ("before-notice", ADR92_COMMIT, "2026-11-16T16:10:15Z"),
+    ][:7]:
+        pr = adr92_pull(
+            adr92_comment("Review limit reached.", when),
+            commits=[{"commit": {"committedDate": commit}}],
+        )
+        cases.append(("E-" + name, pr, name != "before-notice"))
+    return cases
+
+
+def adr92_reader():
+    import importlib.util
+    import os
+
+    root = Path(os.environ.get("HORISTES_READER_SOURCE", FIXTURES.parents[2]))
+    spec = importlib.util.spec_from_file_location(
+        "adr92_review_state", root / "tools/review_state.py"
+    )
+    reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reader)
+    return reader
+
+
+@pytest.mark.parametrize(
+    ("name", "pr", "expected"),
+    adr92_reader_cases(),
+    ids=[case[0] for case in adr92_reader_cases()[:100]],
+)
+def test_adr92_reader_planted(name, pr, expected):
+    assert bool(adr92_reader().review_incomplete(pr)) is expected, name
+
+
+@pytest.mark.parametrize(
+    "body", ["Review limit reached is handled by retrying.", "| Review limit reached | handled |"]
+)
+def test_adr92_notice_controls(body):
+    assert adr92_reader().review_incomplete(adr92_pull(adr92_comment(body))) == ""
+
+
+@pytest.mark.parametrize("raw", [{"a": 1}, 1, "str"])
+def test_adr92_nodes_malformed(raw):
+    assert adr92_reader()._nodes({"nodes": raw}, 100) == []
+
+
+def test_adr92_reader_complexity_bounds():
+    """Reader functions obey the local line ceiling and McCabe 10 without new dependencies."""
+    import ast
+    import subprocess
+    import sys
+
+    reader = adr92_reader()
+    source = Path(reader.__file__)
+    functions = [
+        node
+        for node in ast.parse(source.read_text()).body[:100]
+        if isinstance(node, ast.FunctionDef)
+    ]
+    assert all(node.end_lineno - node.lineno + 1 <= 60 for node in functions[:100])
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ruff",
+            "check",
+            "--select",
+            "C901",
+            "--config",
+            "lint.mccabe.max-complexity=10",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("state", ["DISMISSED", "PENDING"])
+def test_adr92_unfinished_allowance_review_keeps_notice(state):
+    review = {
+        "author": {"login": "coderabbitai"},
+        "state": state,
+        "submittedAt": ADR92_NOTICE,
+        "body": (
+            "Reviewing files that changed from the base of the PR and between "
+            + "a" * 40
+            + " and "
+            + ADR92_HEAD
+            + ".\n0 remain after this review"
+        ),
+    }
+    assert adr92_reader().review_incomplete(adr92_pull(reviews=[review]))
