@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 import records
 from records_cases import (
+    APP,
     NEW,
     NEW_RECORD,
     NO_POINTER,
@@ -195,3 +196,80 @@ def test_unclosed_nested_fence_ends_with_its_item(tree):
     assert done.returncode == 1, done.stdout + done.stderr
     assert failures(done) == [f"FAIL: {NEW}:17: claim under 'Decision' {NO_POINTER}"]
     assert not records.blocks(text)[-2].fenced
+
+
+@pytest.mark.parametrize("container", ["- ", "1. "])
+@pytest.mark.parametrize("marker", ["~~~", "```"])
+@pytest.mark.parametrize("copied", [True, False], ids=["source", "original"])
+def test_planted_marker_line_fence_judges_source_line(tree, container, marker, copied):
+    repo = base_repo(tree)
+    body = 'DEADLINE_SECONDS = timeout_for("forge")' if copied else "some original explanation"
+    assert not copied or (body in APP and len(body) >= records.MIN_RESTATED_CHARS)
+    indent = " " * len(container)
+    text = NEW_RECORD.replace(
+        POINTED,
+        "- The app waits (`tools/app.py`).\n\n"
+        f"{container}{marker}python\n{indent}{body}\n{indent}{marker}",
+    )
+    done = change(repo, {NEW: text})
+    assert done.returncode == (1 if copied else 0), done.stdout + done.stderr
+    if copied:
+        assert any(f"{NEW}:14: restated code" in line for line in failures(done))
+
+
+@pytest.mark.parametrize("container", ["- ", "1. ", "-    ", "-\t"])
+@pytest.mark.parametrize("marker", ["~~~", "```"])
+def test_marker_line_fence_closes_before_next_paragraph(container, marker):
+    indent = " " * len(container.expandtabs(4))
+    text = (
+        f"## Decision\n\n{container}{marker}python\n{indent}body\n{indent}{marker}\n"
+        "\nNext paragraph.\n"
+    )
+    found = records.blocks(text)
+    assert [(b.start, b.end, b.fenced) for b in found] == [(3, 5, True), (7, 7, False)]
+    assert found[-1].lines == ["Next paragraph."]
+
+
+@pytest.mark.parametrize("container", ["- ", "1. "])
+@pytest.mark.parametrize("marker", ["~~~", "```"])
+def test_marker_line_fence_comment_markers_stay_literal(container, marker):
+    indent = " " * len(container)
+    text = f"{container}{marker}python\n{indent}<!-- literal ` marker\n{indent}{marker}\n"
+    assert records.visible_text(text) == text
+
+
+@pytest.mark.parametrize("line", ["-", "-     ~~~", "1.     ```"])
+def test_empty_or_excess_padding_item_opens_no_fence(line):
+    found = records.blocks(line)
+    assert len(found) == 1
+    assert not found[0].fenced
+    assert found[0].content_indent == (3 if line.startswith("1.") else 2)
+
+
+@pytest.mark.parametrize(
+    "separator", ["\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+)
+def test_non_lf_separators_keep_git_block_lines_and_comment_positions(separator):
+    text = f"# Title{separator}subtitle\n\n## Decision\n\nClaim{separator}continued.\n"
+    found = records.blocks(text)
+    assert [(b.start, b.end, b.lines) for b in found] == [(5, 5, [f"Claim{separator}continued."])]
+    comment = f"<!-- hidden{separator}text -->"
+    text += f"\n{comment}\nVisible.\n"
+    masked = records.visible_text(text)
+    assert masked == text.replace(comment, " " * len(comment))
+    assert len(masked) == len(text)
+    assert [i for i, c in enumerate(masked) if c == "\n"] == [
+        i for i, c in enumerate(text) if c == "\n"
+    ]
+
+
+def test_crlf_record_matches_lf_blocks_and_preserves_comment_positions():
+    text = "## Decision\n\n- ~~~python\n  <!-- literal\n  ~~~\n\n<!-- hidden -->\nClaim.\n"
+    crlf = text.replace("\n", "\r\n")
+    assert records.blocks(crlf) == records.blocks(text)
+    assert records.visible_text(crlf) == crlf.replace("<!-- hidden -->", " " * 15)
+
+
+def test_blocks_strip_only_the_cr_touching_lf():
+    found = records.blocks("## Decision\n\nClaim\r\r\ncontinued\r")
+    assert [(b.start, b.end, b.lines) for b in found] == [(3, 4, ["Claim\r", "continued\r"])]

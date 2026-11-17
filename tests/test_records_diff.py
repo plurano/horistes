@@ -337,3 +337,64 @@ def test_deleted_record_is_never_read(tree, monkeypatch):
 
     monkeypatch.setattr(records, "record_text", unexpected_read)
     assert records.check_records(repo.root, "main") == ([], 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "finding"),
+    [
+        ("The app waits (`tools/app.py`).\n", "The app retries.\n", "claim under 'Decision'"),
+        (
+            "The app waits (`tools/app.py`).\n",
+            '`DEADLINE_SECONDS = timeout_for("forge")`\n',
+            "restated code",
+        ),
+        ("The app waits.\nSee `tools/app.py`.\n", "The app waits.\n", "claim under 'Decision'"),
+    ],
+    ids=["edit-claim", "copy-source", "delete-pointer"],
+)
+def test_planted_lf_line_numbers_keep_edited_claim_visible(tree, before, after, finding):
+    repo = base_repo(tree)
+    prefix = "# Title\u2028subtitle\n\n## Decision\n\n"
+    repo.write({OLD: prefix + before})
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "accepted record with a Unicode separator")
+    repo.write({OLD: prefix + after})
+    problems, changed, judged = records.check_records(repo.root, "main")
+    assert (changed, judged) == (1, 1)
+    assert any(f"{OLD}:5: {finding}" in problem for problem in problems)
+    assert all(problem.startswith(f"{OLD}:5:") for problem in problems)
+
+
+def test_diff_context_unicode_separator_is_one_git_line():
+    changes = records.diff_changes("@@ -1,2 +1,2 @@\n # A\u2028+B\n-old\n+new\n")
+    assert changes.added == {2}
+    assert [(d.point, d.first, d.last) for d in changes.deletions] == [(1, True, True)]
+
+
+@pytest.mark.parametrize("extra", [0, 1], ids=["limit", "over-limit"])
+def test_record_line_limit_counts_lf_only(tmp_path, extra):
+    path = tmp_path / "record.md"
+    text = "text\u2028continued\n" * (records.MAX_LINES + extra)
+    path.write_bytes(text.encode())
+    if extra:
+        with pytest.raises(records.ciwf.ReadError, match="record line limit"):
+            records.record_text(path)
+    else:
+        assert records.record_text(path) == text
+
+
+@pytest.mark.parametrize("keepends", [False, True])
+@pytest.mark.parametrize("text", ["", "a", "\n", "a\n", "a\n\n", "a\r\nb\r", "a\r\r\nb"])
+def test_git_lines_preserve_lone_cr_and_terminal_lf_count(text, keepends):
+    expected = {
+        "": [],
+        "a": ["a"],
+        "\n": [""],
+        "a\n": ["a"],
+        "a\n\n": ["a", ""],
+        "a\r\nb\r": ["a", "b\r"],
+        "a\r\r\nb": ["a\r", "b"],
+    }
+    lines = records.git_lines(text, keepends=keepends)
+    assert len(lines) == len(expected[text])
+    assert "".join(lines) == text if keepends else lines == expected[text]

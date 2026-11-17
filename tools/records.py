@@ -153,11 +153,21 @@ class Changes:
     deletions: list[Deletion] = field(default_factory=list)
 
 
+def git_lines(text: str, *, keepends: bool = False) -> list[str]:
+    """Split only at LF, stripping CR only before LF unless endings must stay exact."""
+    parts = text.split("\n")
+    if keepends:
+        lines = [line + "\n" for line in parts[:-1]]
+    else:
+        lines = [line.removesuffix("\r") for line in parts[:-1]]
+    return lines + ([parts[-1]] if parts[-1] else [])
+
+
 def diff_changes(diff: str) -> Changes:
     """Walk new-side coordinates once, including zero-length hunks and removed runs."""
     changes = Changes()
     number, deleting = None, False
-    for line in limited(diff.splitlines(), MAX_LINES * 10, "diff line limit"):
+    for line in limited(git_lines(diff), MAX_LINES * 10, "diff line limit"):
         hunk = HUNK.match(line)
         if hunk:
             number = int(hunk.group(1)) + (hunk.group(2) == "0")
@@ -187,7 +197,7 @@ def added_lines(diff: str) -> set[int]:
 
 def affected_lines(text: str, changes: Changes) -> set[int]:
     """Bind only nonblank surviving neighbours contiguous with a removed run's text."""
-    lines = limited(text.splitlines(), MAX_LINES, "record line limit")
+    lines = limited(git_lines(text), MAX_LINES, "record line limit")
     affected = changes.added.copy()
     for deletion in changes.deletions[: MAX_LINES * 10]:
         point = deletion.point
@@ -255,7 +265,7 @@ def limited(items: list[str], bound: int, label: str) -> list[str]:
 def record_text(path: Path) -> str:
     """Read one regular record under byte and line limits, with contextual input errors."""
     text = _bounded_text(path)
-    limited(text.splitlines(), MAX_LINES, "record line limit")
+    limited(git_lines(text), MAX_LINES, "record line limit")
     return text
 
 
@@ -307,7 +317,7 @@ class FenceState:
 
 def _find_fence(line: str, content_indent: int) -> tuple[re.Match[str] | None, int]:
     """Apply the unchanged fence rule after stripping a containing item's columns."""
-    offset = content_indent if _indent(line) >= content_indent else 0
+    offset = content_indent if TOP_ITEM.match(line) or _indent(line) >= content_indent else 0
     return FENCE.match(line.expandtabs(4)[offset:]), offset
 
 
@@ -362,9 +372,11 @@ def visible_text(text: str) -> str:
     """Mask HTML comments, preserving positions and literal markers in spans and fences."""
     masked, offset, literal_until = list(text), 0, 0
     state = FenceState()
-    for line in limited(text.splitlines(keepends=True), MAX_LINES, "record line limit"):
+    for line in limited(git_lines(text, keepends=True), MAX_LINES, "record line limit"):
         end = offset + len(line)
-        if offset >= literal_until and _fence_step(line.rstrip("\r\n"), state):
+        if offset >= literal_until and _fence_step(
+            line.removesuffix("\r\n").removesuffix("\n"), state
+        ):
             literal_until = end
         else:
             literal_until = _mask_tokens(text, masked, max(offset, literal_until), end)
@@ -395,8 +407,7 @@ def blocks(text: str) -> list[Block]:
     found: list[Block] = []
     section, current = "", None
     state = FenceState()
-    lines = limited(text.splitlines(), MAX_LINES, "record line limit")
-    lines = visible_text("\n".join(lines)).splitlines()
+    lines = limited(git_lines(visible_text(text)), MAX_LINES, "record line limit")
     for number, line in enumerate(lines, start=1):
         event = _fence_step(line, state)
         if event == "open":
@@ -504,7 +515,7 @@ def judge(record: str, block: Block, tree: Tree) -> list[str]:
 
 def _record_changes(root: Path, name: str, diff: str) -> Changes | None:
     """Refuse nontext diffs and skip removed records before binding any surviving text."""
-    if any(line.startswith(("Binary files ", "GIT binary patch")) for line in diff.splitlines()):
+    if any(line.startswith(("Binary files ", "GIT binary patch")) for line in git_lines(diff)):
         raise ciwf.ReadError(f"{name}: binary record diff")
     if "\n+++ /dev/null\n" in "\n" + diff or not os.path.lexists(root / name):
         return None
@@ -521,7 +532,7 @@ def changed_records(root: Path, base: str) -> dict[str, Changes]:
         if not RECORD.fullmatch(name):
             continue
         diff = git(root, *DIFF, base, "--", f":(literal){name}")
-        diff_lines += len(diff.splitlines())
+        diff_lines += len(git_lines(diff))
         if diff_lines > MAX_LINES * 10:
             raise ciwf.ReadError(f"diff line limit {MAX_LINES * 10} exceeded")
         changes = _record_changes(root, name, diff)
@@ -530,7 +541,7 @@ def changed_records(root: Path, base: str) -> dict[str, Changes]:
     untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", "docs/adr")
     for name in limited(untracked.rstrip("\0").split("\0"), MAX_FILES, "new file limit"):
         if RECORD.fullmatch(name):
-            count = len(record_text(root / name).splitlines())
+            count = len(git_lines(record_text(root / name)))
             changed[name] = Changes(set(range(1, count + 1)))
     return changed
 

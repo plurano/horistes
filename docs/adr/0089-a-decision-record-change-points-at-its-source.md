@@ -32,7 +32,10 @@ content column, measured with four-column tab stops; `test_planted_item_continua
 and `test_planted_list_item_holds_nested_paragraph` in `tests/test_records_blocks.py`
 cover the boundary. Nested fences use that column and end when their container
 ends, as `test_planted_nested_fence_judges_source_line` and
-`test_unclosed_nested_fence_ends_with_its_item` verify. A changed line binds its
+`test_unclosed_nested_fence_ends_with_its_item` verify. A fence may start on
+the list marker's line; `test_planted_marker_line_fence_judges_source_line` in
+`tests/test_records_blocks.py` checks copied source in that position.
+A changed line binds its
 whole block; untouched blocks stay unjudged, as
 `test_untouched_blocks_of_an_accepted_record_stay_unjudged` verifies.
 Local new records are judged before staging too, as
@@ -47,6 +50,10 @@ run; deleting a paragraph with its blank line leaves its neighbours unjudged.
 `tests/test_records_diff.py` verify these boundaries. Text
 conversion is disabled so the diff uses the record's line coordinates;
 `test_planted_textconv_cannot_shift_record_lines` verifies this boundary.
+Line boundaries follow Git's LF coordinates, with CRLF treated like LF and
+other separators retained within a line; `test_planted_lf_line_numbers_keep_edited_claim_visible`
+in `tests/test_records_diff.py` and `test_crlf_record_matches_lf_blocks_and_preserves_comment_positions`
+in `tests/test_records_blocks.py` cover these inputs.
 Inter-hunk context is disabled too, and context lines never count as added,
 as `test_planted_interhunk_context_judges_only_edits` and
 `test_planted_hunk_body_excludes_context_and_deleted_lines` verify in
