@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Check what a change adds to the decision records: no restated code, every claim points somewhere.
 
-Only blocks holding a line added or changed since the merge base of --base-ref and HEAD
-are judged (ADR-0089). An accepted record stays as written (docs/adr/README.md), so the
-rules bind it again whenever a line of it changes, and never through an exception list.
+Only blocks holding added lines or surviving text contiguous with removed lines since
+the merge base of --base-ref and HEAD are judged (ADR-0089). An accepted record stays
+as written (docs/adr/README.md), so the rules bind it again whenever a line of it changes,
+and never through an exception list.
 A block is a paragraph, a top-level list item with its nested lines, or a fenced block.
 
 - restated code: a code span or fenced line of MIN_RESTATED_CHARS or more that is not a
@@ -66,10 +67,7 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$")
 TOP_ITEM = re.compile(r"^(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
 CODE_SPAN = re.compile(r"(?<!`)(?P<ticks>`+)(?!`)(?P<code>.+?)(?<!`)(?P=ticks)(?!`)", re.DOTALL)
-MARKDOWN_TOKEN = re.compile(
-    r"(?P<fence>^ {0,3}(?:`{3,}|~{3,}))[^\n]*$|" + CODE_SPAN.pattern + r"|<!--",
-    re.MULTILINE | re.DOTALL,
-)
+MARKDOWN_TOKEN = re.compile(r"`+|<!--")
 # A bare path, identifier, flag or call names code; it does not restate it.
 POINTER_SHAPE = re.compile(r"[\w.:/@+\[\]-]+(?:\(\))?")
 CODE_SHAPE = re.compile(r"[=\{\}\"']|\w\(.+\)|\s")
@@ -89,6 +87,7 @@ class Block:
     start: int
     lines: list[str] = field(default_factory=list)
     fenced: bool = False
+    content_indent: int = 0
 
     @property
     def end(self) -> int:
@@ -137,20 +136,66 @@ def merge_base(root: Path, ref: str) -> str:
         raise ciwf.ReadError(f"no merge base of {ref} and HEAD: {err}") from err
 
 
-def added_lines(diff: str) -> set[int]:
-    """Added line numbers from one literal record's diff, independent of path headers."""
-    added: set[int] = set()
-    number = None
+@dataclass
+class Deletion:
+    """New-side boundary and whether the removed run began and ended with text."""
+
+    point: int
+    first: bool
+    last: bool
+
+
+@dataclass
+class Changes:
+    """Added lines and contiguous removed runs from one bounded diff walk."""
+
+    added: set[int] = field(default_factory=set)
+    deletions: list[Deletion] = field(default_factory=list)
+
+
+def diff_changes(diff: str) -> Changes:
+    """Walk new-side coordinates once, including zero-length hunks and removed runs."""
+    changes = Changes()
+    number, deleting = None, False
     for line in limited(diff.splitlines(), MAX_LINES * 10, "diff line limit"):
         hunk = HUNK.match(line)
         if hunk:
-            number = int(hunk.group(1))
-        elif number is not None and line.startswith("+"):
-            added.add(number)
+            number = int(hunk.group(1)) + (hunk.group(2) == "0")
+        elif number is None or line.startswith("\\"):
+            continue
+        elif line.startswith("-"):
+            nonblank = bool(line[1:].strip())
+            if deleting:
+                changes.deletions[-1].last = nonblank
+            else:
+                changes.deletions.append(Deletion(number - 1, nonblank, nonblank))
+            deleting = True
+            continue
+        elif line.startswith("+"):
+            changes.added.add(number)
             number += 1
-        elif number is not None and line.startswith(" "):
+        elif line.startswith(" "):
             number += 1
-    return added
+        deleting = False
+    return changes
+
+
+def added_lines(diff: str) -> set[int]:
+    """Added line numbers from the shared diff walk, independent of path headers."""
+    return diff_changes(diff).added
+
+
+def affected_lines(text: str, changes: Changes) -> set[int]:
+    """Bind only nonblank surviving neighbours contiguous with a removed run's text."""
+    lines = limited(text.splitlines(), MAX_LINES, "record line limit")
+    affected = changes.added.copy()
+    for deletion in changes.deletions[: MAX_LINES * 10]:
+        point = deletion.point
+        if deletion.first and 0 < point <= len(lines) and lines[point - 1].strip():
+            affected.add(point)
+        if deletion.last and point < len(lines) and lines[point].strip():
+            affected.add(point + 1)
+    return affected
 
 
 def read_tree(root: Path) -> Tree:
@@ -214,13 +259,31 @@ def record_text(path: Path) -> str:
     return text
 
 
+def _indent(line: str) -> int:
+    """Leading columns with CommonMark's four-column tab stops."""
+    expanded = line.expandtabs(4)
+    return len(expanded) - len(expanded.lstrip(" "))
+
+
+def _item_indent(line: str) -> int:
+    """Content column: marker width plus one for an empty item or excess whitespace."""
+    expanded = line.expandtabs(4)
+    item = TOP_ITEM.match(expanded)
+    if item is None:
+        return 0
+    marker = len(expanded.split(maxsplit=1)[0])
+    tail = expanded[marker:]
+    padding = len(tail) - len(tail.lstrip(" "))
+    return marker + (padding if tail.strip() and 1 <= padding <= 4 else 1)
+
+
 def _breaks_block(line: str, current: Block | None, number: int) -> bool:
     """Headings and items start blocks; after blanks only indented item lines continue."""
     if HEADING.match(line) or TOP_ITEM.match(line):
         return True
     if current is None or number == current.end + 1:
         return False
-    return not (TOP_ITEM.match(current.lines[0]) and line.startswith((" ", "\t")))
+    return not (current.content_indent and _indent(line) >= current.content_indent)
 
 
 def _closing_fence(fence: str) -> re.Pattern[str]:
@@ -233,12 +296,39 @@ def _closes(line: str, fence: str) -> bool:
     return bool(_closing_fence(fence).fullmatch(line))
 
 
-def _fenced_line(current: Block, line: str, fence: str) -> tuple[str, Block | None]:
-    """Append a literal fenced line and clear the active block at its closing fence."""
-    current.lines.append(line)
-    if _closes(line, fence):
-        return "", None
-    return fence, current
+@dataclass
+class FenceState:
+    """Container and active fence columns shared by masking and block parsing."""
+
+    marker: str = ""
+    indent: int = 0
+    item_indent: int = 0
+
+
+def _find_fence(line: str, content_indent: int) -> tuple[re.Match[str] | None, int]:
+    """Apply the unchanged fence rule after stripping a containing item's columns."""
+    offset = content_indent if _indent(line) >= content_indent else 0
+    return FENCE.match(line.expandtabs(4)[offset:]), offset
+
+
+def _fence_step(line: str, state: FenceState) -> str:
+    """Open, continue or close a fence; a nested fence also closes with its container."""
+    if state.marker and state.indent and line.strip() and _indent(line) < state.indent:
+        state.marker = ""
+    if state.marker:
+        if _closes(line.expandtabs(4)[state.indent :], state.marker):
+            state.marker = ""
+            return "close"
+        return "body"
+    if TOP_ITEM.match(line):
+        state.item_indent = _item_indent(line)
+    elif line.strip() and _indent(line) < state.item_indent:
+        state.item_indent = 0
+    opened, indent = _find_fence(line, state.item_indent)
+    if opened:
+        state.marker, state.indent = opened.group(1), indent
+        return "open"
+    return ""
 
 
 def _section(line: str, section: str) -> str:
@@ -249,51 +339,77 @@ def _section(line: str, section: str) -> str:
     return section
 
 
-def visible_text(text: str) -> str:
-    """Mask HTML comments, preserving positions and literal comment markers inside code."""
-    masked, position = list(text), 0
-    for _ in range(len(text) + 1):
-        token = MARKDOWN_TOKEN.search(text, position)
+def _mask_tokens(text: str, masked: list[str], position: int, end: int) -> int:
+    """Mask comments starting on this line; spans and comments may finish on later lines."""
+    for _ in range(end - position + 1):
+        token = MARKDOWN_TOKEN.search(text, position, end)
         if token is None:
             break
         position = token.end()
-        if token.group("fence"):
-            closing = _closing_fence(token.group("fence").strip()).search(text, position)
-            position = closing.end() if closing else len(text)
-        elif token.group() == "<!--":
+        if token.group() == "<!--":
             closing = text.find("-->", position)
             position = closing + 3 if closing >= 0 else len(text)
             start = token.start()
             masked[start:position] = ["\n" if c == "\n" else " " for c in text[start:position]]
+        else:
+            span = CODE_SPAN.match(text, token.start())
+            if span is not None:
+                position = span.end()
+    return position
+
+
+def visible_text(text: str) -> str:
+    """Mask HTML comments, preserving positions and literal markers in spans and fences."""
+    masked, offset, literal_until = list(text), 0, 0
+    state = FenceState()
+    for line in limited(text.splitlines(keepends=True), MAX_LINES, "record line limit"):
+        end = offset + len(line)
+        if offset >= literal_until and _fence_step(line.rstrip("\r\n"), state):
+            literal_until = end
+        else:
+            literal_until = _mask_tokens(text, masked, max(offset, literal_until), end)
+        offset = end
     return "".join(masked)
+
+
+def _plain_line(
+    found: list[Block], current: Block | None, section: str, number: int, lines: list[str]
+) -> Block | None:
+    """Collect one non-fenced line, preserving blanks only inside a continued item."""
+    line = lines[number - 1]
+    if HEADING.match(line):
+        return None
+    if not line.strip():
+        return current
+    if _breaks_block(line, current, number):
+        current = None
+    if current is None or current.fenced:
+        current = Block(section, number, content_indent=_item_indent(line))
+        found.append(current)
+    current.lines.extend(lines[current.end : number])
+    return current
 
 
 def blocks(text: str) -> list[Block]:
     """Split a record into blocks, each with its `## ` section and first line number."""
     found: list[Block] = []
-    section, current, fence = "", None, ""
+    section, current = "", None
+    state = FenceState()
     lines = limited(text.splitlines(), MAX_LINES, "record line limit")
     lines = visible_text("\n".join(lines)).splitlines()
     for number, line in enumerate(lines, start=1):
-        if fence:
-            fence, current = _fenced_line(current, line, fence)
-            continue
-        opened = FENCE.match(line)
-        if opened:
-            fence, current = opened.group(1), Block(section, number, [line], fenced=True)
+        event = _fence_step(line, state)
+        if event == "open":
+            current = Block(section, number, [line], fenced=True)
             found.append(current)
+            continue
+        if event in ("body", "close"):
+            current.lines.append(line)
+            if event == "close":
+                current = None
             continue
         section = _section(line, section)
-        if not line.strip():
-            continue
-        if _breaks_block(line, current, number):
-            current = None
-        if HEADING.match(line):
-            continue
-        if current is None:
-            current = Block(section, number)
-            found.append(current)
-        current.lines.extend(lines[current.end : number])
+        current = _plain_line(found, current, section, number, lines)
     return found
 
 
@@ -386,10 +502,20 @@ def judge(record: str, block: Block, tree: Tree) -> list[str]:
     return problems
 
 
-def changed_records(root: Path, base: str) -> dict[str, set[int]]:
-    """Changed tracked lines plus local new records, which git diff does not show."""
+def _record_changes(root: Path, name: str, diff: str) -> Changes | None:
+    """Refuse nontext diffs and skip removed records before binding any surviving text."""
+    if any(line.startswith(("Binary files ", "GIT binary patch")) for line in diff.splitlines()):
+        raise ciwf.ReadError(f"{name}: binary record diff")
+    if "\n+++ /dev/null\n" in "\n" + diff or not os.path.lexists(root / name):
+        return None
+    changes = diff_changes(diff)
+    return changes if changes.added or changes.deletions else None
+
+
+def changed_records(root: Path, base: str) -> dict[str, Changes]:
+    """Added lines and deletion boundaries plus local new records absent from git diff."""
     names = git(root, "diff", "-z", "--name-only", "--no-renames", base, "--", "docs/adr")
-    changed: dict[str, set[int]] = {}
+    changed: dict[str, Changes] = {}
     diff_lines = 0
     for name in limited(names.rstrip("\0").split("\0"), MAX_FILES, "changed file limit"):
         if not RECORD.fullmatch(name):
@@ -398,18 +524,14 @@ def changed_records(root: Path, base: str) -> dict[str, set[int]]:
         diff_lines += len(diff.splitlines())
         if diff_lines > MAX_LINES * 10:
             raise ciwf.ReadError(f"diff line limit {MAX_LINES * 10} exceeded")
-        if any(
-            line.startswith(("Binary files ", "GIT binary patch")) for line in diff.splitlines()
-        ):
-            raise ciwf.ReadError(f"{name}: binary record diff")
-        lines = added_lines(diff)
-        if lines:
-            changed[name] = lines
+        changes = _record_changes(root, name, diff)
+        if changes is not None:
+            changed[name] = changes
     untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", "docs/adr")
     for name in limited(untracked.rstrip("\0").split("\0"), MAX_FILES, "new file limit"):
         if RECORD.fullmatch(name):
             count = len(record_text(root / name).splitlines())
-            changed[name] = set(range(1, count + 1))
+            changed[name] = Changes(set(range(1, count + 1)))
     return changed
 
 
@@ -420,8 +542,8 @@ def check_records(root: Path, base_ref: str) -> tuple[list[str], int, int]:
     tree = read_tree(root) if changed else Tree(frozenset(), "", frozenset())
     problems, judged = [], 0
     for record in limited(sorted(changed), MAX_FILES, "changed file limit"):
-        lines = changed[record]
         text = record_text(root / record)
+        lines = affected_lines(text, changed[record])
         for block in blocks(text):
             if any(block.start <= number <= block.end for number in lines):
                 judged += 1
