@@ -12,6 +12,7 @@ answers the closed and open pull requests with the fields the checks read.
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
 import subprocess
@@ -74,6 +75,9 @@ class Forge:
     def __init__(self) -> None:
         self.config: dict | None = None
         self.workflows: dict[str, str] | None = None
+        self.default_branch: object = "main"
+        self.repo_error = False
+        self.repo_reads = 0
         self.pulls: list[dict] = []
         self.tags: dict[str, tuple[str, str]] = {}
         self.tag_objects: dict[str, tuple[str, str]] = {}
@@ -156,6 +160,13 @@ class Forge:
 
     def get(self, path: str) -> tuple[int, object]:
         """The answer to one GET, by the part of the path after fleet/app."""
+        if path == "/repos/fleet/app":
+            self.repo_reads += 1
+            if self.repo_error:
+                return 500, {"message": "repository read failed"}
+            return 200, {"default_branch": self.default_branch} if hasattr(
+                self, "default_branch"
+            ) else {}
         rest = path.removeprefix("/repos/fleet/app/")
         routes = (
             ("contents/release-please-config.json", self.contents),
@@ -1044,7 +1055,7 @@ jobs:
     [
         pytest.param(
             "workflow_call_only",
-            ("if not workflow_has_allowed_trigger(content):", "if False:"),
+            ("if not workflow_has_allowed_trigger(content, default_branch):", "if False:"),
             {"release-please.yml": WORKFLOW_CALL_ONLY_WORKFLOW},
             id="workflow_call_only",
         ),
@@ -1333,3 +1344,469 @@ def test_a_failed_release_pull_request_attempt_runs_once_more():
     order = [s.get("name") for s in found]
     assert order.index(first["name"]) + 1 == order.index(wait["name"])
     assert order.index(wait["name"]) + 1 == order.index(second["name"])
+
+
+def push_workflow(trigger: str) -> str:
+    """Keep the planted release job while varying only its event declaration."""
+    return f"name: Release\n{trigger}\njobs:\n" + PLANTED_WORKFLOW.split("jobs:\n", 1)[1]
+
+
+PUSH_EXCLUSIONS = [
+    pytest.param("main", "branches: [release]", id="other-branch"),
+    pytest.param("main", "branches-ignore: [main]", id="ignored-default"),
+    pytest.param("main", "tags: ['v*']", id="tags-only"),
+    pytest.param("main", "tags-ignore: ['v*']", id="tags-ignore-only"),
+    pytest.param("main", "branches: ['**', '!main']", id="negative-last"),
+    pytest.param("trunk/main", "branches: ['*']", id="star-stops-at-slash"),
+    pytest.param("main", "branches:\n    - release", id="compact-sequence"),
+    pytest.param("trunk", "branches: [main]", id="different-default"),
+]
+
+
+@pytest.mark.parametrize(("branch", "filters"), PUSH_EXCLUSIONS)
+def test_planted_push_filter_allows_train_release(tmp_path, forge, branch, filters):
+    """A release writer excluded from the default branch leaves release creation to the train."""
+    forge.config = {}
+    forge.default_branch = branch
+    forge.workflows = {"release.yml": push_workflow(f"on:\n  push:\n    {filters}")}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n", outputs
+    assert "runs release-please in its own workflow" not in done.stdout
+
+
+@pytest.mark.parametrize(
+    ("branch", "trigger"),
+    [
+        pytest.param("main", "on:\n  push:\n    branches: [main]", id="default-branch"),
+        pytest.param("main", "on:\n  push:\n    branches: ['ma*']", id="star-match"),
+        pytest.param("main", "on:\n  push:\n    branches-ignore: [release]", id="ignore-other"),
+        pytest.param(
+            "main", "on:\n  push:\n    branches: ['**', '!main', 'main']", id="positive-last"
+        ),
+        pytest.param("trunk", "on:\n  push:\n    branches: [trunk]", id="trunk-default"),
+        pytest.param(
+            "main", "on:\n  push:\n    branches: [main]\n    paths: [src/**]", id="paths-ignored"
+        ),
+        pytest.param("main", "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:", id="dispatch"),
+        pytest.param("main", "on: push", id="inline-name"),
+        pytest.param("main", "on: [push]", id="inline-list"),
+        pytest.param("main", "on: {push: {branches: [release]}}", id="inline-mapping"),
+        pytest.param("main", "on:\n  push:", id="empty-push"),
+        pytest.param("main", "on:\n  push: {}", id="empty-mapping"),
+        pytest.param("main", "on:\n  push: null", id="null-push"),
+        pytest.param("main", "on:\n  push:\n    paths: [src/**]", id="paths-only"),
+        pytest.param("main", "on:\n  schedule:\n    - cron: '0 0 * * *'", id="schedule"),
+        pytest.param("main", "on:\n  workflow_run:\n    workflows: [CI]", id="workflow-run"),
+    ],
+)
+def test_push_trigger_controls_skip_train_release(tmp_path, forge, branch, trigger):
+    """Admitted default-branch pushes and other allowed events retain the release writer."""
+    forge.config = {}
+    forge.default_branch = branch
+    forge.workflows = {"release.yml": push_workflow(trigger)}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=true\npending=[]\nfrozen=false\n"
+
+
+UNDECIDABLE_FILTERS = [
+    pytest.param("branches: ['ma?']", id="question-mark"),
+    pytest.param("branches: ['ma+']", id="plus"),
+    pytest.param("branches: ['m[ab]in']", id="character-class"),
+    pytest.param("branches: ['ma\\in']", id="backslash"),
+    pytest.param("branches: [refs/heads/main]", id="refs-prefix"),
+    pytest.param("branches: *release", id="alias"),
+    pytest.param("branches: &release [other]", id="anchor"),
+    pytest.param("branches: !!str other", id="yaml-tag"),
+    pytest.param("branches: [*release]", id="list-alias"),
+    pytest.param("branches:\n      - &release other", id="sequence-anchor"),
+    pytest.param("branches:\n      - !!str other", id="sequence-tag"),
+    pytest.param("branches: [release]\n    branches-ignore: [main]", id="both-branch-filters"),
+    pytest.param("branches-ignore: ['!release']", id="ignore-negation"),
+    pytest.param("branches: |\n      release", id="block-scalar"),
+    pytest.param("branches: {name: release}", id="child-mapping"),
+    pytest.param("branches:\n      name: release", id="block-child-mapping"),
+    pytest.param("branches: ['other branch']", id="space"),
+    pytest.param("branches: ['!!main']", id="double-negation"),
+    pytest.param("tags: ['v?']", id="undecidable-tag"),
+    pytest.param("branches: ['!refs/heads/main']", id="negative-refs-prefix"),
+]
+
+
+@pytest.mark.parametrize("filters", UNDECIDABLE_FILTERS)
+def test_undecidable_push_filter_keeps_counting(tmp_path, forge, filters):
+    """Unsupported syntax preserves the existing protection against a second release."""
+    forge.config = {}
+    forge.workflows = {"release.yml": push_workflow(f"on:\n  push:\n    {filters}")}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=true\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize(
+    ("filters", "skip"),
+    [
+        pytest.param("branches: main # comment", True, id="scalar"),
+        pytest.param("branches: 'release' # comment", False, id="quoted-scalar"),
+        pytest.param("branches: [release, 'main', \"other\"] # comment", True, id="flow-list"),
+        pytest.param("branches:\n      - release\n      - 'main' # comment", True, id="sequence"),
+        pytest.param('branches:\n    - release\n    - "main"', True, id="compact-sequence"),
+        pytest.param("branches: ['**']", True, id="globstar"),
+        pytest.param("branches: []", False, id="empty-branches"),
+        pytest.param("branches-ignore: []", True, id="empty-ignore"),
+        pytest.param("branches: [main]\n    tags: ['v*']", True, id="branch-and-tag"),
+        pytest.param(
+            "branches: [release]\n    paths: |\n      branches: [main]",
+            False,
+            id="ignored-block-scalar",
+        ),
+        pytest.param("branches: [release]\n" + "    # comment\n" * 2, False, id="comments"),
+        pytest.param("branches: [" + ",".join(["release"] * 200) + "]", False, id="200-patterns"),
+        pytest.param("branches: [" + ",".join(["release"] * 201) + "]", True, id="201-patterns"),
+    ],
+)
+def test_push_filter_values_and_bounds(tmp_path, forge, filters, skip):
+    forge.config = {}
+    forge.workflows = {"release.yml": push_workflow(f"on:\n  push:\n    {filters}")}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip={str(skip).lower()}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize(
+    "branch", [None, "", 7, [], {}], ids=["null", "empty", "int", "list", "map"]
+)
+def test_invalid_default_branch_fails_without_outputs(tmp_path, forge, branch):
+    forge.config = {}
+    forge.workflows = {"release.yml": PLANTED_WORKFLOW}
+    forge.default_branch = branch
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode != 0
+    assert "default_branch" in done.stdout
+    assert outputs == ""
+    assert forge.repo_reads == 1
+
+
+def test_absent_default_branch_fails_without_outputs(tmp_path, forge):
+    forge.config = {}
+    forge.workflows = {"release.yml": PLANTED_WORKFLOW}
+    del forge.default_branch
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode != 0
+    assert "default_branch" in done.stdout
+    assert outputs == ""
+
+
+def test_failed_repository_read_fails_without_outputs(tmp_path, forge):
+    forge.config = {}
+    forge.workflows = {"release.yml": PLANTED_WORKFLOW}
+    forge.repo_error = True
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode != 0
+    assert "HTTP 500" in done.stdout
+    assert outputs == ""
+    assert forge.repo_reads == 1
+
+
+@pytest.mark.parametrize("workflows", [None, {}, {"notes.md": "not a workflow"}])
+def test_no_workflow_files_reads_no_repository(tmp_path, forge, workflows):
+    forge.config = {}
+    forge.workflows = workflows
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    assert forge.repo_reads == 0
+
+
+def test_workflow_files_read_repository_once(tmp_path, forge):
+    forge.config = {}
+    forge.workflows = {"ci.yml": UNRELATED_WORKFLOW, "release.yml": PLANTED_WORKFLOW}
+    done, _ = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.repo_reads == 1
+
+
+REVIEW_FILTER_CASES = [
+    pytest.param('"branches": [main]', True, id="double-quoted-branch"),
+    pytest.param("branches : [main]", True, id="spaced-branch"),
+    pytest.param("'branches': [main]", True, id="single-quoted-branch"),
+    pytest.param("types: [x]", True, id="unknown-key"),
+    pytest.param("not-a-mapping", True, id="unparsed-child"),
+    pytest.param("\"branches': [main]", True, id="mismatched-key-quotes"),
+    pytest.param('"branches": [dev]', False, id="quoted-other-branch"),
+    pytest.param("paths: [src/**]", False, id="paths-with-tags-only"),
+    pytest.param("'paths-ignore' : [src/**]", False, id="quoted-paths-with-tags-only"),
+    pytest.param("branches: # note: |\n      - main", True, id="literal-comment"),
+    pytest.param("branches: # note: >\n      - main", True, id="folded-comment"),
+    pytest.param("branches:", True, id="null-branches-with-tags"),
+    pytest.param("branches: []", False, id="empty-branches-with-tags"),
+]
+
+
+@pytest.mark.parametrize(("filters", "skip"), REVIEW_FILTER_CASES)
+def test_review_push_filter_keys(tmp_path, forge, filters, skip):
+    """Every child key is understood or keeps the push counting as unknown."""
+    forge.config = {}
+    forge.workflows = {
+        "release.yml": push_workflow(f"on:\n  push:\n    {filters}\n    tags: ['v*']")
+    }
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip={str(skip).lower()}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        pytest.param("on: # note: >\n  push:", id="on-folded-comment"),
+        pytest.param("on: # note: |\n  push:", id="on-literal-comment"),
+        pytest.param("on:\n  push:\n    branches:", id="null-branches-without-tags"),
+    ],
+)
+def test_review_trigger_shapes(tmp_path, forge, trigger):
+    """Comment text and null filters cannot prove that a push excludes the branch."""
+    forge.config = {}
+    forge.workflows = {"release.yml": push_workflow(trigger)}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=true\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize("header", ["run: |", "run: |  # c", "run: >  # c"])
+def test_review_trigger_lines_hide_scalar_body(tmp_path, header):
+    """Real scalar headers still hide event-like text after comment removal."""
+    path = tmp_path / "release_labels.py"
+    path.write_text(module(), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("release_labels", path)
+    assert spec is not None and spec.loader is not None
+    labels = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(labels)
+    lines = [header, "  push:", "    branches: [main]", "on:", "  pull_request:"]
+    assert list(labels.trigger_lines(lines)) == [
+        (0, header.split("  #", 1)[0]),
+        (0, "on:"),
+        (2, "pull_request:"),
+    ]
+
+
+def window_push_workflow(closed: bool, compact: bool = False) -> str:
+    """Place the release job before on: and the branch admission at the window boundary."""
+    prefix = "name: Release\njobs:\n" + PLANTED_WORKFLOW.split("jobs:\n", 1)[1]
+    item_indent = "    " if compact else "      "
+    prefix += f"on:\n  push:\n    branches:\n{item_indent}- dev\n"
+    if closed:
+        prefix += "permissions: {}\n"
+    padding = 5000 - len(prefix.splitlines())
+    suffix = "# after window\n" if closed else f"{item_indent}- main\n"
+    return prefix + "      # padding\n" * padding + suffix
+
+
+@pytest.mark.parametrize("closed", [False, True], ids=["cut", "closed"])
+@pytest.mark.parametrize("compact", [False, True], ids=["ordinary", "compact"])
+def test_review_push_filter_window(tmp_path, forge, closed, compact):
+    """A cut push is unknown; an already closed push still excludes the default branch."""
+    forge.config = {}
+    workflow = window_push_workflow(closed, compact)
+    assert workflow.splitlines()[5000].strip() == ("# after window" if closed else "- main")
+    forge.workflows = {"release.yml": workflow}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip={str(not closed).lower()}\npending=[]\nfrozen=false\n"
+
+
+def window_event_workflow(late_on: bool, truncated: bool) -> str:
+    """Close push before the window ends, or place the entire on: beyond it."""
+    prefix = "name: Release\njobs:\n" + PLANTED_WORKFLOW.split("jobs:\n", 1)[1]
+    if not late_on:
+        prefix += "on:\n  push:\n    branches: [dev]\n  pull_request:\n"
+    suffix = "on:\n  pull_request:\n" if late_on else "  workflow_dispatch:\n"
+    if not truncated and not late_on:
+        suffix = ""
+    padding = 5000 - len(prefix.splitlines()) - (0 if truncated else len(suffix.splitlines()))
+    return prefix + "# padding\n" * padding + suffix
+
+
+@pytest.mark.parametrize("truncated", [False, True], ids=["complete", "cut"])
+@pytest.mark.parametrize("late_on", [False, True], ids=["closed-push", "late-on"])
+def test_review_event_window(tmp_path, forge, late_on, truncated):
+    """An open on: or an unseen on: stays unknown only when the file exceeds the window."""
+    workflow = window_event_workflow(late_on, truncated)
+    assert (len(workflow.splitlines()) > 5000) is truncated
+    assert truncated or len(workflow.splitlines()) == 5000
+    if truncated:
+        assert workflow.splitlines()[5000] == ("on:" if late_on else "  workflow_dispatch:")
+    forge.config = {}
+    forge.workflows = {"release.yml": workflow}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == f"skip={str(truncated).lower()}\npending=[]\nfrozen=false\n"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "workflow"),
+    [
+        pytest.param(
+            (
+                (
+                    'if key not in ("branches", "branches-ignore", "tags", "tags-ignore"):\n'
+                    "            return None"
+                ),
+                (
+                    'if key not in ("branches", "branches-ignore", "tags", "tags-ignore"):\n'
+                    "            continue"
+                ),
+            ),
+            push_workflow("on:\n  push:\n    types: [x]\n    tags: ['v*']"),
+            id="unknown-key-refusal",
+        ),
+        pytest.param(
+            ("return None if truncated else events", "return events"),
+            window_push_workflow(False),
+            id="window-cut-refusal",
+        ),
+        pytest.param(
+            ("BLOCK_SCALAR_RE.search(clean)", "BLOCK_SCALAR_RE.search(line)"),
+            push_workflow("on: # note: >\n  push:"),
+            id="comment-scalar-refusal",
+        ),
+        pytest.param(
+            (
+                "return values or None\n\n\ndef filter_patterns",
+                "return values\n\n\ndef filter_patterns",
+            ),
+            push_workflow("on:\n  push:\n    branches:\n    tags: ['v*']"),
+            id="null-sequence-refusal",
+        ),
+        pytest.param(
+            (
+                "return truncated\n\n\ndef workflow_has_allowed_trigger",
+                "return False\n\n\ndef workflow_has_allowed_trigger",
+            ),
+            window_event_workflow(False, True),
+            id="open-event-window-refusal",
+        ),
+    ],
+)
+@pytest.mark.parametrize("mutated", [False, True])
+def test_review_push_filter_mutations_flip_planted_oracle(
+    tmp_path, forge, mutation, workflow, mutated
+):
+    """Removing each refusal flips a planted case away from its fixed oracle."""
+    source = module()
+    if mutation[0] == "return None if truncated else events":
+        # Isolate the push guard from the new, independently tested on: window fallback.
+        fallback = "return truncated\n\n\ndef workflow_has_allowed_trigger"
+        assert source.count(fallback) == 1
+        source = source.replace(fallback, "return False\n\n\ndef workflow_has_allowed_trigger")
+    assert source.count(mutation[0]) == 1
+    if mutated:
+        source = source.replace(*mutation)
+        assert source != module()
+    forge.config = {}
+    forge.workflows = {"release.yml": workflow}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = "skip=true\npending=[]\nfrozen=false\n"
+    if mutated:
+        with pytest.raises(AssertionError):
+            assert outputs == expected
+        assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    else:
+        assert outputs == expected
+
+
+@pytest.mark.parametrize(
+    ("mutation", "branch", "filters", "skip"),
+    [
+        pytest.param(
+            (
+                "return push_runs_on_branch(following, indent, default_branch, truncated)",
+                "return True",
+            ),
+            "main",
+            "branches: [release]",
+            False,
+            id="filters-ignored",
+        ),
+        pytest.param(
+            ('.replace(r"\\*", "[^/]*")', '.replace(r"\\*", ".*")'),
+            "trunk/main",
+            "branches: ['*']",
+            False,
+            id="star-crosses-slash",
+        ),
+        pytest.param(
+            ('included = not pattern.startswith("!")', 'return not pattern.startswith("!")'),
+            "main",
+            "branches: ['**', '!main']",
+            False,
+            id="first-match-wins",
+        ),
+        pytest.param(
+            ('return not ({"tags", "tags-ignore"} & filters.keys())', "return True"),
+            "main",
+            "tags: ['v*']",
+            False,
+            id="tags-only-counts",
+        ),
+        pytest.param(
+            (
+                "default_branch = read_default_branch(api_url, repo, token)",
+                'default_branch = "main"',
+            ),
+            "trunk",
+            "branches: [main]",
+            False,
+            id="hardcoded-main",
+        ),
+        pytest.param(
+            (
+                (
+                    'if filters is None or {"branches", "branches-ignore"} <= filters.keys():\n'
+                    "        return True"
+                ),
+                (
+                    'if filters is None or {"branches", "branches-ignore"} <= filters.keys():\n'
+                    "        return False"
+                ),
+            ),
+            "main",
+            "branches: ['ma?']",
+            True,
+            id="undecidable-excluded",
+        ),
+        pytest.param(
+            (
+                "filters[key] = patterns",
+                'filters["branches" if key == "branches-ignore" else key] = patterns',
+            ),
+            "main",
+            "branches-ignore: [main]",
+            False,
+            id="ignore-read-as-branches",
+        ),
+    ],
+)
+@pytest.mark.parametrize("mutated", [False, True])
+def test_push_filter_mutations_flip_planted_oracle(
+    tmp_path, forge, mutation, branch, filters, skip, mutated
+):
+    """Every mutation flips a specific release decision and fails the fixed-behavior oracle."""
+    source = module()
+    assert source.count(mutation[0]) == 1
+    if mutated:
+        source = source.replace(*mutation)
+        assert source != module()
+    forge.config = {}
+    forge.default_branch = branch
+    forge.workflows = {"release.yml": push_workflow(f"on:\n  push:\n    {filters}")}
+    done, outputs = settings(tmp_path, forge, source=source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = f"skip={str(skip).lower()}\npending=[]\nfrozen=false\n"
+    if mutated:
+        with pytest.raises(AssertionError):
+            assert outputs == expected
+        assert outputs == f"skip={str(not skip).lower()}\npending=[]\nfrozen=false\n"
+    else:
+        assert outputs == expected
