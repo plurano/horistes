@@ -113,17 +113,16 @@ def git(root: Path, *args: str) -> str:
         done = subprocess.run(
             ["git", "-C", str(root), *args],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
             check=False,
             timeout=DEADLINE_SECONDS,
             env=ciwf.git_env(),
         )
+        if done.returncode != 0:
+            message = done.stderr.decode("utf-8", errors="replace").strip() or done.returncode
+            raise ciwf.ReadError(f"git {' '.join(args)}: {message}")
+        return done.stdout.decode("utf-8")
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as err:
         raise ciwf.ReadError(f"git {args[0]}: {err}") from err
-    if done.returncode != 0:
-        raise ciwf.ReadError(f"git {' '.join(args)}: {done.stderr.strip() or done.returncode}")
-    return done.stdout
 
 
 def merge_base(root: Path, ref: str) -> str:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import shlex
 import sys
+from subprocess import CompletedProcess
 from subprocess import run as subprocess_run
 
 import pytest
@@ -363,6 +364,61 @@ def test_planted_lf_line_numbers_keep_edited_claim_visible(tree, before, after, 
     assert (changed, judged) == (1, 1)
     assert any(f"{OLD}:5: {finding}" in problem for problem in problems)
     assert all(problem.startswith(f"{OLD}:5:") for problem in problems)
+
+
+@pytest.mark.parametrize("tracked", [False, True], ids=["untracked", "tracked"])
+def test_planted_lone_cr_new_record_keeps_claim_visible(tree, tracked):
+    repo = base_repo(tree)
+    repo.git("checkout", "-q", "-b", "topic")
+    repo.write({NEW: "# T" + "\r x" * 4 + "\n\n## Decision\n\nThe app retries.\n"})
+    if tracked:
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "new record with lone CR")
+    problems, changed, judged = records.check_records(repo.root, "main")
+    assert (changed, judged) == (1, 1)
+    assert problems == [f"{NEW}:5: claim under 'Decision' {NO_POINTER}"]
+
+
+def test_planted_lone_cr_above_edited_claim_keeps_git_line_number(tree):
+    repo = base_repo(tree)
+    repo.write({OLD: "## Decision\nThe app waits.\n"})
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "accepted record")
+    repo.git("checkout", "-q", "-b", "topic")
+    repo.write({OLD: "## Decision\n# T" + "\r x" * 4 + "\nThe app retries.\n"})
+    problems, changed, judged = records.check_records(repo.root, "main")
+    assert (changed, judged) == (1, 1)
+    assert problems == [f"{OLD}:3: claim under 'Decision' {NO_POINTER}"]
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_tracked_crlf_record_matches_lf_findings(tree, newline):
+    repo = base_repo(tree)
+    repo.git("checkout", "-q", "-b", "topic")
+    repo.write({NEW: "# T\n\n## Decision\n\nThe app retries.\n".replace("\n", newline)})
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "new record")
+    assert records.check_records(repo.root, "main") == (
+        [f"{NEW}:5: claim under 'Decision' {NO_POINTER}"],
+        1,
+        1,
+    )
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["stdout-strict", "stderr-replacement"])
+def test_planted_git_byte_output_decode_errors(tree, monkeypatch, returncode):
+    repo = base_repo(tree)
+    run = subprocess_run
+
+    def byte_output(command, **kwargs):
+        if command[:3] == ["git", "-C", str(repo.root)]:
+            return CompletedProcess(command, returncode, b"\xff", b"\xff")
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(records.subprocess, "run", byte_output)
+    message = "git diff.*utf-8" if returncode == 0 else "git diff: \ufffd"
+    with pytest.raises(records.ciwf.ReadError, match=message):
+        records.git(repo.root, "diff")
 
 
 def test_diff_context_unicode_separator_is_one_git_line():
