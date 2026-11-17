@@ -35,6 +35,11 @@ ends, as `test_planted_nested_fence_judges_source_line` and
 `test_unclosed_nested_fence_ends_with_its_item` verify. A fence may start on
 the list marker's line; `test_planted_marker_line_fence_judges_source_line` in
 `tests/test_records_blocks.py` checks copied source in that position.
+Top-level markers may have up to three leading columns; markers at or past
+the containing item's content column stay nested.
+`test_planted_indented_top_items_cannot_share_a_pointer` and
+`test_planted_nested_item_keeps_its_parents_pointer` in `tests/test_records_blocks.py`
+verify that siblings need separate pointers while nested items share their parent's block.
 A changed line binds its
 whole block; untouched blocks stay unjudged, as
 `test_untouched_blocks_of_an_accepted_record_stay_unjudged` verifies.
@@ -63,6 +68,10 @@ User prefix settings and quoted Unicode paths cannot hide a changed record from 
 `test_planted_quoted_unicode_record_is_judged` and
 `test_planted_record_pathspec_is_literal` in `tests/test_records_diff.py` cover
 these inputs without interpreting path headers.
+Only the diff header before the first hunk can mark a record as deleted;
+`test_planted_dev_null_body_cannot_hide_an_added_claim` and
+`test_planted_dev_null_is_a_deletion_only_in_the_diff_header` in
+`tests/test_records_reads.py` keep an added header-like body line visible.
 
 A changed block must not copy tracked source through a code span or fenced
 line. `tools/records.py` compares substantive snippets with tracked source
@@ -71,6 +80,11 @@ source instead. The span and fence cases in `tests/test_records_claims.py` hold 
 rule; HTML comments contribute neither claims nor pointers. The nested fence
 cases in `tests/test_records_blocks.py` preserve literal comment markers inside
 code, using the same fence finder as the block parser.
+Backtick fence info strings cannot contain backticks; refused openers stay
+plain lines whose code spans are judged. Tilde info strings may contain backticks.
+`test_planted_backticks_in_fence_info_leave_a_judged_span` and
+`test_valid_fence_info_preserves_body_and_literal_comments` in
+`tests/test_records_blocks.py` cover refused and accepted openers, including a later fence.
 
 `tools/records.py` reads only regular files, with a byte bound shared by
 sources and records before decoding. Missing or non-text sources contribute

@@ -273,3 +273,80 @@ def test_crlf_record_matches_lf_blocks_and_preserves_comment_positions():
 def test_blocks_strip_only_the_cr_touching_lf():
     found = records.blocks("## Decision\n\nClaim\r\r\ncontinued\r")
     assert [(b.start, b.end, b.lines) for b in found] == [(3, 4, ["Claim\r", "continued\r"])]
+
+
+@pytest.mark.parametrize("later_fence", [False, True], ids=["span-only", "later-fence"])
+def test_planted_backticks_in_fence_info_leave_a_judged_span(later_fence):
+    source = "CLOCK_SKEW_MINUTES = 5"
+    tree = records.Tree(frozenset(), source, frozenset())
+    text = f"# Record\n\n## Decision\n\n```{source}```\n"
+    if later_fence:
+        text += "\n```python\nx = 1\n```\n\nAfter the fence.\n"
+    found = records.blocks(text)
+    assert records.restated(found[0], tree) == [source]
+    assert records.judge(NEW, found[0], tree) == [
+        f"{NEW}:5: restated code, cite the file instead: `{source}`",
+        f"{NEW}:5: claim under 'Decision' {NO_POINTER}",
+    ]
+    if later_fence:
+        assert [(b.start, b.end, b.fenced) for b in found] == [
+            (5, 5, False),
+            (7, 9, True),
+            (11, 11, False),
+        ]
+
+
+@pytest.mark.parametrize("opener", ["```python", "~~~ a`b`"], ids=["backtick", "tilde-info"])
+def test_valid_fence_info_preserves_body_and_literal_comments(opener):
+    closer = opener[:3]
+    text = f"## Decision\n\n{opener}\nx = 1\n<!-- literal -->\n{closer}\n"
+    found = records.blocks(text)
+    assert records.visible_text(text) == text
+    assert [(b.start, b.end, b.fenced) for b in found] == [(3, 6, True)]
+    assert records.judge(NEW, found[0], records.Tree(frozenset(), "", frozenset())) == []
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "content_indent"),
+    [("- ", "- ", 2), (" - ", " - ", 3), ("   1. ", "   2. ", 6)],
+    ids=["column-zero", "one-space-bullet", "three-space-ordered"],
+)
+def test_planted_indented_top_items_cannot_share_a_pointer(first, second, content_indent):
+    text = f"# Record\n\n## Decision\n\n{first}The app waits.\n{second}See `tools/records.py`.\n"
+    found = records.blocks(text)
+    tree = records.Tree(frozenset({"tools/records.py"}), "", frozenset())
+    assert [p for b in found for p in records.judge(NEW, b, tree)] == [
+        f"{NEW}:5: claim under 'Decision' {NO_POINTER}"
+    ]
+    assert [(b.start, b.end, b.content_indent) for b in found] == [
+        (5, 5, content_indent),
+        (6, 6, content_indent),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("parent", "nested"),
+    [("- ", "  - "), (" - ", "   - "), ("- ", "\t- ")],
+    ids=["at-content-column", "indented-parent", "tab-expanded"],
+)
+def test_planted_nested_item_keeps_its_parents_pointer(parent, nested):
+    text = f"## Decision\n\n{parent}Parent see `tools/records.py`.\n{nested}nested claim\n"
+    found = records.blocks(text)
+    assert [(b.start, b.end) for b in found] == [(3, 4)]
+    tree = records.Tree(frozenset({"tools/records.py"}), "", frozenset())
+    assert records.judge(NEW, found[0], tree) == []
+
+
+@pytest.mark.parametrize("indent", ["    ", "\t"], ids=["four-spaces", "tab"])
+def test_four_column_marker_continues_the_paragraph(indent):
+    found = records.blocks(f"## Decision\n\nParagraph.\n{indent}- x\n")
+    assert [(b.start, b.end, b.content_indent) for b in found] == [(3, 4, 0)]
+
+
+@pytest.mark.parametrize("container", [" - ", "   1. "])
+def test_indented_marker_fence_uses_the_items_content_column(container):
+    indent = " " * len(container)
+    text = f"## Decision\n\n{container}```python\n{indent}<!-- literal -->\n{indent}```\n"
+    assert records.visible_text(text) == text
+    found = records.blocks(text)
+    assert [(b.start, b.end, b.fenced) for b in found] == [(3, 5, True)]

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 import records
-from records_cases import NEW, NEW_RECORD, base_repo
+from records_cases import NEW, NEW_RECORD, NO_POINTER, OLD, base_repo
 
 
 def test_planted_oversized_source_fails_closed(tree, monkeypatch):
@@ -129,3 +129,39 @@ def test_limited_tool_obeys_timeout(tree, monkeypatch):
     monkeypatch.setattr(conftest, "ROOT", tree.root)
     with pytest.raises(subprocess.TimeoutExpired):
         tree.tool("slow_fixture.py", memory_limit=67108864, timeout=0.1)
+
+
+def test_planted_dev_null_body_cannot_hide_an_added_claim(tree):
+    repo = base_repo(tree)
+    before = "# Record\n\n## Decision\n\nSee `tools/app.py`.\n"
+    repo.write({OLD: before})
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "accepted record")
+    repo.git("checkout", "-q", "-b", "topic")
+    repo.write({OLD: before + "\nThe app retries.\n++ /dev/null\n"})
+    problems, changed, judged = records.check_records(repo.root, "main")
+    assert (changed, judged) == (1, 1)
+    assert problems == [f"{OLD}:7: claim under 'Decision' {NO_POINTER}"]
+
+
+@pytest.mark.parametrize("deleted", [False, True], ids=["hunk-body", "deletion-header"])
+def test_planted_dev_null_is_a_deletion_only_in_the_diff_header(tmp_path, deleted):
+    path = tmp_path / OLD
+    path.parent.mkdir(parents=True)
+    path.write_text("present\n", encoding="utf-8")
+    diff = (
+        f"--- a/{OLD}\n+++ "
+        + ("/dev/null" if deleted else f"b/{OLD}")
+        + "\n@@ -10,0 +11,2 @@\n+The app retries.\n+++ /dev/null\n"
+    )
+    changes = records._record_changes(tmp_path, OLD, diff)
+    assert changes == (None if deleted else records.Changes(added={11, 12}))
+
+
+def test_deleted_record_is_not_counted_or_judged(tree):
+    repo = base_repo(tree)
+    repo.git("checkout", "-q", "-b", "topic")
+    (repo.root / OLD).unlink()
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "remove record")
+    assert records.check_records(repo.root, "main") == ([], 0, 0)

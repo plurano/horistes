@@ -63,9 +63,9 @@ DIFF = (
     "--default-prefix",
 )
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+FENCE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
 HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)(?:[ \t]+#+)?)?[ \t]*$")
-TOP_ITEM = re.compile(r"^(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
+TOP_ITEM = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
 CODE_SPAN = re.compile(r"(?<!`)(?P<ticks>`+)(?!`)(?P<code>.+?)(?<!`)(?P=ticks)(?!`)", re.DOTALL)
 MARKDOWN_TOKEN = re.compile(r"`+|<!--")
 # A bare path, identifier, flag or call names code; it does not restate it.
@@ -275,12 +275,12 @@ def _indent(line: str) -> int:
 
 
 def _item_indent(line: str) -> int:
-    """Content column: marker width plus one for an empty item or excess whitespace."""
+    """Content column: indent, marker, padding (one for empty items or excess whitespace)."""
     expanded = line.expandtabs(4)
     item = TOP_ITEM.match(expanded)
     if item is None:
         return 0
-    marker = len(expanded.split(maxsplit=1)[0])
+    marker = _indent(expanded) + len(expanded.split(maxsplit=1)[0])
     tail = expanded[marker:]
     padding = len(tail) - len(tail.lstrip(" "))
     return marker + (padding if tail.strip() and 1 <= padding <= 4 else 1)
@@ -288,7 +288,9 @@ def _item_indent(line: str) -> int:
 
 def _breaks_block(line: str, current: Block | None, number: int) -> bool:
     """Headings and items start blocks; after blanks only indented item lines continue."""
-    if HEADING.match(line) or TOP_ITEM.match(line):
+    content_indent = current.content_indent if current else 0
+    item = _item_indent(line) and (not content_indent or _indent(line) < content_indent)
+    if HEADING.match(line) or item:
         return True
     if current is None or number == current.end + 1:
         return False
@@ -315,8 +317,8 @@ class FenceState:
 
 
 def _find_fence(line: str, content_indent: int) -> tuple[re.Match[str] | None, int]:
-    """Apply the unchanged fence rule after stripping a containing item's columns."""
-    offset = content_indent if TOP_ITEM.match(line) or _indent(line) >= content_indent else 0
+    """Apply the shared fence rule after stripping a containing item's columns."""
+    offset = content_indent if _item_indent(line) or _indent(line) >= content_indent else 0
     return FENCE.match(line.expandtabs(4)[offset:]), offset
 
 
@@ -329,8 +331,8 @@ def _fence_step(line: str, state: FenceState) -> str:
             state.marker = ""
             return "close"
         return "body"
-    if TOP_ITEM.match(line):
-        state.item_indent = _item_indent(line)
+    if item_indent := _item_indent(line):
+        state.item_indent = item_indent
     elif line.strip() and _indent(line) < state.item_indent:
         state.item_indent = 0
     opened, indent = _find_fence(line, state.item_indent)
@@ -514,9 +516,15 @@ def judge(record: str, block: Block, tree: Tree) -> list[str]:
 
 def _record_changes(root: Path, name: str, diff: str) -> Changes | None:
     """Refuse nontext diffs and skip removed records before binding any surviving text."""
-    if any(line.startswith(("Binary files ", "GIT binary patch")) for line in git_lines(diff)):
+    lines = limited(git_lines(diff), MAX_LINES * 10, "diff line limit")
+    if any(line.startswith(("Binary files ", "GIT binary patch")) for line in lines):
         raise ciwf.ReadError(f"{name}: binary record diff")
-    if "\n+++ /dev/null\n" in "\n" + diff or not os.path.lexists(root / name):
+    for line in lines:
+        if HUNK.match(line):
+            break
+        if line == "+++ /dev/null":
+            return None
+    if not os.path.lexists(root / name):
         return None
     changes = diff_changes(diff)
     return changes if changes.added or changes.deletions else None
