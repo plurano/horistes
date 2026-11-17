@@ -94,5 +94,6 @@ record that supersedes it.
 | [0085](0085-the-train-holds-a-retried-red-pull-request.md) | 2026-11-15 | The train holds a retried red pull request | Accepted |
 | [0086](0086-an-exception-for-a-finding-without-a-file-names-no-path.md) | 2026-11-15 | An exception for a finding without a file names no path | Accepted |
 | [0087](0087-the-regenerate-commit-message-fits-commitlint.md) | 2026-11-16 | The regenerate commit message fits commitlint | Accepted |
+| [0088](0088-a-push-trigger-counts-only-for-the-default-branch.md) | 2026-11-16 | A push trigger counts only for the default branch | Accepted |
 | [0090](0090-the-train-holds-on-an-incomplete-review.md) | 2026-11-16 | The train holds on an incomplete review | Accepted |
 | [0091](0091-the-train-re-arms-after-a-bot-force-push.md) | 2026-11-16 | The train re-arms after a bot force push | Accepted |
