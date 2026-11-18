@@ -14,6 +14,7 @@ import hashlib
 import http.client
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -131,6 +132,27 @@ LANDER_LEASE = """
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     landerLease: label(name: "merge-train: lander lease") { description }
+  }
+}
+"""
+ARM_HISTORY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      timelineItems(last: 20, itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT,
+        AUTO_REBASE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, HEAD_REF_FORCE_PUSHED_EVENT]) {
+        nodes {
+          __typename
+          ... on AutoMergeEnabledEvent { createdAt actor { __typename login } }
+          ... on AutoSquashEnabledEvent { createdAt actor { __typename login } }
+          ... on AutoRebaseEnabledEvent { createdAt actor { __typename login } }
+          ... on AutoMergeDisabledEvent { createdAt actor { __typename login } }
+          ... on HeadRefForcePushedEvent { createdAt actor { __typename login } }
+        }
+      }
+      comments(last: 20) { nodes { body } }
+    }
   }
 }
 """
@@ -269,6 +291,9 @@ SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its produc
 REVIEW_BODY = "review body: "
 # Pull requests whose review bodies one run reads in one repository (ADR-0070).
 REVIEW_READS = 10
+# Unarmed heads whose arm history one sweep reads (ADR-0091).
+REARM_READS = 5
+ARM_ENABLE_EVENTS = ("AutoMergeEnabledEvent", "AutoSquashEnabledEvent", "AutoRebaseEnabledEvent")
 # advance arms at most one pull per sweep; a small allowance covers held candidates before it.
 ARMING_READS = 3
 # Distinct maintainer logins whose rights one pull request checks (ADR-0077).
@@ -1397,6 +1422,175 @@ def re_arm_drifted(env, conf, served, held, notes):
     return None
 
 
+def bot_force_pusher(pull, actor, conf):
+    """A bot actor, including a dependency author pushing with a person's token."""
+    if actor.get("__typename") == "Bot":
+        return True
+    author = pull.get("author") or {}
+    login = (actor.get("login") or "").removesuffix("[bot]")
+    return (
+        bool(login)
+        and is_bot_dependency(pull, conf)
+        and login == (author.get("login") or "").removesuffix("[bot]")
+    )
+
+
+def force_disabler_allowed(actor, pusher, conf):
+    """A forge or bot drop is recoverable; the train and other people deliberately hold."""
+    if not actor:
+        return True
+    if (actor.get("login") or "").removesuffix("[bot]") == bot_slug(conf):
+        return False
+    return actor.get("login") == pusher.get("login") or actor.get("__typename") == "Bot"
+
+
+def forced_disarm(pull, items, conf):
+    """Whether a bounded chronological timeline proves an arm lost after a bot force push."""
+    enabled = False
+    pusher = None
+    for item in items[:20]:
+        kind = item["__typename"]
+        actor = item.get("actor") or {}
+        if kind in ARM_ENABLE_EVENTS:
+            enabled, pusher = True, None
+        elif kind == "HeadRefForcePushedEvent":
+            if not bot_force_pusher(pull, actor, conf):
+                pusher = None
+            elif enabled:
+                pusher = actor
+        elif kind == "AutoMergeDisabledEvent":
+            enabled = False
+            if pusher and not force_disabler_allowed(actor, pusher, conf):
+                pusher = None
+    return pusher is not None
+
+
+def forced_arm_history(env, pull, notes):
+    """Read one arm history, refusing unreadable or moved heads without a write."""
+    owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
+    try:
+        data = read_graphql(
+            env, ARM_HISTORY, {"owner": owner, "name": name, "number": pull["number"]}
+        )
+        detail = data["repository"]["pullRequest"]
+        if detail["headRefOid"] != pull["headRefOid"]:
+            notes[pull["number"]] = "head moved since the page read: re-arm waits"
+            return None
+        return detail
+    except (RefusedError, KeyError, TypeError) as err:
+        notes[pull["number"]] = f"not re-armed: arm history unreadable: {err}"[:200]
+        return None
+
+
+def forced_arm_failure_marker(oid):
+    """The per-head refusal marker shared by scheduling and comment deduplication."""
+    return f"<!-- merge-train:re-arm-failed {oid} -->"
+
+
+def forced_arm_failure(env, pull, detail, err, notes):
+    """Say an arm refusal once per head; a refused comment remains a bounded summary note."""
+    number = pull["number"]
+    reason = str(err).replace("\n", " ")[:200]
+    note = f"not re-armed after a bot force push: {reason}"
+    if isinstance(err, UnsignedBotError):
+        note = err.note
+    marker = forced_arm_failure_marker(pull["headRefOid"])
+    comments = (detail.get("comments") or {}).get("nodes") or []
+    if not any(marker in (comment.get("body") or "") for comment in comments[:20]):
+        text = (
+            f"{marker}\nThe train could not re-arm auto-merge on this head after a bot force "
+            f"push because {reason}; a person must arm it or push again."
+        )
+        try:
+            call(
+                f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}/issues/{number}/comments",
+                env["TRAIN_TOKEN"],
+                "POST",
+                {"body": text},
+            )
+        except RefusedError as failure:
+            note += f"; comment not posted: {str(failure)[:200]}"
+    notes[number] = note
+    return f"re-arm failed #{number}: {reason}"
+
+
+def rearm_run_number(env):
+    """Use a nonnegative sweep number, defaulting to zero when missing or invalid."""
+    try:
+        return max(0, int(env.get("GITHUB_RUN_NUMBER", "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def rearm_window(env, candidates):
+    """Rotate a bounded history-read window without changing small serving lists."""
+    if len(candidates) <= REARM_READS:
+        return candidates
+    start = (rearm_run_number(env) * REARM_READS) % len(candidates)
+    return (candidates[start:] + candidates[:start])[:REARM_READS]
+
+
+def rearm_turn(env, count):
+    """Advance marked-head turns once per full history-window cycle."""
+    run = rearm_run_number(env)
+    if count <= REARM_READS:
+        return run
+    return run // (count // math.gcd(count, REARM_READS))
+
+
+def forced_rearm_target(env, conf, window, count, notes):
+    """Prefer unrefused qualifying heads, rotating marked heads with a fresh hold read."""
+    marked = []
+    for pull in window[:REARM_READS]:
+        detail = forced_arm_history(env, pull, notes)
+        if not detail or not forced_disarm(pull, detail["timelineItems"]["nodes"], conf):
+            continue
+        if late_review_hold(env, conf, pull, notes):
+            continue
+        marker = forced_arm_failure_marker(pull["headRefOid"])
+        comments = (detail.get("comments") or {}).get("nodes") or []
+        if not any(marker in (comment.get("body") or "") for comment in comments[:20]):
+            return pull, detail
+        marked.append((pull, detail))
+        notes[pull["number"]] = "re-arm refused on this head before: unrefused candidates go first"
+    if not marked:
+        return None
+    pick = marked[rearm_turn(env, count) % len(marked)]
+    if late_review_hold(env, conf, pick[0], notes):
+        return None
+    return pick
+
+
+def re_arm_forced(env, conf, repo, served, held, notes):
+    """Recover one unheld auto-merge request dropped after a bot force push."""
+    if conf.get("required_status") or conf.get("review_bots") or not repo["autoMergeAllowed"]:
+        return None
+    if any(in_flight(pull, reason) for pull, reason in served):
+        return None
+    candidates = [
+        pull
+        for pull, reason in served
+        if not pull.get("autoMergeRequest")
+        and pull["number"] not in held
+        and reason in ("merge state BLOCKED", "merge state UNSTABLE")
+        and not is_red(pull)
+        and not has_red_code_scanning(pull)
+    ]
+    target = forced_rearm_target(env, conf, rearm_window(env, candidates), len(candidates), notes)
+    if target is None:
+        return None
+    pull, detail = target
+    try:
+        arm(env, conf, pull)
+    except UnsignedBotError as err:
+        forced_arm_failure(env, pull, detail, err, notes)
+        return None
+    except RefusedError as err:
+        return forced_arm_failure(env, pull, detail, err, notes)
+    notes[pull["number"]] = "re-armed: auto-merge came off after a bot force push"
+    return f"re-armed #{pull['number']} after a bot force push"
+
+
 def disarm_red_scanning(env, rows, notes, conf):
     """Disarm or dequeue a pull request a hold covers.
 
@@ -2044,6 +2238,9 @@ def serve_cycle(env, conf, repo, served, notes, now, held, lease):
     landed_pr = land_clean(env, conf, repo, served, notes)
     if landed_pr:
         return landed_pr
+    forced = re_arm_forced(env, conf, repo, served, held, notes)
+    if forced:
+        return forced
     return serve_pending(env, conf, repo, served, notes, now, lease)
 
 
