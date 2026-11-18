@@ -19,7 +19,9 @@ name: Sign-off check
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    # edited: a changed base branch widens the judged range without a new head
+    # commit, so the check runs again; a title or body edit reruns it too.
+    types: [opened, synchronize, reopened, edited, ready_for_review, converted_to_draft]
   merge_group:
 
 permissions: {}

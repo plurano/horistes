@@ -34,6 +34,10 @@ other events it reports a notice that sign-offs are judged on the pull request.
 The repository's [caller](../../.github/workflows/sign-off-check.yml) runs on pull
 requests and merge groups; its `result` job reports the required `Sign-off` check,
 including a failure when a draft skips the call.
+The caller also subscribes to the `edited` activity: a changed base branch
+widens the judged range without a new head commit, so the check runs again
+(`test_sign_off_caller_reports_required_check_even_on_draft`,
+`test_own_caller_equals_rendered_template`).
 
 [commit_message.py](../../tools/commit_message.py) adds a `range` command that
 requires at least one sign-off whose name and email match the commit author's

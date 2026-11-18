@@ -86,6 +86,7 @@ def test_sign_off_caller_reports_required_check_even_on_draft():
         "opened",
         "synchronize",
         "reopened",
+        "edited",
         "ready_for_review",
         "converted_to_draft",
     ]
