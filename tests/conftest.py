@@ -49,6 +49,7 @@ CALLER_TEMPLATES: dict[str, str] = {
     "templates/callers/release-please.yml.tmpl": ".github/workflows/release-please.yml",
     "templates/callers/scorecard.yml.tmpl": ".github/workflows/scorecard-check.yml",
     "templates/callers/secret-scan.yml.tmpl": ".github/workflows/secret-scan.yml",
+    "templates/callers/sign-off.yml.tmpl": ".github/workflows/sign-off-check.yml",
     "templates/callers/workflow-check.yml.tmpl": ".github/workflows/workflow-check.yml",
 }
 CALLER_IDS = [

@@ -319,8 +319,13 @@ def test_caller_passing_pinned_runner_is_accepted_and_floating_label_is_refused(
             "templates/callers/workflow-check.yml.tmpl",
             ".github/workflows/workflow-check.yml",
         ),
+        (
+            ".github/workflows/sign-off.yml",
+            "templates/callers/sign-off.yml.tmpl",
+            ".github/workflows/sign-off-check.yml",
+        ),
     ],
-    ids=["licence", "workflow-check"],
+    ids=["licence", "workflow-check", "sign-off"],
 )
 def test_caller_without_runner_input_relies_on_pinned_workflow_default(
     tree, workflow_file: str, template_file: str, caller_file: str

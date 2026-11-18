@@ -281,6 +281,21 @@
       "secrets": {},
       "write_scopes": []
     },
+    ".github/workflows/sign-off.yml": {
+      "inputs": {
+        "runner": {
+          "default": "ubuntu-26.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "sign-off": "Sign-off"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": []
+    },
     ".github/workflows/workflow-check.yml": {
       "inputs": {
         "runner": {
