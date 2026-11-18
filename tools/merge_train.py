@@ -1563,7 +1563,7 @@ def forced_rearm_target(env, conf, window, count, notes):
 
 def re_arm_forced(env, conf, repo, served, held, notes):
     """Recover one unheld auto-merge request dropped after a bot force push."""
-    if conf.get("required_status") or not repo["autoMergeAllowed"]:
+    if conf.get("required_status") or conf.get("review_bots") or not repo["autoMergeAllowed"]:
         return None
     if any(in_flight(pull, reason) for pull, reason in served):
         return None
@@ -1582,6 +1582,9 @@ def re_arm_forced(env, conf, repo, served, held, notes):
     pull, detail = target
     try:
         arm(env, conf, pull)
+    except UnsignedBotError as err:
+        forced_arm_failure(env, pull, detail, err, notes)
+        return None
     except RefusedError as err:
         return forced_arm_failure(env, pull, detail, err, notes)
     notes[pull["number"]] = "re-armed: auto-merge came off after a bot force push"

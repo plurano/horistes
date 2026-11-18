@@ -10515,6 +10515,16 @@ def test_forced_rearm_required_status_stays_off(tmp_path):
     assert forge.writes == []
 
 
+def test_forced_rearm_review_bots_stays_off(tmp_path):
+    forge = forced_forge()
+    p = forge.reads["fleet/app"][0]["pullRequests"]["nodes"][0]
+    forge.review_details[1] = adr92_head_detail(p)
+    done, _ = train(tmp_path, forge, review_bots="CodeRabbitAI[bot]")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.arm_history_calls == []
+    assert forge.writes == []
+
+
 @pytest.mark.parametrize(
     "fields", [{"isDraft": True}, {"labels": ("hold",)}], ids=["draft", "hold-label"]
 )
@@ -10927,6 +10937,20 @@ def test_forced_rearm_unsigned_bot_keeps_note(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
     assert "skipped: bot pull request without Signed-off-by, its producer signs it" in summary
+
+
+def test_forced_rearm_unsigned_bot_leaves_pending_updates(tmp_path):
+    forge = forced_forge(author=APP)
+    forge.commits[1] = [("unsigned change", 1)]
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"].append(pull(2, "BEHIND"))
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [armed(2), updated(2)]
+    assert "skipped: bot pull request without Signed-off-by, its producer signs it" in summary
+    assert len(forge.posted_comments) == 1
+    number, body = forge.posted_comments[0]
+    assert number == 1
+    assert body.startswith(f"<!-- merge-train:re-arm-failed {1:040x} -->\n")
 
 
 @pytest.mark.parametrize("auto_merge,switch", [(False, "on"), (True, "off")])

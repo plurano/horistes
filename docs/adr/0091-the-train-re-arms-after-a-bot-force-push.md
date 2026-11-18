@@ -73,7 +73,11 @@ or the bounded refusal reason. A refusal posts a plain issue comment starting
 with `<!-- merge-train:re-arm-failed <headRefOid> -->`; a marker already present
 in the queried comments suppresses another post for that head. A refused
 comment becomes a summary note and does not escape the step. Unsigned bot
-refusals retain their existing skip note.
+refusals retain their existing skip note and the same comment deduplication,
+then leave pending branch updates eligible
+(`test_forced_rearm_unsigned_bot_keeps_note`,
+`test_forced_rearm_unsigned_bot_leaves_pending_updates`). Other refusals end
+the sweep (`test_forced_rearm_refusal_comment_once`).
 
 Within the read window, qualifying heads without their current head's refusal
 marker go first. When no unmarked candidate qualifies, marked qualifying heads
@@ -94,9 +98,12 @@ At most `REARM_READS = 5` candidates have their arm history read per repository
 per sweep, with at most one review-body read for each qualifying candidate plus
 one more for the picked marked head: at most eleven history and review-body
 reads in the recovery step. Held unmarked heads retain the ten-read bound
-(`test_forced_rearm_review_read_budget`). One arm attempt ends the sweep,
-preserving the train's one-write scheduling policy; a failed attempt may also
-post its diagnostic comment.
+(`test_forced_rearm_review_read_budget`). A successful arm or a refusal other
+than an unsigned-bot refusal ends the sweep; an unsigned-bot refusal happens
+before the arm mutation and permits a pending branch update. A failed attempt
+may also post its diagnostic comment (`test_forced_rearm_pending_states`,
+`test_forced_rearm_refusal_comment_once`,
+`test_forced_rearm_unsigned_bot_leaves_pending_updates`).
 When candidates exceed that budget, the read window rotates by
 `(GITHUB_RUN_NUMBER * REARM_READS) % len(candidates)`, wrapping at the end.
 Missing, invalid or negative run numbers use zero. For a stable candidate list,
@@ -109,8 +116,9 @@ With a stable candidate list, each marked qualifying head in a window holding
 `m` marked qualifying heads is tried at least once every `m` cycles while no
 unmarked candidate in that window qualifies. The turn stays constant within a
 cycle, preventing read-window rotation from repeatedly selecting the same marked
-head. This preserves one arm attempt per sweep and lets a transient refusal on
-any marked head heal.
+head. This preserves one recovery arm attempt per sweep and lets a transient
+refusal on any marked head heal (`test_forced_rearm_one_arm_per_sweep`,
+`test_forced_rearm_marked_head_heals`).
 The picked marked head's review hold is read again right before its arm; a new
 hold prevents the arm for that sweep
 (`test_forced_rearm_refused_head_yields_to_unmarked[run-0]`,
@@ -136,9 +144,14 @@ If the marker comment cannot be posted or leaves the last 20 comments, the
 refused head counts as unmarked and is tried first again; its next refusal posts
 the marker, if the comment write succeeds.
 
-Repository auto-merge disabled and `required_status` mode perform no recovery
-reads or arms. The train continues to land required-status pull requests
-directly under [ADR-0076](0076-train-holds-on-a-required-status.md).
+Repository auto-merge disabled, `required_status` mode and non-empty
+`review_bots` perform no recovery reads or arms
+(`test_forced_rearm_disabled_modes_read_nothing`,
+`test_forced_rearm_required_status_stays_off`,
+`test_forced_rearm_review_bots_stays_off`). The review-bot restriction follows
+[ADR-0092](0092-the-train-requires-a-completed-review-on-the-head.md).
+The train continues to land required-status pull requests directly under
+[ADR-0076](0076-train-holds-on-a-required-status.md).
 `test_planted_force_push_rearms_new_head` and the `test_forced_rearm_*` cases in
 [tests/test_merge_train.py](../../tests/test_merge_train.py) cover recovery,
 deliberate disarms, holds, read bounds, head movement and failure reporting.
