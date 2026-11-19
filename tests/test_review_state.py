@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
-from review_state import MAX_COMMENTS, MAX_LINES, review_incomplete
+from review_state import MAX_COMMENTS, MAX_LINES, MAX_SUMMARY_CHARS, review_incomplete
 
 FIXTURES = Path(__file__).parent / "fixtures/review-state"
 
@@ -1172,3 +1172,104 @@ def test_notice_body_cut_cannot_be_cleared_by_head_check():
     assert review_incomplete(pr) == (
         "review incomplete: coderabbitai notice body exceeds the read bound"
     )
+
+
+def test_notice_on_line_2001_holds():
+    """A newer bot notice after 2000 ordinary lines must hold with the read-bound reason."""
+    body = "Ordinary prose.\n" * MAX_LINES + "Review limit reached."
+    pr = adr92_pull(adr92_comment(body))
+    assert review_incomplete(pr) == (
+        "review incomplete: coderabbitai notice body exceeds the read bound"
+    )
+
+
+@pytest.mark.parametrize("line", [MAX_LINES, MAX_LINES + 1, 5000])
+def test_notice_line_detection_boundary(line):
+    """Detect notices through line 5000; only the first 2000 lines are readable."""
+    body = "Prose.\n" * (line - 1) + "Review limit reached."
+    assert len(body) < MAX_SUMMARY_CHARS
+    reason = review_incomplete(adr92_pull(adr92_comment(body)))
+    if line <= MAX_LINES:
+        assert reason == f"review incomplete: coderabbitai limit reached at {ADR92_NOTICE}"
+    else:
+        assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
+
+
+@pytest.mark.parametrize(
+    "notice",
+    ["Review limit reached.", "## Reviews paused", "Rate limit reached."],
+)
+@pytest.mark.parametrize("when", [ADR92_NOTICE, "2026-11-16T16:00:00Z", "invalid"])
+def test_unread_notice_time_policy(notice, when):
+    """Old ordinary/pause/rate notices stay stale; fresh or unknown times hold unread."""
+    pr = adr92_pull(adr92_comment("Prose.\n" * MAX_LINES + notice, when))
+    reason = review_incomplete(pr)
+    if when == "2026-11-16T16:00:00Z":
+        assert reason == review_incomplete(adr92_pull(adr92_comment(notice, when))) == ""
+    else:
+        assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
+
+
+@pytest.mark.parametrize(
+    "notice",
+    ["0 remain after this review", "Review limit reached for commit " + ADR92_HEAD + "."],
+)
+def test_old_unread_notice_head_policy(notice):
+    """Old allowances and notices naming the current head still hold beyond the prefix."""
+    when = "2026-11-16T16:00:00Z"
+    assert review_incomplete(adr92_pull(adr92_comment(notice, when)))
+    body = "Prose.\n" * MAX_LINES + notice
+    assert review_incomplete(adr92_pull(adr92_comment(body, when))) == (
+        "review incomplete: coderabbitai notice body exceeds the read bound"
+    )
+
+
+@pytest.mark.parametrize("size", [MAX_SUMMARY_CHARS, MAX_SUMMARY_CHARS + 1])
+def test_notice_detection_character_ceiling(size):
+    """A notice-free body at the ceiling completes; beyond it detection fails closed."""
+    reason = review_incomplete(adr92_pull(adr92_comment("x" * size)))
+    if size <= MAX_SUMMARY_CHARS:
+        assert reason == ""
+    else:
+        assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
+
+
+@pytest.mark.parametrize("line_count", [MAX_LINES + 1, 5000])
+def test_long_ordinary_body_has_no_notice(line_count):
+    """Oversized line counts alone do not create a notice within the character ceiling."""
+    body = "Prose.\n" * (line_count - 1) + "Prose."
+    assert len(body) < MAX_SUMMARY_CHARS
+    assert review_incomplete(adr92_pull(adr92_comment(body))) == ""
+
+
+@pytest.mark.parametrize("form", ["check-run", "summary", "pause-block", "reviewed-range"])
+def test_unread_tail_cannot_prove_completion(form):
+    """Neither head success nor evidence in an unread tail exempts its allowance notice."""
+    pr = completed_head_pull(completed_head_run() if form == "check-run" else {})
+    body = "Prose.\n" * MAX_LINES + "0 remain after this review"
+    if form == "summary":
+        body += "\n" + completed_head_summary()
+    elif form == "pause-block":
+        body += "\n## Reviews paused\nLast reviewed commit: " + ADR92_HEAD
+    elif form == "reviewed-range":
+        body += "\n" + completed_head_summary(statement="")
+    pr["comments"]["nodes"][0]["body"] = body
+    assert review_incomplete(pr) == (
+        "review incomplete: coderabbitai notice body exceeds the read bound"
+    )
+
+
+@pytest.mark.parametrize(
+    ("count", "runs", "holds"),
+    [
+        pytest.param(True, 1, True, id="bool"),
+        pytest.param(1.0, 1, True, id="float"),
+        pytest.param(4, 4, False, id="integer-four"),
+    ],
+)
+def test_completed_check_count_integer_only(count, runs, holds):
+    """Refuse bool and float counts even when equal to length; accept integer four."""
+    pr = completed_head_pull(*[completed_head_run()] * runs)
+    contexts = pr["headCommit"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+    contexts["totalCount"] = count
+    assert bool(review_incomplete(pr)) is holds

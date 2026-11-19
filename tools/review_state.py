@@ -15,7 +15,8 @@ MAX_COMMITS = 100
 MAX_REVIEWS = 100
 MAX_CHECKS = 100
 MAX_LINES = 2000
-# Match the planning reader's character ceiling for bodies proving summary coverage.
+# GitHub comments nominally allow 65536 characters; enforce that ceiling locally
+# for whole-body notice detection as well as bodies proving summary coverage.
 MAX_SUMMARY_CHARS = 65536
 # A markdown row needs only name, status, and explanation; bound hostile wide tables.
 MAX_CELLS = 32
@@ -275,7 +276,13 @@ def _complete_check_contexts(conn) -> list[dict]:
         return []
     nodes = conn["nodes"]
     count = conn.get("totalCount")
-    if type(count) is not int or count != len(nodes) or count > MAX_CHECKS:
+    # bool is an int subclass, but cannot represent a connection's count.
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(nodes)
+        or count > MAX_CHECKS
+    ):
         return []
     page = conn.get("pageInfo")
     if not isinstance(page, dict) or page.get("hasNextPage") is not False:
@@ -329,6 +336,8 @@ def _suite_on_head(suite, head: str) -> bool:
 
 def _non_allowance_notice(body: str) -> bool:
     """A skipped review cannot also prove completed review evidence."""
+    if len(body) > MAX_SUMMARY_CHARS:
+        return True
     return any(
         not match.group("allowance") for match in list(LIMIT_NOTICE_RE.finditer(body))[:MAX_LINES]
     )
@@ -393,9 +402,39 @@ def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
 
 
 def _notice_read(body: str) -> tuple[str, bool]:
-    """Read a bounded line prefix and retain whether a notice body has an unread tail."""
-    lines = body.splitlines()
-    return "\n".join(lines[:MAX_LINES]), len(lines) > MAX_LINES
+    """Read at most 65536 characters and 2000 lines; retain whether any tail is unread."""
+    lines = body[:MAX_SUMMARY_CHARS].splitlines()
+    return "\n".join(lines[:MAX_LINES]), len(body) > MAX_SUMMARY_CHARS or len(lines) > MAX_LINES
+
+
+def _notice_time_rule(allowance: bool, names_head: bool, when, last_commit) -> bool:
+    """One time rule for a notice, read or beyond the read bound.
+
+    An allowance notice and a notice that names the head hold; any other holds from
+    the head commit's time on.
+    """
+    return allowance or names_head or when >= last_commit
+
+
+def _unread_notice_holds(comment: dict, head: str, last_commit) -> bool:
+    """Detect notices in a cut body's full bounded text without granting tail completion."""
+    body = str(comment.get("body") or "")
+    if len(body) > MAX_SUMMARY_CHARS:
+        return True
+    prefix, _cut = _notice_read(body)
+    if LIMIT_NOTICE_RE.search(prefix):
+        # Preserve the existing fail-closed policy for a notice in a cut prefix.
+        return True
+    notices = list(LIMIT_NOTICE_RE.finditer(body))
+    if not notices:
+        return False
+    when = _body_at(comment)
+    if when is None or last_commit is None:
+        return True
+    # A match consumes characters; at most MAX_SUMMARY_CHARS matches can exist.
+    allowance = all(notice.group("allowance") for notice in notices[:MAX_SUMMARY_CHARS])
+    names_head = bool(head and head[:7] in body.lower())
+    return _notice_time_rule(allowance, names_head, when, last_commit)
 
 
 def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> bool:
@@ -419,7 +458,7 @@ def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> boo
     later = formal if allowance else ordinary
     if _later_evidence(later, login, when, last_commit, allowance or names_head):
         return False
-    return allowance or names_head or when >= last_commit
+    return _notice_time_rule(allowance, names_head, when, last_commit)
 
 
 def review_incomplete(pr: dict, me: str = "") -> str:
@@ -442,8 +481,8 @@ def review_incomplete(pr: dict, me: str = "") -> str:
         login = _login(comment)
         if login.lower().removesuffix("[bot]") in answerers:
             continue
-        prefix, cut = _notice_read(str(comment.get("body") or ""))
-        if cut and LIMIT_NOTICE_RE.search(prefix):
+        _prefix, cut = _notice_read(str(comment.get("body") or ""))
+        if cut and _unread_notice_holds(comment, head, last_commit):
             return f"review incomplete: {login or 'reviewer'} notice body exceeds the read bound"
         if _notice_holds(comment, head, last_commit, evidence):
             when = _body_at(comment)
