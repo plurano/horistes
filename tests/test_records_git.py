@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 
 import pytest
@@ -75,7 +76,9 @@ def test_planted_record_type_change_keeps_surviving_side(tree, regular_before):
     path.unlink()
     if regular_before:
         path.symlink_to("../../tools/app.py")
-        with pytest.raises(records.ciwf.ReadError, match="record is not a regular file"):
+        with pytest.raises(
+            records.ciwf.ReadError, match=rf"^{re.escape(OLD)}: record is not a regular file$"
+        ):
             records.check_records(repo.root, "main")
         done = repo.tool("records.py", "check", "--base-ref", "main", timeout=30)
         assert done.returncode == 3, done.stdout + done.stderr
@@ -88,6 +91,19 @@ def test_planted_record_type_change_keeps_surviving_side(tree, regular_before):
             1,
         )
         assert records_diff.changed_records(repo.root, "main")[OLD].deletions == []
+
+
+def test_planted_record_reader_refuses_symlink_to_tracked_markdown(tree):
+    repo = base_repo(tree)
+    regular = repo.root / OLD
+    symlink = repo.root / NEW
+    symlink.symlink_to(regular.name)
+    assert records_diff.record_text(regular) == OLD_RECORD
+    assert records._source_text(symlink) == ""
+    with pytest.raises(
+        records.ciwf.ReadError, match=rf"^{re.escape(str(symlink))}: record is not a regular file$"
+    ):
+        records_diff.record_text(symlink)
 
 
 @pytest.mark.parametrize(
