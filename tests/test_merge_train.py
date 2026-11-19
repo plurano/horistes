@@ -9092,7 +9092,11 @@ def test_dependency_pull_held_by_required_status_commits_generated_files(tmp_pat
 
 
 # workflow_call inputs the job reads itself, not the train script.
-INPUTS_OFF_TRAIN = frozenset({"runner"})
+JOB_RUNNER_INPUTS = {
+    "train": "${{ inputs.runner }}",
+    "release": "${{ inputs.release_runner || inputs.runner }}",
+}
+INPUTS_OFF_TRAIN = frozenset({"runner", "release_runner"})
 
 
 def input_wiring_findings(doc: dict, source: str) -> list[str]:
@@ -9103,6 +9107,10 @@ def input_wiring_findings(doc: dict, source: str) -> list[str]:
     pattern = r"""\benv(?:\s*\[\s*["']|\s*\.\s*get\s*\(\s*["'])(TRAIN_[A-Z0-9_]+)["']"""
     read = set(re.findall(pattern, source))
     found = []
+    for job_name, expected_runs_on in JOB_RUNNER_INPUTS.items():
+        actual = doc["jobs"].get(job_name, {}).get("runs-on")
+        if actual != expected_runs_on:
+            found.append(f"job {job_name} runs-on is {actual!r}, not {expected_runs_on!r}")
     for name in sorted(set(inputs) - INPUTS_OFF_TRAIN):
         key = f"TRAIN_{name.upper()}"
         if env.get(key) != f"${{{{ inputs.{name} }}}}":
@@ -9113,7 +9121,7 @@ def input_wiring_findings(doc: dict, source: str) -> list[str]:
 
 
 def test_every_train_input_reaches_the_train_env():
-    """Each workflow_call input but the runner is passed to the train step and read by the train."""
+    """Each workflow_call input but the runner inputs is passed to the train step and read."""
     doc = ciwf.load(TRAIN)
     assert INPUTS_OFF_TRAIN.issubset(doc["on"]["workflow_call"]["inputs"])
     assert input_wiring_findings(doc, SCRIPT.read_text(encoding="utf-8")) == []
@@ -9141,6 +9149,32 @@ def _train_env(doc: dict) -> dict:
             lambda doc: doc["on"]["workflow_call"]["inputs"].update(extra={"type": "string"}),
             None,
             "input extra does not reach TRAIN_EXTRA",
+        ),
+        (
+            lambda doc: doc["jobs"]["release"].update({"runs-on": "${{ inputs.runner }}"}),
+            None,
+            (
+                "job release runs-on is '${{ inputs.runner }}', "
+                "not '${{ inputs.release_runner || inputs.runner }}'"
+            ),
+        ),
+        (
+            lambda doc: doc["jobs"]["release"].update({"runs-on": "${{ inputs.release_runner }}"}),
+            None,
+            (
+                "job release runs-on is '${{ inputs.release_runner }}', "
+                "not '${{ inputs.release_runner || inputs.runner }}'"
+            ),
+        ),
+        (
+            lambda doc: doc["jobs"]["train"].update(
+                {"runs-on": "${{ inputs.release_runner || inputs.runner }}"}
+            ),
+            None,
+            (
+                "job train runs-on is '${{ inputs.release_runner || inputs.runner }}', "
+                "not '${{ inputs.runner }}'"
+            ),
         ),
         (
             lambda doc: None,
