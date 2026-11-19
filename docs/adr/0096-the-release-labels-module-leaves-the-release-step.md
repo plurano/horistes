@@ -46,8 +46,8 @@ commit therefore runs that commit's labels module, as it does the train sweep.
 
 Behaviour stays unchanged: the original heredoc and the new file have equal
 ASTs, and the body beneath the SPDX header is byte-identical. The existing
-[release-label tests](../../tests/test_release_labels.py) now read the file
-directly, retaining their forge stand-in and temporary module copies.
+[release-label tests](../../tests/test_release_labels.py) run the checked-out
+file, so coverage measures it at 91.53%.
 
 Release step 2 is a checkout, and the release job's largest remaining run step
 counts 3 conservative fields. The unchanged

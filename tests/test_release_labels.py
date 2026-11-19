@@ -3,6 +3,8 @@
 """The release job's labels module, run as written against a stand-in forge (decision record 0040).
 
 The checked-out tools/release_labels.py module is run with `python3 -I`.
+Coverage measures files under tools/ only (ADR-0096); only planted source is
+written to a temporary file.
 A small HTTP server stands in for the forge's REST API: the config file, tags,
 releases and label writes, each write recorded; and for its GraphQL API, which
 answers the closed and open pull requests with the fields the checks read.
@@ -299,9 +301,11 @@ def forge() -> Iterator[Forge]:
 def run(
     tmp_path: Path, command: str, env: dict, source: str | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """The module run with python3 -I, as a step runs it."""
-    path = tmp_path / "release_labels.py"
-    path.write_text(source or module(), encoding="utf-8")
+    """Run the checked-out module, or a temporary file containing planted source."""
+    path = ROOT / "tools/release_labels.py"
+    if source is not None and source != module():
+        path = tmp_path / "release_labels.py"
+        path.write_text(source, encoding="utf-8")
     # A runner sets GITHUB_GRAPHQL_URL to the real forge; only the stand-in may answer.
     host = {key: value for key, value in os.environ.items() if key != "GITHUB_GRAPHQL_URL"}
     return subprocess.run(
@@ -344,9 +348,8 @@ def after(
     return run(tmp_path, "after", env, source)
 
 
-def test_module_passes_ruff(tmp_path):
-    path = tmp_path / "release_labels.py"
-    path.write_text(module(), encoding="utf-8")
+def test_module_passes_ruff():
+    path = ROOT / "tools/release_labels.py"
     ruff = ROOT / ".venv/bin/ruff"
     command = [str(ruff)] if ruff.exists() else [sys.executable, "-m", "ruff"]
     for args in (["check"], ["format", "--check"]):
@@ -1625,10 +1628,9 @@ def test_review_trigger_shapes(tmp_path, forge, trigger):
 
 
 @pytest.mark.parametrize("header", ["run: |", "run: |  # c", "run: >  # c"])
-def test_review_trigger_lines_hide_scalar_body(tmp_path, header):
+def test_review_trigger_lines_hide_scalar_body(header):
     """Real scalar headers still hide event-like text after comment removal."""
-    path = tmp_path / "release_labels.py"
-    path.write_text(module(), encoding="utf-8")
+    path = ROOT / "tools/release_labels.py"
     spec = importlib.util.spec_from_file_location("release_labels", path)
     assert spec is not None and spec.loader is not None
     labels = importlib.util.module_from_spec(spec)
