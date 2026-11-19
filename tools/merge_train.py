@@ -287,23 +287,23 @@ REVIEW_BODIES = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      headRefOid
-      author { login }
-      reviews(first: 100) {
-        totalCount
-        nodes {
-          databaseId state body submittedAt updatedAt url authorAssociation
-          author { login __typename } commit { oid }
-        }
-      }
-      comments(first: 100) {
-        totalCount
+      headRefOid author { login }
+      reviews(first: 100) { totalCount nodes {
+        databaseId state body submittedAt updatedAt url authorAssociation
+        author { login __typename } commit { oid }
+      } }
+      comments(first: 100) { totalCount
         nodes { body createdAt updatedAt url authorAssociation author { login __typename } }
       }
-      commits(first: 100) {
-        totalCount
-        nodes { commit { message committedDate } }
-      }
+      commits(first: 100) { totalCount nodes { commit { message committedDate } } }
+      headCommit: commits(last: 1) { nodes { commit { oid
+        statusCheckRollup { contexts(first: 100) {
+          totalCount pageInfo { hasNextPage }
+          nodes { __typename ... on CheckRun {
+            status conclusion checkSuite { app { slug } }
+          } }
+        } }
+      } } }
     }
   }
 }

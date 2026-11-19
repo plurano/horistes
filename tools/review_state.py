@@ -13,11 +13,24 @@ from datetime import UTC, datetime
 MAX_COMMENTS = 100
 MAX_COMMITS = 100
 MAX_REVIEWS = 100
+MAX_CHECKS = 100
 MAX_LINES = 2000
 # A markdown row needs only name, status, and explanation; bound hostile wide tables.
 MAX_CELLS = 32
 MAX_SNIPPET = 160
 COMPLETED_STATES = frozenset({"COMMENTED", "APPROVED", "CHANGES_REQUESTED"})
+# Existing review-state fixtures and train body classifiers name these reviewers.
+REVIEWER_BOTS = frozenset({"coderabbitai", "copilot", "sourcery-ai", "codacy-production"})
+NO_ACTIONABLE_RE = re.compile(
+    r"^[ \t]*(?:\*\*)?No actionable comments were generated in the recent review\."
+    r"(?:\*\*)?[ \t]*\r?$",
+    re.MULTILINE,
+)
+ACTIONABLE_COUNT_RE = re.compile(
+    r"^[ \t]*(?:\*\*)?Actionable comments posted:(?:\*\*)?[ \t]*"
+    r"(?:\*\*)?([0-9]+)(?:\*\*)?[ \t]*\r?$",
+    re.MULTILINE,
+)
 
 PRE_MERGE_MARKER = re.compile(r"pre[-_ ]merge[-_ ]checks", re.I)
 STATUS_CELL_RE = re.compile(
@@ -232,6 +245,73 @@ def _allowance_head_reviewed(body: str, head: str) -> bool:
     return len(ranges) == 1 and ranges[0].group(2).lower() == head
 
 
+def _completed_summary_reviewers(pr: dict, head: str) -> set[str]:
+    """Listed bots with one head range and unquoted, uncontradicted zero-action evidence."""
+    reviewers = set()
+    for comment in _all_comments(pr)[: MAX_COMMENTS + MAX_REVIEWS]:
+        login = _login(comment).lower().removesuffix("[bot]")
+        if login not in REVIEWER_BOTS or not _can_complete(comment):
+            continue
+        body = str(comment.get("body") or "")
+        if _non_allowance_notice(body) or not _allowance_head_reviewed(body, head):
+            continue
+        counts = list(ACTIONABLE_COUNT_RE.finditer(body))[:MAX_LINES]
+        if any(count.group(1).strip("0") for count in counts[:MAX_LINES]):
+            continue
+        if counts or NO_ACTIONABLE_RE.search(body):
+            reviewers.add(login)
+    return reviewers
+
+
+def _complete_check_contexts(conn) -> list[dict]:
+    """Grant no checks unless all at most 100 contexts and their exact count were read."""
+    if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+        return []
+    nodes = conn["nodes"]
+    count = conn.get("totalCount")
+    if type(count) is not int or count != len(nodes) or count > MAX_CHECKS:
+        return []
+    page = conn.get("pageInfo")
+    if not isinstance(page, dict) or page.get("hasNextPage") is not False:
+        return []
+    if any(not isinstance(node, dict) for node in nodes[:MAX_CHECKS]):
+        return []
+    return nodes
+
+
+def _completed_check_reviewers(pr: dict, head: str) -> set[str]:
+    """Listed check-suite apps with COMPLETED/SUCCESS on the exact full head only."""
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return set()
+    connection = pr.get("headCommit")
+    commits = connection.get("nodes") if isinstance(connection, dict) else None
+    if not isinstance(commits, list) or len(commits) != 1 or not isinstance(commits[0], dict):
+        return set()
+    commit = commits[0].get("commit")
+    if not isinstance(commit, dict) or commit.get("oid") != head:
+        return set()
+    rollup = commit.get("statusCheckRollup")
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    reviewers = set()
+    for run in _complete_check_contexts(contexts)[:MAX_CHECKS]:
+        if (run.get("__typename"), run.get("status"), run.get("conclusion")) != (
+            "CheckRun",
+            "COMPLETED",
+            "SUCCESS",
+        ):
+            continue
+        suite = run.get("checkSuite")
+        app = suite.get("app") if isinstance(suite, dict) else None
+        slug = (
+            str(app.get("slug") or "").lower().removesuffix("[bot]")
+            if isinstance(app, dict)
+            else ""
+        )
+        if slug in REVIEWER_BOTS:
+            reviewers.add(slug)
+    return reviewers
+
+
 def _non_allowance_notice(body: str) -> bool:
     """A skipped review cannot also prove completed review evidence."""
     return any(
@@ -239,14 +319,14 @@ def _non_allowance_notice(body: str) -> bool:
     )
 
 
-def _head_evidence(comment: dict, head: str) -> bool:
+def _head_evidence(comment: dict, head: str, formal_only: bool = False) -> bool:
     """Allow only a completed formal review of the full head or an exact reviewed range."""
     if not re.fullmatch(r"[0-9a-f]{40}", head):
         return False
     commit = comment.get("commit")
     formal = comment.get("state") in COMPLETED_STATES and isinstance(commit, dict)
-    return bool(formal and commit.get("oid") == head) or _allowance_head_reviewed(
-        str(comment.get("body") or ""), head
+    return bool(formal and commit.get("oid") == head) or (
+        not formal_only and _allowance_head_reviewed(str(comment.get("body") or ""), head)
     )
 
 
@@ -258,7 +338,9 @@ def _can_complete(comment: dict) -> bool:
     return isinstance(state, str) and state in COMPLETED_STATES
 
 
-def review_evidence(node: dict, me: str = "") -> list[tuple[str, datetime | None, bool]]:
+def review_evidence(
+    node: dict, me: str = "", *, formal_only: bool = False
+) -> list[tuple[str, datetime | None, bool]]:
     """One scoped evidence reader for both notice clearing and the opt-in head barrier."""
     answerers = _answerers(node, me)
     head = str(node.get("headRefOid") or "").strip().lower()
@@ -272,7 +354,7 @@ def review_evidence(node: dict, me: str = "") -> list[tuple[str, datetime | None
         body = str(comment.get("body") or "")
         if _non_allowance_notice(body):
             continue
-        on_head = _head_evidence(comment, head)
+        on_head = _head_evidence(comment, head, formal_only)
         if comment.get("state") in COMPLETED_STATES or pre_merge_rows(body) or on_head:
             evidence.append((login, _body_at(comment), on_head))
     return evidence
@@ -295,21 +377,25 @@ def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
     return _paused_head_reviewed(body, head) or (allowance and _allowance_head_reviewed(body, head))
 
 
-def _notice_holds(comment: dict, head: str, last_commit, evidence: list) -> bool:
+def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> bool:
     """Apply head coverage, reviewer scope, and instant ordering to one notice body."""
     body = str(comment.get("body") or "")
     notices = list(LIMIT_NOTICE_RE.finditer(body))[:MAX_LINES]
     if not notices:
         return False
+    ordinary, formal, completed = evidence
+    allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
+    login = _login(comment).lower().removesuffix("[bot]")
+    if allowance and login in REVIEWER_BOTS and login in completed:
+        return False
     when = _body_at(comment)
     if when is None or last_commit is None:
         return True
-    allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
     if _can_complete(comment) and _notice_covers_head(body, head, allowance):
         return False
     names_head = bool(head and head[:7] in body.lower())
-    login = _login(comment).lower().removesuffix("[bot]")
-    if _later_evidence(evidence, login, when, last_commit, allowance or names_head):
+    later = formal if allowance else ordinary
+    if _later_evidence(later, login, when, last_commit, allowance or names_head):
         return False
     return allowance or names_head or when >= last_commit
 
@@ -320,7 +406,11 @@ def review_incomplete(pr: dict, me: str = "") -> str:
     answerers = _answerers(node, me)
     head = str(node.get("headRefOid") or "").strip().lower()
     last_commit = _last_commit_at(node)
-    evidence = review_evidence(node, me)
+    evidence = (
+        review_evidence(node, me),
+        review_evidence(node, me, formal_only=True),
+        _completed_check_reviewers(node, head) | _completed_summary_reviewers(node, head),
+    )
     comments = sorted(
         _all_comments(node),
         key=lambda c: _body_at(c) or datetime.max.replace(tzinfo=UTC),
