@@ -11,12 +11,13 @@ from pathlib import Path
 
 import pytest
 import records
+import records_diff
 from records_cases import NEW, NEW_RECORD, NO_POINTER, OLD, base_repo
 
 
 def test_planted_oversized_source_fails_closed(tree, monkeypatch):
     repo = base_repo(tree)
-    monkeypatch.setattr(records, "MAX_SOURCE_BYTES", 5)
+    monkeypatch.setattr(records_diff, "MAX_SOURCE_BYTES", 5)
     with pytest.raises(records.ciwf.ReadError, match="source byte limit"):
         records._source_text(repo.root / "tools/app.py")
 
@@ -54,27 +55,27 @@ def test_planted_reader_caps_each_read(tmp_path, monkeypatch, reader):
     class ReadSpy(io.BytesIO):
         def read(self, size=-1):
             requested.append(size)
-            assert 0 <= size <= records.MAX_SOURCE_BYTES + 1
+            assert 0 <= size <= records_diff.MAX_SOURCE_BYTES + 1
             return super().read(size)
 
     monkeypatch.setattr(Path, "open", lambda *args, **kwargs: ReadSpy(b"text"))
     assert getattr(records, reader)(path) == "text"
-    assert requested == [records.MAX_SOURCE_BYTES + 1]
+    assert requested == [records_diff.MAX_SOURCE_BYTES + 1]
 
 
 @pytest.mark.parametrize("reader", ["_source_text", "record_text"])
 def test_planted_reader_byte_limit(tmp_path, reader):
     path = tmp_path / "regular"
-    path.write_bytes(b"x" * (records.MAX_SOURCE_BYTES + 1))
-    with pytest.raises(records.ciwf.ReadError, match=f"byte limit {records.MAX_SOURCE_BYTES}"):
+    path.write_bytes(b"x" * (records_diff.MAX_SOURCE_BYTES + 1))
+    with pytest.raises(records.ciwf.ReadError, match=f"byte limit {records_diff.MAX_SOURCE_BYTES}"):
         getattr(records, reader)(path)
 
 
 @pytest.mark.parametrize("reader", ["_source_text", "record_text"])
 def test_reader_byte_limit_boundary(tmp_path, reader):
     path = tmp_path / "regular"
-    path.write_bytes(b"x" * records.MAX_SOURCE_BYTES)
-    assert len(getattr(records, reader)(path)) == records.MAX_SOURCE_BYTES
+    path.write_bytes(b"x" * records_diff.MAX_SOURCE_BYTES)
+    assert len(getattr(records, reader)(path)) == records_diff.MAX_SOURCE_BYTES
 
 
 @pytest.mark.parametrize("kind", ["missing", "directory", "binary"])
@@ -133,12 +134,12 @@ def test_limited_tool_obeys_timeout(tree, monkeypatch):
 
 def test_planted_dev_null_body_cannot_hide_an_added_claim(tree):
     repo = base_repo(tree)
-    before = "# Record\n\n## Decision\n\nSee `tools/app.py`.\n"
+    before = "# Record\n\n## Decision\n\nSee `tools/app.py`.\n\n"
     repo.write({OLD: before})
     repo.git("add", "-A")
     repo.git("commit", "-q", "-m", "accepted record")
     repo.git("checkout", "-q", "-b", "topic")
-    repo.write({OLD: before + "\nThe app retries.\n++ /dev/null\n"})
+    repo.write({OLD: before + "The app retries.\n++ /dev/null\n"})
     problems, changed, judged = records.check_records(repo.root, "main")
     assert (changed, judged) == (1, 1)
     assert problems == [f"{OLD}:7: claim under 'Decision' {NO_POINTER}"]
@@ -154,8 +155,8 @@ def test_planted_dev_null_is_a_deletion_only_in_the_diff_header(tmp_path, delete
         + ("/dev/null" if deleted else f"b/{OLD}")
         + "\n@@ -10,0 +11,2 @@\n+The app retries.\n+++ /dev/null\n"
     )
-    changes = records._record_changes(tmp_path, OLD, diff)
-    assert changes == (None if deleted else records.Changes(added={11, 12}))
+    changes = records_diff._record_changes(tmp_path, OLD, diff)
+    assert changes == (None if deleted else records_diff.Changes(added={11, 12}))
 
 
 def test_deleted_record_is_not_counted_or_judged(tree):

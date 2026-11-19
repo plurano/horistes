@@ -157,6 +157,10 @@ def test_numbers_under_references_are_no_claim(tree):
 
 def test_untouched_blocks_of_an_accepted_record_stay_unjudged(tree):
     repo = base_repo(tree)
+    # The separator predates the edit; an added blank now binds its neighbours.
+    repo.write({OLD: OLD_RECORD + "\n"})
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "accepted separator")
     added = f"{OLD_RECORD}\nThe retries are counted in `tools/app.py` `RETRY_LIMIT`.\n"
     done = change(repo, {OLD: added})
     assert done.returncode == 0, done.stderr

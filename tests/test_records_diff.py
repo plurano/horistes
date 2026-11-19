@@ -4,13 +4,15 @@
 
 from __future__ import annotations
 
+import io
 import shlex
 import sys
-from subprocess import run as subprocess_run
+from subprocess import Popen
 from types import SimpleNamespace
 
 import pytest
 import records
+import records_diff
 from records_cases import (
     NEW,
     NEW_RECORD,
@@ -32,7 +34,7 @@ def test_planted_user_diff_prefix_cannot_hide_a_record(tree, setting):
     done = change(repo, {NEW: NEW_RECORD.replace(POINTED, UNPOINTED)})
     assert done.returncode == 1, done.stdout + done.stderr
     assert failures(done) == [f"FAIL: {NEW}:12: claim under 'Decision' {NO_POINTER}"]
-    diff = records.git(repo.root, *records.DIFF, "main", "--", f":(literal){NEW}")
+    diff = records_diff.git(repo.root, *records_diff.DIFF, "main", "--", f":(literal){NEW}")
     assert f"+++ b/{NEW}\n" in diff
 
 
@@ -102,16 +104,16 @@ def test_an_unrelated_history_fails_closed(tree):
 
 def test_planted_git_output_with_invalid_utf8_fails_closed(tree, monkeypatch):
     repo = base_repo(tree)
-    run = subprocess_run
+    popen = Popen
 
     def undecodable(command, **kwargs):
         if command[:3] == ["git", "-C", str(repo.root)]:
             raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid filename")
-        return run(command, **kwargs)
+        return popen(command, **kwargs)
 
-    monkeypatch.setattr(records.subprocess, "run", undecodable)
+    monkeypatch.setattr(records_diff.subprocess, "Popen", undecodable)
     with pytest.raises(records.ciwf.ReadError, match="git diff.*utf-8"):
-        records.git(repo.root, "diff", "-z", "--name-only", "main")
+        records_diff.git(repo.root, "diff", "-z", "--name-only", "main")
 
 
 def test_planted_untracked_new_record_is_judged(tree):
@@ -128,14 +130,14 @@ def test_boundary_diff_hunk_counts(new_count):
     body = "-old\n-other\n" + ("" if new_count == "0" else "+new\n")
     diff = f"+++ b/{OLD}\n@@ -12,2 +12{suffix} @@\n{body}"
     expected = set() if new_count == "0" else {12}
-    assert records.added_lines(diff) == expected
+    assert records_diff.added_lines(diff) == expected
 
 
 def test_boundary_diff_dev_null_clears_the_record():
     added = f"+++ b/{OLD}\n@@ -1 +1 @@\n-old\n+new\n"
     diff = f"--- a/{OLD}\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-one\n-two\n-three\n"
-    assert records.added_lines(added) == {1}
-    assert records.added_lines(diff) == set()
+    assert records_diff.added_lines(added) == {1}
+    assert records_diff.added_lines(diff) == set()
 
 
 def test_deleted_record_has_no_added_lines(tree):
@@ -165,32 +167,36 @@ def test_planted_record_beyond_the_line_limit_fails_closed(tree, monkeypatch):
 
 
 def test_planted_diff_beyond_the_line_limit_fails_closed(monkeypatch):
-    monkeypatch.setattr(records, "MAX_LINES", 1)
+    monkeypatch.setattr(records_diff, "MAX_LINES", 1)
     diff = "\n" * 11 + f"+++ b/{NEW}\n@@ -0,0 +1 @@\n"
     with pytest.raises(records.ciwf.ReadError, match="diff line limit"):
-        records.added_lines(diff)
+        records_diff.added_lines(diff)
 
 
 def test_planted_changed_names_beyond_the_file_limit_fails_closed(tree, monkeypatch):
     repo = base_repo(tree)
-    monkeypatch.setattr(records, "MAX_FILES", 1)
-    monkeypatch.setattr(records, "git", lambda *args: f"{OLD}\0{NEW}\0")
+    monkeypatch.setattr(records_diff, "MAX_FILES", 1)
+    monkeypatch.setattr(records_diff, "git", lambda *args: f"{OLD}\0{NEW}\0")
     with pytest.raises(records.ciwf.ReadError, match="changed file limit"):
-        records.changed_records(repo.root, "main")
+        records_diff.changed_records(repo.root, "main")
 
 
 def test_planted_combined_diffs_beyond_the_line_limit_fails_closed(tree, monkeypatch):
     repo = base_repo(tree)
 
+    git = records_diff.git
+
     def diff_output(root, *args):
+        if args[0] == "check-attr":
+            return git(root, *args)
         if "--name-only" in args:
             return f"{OLD}\0{NEW}\0"
         return "@@ -0,0 +1 @@\n" + "\n" * 5
 
-    monkeypatch.setattr(records, "MAX_LINES", 1)
-    monkeypatch.setattr(records, "git", diff_output)
+    monkeypatch.setattr(records_diff, "MAX_LINES", 1)
+    monkeypatch.setattr(records_diff, "git", diff_output)
     with pytest.raises(records.ciwf.ReadError, match="diff line limit"):
-        records.changed_records(repo.root, "main")
+        records_diff.changed_records(repo.root, "main")
 
 
 def test_planted_tracked_tree_beyond_the_file_limit_fails_closed(tree, monkeypatch):
@@ -236,6 +242,10 @@ def test_planted_textconv_cannot_shift_record_lines(tree):
 @pytest.mark.parametrize("edit_claim", [False, True], ids=["untouched", "edited"])
 def test_planted_interhunk_context_judges_only_edits(tree, edit_claim):
     repo = base_repo(tree)
+    # Keep the separator unchanged so this isolates inter-hunk context.
+    repo.write({OLD: OLD_RECORD + "\n"})
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "accepted separator")
     repo.git("config", "diff.interHunkContext", "100")
     text = OLD_RECORD.replace("Accepted", "Proposed") + f"\n{POINTED}\n"
     if edit_claim:
@@ -254,7 +264,7 @@ def test_planted_hunk_body_excludes_context_and_deleted_lines():
         "-removed\n+added\n unchanged\n+another\n\\ No newline at end of file\n"
         " unchanged too\n+last\n@@ -20 +21,0 @@\n-deleted\n"
     )
-    assert records.added_lines(diff) == {10, 12, 14}
+    assert records_diff.added_lines(diff) == {10, 12, 14}
 
 
 @pytest.mark.parametrize("binary_attribute", [False, True], ids=["normal", "minus-diff"])
@@ -280,12 +290,16 @@ def test_planted_binary_attribute_cannot_hide_record(tree, binary_attribute, inv
 def test_planted_binary_summary_fails_closed(tree, monkeypatch, summary):
     repo = base_repo(tree)
 
+    git = records_diff.git
+
     def binary_diff(root, *args):
+        if args[0] == "check-attr":
+            return git(root, *args)
         return f"{NEW}\0" if "--name-only" in args else summary + "\n"
 
-    monkeypatch.setattr(records, "git", binary_diff)
+    monkeypatch.setattr(records_diff, "git", binary_diff)
     with pytest.raises(records.ciwf.ReadError, match="binary record diff"):
-        records.changed_records(repo.root, "main")
+        records_diff.changed_records(repo.root, "main")
 
 
 @pytest.mark.parametrize("pointer_first", [False, True], ids=["last-line", "first-line"])
@@ -320,7 +334,7 @@ def test_deletion_walk_tracks_runs_and_new_side_coordinates():
         "@@ -5,4 +3,4 @@\n-old\n+new\n context\n-\n-last\n"
         "\\ No newline at end of file\n+replacement\n+end\n"
     )
-    changes = records.diff_changes(diff)
+    changes = records_diff.diff_changes(diff)
     assert changes.added == {3, 5, 6}
     assert [(d.point, d.first, d.last) for d in changes.deletions] == [
         (0, True, False),
@@ -336,7 +350,7 @@ def test_deleted_record_is_never_read(tree, monkeypatch):
     def unexpected_read(path):
         raise AssertionError(f"deleted record was read: {path}")
 
-    monkeypatch.setattr(records, "record_text", unexpected_read)
+    monkeypatch.setattr(records_diff, "record_text", unexpected_read)
     assert records.check_records(repo.root, "main") == ([], 0, 0)
 
 
@@ -408,21 +422,27 @@ def test_tracked_crlf_record_matches_lf_findings(tree, newline):
 @pytest.mark.parametrize("returncode", [0, 1], ids=["stdout-strict", "stderr-replacement"])
 def test_planted_git_byte_output_decode_errors(tree, monkeypatch, returncode):
     repo = base_repo(tree)
-    run = subprocess_run
+    popen = Popen
 
     def byte_output(command, **kwargs):
         if command[:3] == ["git", "-C", str(repo.root)]:
-            return SimpleNamespace(returncode=returncode, stdout=b"\xff", stderr=b"\xff")
-        return run(command, **kwargs)
+            kwargs["stderr"].write(b"\xff")
+            return SimpleNamespace(
+                returncode=returncode,
+                stdout=io.BytesIO(b"\xff"),
+                wait=lambda **kwargs: returncode,
+                poll=lambda: returncode,
+            )
+        return popen(command, **kwargs)
 
-    monkeypatch.setattr(records.subprocess, "run", byte_output)
+    monkeypatch.setattr(records_diff.subprocess, "Popen", byte_output)
     message = "git diff.*utf-8" if returncode == 0 else "git diff: \ufffd"
     with pytest.raises(records.ciwf.ReadError, match=message):
-        records.git(repo.root, "diff")
+        records_diff.git(repo.root, "diff")
 
 
 def test_diff_context_unicode_separator_is_one_git_line():
-    changes = records.diff_changes("@@ -1,2 +1,2 @@\n # A\u2028+B\n-old\n+new\n")
+    changes = records_diff.diff_changes("@@ -1,2 +1,2 @@\n # A\u2028+B\n-old\n+new\n")
     assert changes.added == {2}
     assert [(d.point, d.first, d.last) for d in changes.deletions] == [(1, True, True)]
 
@@ -434,9 +454,9 @@ def test_record_line_limit_counts_lf_only(tmp_path, extra):
     path.write_bytes(text.encode())
     if extra:
         with pytest.raises(records.ciwf.ReadError, match="record line limit"):
-            records.record_text(path)
+            records_diff.record_text(path)
     else:
-        assert records.record_text(path) == text
+        assert records_diff.record_text(path) == text
 
 
 @pytest.mark.parametrize("keepends", [False, True])
@@ -451,6 +471,6 @@ def test_git_lines_preserve_lone_cr_and_terminal_lf_count(text, keepends):
         "a\r\nb\r": ["a", "b\r"],
         "a\r\r\nb": ["a\r", "b"],
     }
-    lines = records.git_lines(text, keepends=keepends)
+    lines = records_diff.git_lines(text, keepends=keepends)
     assert len(lines) == len(expected[text])
     assert "".join(lines) == text if keepends else lines == expected[text]

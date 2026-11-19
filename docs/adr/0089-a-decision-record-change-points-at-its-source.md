@@ -43,18 +43,25 @@ verify that siblings need separate pointers while nested items share their paren
 A changed line binds its
 whole block; untouched blocks stay unjudged, as
 `test_untouched_blocks_of_an_accepted_record_stay_unjudged` verifies.
+When whitespace-only lines are added, `tools/records.py` also selects the closest
+surviving text on either side. Splitting a paragraph therefore subjects both
+resulting blocks to the pointer rule. `test_planted_added_blank_binds_neighbouring_blocks`
+in `tests/test_records_markdown.py` covers a detached pointer and two pointed blocks.
 Local new records are judged before staging too, as
 `test_planted_untracked_new_record_is_judged` verifies in `tests/test_records_diff.py`.
 
-`tools/records.py` reads changed names through NUL-delimited Git output and
+`tools/records_diff.py` reads changed names through NUL-delimited Git output and
 tracks added lines and deletion boundaries in each literal path's diff with pinned prefixes.
 A deletion binds adjacent surviving text only at a nonblank end of the removed
 run; deleting a paragraph with its blank line leaves its neighbours unjudged.
 `test_planted_deletion_only_pointer_removal_judges_surviving_claim` and
 `test_deleted_paragraph_and_blank_bind_no_untouched_neighbour` in
-`tests/test_records_diff.py` verify these boundaries. Text
-conversion is disabled so the diff uses the record's line coordinates;
-`test_planted_textconv_cannot_shift_record_lines` verifies this boundary.
+`tests/test_records_diff.py` verify these boundaries. Textconv is disabled;
+records with a `filter` or `working-tree-encoding` attribute other than
+`unspecified` or `unset` are refused before diffing, so conversion cannot shift
+the raw record's coordinates. `test_planted_textconv_cannot_shift_record_lines`
+in `tests/test_records_diff.py` and `test_planted_record_conversion_attribute_fails_closed`
+in `tests/test_records_git.py` verify these boundaries.
 Line boundaries follow Git's LF coordinates, with CRLF treated like LF and
 other separators retained within a line; `test_planted_lf_line_numbers_keep_edited_claim_visible`
 in `tests/test_records_diff.py` and `test_crlf_record_matches_lf_blocks_and_preserves_comment_positions`
@@ -68,10 +75,13 @@ User prefix settings and quoted Unicode paths cannot hide a changed record from 
 `test_planted_quoted_unicode_record_is_judged` and
 `test_planted_record_pathspec_is_literal` in `tests/test_records_diff.py` cover
 these inputs without interpreting path headers.
-Only the diff header before the first hunk can mark a record as deleted;
+Only a patch header before its first hunk can mark that patch as deleted;
 `test_planted_dev_null_body_cannot_hide_an_added_claim` and
 `test_planted_dev_null_is_a_deletion_only_in_the_diff_header` in
 `tests/test_records_reads.py` keep an added header-like body line visible.
+Type changes split into deletion and creation patches; only surviving patches
+bind the record. `test_planted_record_type_change_keeps_surviving_side` in
+`tests/test_records_git.py` covers both directions and refuses surviving symlinks.
 
 A changed block must not copy tracked source through a code span or fenced
 line. `tools/records.py` compares substantive snippets with tracked source
@@ -86,13 +96,18 @@ plain lines whose code spans are judged. Tilde info strings may contain backtick
 `test_valid_fence_info_preserves_body_and_literal_comments` in
 `tests/test_records_blocks.py` cover refused and accepted openers, including a later fence.
 
-`tools/records.py` reads only regular files, with a byte bound shared by
+`tools/records_diff.py` reads only regular files, with a byte bound shared by
 sources and records before decoding. Missing or non-text sources contribute
 no text; non-regular records are input errors. The bounded-child symlink cases
 in `test_planted_device_symlinks_are_not_read`, the read-size spy in
 `test_planted_reader_caps_each_read` and the size boundaries in
 `test_planted_reader_byte_limit` and `test_reader_byte_limit_boundary` verify
 these guarantees in `tests/test_records_reads.py`.
+The Git runner in `tools/records_diff.py` bounds stdout while reading under a
+deadline, kills and reaps a child on either limit, and bounds stderr diagnostics.
+`test_planted_git_output_byte_budget_reaps_child` and
+`test_planted_git_deadline_kills_and_reaps_child` in `tests/test_records_git.py`
+check refusal and cleanup, including output exactly at the byte budget.
 
 `tools/records.py` forces textual diffs for records, refuses binary summaries
 and treats invalid UTF-8 as an input error. Attributes cannot silently hide a
@@ -106,6 +121,12 @@ numbers, code spans and link destinations do not count as numeric prose.
 a `make` or `praetorctl` command, a defined test function, or an inline link
 to a tracked file or an HTTP page. `test_pointer_kinds_pass` and
 `test_pointers_to_nothing_fail` in `tests/test_records_claims.py` cover these boundaries.
+Test pointers come from parsed function definitions rather than strings or
+comments; invalid syntax and an exceeded AST node bound are input errors.
+`test_planted_test_pointer_requires_ast_definition`,
+`test_planted_unparseable_test_source_fails_closed` and
+`test_planted_test_ast_node_limit_fails_closed` in `tests/test_records_markdown.py`
+cover these boundaries without importing or executing the tracked tests.
 
 Without a merge base, `tools/records.py` exits with an input error rather than
 guessing which records changed. Null commits, unknown refs, unrelated or
