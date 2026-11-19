@@ -159,6 +159,11 @@
           "required": false,
           "type": "string"
         },
+        "release_runner": {
+          "default": "",
+          "required": false,
+          "type": "string"
+        },
         "required_status": {
           "default": "",
           "required": false,
@@ -276,6 +281,21 @@
       },
       "jobs": {
         "scan": "Secret scan"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": []
+    },
+    ".github/workflows/sign-off.yml": {
+      "inputs": {
+        "runner": {
+          "default": "ubuntu-26.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "sign-off": "Sign-off"
       },
       "outputs": [],
       "secrets": {},

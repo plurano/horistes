@@ -60,6 +60,9 @@
           },
           {
             "context": "Action pins"
+          },
+          {
+            "context": "Sign-off"
           }
         ],
         "strict_required_status_checks_policy": true
