@@ -60,7 +60,9 @@ workflow together.
 
 The new conservative count is 3424 fields for train step 1, leaving 576 fields
 below the local 4000 limit and at least 672 below the engine cap. Release step
-2 counts 3530. These are conservative counts, not a new engine audit result.
+2 is now a checkout; the release job's largest run step counts 3 fields after
+[ADR-0096](0096-the-release-labels-module-leaves-the-release-step.md).
+These are conservative counts, not a new engine audit result.
 [tests/test_run_script_fields.py](../../tests/test_run_script_fields.py)
 checks every workflow run step before the engine gate. It retains comments and
 joined lines, so its word, newline, and trailing-semicolon count over-counts

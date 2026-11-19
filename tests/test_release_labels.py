@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: EUPL-1.2
 """The release job's labels module, run as written against a stand-in forge (decision record 0040).
 
-The module the step "Write the release labels module" writes is taken out of
-the reusable workflow and run with `python3 -I`, as the steps after it run it.
+The checked-out tools/release_labels.py module is run with `python3 -I`.
 A small HTTP server stands in for the forge's REST API: the config file, tags,
 releases and label writes, each write recorded; and for its GraphQL API, which
 answers the closed and open pull requests with the fields the checks read.
@@ -25,13 +24,12 @@ from typing import cast
 from urllib.parse import unquote, urlsplit
 
 import pytest
-from conftest import ROOT
+from conftest import CHECKOUT, ROOT
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
 
 TRAIN = ROOT / ".github/workflows/merge-train.yml"
-MODULE_STEP = "Write the release labels module"
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
 TAG_OBJECT = "c" * 40
@@ -43,15 +41,68 @@ HOLD = "hold,do-not-merge,planted"
 
 
 def module() -> str:
-    """The release labels module the step writes."""
-    steps = [
-        s for s in ciwf.load(TRAIN)["jobs"]["release"]["steps"] if s.get("name") == MODULE_STEP
+    """The release labels module checked out from the workflow's own commit."""
+    return (ROOT / "tools/release_labels.py").read_text(encoding="utf-8")
+
+
+def check_release_checkout(path: Path) -> None:
+    """The release job runs only its own commit's narrowly checked-out module."""
+    job = ciwf.load(path)["jobs"]["release"]
+    assert job["permissions"] == {}
+    steps = job["steps"]
+    checkouts = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("actions/checkout@")
     ]
-    assert len(steps) == 1, f"one step named {MODULE_STEP!r}"
-    lines = steps[0]["run"].splitlines()
-    assert lines[0] == """cat > "$RUNNER_TEMP/release_labels.py" <<'PY'""", lines[0]
-    assert lines[-1] == "PY", lines[-1]
-    return "\n".join(lines[1:-1]) + "\n"
+    assert len(checkouts) == 1, "one release module checkout"
+    checkout_index, checkout = checkouts[0]
+    assert checkout["uses"] == CHECKOUT.split()[0]
+    assert checkout["with"] == {
+        "repository": "${{ job.workflow_repository }}",
+        "ref": "${{ job.workflow_sha }}",
+        "path": "merge-train-source",
+        "persist-credentials": False,
+        "sparse-checkout": "tools/release_labels.py\n",
+        "sparse-checkout-cone-mode": False,
+    }
+    for command in ("settings", "after"):
+        runs = [
+            (index, step["run"])
+            for index, step in enumerate(steps)
+            if str(step.get("run", "")).endswith(f'release_labels.py" {command}')
+        ]
+        assert len(runs) == 1, f"one release module run for {command}"
+        run_index, run = runs[0]
+        assert checkout_index < run_index, "checkout precedes every module run"
+        assert run == (
+            f'python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py" {command}'
+        )
+
+
+def test_release_module_checkout():
+    check_release_checkout(TRAIN)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        pytest.param("            tools/release_labels.py", "            tools/missing.py", id="a"),
+        pytest.param("ref: ${{ job.workflow_sha }}", "ref: main", id="b"),
+        pytest.param(
+            "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py",
+            "$RUNNER_TEMP/release_labels.py",
+            id="c",
+        ),
+    ],
+)
+def test_planted_release_module_checkout_is_refused(tmp_path, old, new):
+    before, separator, release = TRAIN.read_text(encoding="utf-8").partition("\n  release:\n")
+    assert separator and old in release
+    path = tmp_path / TRAIN.name
+    path.write_text(before + separator + release.replace(old, new, 1), encoding="utf-8")
+    with pytest.raises(AssertionError):
+        check_release_checkout(path)
 
 
 def release_pull(number: int = 10, labels: tuple = (PENDING,), **fields) -> dict:
