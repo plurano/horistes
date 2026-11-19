@@ -101,6 +101,7 @@
 # `autorelease: pending` is not updated by the release job (decision record
 # 0049). At most 3 release
 # jobs run at once (`release_max_parallel`, a whole number from 1 to 3, default 3).
+# `release_runner` sets the runner label for the release jobs; empty means `runner`.
 #
 # CREDENTIAL. One repository holds the app's private key, as the secret
 # MERGE_TRAIN_APP_KEY of its environment `merge-train`; the environment lets
@@ -184,6 +185,11 @@ on:
         description: >-
           Repositories, owner/name separated by spaces, where the train opens
           and pushes no release pull request.
+        type: string
+        required: false
+        default: ""
+      release_runner:
+        description: Label of the runner for the release fan-out jobs; empty means runner.
         type: string
         required: false
         default: ""
@@ -1095,7 +1101,7 @@ jobs:
     if: >-
       ${{ !cancelled() && inputs.switch == 'on'
       && needs.train.outputs.releases != '' && needs.train.outputs.releases != '[]' }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.release_runner || inputs.runner }}
     environment: merge-train
     timeout-minutes: 15
     permissions: {}

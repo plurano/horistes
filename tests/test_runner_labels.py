@@ -16,6 +16,7 @@ import sys
 
 import pytest
 from conftest import ROOT
+from expressions import evaluate
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
@@ -188,8 +189,12 @@ def test_every_floating_label_of_one_value_is_a_finding(tree):
     ]
 
 
-def test_label_taken_from_an_expression_is_counted_and_its_values_are_read(tree):
-    done = run(tree, planted(RUNS_ON, "    runs-on: ${{ inputs.runner }}\n"))
+@pytest.mark.parametrize(
+    "expression",
+    ["${{ inputs.runner }}", "${{ inputs.release_runner || inputs.runner }}"],
+)
+def test_label_taken_from_an_expression_is_counted_and_its_values_are_read(tree, expression):
+    done = run(tree, planted(RUNS_ON, f"    runs-on: {expression}\n"))
     assert done.returncode == 0, done.stderr
     assert "1 job(s) with a `runs-on`" in done.stdout
     assert "1 of them take(s) the label from an expression" in done.stdout
@@ -364,3 +369,155 @@ def test_caller_without_runner_input_relies_on_pinned_workflow_default(
         "default` of input `runner` of workflow_call: `ubuntu-latest` is a floating runner label"
         in done.stderr
     )
+
+
+MERGE_TRAIN_WORKFLOW = ".github/workflows/merge-train.yml"
+TRAIN_RUNNER_EXPR = "${{ inputs.runner }}"
+RELEASE_RUNNER_EXPR = "${{ inputs.release_runner || inputs.runner }}"
+
+
+def merge_train_runner_findings(doc: dict) -> list[str]:
+    """What breaks the train and release runner expressions or inputs in merge-train.yml."""
+    found = []
+    inputs = doc.get("on", {}).get("workflow_call", {}).get("inputs", {})
+    runner = inputs.get("runner") or {}
+    if runner.get("type") != "string" or runner.get("required") is not True or "default" in runner:
+        found.append("workflow_call input runner must be a required string without a default")
+    release_runner = inputs.get("release_runner") or {}
+    if (
+        release_runner.get("type") != "string"
+        or release_runner.get("required") is True
+        or release_runner.get("default") != ""
+    ):
+        found.append(
+            "workflow_call input release_runner must be an optional string with default ''"
+        )
+    jobs = doc.get("jobs") or {}
+    train_runs_on = (jobs.get("train") or {}).get("runs-on")
+    if train_runs_on != TRAIN_RUNNER_EXPR:
+        found.append(f"train job runs-on is {train_runs_on!r}, not {TRAIN_RUNNER_EXPR!r}")
+    release_runs_on = (jobs.get("release") or {}).get("runs-on")
+    if release_runs_on != RELEASE_RUNNER_EXPR:
+        found.append(f"release job runs-on is {release_runs_on!r}, not {RELEASE_RUNNER_EXPR!r}")
+    return found
+
+
+def test_merge_train_release_job_uses_release_runner_with_runner_fallback():
+    """The release job uses release_runner when set and falls back to runner when empty."""
+    doc = ciwf.load(ROOT / MERGE_TRAIN_WORKFLOW)
+    assert merge_train_runner_findings(doc) == []
+    inputs = doc["on"]["workflow_call"]["inputs"]
+    default_release_runner = inputs["release_runner"]["default"]
+    assert default_release_runner == ""
+    release_runs_on = doc["jobs"]["release"]["runs-on"]
+    assert (
+        evaluate(
+            release_runs_on,
+            {"runner": "arc-cauda-train", "release_runner": default_release_runner},
+        )
+        == "arc-cauda-train"
+    )
+    assert (
+        evaluate(
+            release_runs_on,
+            {"runner": "arc-cauda-train", "release_runner": "arc-cauda"},
+        )
+        == "arc-cauda"
+    )
+
+
+def test_merge_train_train_job_uses_only_inputs_runner():
+    """The train job uses only inputs.runner, even when release_runner is set."""
+    doc = ciwf.load(ROOT / MERGE_TRAIN_WORKFLOW)
+    train_runs_on = doc["jobs"]["train"]["runs-on"]
+    assert train_runs_on == TRAIN_RUNNER_EXPR
+    assert (
+        evaluate(
+            train_runs_on,
+            {"runner": "arc-cauda-train", "release_runner": "arc-cauda"},
+        )
+        == "arc-cauda-train"
+    )
+    doc["jobs"]["train"]["runs-on"] = RELEASE_RUNNER_EXPR
+    assert merge_train_runner_findings(doc) == [
+        f"train job runs-on is {RELEASE_RUNNER_EXPR!r}, not {TRAIN_RUNNER_EXPR!r}"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutator", "finding"),
+    [
+        (
+            lambda doc: doc["jobs"]["release"].update({"runs-on": "${{ inputs.release_runner }}"}),
+            (
+                "release job runs-on is '${{ inputs.release_runner }}', "
+                f"not {RELEASE_RUNNER_EXPR!r}"
+            ),
+        ),
+        (
+            lambda doc: doc["jobs"]["release"].update({"runs-on": TRAIN_RUNNER_EXPR}),
+            f"release job runs-on is {TRAIN_RUNNER_EXPR!r}, not {RELEASE_RUNNER_EXPR!r}",
+        ),
+        (
+            lambda doc: doc["jobs"]["train"].update({"runs-on": "${{ inputs.release_runner }}"}),
+            f"train job runs-on is '${{{{ inputs.release_runner }}}}', not {TRAIN_RUNNER_EXPR!r}",
+        ),
+        (
+            lambda doc: doc["on"]["workflow_call"]["inputs"]["release_runner"].update(
+                {"required": True}
+            ),
+            "workflow_call input release_runner must be an optional string with default ''",
+        ),
+        (
+            lambda doc: doc["on"]["workflow_call"]["inputs"].pop("release_runner"),
+            "workflow_call input release_runner must be an optional string with default ''",
+        ),
+    ],
+    ids=[
+        "release-loses-fallback-to-runner",
+        "release-ignores-release-runner",
+        "train-uses-release-runner",
+        "release-runner-made-required",
+        "release-runner-removed",
+    ],
+)
+def test_merge_train_runner_planted_mutants_fail(mutator, finding: str):
+    """Planted mutations on merge-train runner inputs or runs-on expressions fail."""
+    doc = ciwf.load(ROOT / MERGE_TRAIN_WORKFLOW)
+    mutator(doc)
+    assert merge_train_runner_findings(doc) == [finding]
+
+
+def test_merge_train_caller_with_and_without_release_runner(tree):
+    """An existing caller omitting release_runner and one passing it pass; floating fails."""
+    tmpl = (ROOT / "templates/callers/merge-train.yml.tmpl").read_text(encoding="utf-8")
+    caller = render.render(tmpl, render.SAMPLE, "merge-train.yml.tmpl")
+    workflow_text = (ROOT / MERGE_TRAIN_WORKFLOW).read_text(encoding="utf-8")
+    tree.write(
+        {
+            MERGE_TRAIN_WORKFLOW: workflow_text,
+            ".github/workflows/caller-merge-train.yml": caller,
+        }
+    )
+    done = tree.tool("pins.py", "runners")
+    assert done.returncode == 0, done.stderr
+
+    with_release_runner = caller.replace(
+        "      runner: ubuntu-26.04\n",
+        "      runner: arc-cauda-train\n      release_runner: ubuntu-26.04\n",
+    )
+    assert with_release_runner != caller
+    tree.write({".github/workflows/caller-merge-train.yml": with_release_runner})
+    done = tree.tool("pins.py", "runners")
+    assert done.returncode == 0, done.stderr
+
+    planted_caller = with_release_runner.replace(
+        "release_runner: ubuntu-26.04", "release_runner: ubuntu-latest"
+    )
+    tree.write({".github/workflows/caller-merge-train.yml": planted_caller})
+    done = tree.tool("pins.py", "runners")
+    assert done.returncode == 1, done.stdout
+    assert (
+        "`with` of job `train`: `ubuntu-latest` is a floating runner label; "
+        "name the release it stands for"
+    ) in done.stderr

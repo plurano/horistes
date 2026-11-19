@@ -159,6 +159,11 @@
           "required": false,
           "type": "string"
         },
+        "release_runner": {
+          "default": "",
+          "required": false,
+          "type": "string"
+        },
         "required_status": {
           "default": "",
           "required": false,
