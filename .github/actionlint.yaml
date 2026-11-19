@@ -23,6 +23,9 @@ paths:
   .github/workflows/secret-scan.yml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20 category D: lacks job.workflow_*
+  .github/workflows/sign-off.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20 category D: lacks job.workflow_*
   .github/workflows/workflow-check.yml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20 category D: lacks job.workflow_*

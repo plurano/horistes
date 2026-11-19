@@ -677,8 +677,9 @@ def test_adr92_nodes_malformed(raw):
 def test_adr92_reader_complexity_bounds():
     """Reader functions obey the local line ceiling and McCabe 10 without new dependencies."""
     import ast
-    import subprocess
-    import sys
+
+    from conftest import Tree
+    from test_lint import ruff
 
     reader = adr92_reader()
     source = Path(reader.__file__)
@@ -688,22 +689,14 @@ def test_adr92_reader_complexity_bounds():
         if isinstance(node, ast.FunctionDef)
     ]
     assert all(node.end_lineno - node.lineno + 1 <= 60 for node in functions[:100])
-    done = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "ruff",
-            "check",
-            "--select",
-            "C901",
-            "--config",
-            "lint.mccabe.max-complexity=10",
-            str(source),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
+    done = ruff(
+        Tree(source.parent),
+        "check",
+        "--select",
+        "C901",
+        "--config",
+        "lint.mccabe.max-complexity=10",
+        str(source),
     )
     assert done.returncode == 0, done.stdout + done.stderr
 

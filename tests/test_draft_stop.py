@@ -39,8 +39,69 @@ COPIES = [
     (".github/workflows/licence.yml", "reuse"),
     (".github/workflows/pins.yml", "pins"),
     (".github/workflows/secret-scan.yml", "scan"),
+    (".github/workflows/sign-off.yml", "sign-off"),
     (".github/workflows/workflow-check.yml", "check"),
 ]
+
+
+def test_sign_off_workflow_judges_merge_parents_after_self_test():
+    doc = ciwf.load(ROOT / ".github/workflows/sign-off.yml")
+    assert doc["name"] == "Sign-off"
+    assert doc["permissions"] == {}
+    assert doc["on"]["workflow_call"]["inputs"]["runner"]["default"] == "ubuntu-26.04"
+    job = doc["jobs"]["sign-off"]
+    assert job["name"] == "Sign-off"
+    assert job["permissions"] == {"contents": "read"}
+    assert job["timeout-minutes"] == 10
+    steps = job["steps"]
+    caller, source = steps[1:3]
+    assert caller["with"] == {"persist-credentials": False, "fetch-depth": 0}
+    assert source["with"]["persist-credentials"] is False
+    assert source["with"]["repository"] == "${{ job.workflow_repository }}"
+    assert source["with"]["ref"] == "${{ job.workflow_sha }}"
+    assert source["with"]["path"] == "sign-off-source"
+    assert source["with"]["sparse-checkout"].strip() == "tools/commit_message.py"
+    assert source["with"]["sparse-checkout-cone-mode"] is False
+    assert steps[3]["run"] == "python3 -I -B sign-off-source/tools/commit_message.py self-test"
+    judge = steps[4]
+    assert judge["env"] == {
+        "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+    }
+    assert judge["if"] == (
+        "github.event_name == 'pull_request' && github.event.pull_request.draft != true"
+    )
+    assert judge["run"] == (
+        "python3 -I -B sign-off-source/tools/commit_message.py "
+        'range --merge HEAD --expect-head "$HEAD_SHA"'
+    )
+    assert steps[5]["if"] == "github.event_name != 'pull_request'"
+    assert "::notice::" in steps[5]["run"]
+    assert all("${{" not in step.get("run", "") for step in steps)
+
+
+def test_sign_off_caller_reports_required_check_even_on_draft():
+    doc = ciwf.load(ROOT / ".github/workflows/sign-off-check.yml")
+    assert set(doc["on"]) == {"pull_request", "merge_group"}
+    assert doc["on"]["pull_request"]["types"] == [
+        "opened",
+        "synchronize",
+        "reopened",
+        "edited",
+        "ready_for_review",
+        "converted_to_draft",
+    ]
+    call, result = doc["jobs"]["sign-off"], doc["jobs"]["result"]
+    assert call["name"] == result["name"] == "Sign-off"
+    assert call["uses"] == "./.github/workflows/sign-off.yml"
+    assert call["if"] == (
+        "github.event_name != 'pull_request' || github.event.pull_request.draft == false"
+    )
+    assert result["needs"] == "sign-off"
+    assert result["if"] == "always()"
+    assert result["steps"][0]["if"] == "needs.sign-off.result == 'skipped'"
+    assert result["steps"][1]["name"] == "Fail unless the sign-off check passed"
+    assert result["steps"][1]["if"] == "needs.sign-off.result != 'success'"
+    assert result["steps"][1]["run"].strip().endswith("exit 1")
 
 
 def _draft_steps(job: object, where: str) -> list[dict]:
