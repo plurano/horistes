@@ -16,6 +16,7 @@ import base64
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ from typing import cast
 from urllib.parse import unquote, urlsplit
 
 import pytest
+import yaml
 from conftest import CHECKOUT, ROOT
 
 sys.path.insert(0, str(ROOT / "tools"))
@@ -42,9 +44,9 @@ MOVED = [("post_label", 10, [TAGGED]), ("delete_label", 10, PENDING)]
 HOLD = "hold,do-not-merge,planted"
 
 
-def module() -> str:
+def module(name: str = "release_labels") -> str:
     """The release labels module checked out from the workflow's own commit."""
-    return (ROOT / "tools/release_labels.py").read_text(encoding="utf-8")
+    return (ROOT / "tools" / f"{name}.py").read_text(encoding="utf-8")
 
 
 def check_release_checkout(path: Path) -> None:
@@ -65,9 +67,11 @@ def check_release_checkout(path: Path) -> None:
         "ref": "${{ job.workflow_sha }}",
         "path": "merge-train-source",
         "persist-credentials": False,
-        "sparse-checkout": "tools/release_labels.py\n",
+        "sparse-checkout": "tools/release_labels.py\ntools/release_workflows.py\n",
         "sparse-checkout-cone-mode": False,
     }
+    positions = {}
+    release_index = next(index for index, step in enumerate(steps) if step.get("id") == "release")
     for command in ("settings", "after"):
         runs = [
             (index, step["run"])
@@ -76,10 +80,14 @@ def check_release_checkout(path: Path) -> None:
         ]
         assert len(runs) == 1, f"one release module run for {command}"
         run_index, run = runs[0]
-        assert checkout_index < run_index, "checkout precedes every module run"
+        positions[command] = run_index
         assert run == (
             f'python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py" {command}'
         )
+
+    assert checkout_index < positions["settings"] < release_index < positions["after"], (
+        "checkout < settings < release < after"
+    )
 
 
 def test_release_module_checkout():
@@ -104,6 +112,23 @@ def test_planted_release_module_checkout_is_refused(tmp_path, old, new):
     path = tmp_path / TRAIN.name
     path.write_text(before + separator + release.replace(old, new, 1), encoding="utf-8")
     with pytest.raises(AssertionError):
+        check_release_checkout(path)
+
+
+def test_planted_release_after_before_release_is_refused(tmp_path):
+    workflow = ciwf.load(TRAIN)
+    steps = workflow["jobs"]["release"]["steps"]
+    after_index = next(
+        index
+        for index, step in enumerate(steps)
+        if str(step.get("run", "")).endswith('release_labels.py" after')
+    )
+    after_step = steps.pop(after_index)
+    release_index = next(index for index, step in enumerate(steps) if step.get("id") == "release")
+    steps.insert(release_index, after_step)
+    path = tmp_path / TRAIN.name
+    path.write_text(yaml.safe_dump(workflow), encoding="utf-8")
+    with pytest.raises(AssertionError, match="checkout < settings < release < after"):
         check_release_checkout(path)
 
 
@@ -140,6 +165,8 @@ class Forge:
         self.cut: list[int] = []
         self.short: list[int] = []
         self.url = ""
+        self.requests: list[str] = []
+        self.redirect: str | None = None
 
     def contents(self, _rest: str) -> tuple[int, object]:
         if self.config is None:
@@ -255,6 +282,14 @@ class Handler(BaseHTTPRequestHandler):
         return cast(ForgeServer, self.server).forge
 
     def do_GET(self) -> None:
+        self.forge.requests.append(self.path)
+        if self.forge.redirect is not None:
+            target, self.forge.redirect = self.forge.redirect, None
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.answer(*self.forge.get(urlsplit(self.path).path))
 
     def do_POST(self) -> None:
@@ -299,13 +334,22 @@ def forge() -> Iterator[Forge]:
 
 
 def run(
-    tmp_path: Path, command: str, env: dict, source: str | None = None
+    tmp_path: Path,
+    command: str,
+    env: dict,
+    source: str | None = None,
+    workflow_source: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run the checked-out module, or a temporary file containing planted source."""
     path = ROOT / "tools/release_labels.py"
-    if source is not None and source != module():
+    planted = {"release_labels": source, "release_workflows": workflow_source}
+    if any(text is not None and text != module(name) for name, text in planted.items()):
+        for name, text in planted.items():
+            target = tmp_path / f"{name}.py"
+            shutil.copyfile(ROOT / "tools" / target.name, target)
+            if text is not None:
+                target.write_text(text, encoding="utf-8")
         path = tmp_path / "release_labels.py"
-        path.write_text(source, encoding="utf-8")
     # A runner sets GITHUB_GRAPHQL_URL to the real forge; only the stand-in may answer.
     host = {key: value for key, value in os.environ.items() if key != "GITHUB_GRAPHQL_URL"}
     return subprocess.run(
@@ -320,7 +364,10 @@ def run(
 
 
 def settings(
-    tmp_path: Path, forge: Forge, source: str | None = None
+    tmp_path: Path,
+    forge: Forge,
+    source: str | None = None,
+    workflow_source: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     """The settings command and the outputs it wrote."""
     out = tmp_path / "output"
@@ -331,7 +378,7 @@ def settings(
         "GITHUB_OUTPUT": str(out),
         "HOLD_LABELS": HOLD,
     }
-    done = run(tmp_path, "settings", env, source)
+    done = run(tmp_path, "settings", env, source, workflow_source)
     return done, out.read_text(encoding="utf-8")
 
 
@@ -342,21 +389,109 @@ def after(
     outcome: str,
     pending: str = ONE,
     source: str | None = None,
+    workflow_source: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """The command of the step after the release step."""
     env = {"GITHUB_API_URL": forge.url, "SKIP": skip, "OUTCOME": outcome, "PENDING": pending}
-    return run(tmp_path, "after", env, source)
+    return run(tmp_path, "after", env, source, workflow_source)
 
 
 def test_module_passes_ruff():
-    path = ROOT / "tools/release_labels.py"
+    paths = [ROOT / "tools" / f"{name}.py" for name in ("release_labels", "release_workflows")]
     ruff = ROOT / ".venv/bin/ruff"
     command = [str(ruff)] if ruff.exists() else [sys.executable, "-m", "ruff"]
     for args in (["check"], ["format", "--check"]):
         done = subprocess.run(
-            [*command, *args, str(path)], capture_output=True, text=True, check=False, timeout=60
+            [*command, *args, *map(str, paths)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
         )
         assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_settings_refuses_file_url_before_read(tmp_path, forge):
+    canary_root = tmp_path / "canary"
+    canary = canary_root / "repos/fleet/app/contents/release-please-config.json"
+    canary.parent.mkdir(parents=True)
+    content = "PLANTED_FILE_CANARY_MUST_NOT_APPEAR"
+    canary.write_text(content, encoding="utf-8")
+    output = tmp_path / "output"
+    output.write_text("", encoding="utf-8")
+    done = run(
+        tmp_path,
+        "settings",
+        {
+            "GITHUB_API_URL": canary_root.as_uri(),
+            "GITHUB_GRAPHQL_URL": f"{forge.url}/graphql",
+            "GITHUB_OUTPUT": str(output),
+        },
+    )
+    assert done.returncode != 0
+    assert "call URL refused: HTTPS or loopback HTTP required" in done.stderr
+    assert content not in done.stdout + done.stderr + output.read_text(encoding="utf-8")
+    assert forge.requests == []
+
+
+def test_settings_refuses_ftp_url_before_connection(tmp_path, forge):
+    forge.url = "ftp://127.0.0.1:1/"
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode != 0
+    assert "call URL refused: HTTPS or loopback HTTP required" in done.stderr
+    assert outputs == ""
+    assert forge.requests == []
+
+
+@pytest.mark.parametrize(
+    ("url", "allowed"),
+    [
+        ("https://api.github.com/x", True),
+        ("http://127.0.0.1:5/x", True),
+        ("http://localhost/x", True),
+        ("http://[::1]/x", True),
+        ("http://api.github.com/x", False),
+        ("file:///etc/hostname", False),
+        ("ftp://127.0.0.1/x", False),
+        ("data:,x", False),
+        ("HTTPS://", False),
+        ("HTTPS://api.github.com/x", False),
+        ("http://[invalid/x", False),
+    ],
+)
+def test_release_url_allow_list(url, allowed):
+    """Judge URLs in process without opening a connection or reading the named paths."""
+    spec = importlib.util.spec_from_file_location(
+        "release_labels", ROOT / "tools/release_labels.py"
+    )
+    assert spec is not None and spec.loader is not None
+    labels = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(labels)
+    assert labels.allowed_url(url) is allowed
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["ftp://127.0.0.1:1/x", "data:,x", "file:///unused-canary", "HTTP://127.0.0.1:1/x"],
+)
+def test_settings_refuses_redirect_url(tmp_path, forge, target):
+    forge.redirect = target
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode != 0
+    assert "redirect URL refused: HTTPS or loopback HTTP required" in done.stderr
+    assert outputs == ""
+    assert forge.requests == ["/repos/fleet/app/contents/release-please-config.json"]
+
+
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_settings_follows_allowed_redirect(tmp_path, forge, absolute):
+    forge.config = {}
+    path = "/repos/fleet/app/contents/release-please-config.json"
+    forge.redirect = f"{forge.url}{path}" if absolute else "release-please-config.json"
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    assert forge.requests[:2] == [path, path]
 
 
 def test_skipped_release_moves_the_label_and_writes_no_release(tmp_path, forge):
@@ -836,19 +971,19 @@ def test_planted_own_release_workflow_skips_release(tmp_path, forge, mutated):
 @pytest.mark.parametrize("mutated", [False, True])
 def test_planted_reusable_release_workflow_skips_release(tmp_path, forge, mutated):
     """A repository running reusable release-please workflow sets skip=true."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             "any(target.startswith(w) for w in KNOWN_RELEASE_WORKFLOWS)",
             "False",
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": PLANTED_REUSABLE_WORKFLOW,
         "release.yml": PLANTED_PUBLISH_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "false" if mutated else "true"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -861,19 +996,19 @@ def test_planted_reusable_release_workflow_skips_release(tmp_path, forge, mutate
 @pytest.mark.parametrize("mutated", [False, True])
 def test_forwarded_config_expression_skips_release(tmp_path, forge, mutated):
     """A reusable call forwarding config_file via expression is not treated as custom."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             "if expr_open not in val:",
             "if True:",
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": FORWARDED_CONFIG_REUSABLE_WORKFLOW,
         "release.yml": PLANTED_PUBLISH_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "false" if mutated else "true"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -882,19 +1017,19 @@ def test_forwarded_config_expression_skips_release(tmp_path, forge, mutated):
 @pytest.mark.parametrize("mutated", [False, True])
 def test_embedded_expression_is_custom_config(tmp_path, forge, mutated):
     """An expression embedded in a literal path is treated as custom config."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             'stripped.startswith(expr_open) and stripped.endswith("}}")',
             "True",
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": EMBEDDED_EXPR_CONFIG_WORKFLOW,
         "release.yml": PLANTED_PUBLISH_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "true" if mutated else "false"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -903,19 +1038,19 @@ def test_embedded_expression_is_custom_config(tmp_path, forge, mutated):
 @pytest.mark.parametrize("mutated", [False, True])
 def test_literal_string_expression_is_custom_config(tmp_path, forge, mutated):
     """A literal string expression resolving to a non-default path is custom."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             "return lit.group(1) != default",
             "return False",
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": LITERAL_EXPR_CONFIG_WORKFLOW,
         "release.yml": PLANTED_PUBLISH_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "true" if mutated else "false"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -924,19 +1059,19 @@ def test_literal_string_expression_is_custom_config(tmp_path, forge, mutated):
 @pytest.mark.parametrize("mutated", [False, True])
 def test_block_scalar_forwarded_config_skips_release(tmp_path, forge, mutated):
     """A block-scalar forwarded config_file expression is not treated as custom."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             'if val in (">", ">-", "|", "|-"):',
             "if False:",
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": BLOCK_SCALAR_FORWARDED_CONFIG_WORKFLOW,
         "release.yml": PLANTED_PUBLISH_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "false" if mutated else "true"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -945,19 +1080,19 @@ def test_block_scalar_forwarded_config_skips_release(tmp_path, forge, mutated):
 @pytest.mark.parametrize("mutated", [False, True])
 def test_block_scalar_custom_config_is_detected(tmp_path, forge, mutated):
     """A block-scalar config_file with a custom literal path is treated as custom."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             "if in_with:",
             "if False:",
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": BLOCK_SCALAR_CUSTOM_CONFIG_WORKFLOW,
         "release.yml": PLANTED_PUBLISH_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "true" if mutated else "false"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -966,19 +1101,19 @@ def test_block_scalar_custom_config_is_detected(tmp_path, forge, mutated):
 @pytest.mark.parametrize("mutated", [False, True])
 def test_block_scalar_default_then_runner_not_misclassified(tmp_path, forge, mutated):
     """A runner key after a block-scalar config_file is not mistaken for the config value."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             "if in_with:",
             "if False:",
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": BLOCK_SCALAR_DEFAULT_THEN_RUNNER_WORKFLOW,
         "release.yml": PLANTED_PUBLISH_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "false" if mutated else "true"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -1164,13 +1299,13 @@ jobs:
 def test_non_release_workflow_leaves_skip_false(
     tmp_path, forge, mutated, label, mutation, workflows
 ):
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(mutation[0], mutation[1])
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = workflows
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "true" if mutated else "false"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -1180,16 +1315,16 @@ def test_non_release_workflow_leaves_skip_false(
 @pytest.mark.parametrize("mutated", [False, True])
 def test_two_line_action_step_skips_release(tmp_path, forge, mutated):
     """The action named on a step's second line, under - name:, sets skip=true."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             'r"^(?:-\\s+)?uses:',
             'r"^-\\s+uses:',
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {"release-please.yml": TWO_LINE_ACTION_WORKFLOW}
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "false" if mutated else "true"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -1224,16 +1359,16 @@ jobs:
 @pytest.mark.parametrize("mutated", [False, True])
 def test_inline_mapping_trigger_skips_release(tmp_path, forge, mutated):
     """An inline on: {push: ...} mapping counts as a push trigger."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             'ends = ":" if rest.startswith("{") else ",]"',
             'ends = ",]"',
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {"release-please.yml": INLINE_MAPPING_WORKFLOW}
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "false" if mutated else "true"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -1243,13 +1378,13 @@ def test_inline_mapping_trigger_skips_release(tmp_path, forge, mutated):
 @pytest.mark.parametrize("mutated", [False, True])
 def test_local_call_of_release_workflow_skips_release(tmp_path, forge, mutated):
     """A job-level call of a local workflow that runs release-please sets skip=true."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace(
             'if target.removeprefix(LOCAL_WORKFLOW_PREFIX) in flags["local"]:',
             "if False:",
         )
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": LOCAL_CALLER_WORKFLOW,
@@ -1257,7 +1392,7 @@ def test_local_call_of_release_workflow_skips_release(tmp_path, forge, mutated):
         "ci.yml": LOCAL_UNRELATED_CALLER_WORKFLOW,
         "test.yml": UNRELATED_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "false" if mutated else "true"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -1284,17 +1419,17 @@ jobs:
 @pytest.mark.parametrize("mutated", [False, True])
 def test_nested_local_call_of_release_workflow_skips_release(tmp_path, forge, mutated):
     """A push workflow reaching release-please through two local calls sets skip=true."""
-    source = module()
+    source = module("release_workflows")
     if mutated:
         source = source.replace("for _ in range(10):", "for _ in range(1):")
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {
         "release-automation.yml": NESTED_CALLER_WORKFLOW,
         "intermediate.yml": INTERMEDIATE_WORKFLOW,
         "release-please.yml": WORKFLOW_CALL_ONLY_WORKFLOW,
     }
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected_skip = "false" if mutated else "true"
     assert outputs == f"skip={expected_skip}\npending=[]\nfrozen=false\n"
@@ -1630,8 +1765,8 @@ def test_review_trigger_shapes(tmp_path, forge, trigger):
 @pytest.mark.parametrize("header", ["run: |", "run: |  # c", "run: >  # c"])
 def test_review_trigger_lines_hide_scalar_body(header):
     """Real scalar headers still hide event-like text after comment removal."""
-    path = ROOT / "tools/release_labels.py"
-    spec = importlib.util.spec_from_file_location("release_labels", path)
+    path = ROOT / "tools/release_workflows.py"
+    spec = importlib.util.spec_from_file_location("release_workflows", path)
     assert spec is not None and spec.loader is not None
     labels = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(labels)
@@ -1746,7 +1881,7 @@ def test_review_push_filter_mutations_flip_planted_oracle(
     tmp_path, forge, mutation, workflow, mutated
 ):
     """Removing each refusal flips a planted case away from its fixed oracle."""
-    source = module()
+    source = module("release_workflows")
     if mutation[0] == "return None if truncated else events":
         # Isolate the push guard from the new, independently tested on: window fallback.
         fallback = "return truncated\n\n\ndef workflow_has_allowed_trigger"
@@ -1755,10 +1890,10 @@ def test_review_push_filter_mutations_flip_planted_oracle(
     assert source.count(mutation[0]) == 1
     if mutated:
         source = source.replace(*mutation)
-        assert source != module()
+        assert source != module("release_workflows")
     forge.config = {}
     forge.workflows = {"release.yml": workflow}
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(tmp_path, forge, workflow_source=source)
     assert done.returncode == 0, done.stdout + done.stderr
     expected = "skip=true\npending=[]\nfrozen=false\n"
     if mutated:
@@ -1846,15 +1981,25 @@ def test_push_filter_mutations_flip_planted_oracle(
     tmp_path, forge, mutation, branch, filters, skip, mutated
 ):
     """Every mutation flips a specific release decision and fails the fixed-behavior oracle."""
-    source = module()
+    module_name = (
+        "release_labels"
+        if mutation[0] == "default_branch = read_default_branch(api_url, repo, token)"
+        else "release_workflows"
+    )
+    source = module(module_name)
     assert source.count(mutation[0]) == 1
     if mutated:
         source = source.replace(*mutation)
-        assert source != module()
+        assert source != module(module_name)
     forge.config = {}
     forge.default_branch = branch
     forge.workflows = {"release.yml": push_workflow(f"on:\n  push:\n    {filters}")}
-    done, outputs = settings(tmp_path, forge, source=source)
+    done, outputs = settings(
+        tmp_path,
+        forge,
+        source=source if module_name == "release_labels" else None,
+        workflow_source=source if module_name == "release_workflows" else None,
+    )
     assert done.returncode == 0, done.stdout + done.stderr
     expected = f"skip={str(skip).lower()}\npending=[]\nfrozen=false\n"
     if mutated:

@@ -400,7 +400,7 @@ def is_bot_dependency(pull, conf):
     if not isinstance(authors, dict):
         return False
     total, nodes = authors.get("totalCount"), authors.get("nodes")
-    if type(total) is not int or not 1 <= total <= BOT_COMMIT_READS:
+    if isinstance(total, bool) or not isinstance(total, int) or not 1 <= total <= BOT_COMMIT_READS:
         return False
     if not isinstance(nodes, list) or len(nodes) != total:
         return False

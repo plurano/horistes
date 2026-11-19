@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
-from review_state import MAX_COMMENTS, MAX_LINES, review_incomplete
+from review_state import MAX_COMMENTS, MAX_LINES, is_bot_dependency, review_incomplete
 
 FIXTURES = Path(__file__).parent / "fixtures/review-state"
 
@@ -764,3 +764,13 @@ def adr93_paused_cases():
 @pytest.mark.parametrize(("pr", "me", "expected"), adr93_paused_cases())
 def test_adr93_paused_notice(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
+
+
+def test_bot_dependency_count_rejects_boolean():
+    """A valid bot author isolates the count guard from malformed-author refusals."""
+    bot = {"login": "renovate[bot]", "__typename": "Bot"}
+    authors = {"totalCount": True, "nodes": [{"commit": {"author": {"user": bot}}}]}
+    pull = {"headRefName": "renovate/x", "author": bot, "authors": authors}
+    assert is_bot_dependency(pull, {"dependency": ("renovate/",)}) is False
+    authors["totalCount"] = 1
+    assert is_bot_dependency(pull, {"dependency": ("renovate/",)}) is True

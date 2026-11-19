@@ -29,13 +29,21 @@ changes should not require compacting that logic to fit a workflow step.
 ## Decision
 
 Move the heredoc body into
-[tools/release_labels.py](../../tools/release_labels.py), adding only its SPDX
+[tools/release_labels.py](../../tools/release_labels.py) and its workflow parser
+[tools/release_workflows.py](../../tools/release_workflows.py), each with an SPDX
 header. Replace the writing step with the same pinned checkout action used by
 the train sweep (ADR-0053). Read the workflow's repository and commit through
-the job context, retain no credentials, and sparsely check out only the module
+the job context, retain no credentials, and sparsely check out the two modules
 into `merge-train-source`, the directory name the train job uses, with cone
-mode disabled. The release job keeps its empty token permissions; its workflow
-repository is public.
+mode disabled. This narrow checkout requires Git 2.28 or later on the runner
+PATH: the pinned checkout action sets that minimum in
+[`src/git-command-manager.ts` lines 16 and 730–733](https://github.com/actions/checkout/blob/3d3c42e5aac5ba805825da76410c181273ba90b1/src/git-command-manager.ts#L730-L733).
+With an older Git, the manager error falls back to the REST API when LFS is off
+([`src/git-source-provider.ts` lines 383–390](https://github.com/actions/checkout/blob/3d3c42e5aac5ba805825da76410c181273ba90b1/src/git-source-provider.ts#L383-L390)),
+which downloads the whole repository archive and uses `tar` to extract it off
+Windows ([`src/github-api-helper.ts` lines 53–56](https://github.com/actions/checkout/blob/3d3c42e5aac5ba805825da76410c181273ba90b1/src/github-api-helper.ts#L53-L56)).
+The old heredoc needed neither Git nor `tar`. The release job keeps its empty
+token permissions; its workflow repository is public.
 
 Both the settings reader and the label mover run the module beneath
 `$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py`. Their arguments,
@@ -44,10 +52,17 @@ commit therefore runs that commit's labels module, as it does the train sweep.
 
 ## Consequences
 
-Behaviour stays unchanged: the original heredoc and the new file have equal
-ASTs, and the body beneath the SPDX header is byte-identical. The existing
-[release-label tests](../../tests/test_release_labels.py) run the checked-out
-file, so coverage measures it at 91.53%.
+The heredoc body first moved byte-identical beneath the SPDX header, with an
+equal AST. It is now split into two modules to stay below Codacy's
+file-size limit; parser bodies are unchanged apart from renaming a parse word.
+The URL allow-list is the one behaviour change: requests and redirect targets
+must use lower-case `https`, or lower-case `http` with host `127.0.0.1`,
+`localhost` or `::1`. Other HTTP hosts, `file`, `ftp`, `data`, upper-case schemes
+and URLs without a parseable host are refused before opening them. Initial calls
+and redirects have independent checks and distinct refusal diagnostics.
+The existing [release-label tests](../../tests/test_release_labels.py) run the
+checked-out files, so coverage measures `release_labels.py` at 90.83%
+and `release_workflows.py` at 92.79%.
 
 Release step 2 is a checkout, and the release job's largest remaining run step
 counts 3 conservative fields. The unchanged
@@ -60,11 +75,22 @@ fields. These are conservative counts, not a new engine audit result.
 [tests/test_release_labels.py](../../tests/test_release_labels.py) checks the
 checkout's action pin, workflow repository and commit, exact sparse list,
 destination, disabled credential persistence and cone mode, empty job
-permissions, and checkout ordering before both exact run commands. Three
-temporary workflow mutations remove the module from the sparse list, replace
-the workflow commit with a branch, or restore a temporary-directory run path;
-each is rejected. The checkout check also rejects the original inline workflow.
-The module's Ruff check remains in this test file.
+permissions, both exact run commands, and the order checkout < settings <
+release < after. Four temporary workflow mutations remove a module from the
+sparse list, replace the workflow commit with a branch, restore a
+temporary-directory run path, or move after before release; each is rejected.
+The checkout check also rejects the original inline workflow.
+The Ruff check covers both modules.
+
+`test_settings_refuses_file_url_before_read` plants a canary and checks the
+call refusal, no leaked content and no stand-in request.
+`test_settings_refuses_ftp_url_before_connection` rejects a non-allowed scheme
+on loopback; `test_release_url_allow_list` checks accepted and refused URLs
+without connecting. `test_settings_refuses_redirect_url` plants forbidden
+redirects, including loopback FTP, and checks the redirect refusal.
+`test_settings_follows_allowed_redirect` retains both relative and absolute
+redirects to the allowed stand-in.
+`test_planted_release_after_before_release_is_refused` rejects reordered steps.
 
 [tests/test_merge_train.py](../../tests/test_merge_train.py) still selects one
 settings step and one label-judging step by their existing filename suffixes.

@@ -978,8 +978,8 @@ jobs:
           permission-pull-requests: write
           permission-workflows: write
 
-      # The labels module lives in tools/release_labels.py at this workflow's
-      # own commit; this leaves room below the engine field cap (ADR-0053, ADR-0096).
+      # Both tools/release_labels.py and tools/release_workflows.py come from this
+      # workflow's own commit; modules leave room below the field cap (ADR-0053, ADR-0096).
       # The job's token has no permission; the repository is public, so this
       # sparse checkout needs none.
       - name: Check out the release labels module
@@ -991,6 +991,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             tools/release_labels.py
+            tools/release_workflows.py
           sparse-checkout-cone-mode: false
 
       - name: Read the release settings
