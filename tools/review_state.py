@@ -15,6 +15,8 @@ MAX_COMMITS = 100
 MAX_REVIEWS = 100
 MAX_CHECKS = 100
 MAX_LINES = 2000
+# Match the planning reader's character ceiling for bodies proving summary coverage.
+MAX_SUMMARY_CHARS = 65536
 # A markdown row needs only name, status, and explanation; bound hostile wide tables.
 MAX_CELLS = 32
 MAX_SNIPPET = 160
@@ -239,7 +241,11 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
 
 def _allowance_head_reviewed(body: str, head: str) -> bool:
     """Require exactly one reviewed range ending at the full head in an allowance summary."""
-    if not re.fullmatch(r"[0-9a-f]{40}", head) or len(body.splitlines()) > MAX_LINES:
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}", head)
+        or len(body) > MAX_SUMMARY_CHARS
+        or len(body.splitlines()) > MAX_LINES
+    ):
         return False
     ranges = list(REVIEWED_RANGE_RE.finditer(body))
     return len(ranges) == 1 and ranges[0].group(2).lower() == head
@@ -301,6 +307,8 @@ def _completed_check_reviewers(pr: dict, head: str) -> set[str]:
         ):
             continue
         suite = run.get("checkSuite")
+        if not _suite_on_head(suite, head):
+            continue
         app = suite.get("app") if isinstance(suite, dict) else None
         slug = (
             str(app.get("slug") or "").lower().removesuffix("[bot]")
@@ -310,6 +318,13 @@ def _completed_check_reviewers(pr: dict, head: str) -> set[str]:
         if slug in REVIEWER_BOTS:
             reviewers.add(slug)
     return reviewers
+
+
+def _suite_on_head(suite, head: str) -> bool:
+    """Require the run's own suite commit, independently of its rollup placement."""
+    commit = suite.get("commit") if isinstance(suite, dict) else None
+    oid = commit.get("oid") if isinstance(commit, dict) else None
+    return isinstance(oid, str) and oid.lower() == head
 
 
 def _non_allowance_notice(body: str) -> bool:
@@ -377,10 +392,17 @@ def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
     return _paused_head_reviewed(body, head) or (allowance and _allowance_head_reviewed(body, head))
 
 
+def _notice_read(body: str) -> tuple[str, bool]:
+    """Read a bounded line prefix and retain whether a notice body has an unread tail."""
+    lines = body.splitlines()
+    return "\n".join(lines[:MAX_LINES]), len(lines) > MAX_LINES
+
+
 def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> bool:
-    """Apply head coverage, reviewer scope, and instant ordering to one notice body."""
+    """Apply head coverage, reviewer scope, and ordering to notices in the read prefix."""
     body = str(comment.get("body") or "")
-    notices = list(LIMIT_NOTICE_RE.finditer(body))[:MAX_LINES]
+    prefix, _cut = _notice_read(body)
+    notices = list(LIMIT_NOTICE_RE.finditer(prefix))[:MAX_LINES]
     if not notices:
         return False
     ordinary, formal, completed = evidence
@@ -417,10 +439,14 @@ def review_incomplete(pr: dict, me: str = "") -> str:
         reverse=True,
     )
     for comment in comments[: MAX_COMMENTS + MAX_REVIEWS]:
-        if _login(comment).lower().removesuffix("[bot]") in answerers:
+        login = _login(comment)
+        if login.lower().removesuffix("[bot]") in answerers:
             continue
+        prefix, cut = _notice_read(str(comment.get("body") or ""))
+        if cut and LIMIT_NOTICE_RE.search(prefix):
+            return f"review incomplete: {login or 'reviewer'} notice body exceeds the read bound"
         if _notice_holds(comment, head, last_commit, evidence):
             when = _body_at(comment)
             stamp = when.isoformat().replace("+00:00", "Z") if when is not None else "head"
-            return f"review incomplete: {_login(comment) or 'reviewer'} limit reached at {stamp}"
+            return f"review incomplete: {login or 'reviewer'} limit reached at {stamp}"
     return ""

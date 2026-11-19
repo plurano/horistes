@@ -300,7 +300,7 @@ query($owner: String!, $name: String!, $number: Int!) {
         statusCheckRollup { contexts(first: 100) {
           totalCount pageInfo { hasNextPage }
           nodes { __typename ... on CheckRun {
-            status conclusion checkSuite { app { slug } }
+            status conclusion checkSuite { app { slug } commit { oid } }
           } }
         } }
       } } }

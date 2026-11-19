@@ -7868,9 +7868,9 @@ def test_row_with_other_hold_reason_skips_review_bodies_fetch(tmp_path):
 
 
 def test_review_bodies_query_fields(tmp_path, monkeypatch):
-    """REVIEW_BODIES queries reviews, comments, and commits with totalCount on each."""
+    """REVIEW_BODIES selects bounded bodies and each head check run's own suite commit."""
     merge_train = load_train(tmp_path, monkeypatch)
-    q = merge_train.REVIEW_BODIES
+    q = " ".join(merge_train.REVIEW_BODIES.split())
     for token in (
         "reviews(first: 100)",
         "databaseId",
@@ -7887,9 +7887,11 @@ def test_review_bodies_query_fields(tmp_path, monkeypatch):
         "nodes { body createdAt updatedAt url authorAssociation author { login __typename } }",
         "commits(first: 100)",
         "commit { message committedDate }",
+        "headCommit: commits(last: 1)",
+        "status conclusion checkSuite { app { slug } commit { oid } }",
     ):
-        assert token in q
-    assert q.count("totalCount") == 3
+        assert " ".join(token.split()) in q
+    assert q.count("totalCount") == 4
 
 
 def test_planted_code_scanning_failure_holds_clean_pull(tmp_path):

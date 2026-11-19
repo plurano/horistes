@@ -721,7 +721,7 @@ def completed_head_run(slug="coderabbitai", conclusion="SUCCESS", status="COMPLE
         "__typename": "CheckRun",
         "status": status,
         "conclusion": conclusion,
-        "checkSuite": {"app": {"slug": slug}},
+        "checkSuite": {"app": {"slug": slug}, "commit": {"oid": ADR92_HEAD}},
     }
 
 
@@ -1094,6 +1094,81 @@ def test_completed_head_query_contract():
         "headCommit: commits(last: 1) { nodes { commit { oid "
         "statusCheckRollup { contexts(first: 100) { totalCount pageInfo { hasNextPage } "
         "nodes { __typename ... on CheckRun { "
-        "status conclusion checkSuite { app { slug } }"
+        "status conclusion checkSuite { app { slug } commit { oid } }"
     ) in query
     assert "commits(first: 100) { totalCount nodes { commit { message committedDate } } }" in query
+
+
+@pytest.mark.parametrize(
+    ("oid", "other_app", "holds"),
+    [
+        pytest.param(ADR92_HEAD[:7] + "0" * 33, False, True, id="old-suite"),
+        pytest.param(ADR92_HEAD[:7], False, True, id="prefix-suite"),
+        pytest.param(ADR92_HEAD[:7] + "0" * 33, True, True, id="old-suite-other-green"),
+        pytest.param(ADR92_HEAD, False, False, id="exact-suite"),
+        pytest.param(ADR92_HEAD.upper(), False, False, id="uppercase-suite"),
+        pytest.param(None, False, True, id="missing-suite-commit"),
+        pytest.param("z" * 40, False, True, id="nonhex-suite"),
+        pytest.param(ADR92_HEAD + "0", False, True, id="long-suite"),
+        pytest.param(40, False, True, id="nonstring-suite-oid"),
+    ],
+)
+def test_completed_head_suite_commit(oid, other_app, holds):
+    """A successful rollup run must independently name the full head in its own suite."""
+    run = completed_head_run()
+    if oid is None:
+        run["checkSuite"].pop("commit")
+    else:
+        run["checkSuite"]["commit"]["oid"] = oid
+    runs = [run, completed_head_run("copilot")] if other_app else [run]
+    assert bool(review_incomplete(completed_head_pull(*runs))) is holds
+
+
+@pytest.mark.parametrize("commit", [None, {}, "not-a-commit", {"oid": None}])
+def test_completed_head_malformed_suite_commit(commit):
+    """Unreadable suite commit objects grant no completion evidence."""
+    run = completed_head_run()
+    run["checkSuite"]["commit"] = commit
+    assert review_incomplete(completed_head_pull(run))
+
+
+@pytest.mark.parametrize("size", [65536, 65537, 65748])
+def test_completed_head_summary_character_bound(size):
+    """Exactly 65536 characters qualify; larger summaries cannot clear an allowance."""
+    summary = completed_head_summary(
+        statement="No actionable comments were generated in the recent review."
+    )
+    body = summary + "\n" + "x" * (size - len(summary) - 1)
+    assert len(body) == size
+    assert bool(review_incomplete(completed_head_pull(summary=body))) is (size > 65536)
+
+
+@pytest.mark.parametrize("kind", ["repeated", "first-line", "ordinary", "last-line-at-bound"])
+def test_notice_body_line_bound(kind):
+    """A cut notice body holds by name; ordinary bodies and the exact bound retain policy."""
+    notice = "0 remain after this review"
+    lines = ["Ordinary review prose."] * (MAX_LINES + 1)
+    if kind == "repeated":
+        lines = [notice] * (MAX_LINES + 1)
+    elif kind == "first-line":
+        lines[0] = notice
+    elif kind == "last-line-at-bound":
+        lines = lines[:MAX_LINES]
+        lines[-1] = notice
+    pr = adr92_pull(adr92_comment("\n".join(lines)))
+    reason = review_incomplete(pr)
+    if kind == "ordinary":
+        assert reason == ""
+    elif kind == "last-line-at-bound":
+        assert reason.startswith("review incomplete: coderabbitai limit reached at ")
+    else:
+        assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
+
+
+def test_notice_body_cut_cannot_be_cleared_by_head_check():
+    """A head success cannot clear a notice whose unread tail could contradict coverage."""
+    pr = completed_head_pull(completed_head_run())
+    pr["comments"]["nodes"][0]["body"] += "\nOrdinary prose." * MAX_LINES
+    assert review_incomplete(pr) == (
+        "review incomplete: coderabbitai notice body exceeds the read bound"
+    )
