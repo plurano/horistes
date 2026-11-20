@@ -42,6 +42,7 @@ from train_rules import (
     check_release_off,
     check_release_parallel,
     check_required_status,
+    check_required_status_creators,
     dependency_hold_target,
     drifted,
     has_red_code_scanning,
@@ -618,6 +619,9 @@ def settings(env):
         "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
         "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
         "required_status": required_status,
+        "required_status_creators": check_required_status_creators(
+            env.get("TRAIN_REQUIRED_STATUS_CREATORS", ""), InvalidSettingError
+        ),
         "review_bots": check_review_bots(env.get("TRAIN_REVIEW_BOTS", "")),
         "session_authors": frozenset(
             name.strip() for name in env.get("TRAIN_SESSION_AUTHORS", "").split(",") if name.strip()

@@ -169,6 +169,11 @@
           "required": false,
           "type": "string"
         },
+        "required_status_creators": {
+          "default": "",
+          "required": false,
+          "type": "string"
+        },
         "review_bots": {
           "default": "",
           "required": false,

@@ -63,6 +63,10 @@
 #   held from landing, an armed pull request held by it is disarmed and a
 #   queued one is dequeued (decision record 0076). While the check is active,
 #   the train never arms auto-merge. An empty input turns the check off.
+#   Set `required_status_creators` to a comma-separated list of account logins
+#   to require the status from one of them (decision record 0097). With a list,
+#   a missing or unlisted creator holds the pull request. The default empty
+#   list accepts any creator.
 # - After that write, it closes the open issues that the pull requests it
 #   merged in the last 7 days name as closed (`Closes #N` and the forge's
 #   other closing forms): the forge leaves them open when the app merges, and
@@ -221,6 +225,13 @@ on:
         type: string
         required: false
         default: ""
+      required_status_creators:
+        description: >-
+          Account logins allowed to create the required status, comma-separated.
+          Include [bot] for app bots. Empty accepts any creator.
+        type: string
+        required: false
+        default: ""
     secrets:
       app_private_key:
         description: >-
@@ -285,6 +296,9 @@ jobs:
           STILL_STOPPED = "stopped at the draft step, a refresh started no run: a person pushes"
           REQUIRED_STATUS_NAME = re.compile(
               r"^[A-Za-z0-9](?:[A-Za-z0-9._/: -]{0,98}[A-Za-z0-9._/:-])?$"
+          )
+          STATUS_CREATOR_LOGIN = re.compile(
+              r"(?!.*--)[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?"
           )
 
 
@@ -436,9 +450,9 @@ jobs:
 
 
           def required_status_hold(pull, conf):
-              """Why the required commit status holds the pull request, or None (decision record 0076).
+              """Why the required commit status holds the pull request, or None.
 
-              Absent status, absent context or a state other than SUCCESS holds.
+              Require the context, an allowed creator when configured, and SUCCESS.
               """
               name = conf.get("required_status") or ""
               if not name:
@@ -449,6 +463,12 @@ jobs:
               ctx = status.get("context")
               if not ctx or not ctx.get("state"):
                   return f"status {name} absent: held"
+              creators = conf.get("required_status_creators")
+              if creators:
+                  login = (ctx.get("creator") or {}).get("login") or ""
+                  if login.lower() not in creators:
+                      creator = f"{login} not allowed" if login else "missing"
+                      return f"status {name} absent (creator {creator}): held"
               state = ctx["state"]
               if state != "SUCCESS":
                   return f"status {name} {state.lower()}: held"
@@ -805,6 +825,18 @@ jobs:
               return name
 
 
+          def check_required_status_creators(raw, error_cls=ValueError):
+              """Account logins allowed to create the required status, case-insensitive."""
+              logins = set()
+              if raw:
+                  for entry in raw.split(","):
+                      login = entry.strip(" ")
+                      if len(login) > 39 or not STATUS_CREATOR_LOGIN.fullmatch(login):
+                          raise error_cls(f"required_status_creators has invalid login {entry!r}")
+                      logins.add(login.lower())
+              return frozenset(logins)
+
+
           QUERY = """
           query($owner: String!, $name: String!, $after: String) {
             repository(owner: $owner, name: $name) {
@@ -874,7 +906,7 @@ jobs:
           ).replace(
               "signature { wasSignedByGitHub }",
               "signature { wasSignedByGitHub }\n"
-              "                        status { context(name: $status) { state } }",
+              "                        status { context(name: $status) { state creator { login } } }",
               1,
           )
 
@@ -933,6 +965,7 @@ jobs:
           TRAIN_SESSION_AUTHORS: ${{ inputs.session_authors }}
           TRAIN_SESSION_HOLD_HOURS: ${{ inputs.session_hold_hours }}
           TRAIN_REQUIRED_STATUS: ${{ inputs.required_status }}
+          TRAIN_REQUIRED_STATUS_CREATORS: ${{ inputs.required_status_creators }}
         run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/merge_train.py"
 
   release:

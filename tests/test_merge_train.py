@@ -711,15 +711,22 @@ class Forge:
             state = matches[0] if matches else "CLEAN"
         return {"data": {"repository": {"pullRequest": {"mergeStateStatus": state}}}}
 
-    def _resolve_status(self, raw: dict | None, name: str | None) -> dict | None:
-        """The head status as a lookup by context name returns it: a state or a null context."""
+    def _resolve_status(
+        self, raw: dict | None, name: str | None, selects_creator: bool
+    ) -> dict | None:
+        """The head status as a lookup by context name returns it."""
         if raw is None:
             return None
         if "context" in raw:
             return raw
         if "contexts" in raw:
             matching = [c for c in raw["contexts"] if c.get("context") == name]
-            return {"context": {"state": matching[0]["state"]}} if matching else {"context": None}
+            if not matching:
+                return {"context": None}
+            context = {"state": matching[0]["state"]}
+            if selects_creator and "creator" in matching[0]:
+                context["creator"] = matching[0]["creator"]
+            return {"context": context}
         return None
 
     def _extract_page_nodes(
@@ -727,6 +734,7 @@ class Forge:
     ) -> list[dict]:
         """One page of pull requests, the head status resolved by name where the query asks."""
         selects_status = bool(re.search(r"\bstatus\s*\{", query))
+        selects_creator = bool(re.search(r"\bcreator\s*\{\s*login\s*\}", query))
         status_name = variables.get("status")
         page_nodes = []
         for p in nodes[start : min(start + size, len(nodes))]:
@@ -739,7 +747,7 @@ class Forge:
                         commit_copy = dict(ln["commit"])
                         if selects_status:
                             commit_copy["status"] = self._resolve_status(
-                                commit_copy.get("status"), status_name
+                                commit_copy.get("status"), status_name, selects_creator
                             )
                         else:
                             commit_copy.pop("status", None)
@@ -1237,8 +1245,8 @@ def updated(number: int) -> tuple:
     return ("update", number, f"{number:040x}")
 
 
-def ctx(name, state):
-    return {"contexts": [{"context": name, "state": state}]}
+def ctx(name, state, **fields):
+    return {"contexts": [{"context": name, "state": state, **fields}]}
 
 
 CHECKOUT = {
@@ -5406,8 +5414,8 @@ def test_session_hold_query_keeps_required_status_selection_replaceable(tmp_path
         assert "mergeStateStatus isInMergeQueue reviewDecision" in query
         assert "... on LabeledEvent { createdAt label { name } }" in query
         assert "signature { wasSignedByGitHub }" in query
-    assert "status { context(name: $status) { state } }" in rules.STATUS_QUERY
-    assert "status { context(name: $status) { state } }" not in rules.QUERY
+    assert "status { context(name: $status) { state creator { login } } }" in rules.STATUS_QUERY
+    assert "status { context(name: $status)" not in rules.QUERY
 
 
 def test_planted_session_hold_that_finds_no_session_lands_update(tmp_path):
@@ -8768,6 +8776,94 @@ def test_required_status_success_lands(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(1)]
     assert "### fleet/app: landed #1" in summary
+
+
+def test_required_status_listed_creator_lands(tmp_path):
+    status = ctx("lane-judged", "SUCCESS", creator={"login": "Lane-Watcher[bot]"})
+    forge = Forge(repository(pull(1, "CLEAN", status=status)))
+    done, summary = train(
+        tmp_path,
+        forge,
+        required_status="lane-judged",
+        required_status_creators=f"{'x' * 39}, lane-watcher[bot]",
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+    assert any("creator { login }" in query for query in forge.queries)
+
+
+def test_required_status_other_creator_holds(tmp_path):
+    status = ctx("lane-judged", "SUCCESS", creator={"login": "lane-watcher"})
+    forge = Forge(repository(pull(1, "CLEAN", status=status)))
+    done, summary = train(
+        tmp_path, forge, required_status="lane-judged", required_status_creators="lane-watcher[bot]"
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        "| #1 | CLEAN | status lane-judged absent (creator lane-watcher not allowed): held |"
+        in summary
+    )
+
+
+@pytest.mark.parametrize("fields", [{}, {"creator": None}, {"creator": {}}])
+def test_required_status_missing_creator_holds(tmp_path, fields):
+    status = ctx("lane-judged", "SUCCESS", **fields)
+    forge = Forge(repository(pull(1, "CLEAN", status=status)))
+    done, summary = train(
+        tmp_path, forge, required_status="lane-judged", required_status_creators="lane-watcher[bot]"
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | CLEAN | status lane-judged absent (creator missing): held |" in summary
+
+
+def test_required_status_empty_creators_accept_any_creator(tmp_path):
+    status = ctx("lane-judged", "SUCCESS", creator={"login": "another-account"})
+    forge = Forge(repository(pull(1, "CLEAN", status=status)))
+    done, _ = train(tmp_path, forge, required_status="lane-judged", required_status_creators="")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        " ",
+        "has space",
+        ",",
+        "x" * 40,
+        "x" * 35 + "[bot]",
+        "-lead",
+        "trail-",
+        "two--dashes",
+        "valid,",
+    ],
+)
+def test_required_status_invalid_creator_setting_precedes_forge_calls(tmp_path, monkeypatch, raw):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    installations = forge.installation_list
+    calls = []
+
+    def record_installations():
+        calls.append("installations")
+        return installations()
+
+    monkeypatch.setattr(forge, "installation_list", record_installations)
+    done, _ = train(tmp_path, forge, required_status_creators=raw)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::required_status_creators")
+    assert calls == []
+
+
+def test_required_status_creators_input_reaches_settings():
+    doc = ciwf.load(TRAIN)
+    status = doc["on"]["workflow_call"]["inputs"]["required_status_creators"]
+    assert status["type"] == "string"
+    assert status["default"] == ""
+    assert status["required"] is False
+    assert input_wiring_findings(doc, script()) == []
 
 
 def test_unset_required_status_lands_unchanged(tmp_path):
