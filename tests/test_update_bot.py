@@ -254,6 +254,8 @@ BATCH_OUTSIDE = (
     ("custom.regex", "github-release-attachments", "rhysd/actionlint", "patch"),
     ("github-actions", "github-tags", "actions/checkout", "pinDigest"),
 )
+# The pinDigest row is a boundary that majors do not repeat.
+BATCH_MAJOR = BATCH_OUTSIDE[:-1]
 BATCH_OWN = (
     ("github-actions", "github-tags", "plurano/horistes", "digest"),
     ("gomod", "go", "github.com/golusoris/x", "minor"),
@@ -268,18 +270,17 @@ BATCH_CASES = (
             (manager, source, package, kind),
             (f"{manager} non-major", BATCH_SCHEDULE),
         )
-        for manager, source, package, kind in BATCH_OUTSIDE[:7]
+        for manager, source, package, kind in BATCH_OUTSIDE
     ),
     *(
         (f"major:{manager}", (manager, source, package, "major"), (None, None))
-        for manager, source, package, _ in BATCH_OUTSIDE[:6]
+        for manager, source, package, _ in BATCH_MAJOR
     ),
     *(
         (f"own:{source}:{package}", (manager, source, package, kind), (None, []))
-        for manager, source, package, kind in BATCH_OWN[:5]
+        for manager, source, package, kind in BATCH_OWN
     ),
 )
-MAX_BATCH_CASES = 18
 
 
 def _glob_to_regex(glob: str) -> str:
@@ -371,7 +372,7 @@ def _batch_rule_matches(
         ("matchDatasources", datasource),
         ("matchUpdateTypes", update_type),
     )
-    return all(value in rule.get(key, [value]) for key, value in fields[:3]) and patterns_match(
+    return all(value in rule.get(key, [value]) for key, value in fields) and patterns_match(
         rule.get("matchPackageNames", ["*"]), package
     )
 
@@ -379,7 +380,11 @@ def _batch_rule_matches(
 def batch(
     preset: dict, manager: str, datasource: str, package: str, update_type: str
 ) -> tuple[str | None, list | None]:
-    """Emulate later matching rules overriding groupName and schedule."""
+    """Emulate later matching rules overriding groupName and schedule.
+
+    Like release_age, skip rules carrying enabled: the preset uses it only
+    to switch updates off.
+    """
     rules = preset.get("packageRules", [])
     if len(rules) > MAX_RULES:
         raise ValueError(f"preset has {len(rules)} packageRules, at most {MAX_RULES} supported")
@@ -389,7 +394,7 @@ def batch(
             continue
         if not _batch_rule_matches(rule, manager, datasource, package, update_type):
             continue
-        for key in ("groupName", "schedule")[:2]:
+        for key in ("groupName", "schedule"):
             if key in rule:
                 current[key] = rule[key]
     group = current.get("groupName")
@@ -401,9 +406,7 @@ def batch(
 def batch_problems(preset: dict) -> list[str]:
     """Named dependencies whose batching differs from the fixed probe table."""
     return [
-        name
-        for name, dependency, expected in BATCH_CASES[:MAX_BATCH_CASES]
-        if batch(preset, *dependency) != expected
+        name for name, dependency, expected in BATCH_CASES if batch(preset, *dependency) != expected
     ]
 
 
@@ -1200,7 +1203,7 @@ def test_preset_batches_non_major_updates_per_manager():
 
 
 @pytest.mark.parametrize(
-    ("name", "dependency", "expected"), BATCH_CASES, ids=[case[0] for case in BATCH_CASES[:18]]
+    ("name", "dependency", "expected"), BATCH_CASES, ids=[case[0] for case in BATCH_CASES]
 )
 def test_batch_positive_negative_and_boundary_cases(name, dependency, expected):
     assert batch(PRESET, *dependency) == expected, name
@@ -1261,9 +1264,8 @@ def test_batch_skips_rules_with_a_nonmatching_selector(selector):
     assert batch(planted, *BATCH_OUTSIDE[0]) == (None, None)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_batch_skips_enabled_rules(enabled):
-    planted = {"packageRules": [{"enabled": enabled, "groupName": "wrong", "schedule": []}]}
+def test_batch_skips_enabled_rules():
+    planted = {"packageRules": [{"enabled": False, "groupName": "wrong", "schedule": []}]}
     assert batch(planted, *BATCH_OUTSIDE[0]) == (None, None)
 
 
