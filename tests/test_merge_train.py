@@ -11321,6 +11321,7 @@ def hold_read_train(tmp_path, monkeypatch, capsys, forge):
         return result
 
     monkeypatch.setattr(mod, "sweep", capture)
+    forge.workdir = tmp_path
     server = serve(forge)
     forge.api_url = f"http://127.0.0.1:{server.server_address[1]}"
     env = TRAIN_DEFAULTS | {

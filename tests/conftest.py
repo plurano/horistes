@@ -28,6 +28,44 @@ import ciwf
 
 ROOT = Path(__file__).resolve().parent.parent
 
+
+def leaked_root_names(root: Path, before: set[str]) -> list[str]:
+    """Name new root entries not ignored by git; fail closed if git is unavailable.
+
+    Outside a git work tree, or on an ignore-check error, every new name is a leak.
+    """
+    new = set(os.listdir(root)) - before
+    if not new:
+        return []
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--stdin", "-z"],
+            input=b"\0".join(os.fsencode(name) for name in sorted(new)) + b"\0",
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return sorted(new)
+    if done.returncode not in (0, 1):
+        return sorted(new)
+    ignored = {os.fsdecode(name) for name in done.stdout.split(b"\0") if name}
+    return sorted(new - ignored)
+
+
+@pytest.fixture(autouse=True)
+def guard_repository_root():
+    """Require each test to put persistent output under tmp_path or a git-ignored path."""
+    before = set(os.listdir(ROOT))
+    yield
+    leaked = leaked_root_names(ROOT, before)
+    if leaked:
+        pytest.fail(f"New repository-root entries: {', '.join(leaked)}; write under tmp_path")
+
+
 # The consumer path each template's header names.
 CALLER_TEMPLATES: dict[str, str] = {
     "templates/callers/hook-copy.yml.tmpl": ".github/workflows/hook-copy.yml",
