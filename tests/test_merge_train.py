@@ -1250,7 +1250,7 @@ CHECKOUT = {
     "persist-credentials": False,
     "sparse-checkout": (
         "tools/merge_train.py\ntools/review_state.py\ntools/release_workflows.py\n"
-        "tools/release_labels.py\n"
+        "tools/release_labels.py\ntools/release_plan.py\n"
     ),
 }
 
