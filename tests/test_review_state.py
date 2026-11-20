@@ -737,6 +737,10 @@ def adr93_second_summary_cases(pr, notice):
     cases.append(_case("second-summary-short-head", pr, True))
     summary["body"] = body + "\n## Rate limit exceeded\n"
     cases.append(_case("second-summary-mixed-notice", pr, True))
+    summary["body"] = body.replace(
+        "> - Last reviewed commit:", "> ## Rate limit exceeded\n> - Last reviewed commit:"
+    )
+    cases.append(_case("second-summary-inside-mixed-notice", pr, True))
     summary["body"] = body.replace("> - Last reviewed commit: " + pr["headRefOid"], "")
     cases.append(_case("second-summary-missing-last-reviewed", pr, True))
     return cases
