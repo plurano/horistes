@@ -97,3 +97,4 @@ record that supersedes it.
 | [0088](0088-a-push-trigger-counts-only-for-the-default-branch.md) | 2026-11-16 | A push trigger counts only for the default branch | Accepted |
 | [0090](0090-the-train-holds-on-an-incomplete-review.md) | 2026-11-16 | The train holds on an incomplete review | Accepted |
 | [0095](0095-pull-requests-check-the-full-sign-off-ident.md) | 2026-11-17 | Pull requests check the full sign-off ident | Accepted |
+| [0100](0100-release-off-follows-a-moved-repository.md) | 2026-11-20 | Release-off follows a moved repository | Accepted |

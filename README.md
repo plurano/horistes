@@ -164,6 +164,12 @@ while a pre-existing release is verified
 ([ADR-0031](docs/adr/0031-the-merge-train-app-runs-release-please.md),
 [ADR-0040](docs/adr/0040-the-merge-train-leaves-a-release-to-its-writer.md)).
 It runs on `release_runner` when set, else `runner`.
+The `release_off` input accepts at most 50 space-separated `owner/name` entries.
+Opt-outs follow repository transfers and renames through forge metadata; the
+summary names each opted-out repository by its current full name. If resolution
+fails, that installation receives no release runs for this sweep and the summary
+warns with the entry and reason
+([ADR-0100](docs/adr/0100-release-off-follows-a-moved-repository.md)).
 A push trigger counts only when its branch and tag filters admit the default
 branch ([ADR-0088](docs/adr/0088-a-push-trigger-counts-only-for-the-default-branch.md)).
 The app is one public app installed on every account

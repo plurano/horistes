@@ -386,6 +386,10 @@ class Forge:
         self.rest_faults: dict[str, list[int | str]] = {}
         self.label_missing = False
         self.unlabel_status: int | None = None
+        self.repository_moves: dict[str, str] = {}
+        self.repository_statuses: dict[tuple[int, str], int] = {}
+        self.repository_bodies: dict[str, object] = {}
+        self.repository_calls: list[tuple[int, str]] = []
         self.install(7, "fleet", app=list(reads))
 
     def _init_pull_reads(self) -> None:
@@ -868,14 +872,35 @@ class Forge:
         (inst,) = [i for i in self.installations if i["id"] == kind[1]]
         repos = [
             {
+                "id": inst["id"] * 1000 + index,
                 "name": name,
                 "full_name": f"{inst['account']}/{name}",
                 "archived": f"{inst['account']}/{name}" in self.archived,
                 "disabled": False,
             }
-            for name in inst["repos"]
+            for index, name in enumerate(inst["repos"])
         ]
         return {"total_count": len(repos), "repositories": repos}
+
+    def repository_read(self, header: str, path: str) -> tuple[int, object]:
+        """Metadata lookups use the live list token, including a moved repository's new path."""
+        token = header.removeprefix("Bearer ")
+        kind = self.tokens[token]
+        assert kind[0] == "list" and token not in self.revoked
+        self.repository_calls.append((kind[1], path))
+        if status := self.repository_statuses.get((kind[1], path)):
+            return status, {"message": "planted response body must stay private"}
+        if path in self.repository_moves:
+            return 301, self.repository_moves[path]
+        if path in self.repository_bodies:
+            return 200, self.repository_bodies[path]
+        for inst in self.installations:
+            for index, name in enumerate(inst["repos"]):
+                full = f"{inst['account']}/{name}"
+                repo_id = inst["id"] * 1000 + index
+                if path.casefold() in (f"/repos/{full}".casefold(), f"/repositories/{repo_id}"):
+                    return 200, {"id": repo_id, "full_name": full}
+        return 404, {"message": "Not Found"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1009,6 +1034,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/installation/repositories":
             self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
             return True
+        if re.fullmatch(r"/(repos/[^/]+/[^/]+|repositories/\d+)", path):
+            self._get_repository(path)
+            return True
         return False
 
     def _get_collaborator(self, path: str) -> None:
@@ -1028,6 +1056,22 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(200, {"permission": permission, "role_name": permission})
         else:
             self.answer(404, {"message": "Not Found"})
+
+    def _get_repository(self, path: str) -> None:
+        code, body = self.server.forge.repository_read(self.headers["Authorization"], path)
+        if code == 301:
+            api = f"http://{self.headers['Host']}"
+            location = str(body).format(api=api, port=self.server.server_address[1])
+            self.send_response(code)
+            self.send_header("Location", location)
+            self.end_headers()
+        elif isinstance(body, bytes):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.answer(code, body)
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
@@ -2735,11 +2779,183 @@ def test_release_off_is_case_insensitive(tmp_path):
 
 
 def test_without_the_release_off_check_a_listed_repository_is_named(tmp_path):
-    mutant = script().replace('target["full_name"].lower() in conf["release_off"]', "False")
+    mutant = script().replace('target["full_name"].casefold() in conf["release_off"]', "False")
     assert mutant != script()
     done, _ = train(tmp_path, release_forge(), mutant, release_off="other/d")
     assert done.returncode == 0, done.stdout + done.stderr
     assert {"owner": "other", "name": "d"} in releases_of(tmp_path)
+
+
+@pytest.mark.parametrize("entry", ["former/d", "other/old-name"])
+@pytest.mark.parametrize("location", ["/repositories/9002", "/repos/other/d"])
+def test_release_off_follows_a_moved_repository(tmp_path, entry, location):
+    forge = release_forge()
+    forge.repository_moves[f"/repos/{entry}"] = location
+    done, summary = train(tmp_path, forge, release_off=entry)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release train off: other/d" in summary
+    assert (9, f"/repos/{entry}") in forge.repository_calls
+    assert (9, location) in forge.repository_calls
+    assert len(forge.revoked) == len(forge.minted)
+
+
+def test_release_off_exact_match_needs_no_repository_lookup(tmp_path):
+    forge = Forge(repository(release=(True, True)))
+    done, summary = train(tmp_path, forge, release_off="Fleet/App")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == []
+    assert "Release train off: fleet/app" in summary
+    assert forge.repository_calls == []
+
+
+@pytest.mark.parametrize("redirect", [False, True])
+def test_release_off_missing_repository_matches_nothing(tmp_path, redirect):
+    forge = release_forge()
+    if redirect:
+        forge.repository_moves["/repos/former/d"] = "/repositories/99999"
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [
+        {"owner": "fleet", "name": "app"},
+        {"owner": "other", "name": "d"},
+    ]
+    assert "Release train off:" not in summary
+    assert "::warning" not in summary
+
+
+@pytest.mark.parametrize("status", [403, 500, 502, 503, 504])
+@pytest.mark.parametrize("path", ["/repos/former/d", "/repositories/9002"])
+def test_release_off_lookup_failure_closes_only_its_installation(tmp_path, status, path):
+    forge = release_forge()
+    forge.repository_moves["/repos/former/d"] = "/repositories/9002"
+    forge.repository_statuses[(9, path)] = status
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release train off: other/d" in summary
+    assert "::warning" in summary
+    assert f"release_off entry former/d: HTTP {status}" in summary
+    assert "installation 9" in summary
+    assert "planted response body must stay private" not in done.stdout + done.stderr + summary
+    assert forge.repository_calls.count((9, path)) == (3 if status in (502, 503, 504) else 1)
+    assert len(forge.revoked) == len(forge.minted)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://localhost:{port}/repositories/9002",
+        "{api}/user",
+        "{api}/repositories/9002?extra=1",
+        "{api}/repos/other/d#fragment",
+        "{api}/repos/other/d/extra",
+        "{api}/repositories/not-a-number",
+    ],
+    ids=["other-host", "user", "query", "fragment", "extra-path", "non-numeric-id"],
+)
+def test_release_off_refuses_unsafe_repository_redirect(tmp_path, location):
+    forge = release_forge()
+    forge.repository_moves["/repos/former/d"] = location
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == []
+    assert "Release train off: fleet/app, other/d" in summary
+    assert "release_off entry former/d: unsafe repository redirect" in summary
+    assert forge.repository_calls == [(7, "/repos/former/d"), (9, "/repos/former/d")]
+
+
+def test_release_off_refuses_a_second_repository_redirect(tmp_path):
+    forge = release_forge()
+    forge.repository_moves["/repos/former/d"] = "/repos/other/old-name"
+    forge.repository_moves["/repos/other/old-name"] = "/repositories/9002"
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == []
+    assert "release_off entry former/d: second repository redirect" in summary
+    assert forge.repository_calls == [
+        (7, "/repos/former/d"),
+        (7, "/repos/other/old-name"),
+        (9, "/repos/former/d"),
+        (9, "/repos/other/old-name"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"id": "9002"},
+        {"id": True},
+        [],
+        b"{bad JSON",
+        pytest.param(None, id="empty"),
+        pytest.param(b"null", id="null"),
+        pytest.param(b"\xff", id="invalid-utf8"),
+    ],
+)
+@pytest.mark.parametrize("redirect", [False, True])
+def test_release_off_refuses_invalid_repository_metadata(tmp_path, body, redirect):
+    forge = release_forge()
+    path = "/repositories/9002" if redirect else "/repos/former/d"
+    if redirect:
+        forge.repository_moves["/repos/former/d"] = path
+    forge.repository_bodies[path] = body
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == []
+    assert "release_off entry former/d:" in summary
+    assert "invalid repository metadata" in summary
+    assert "bad JSON" not in done.stdout + done.stderr + summary
+
+
+def test_release_off_repository_id_does_not_match_another_owner(tmp_path):
+    forge = release_forge()
+    forge.install(11, "former", d=[repository(release=(True, True))])
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [
+        {"owner": "fleet", "name": "app"},
+        {"owner": "other", "name": "d"},
+    ]
+    assert "Release train off: former/d" in summary
+
+
+def test_release_off_public_repository_outside_installations_matches_nothing(tmp_path):
+    forge = release_forge()
+    forge.repository_bodies["/repos/former/d"] = {"id": 99999, "full_name": "other/d"}
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [
+        {"owner": "fleet", "name": "app"},
+        {"owner": "other", "name": "d"},
+    ]
+    assert "Release train off:" not in summary
+
+
+def test_release_off_resolves_repository_metadata_without_a_redirect(tmp_path):
+    forge = release_forge()
+    forge.repository_bodies["/repos/former/d"] = {
+        "id": 9002,
+        "full_name": "other/d",
+        "temp_clone_token": "planted response body must stay private",
+    }
+    done, summary = train(tmp_path, forge, release_off="Former/D")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release train off: other/d" in summary
+    assert "planted response body must stay private" not in done.stdout + done.stderr + summary
+    assert forge.repository_calls == [(7, "/repos/former/d"), (9, "/repos/former/d")]
+
+
+def test_release_off_bounds_repository_lookups_per_installation(tmp_path):
+    forge = Forge(repository(release=(True, True)))
+    entries = [f"former/repo-{number}" for number in range(50)]
+    done, summary = train(tmp_path, forge, release_off=" ".join(entries))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert forge.repository_calls == [(7, f"/repos/{entry}") for entry in sorted(entries)]
+    assert "::warning" not in summary
 
 
 def test_without_the_manifest_check_a_config_alone_is_named(tmp_path):
@@ -4662,6 +4878,41 @@ def test_check_release_off_refuses_invalid_entry(tmp_path, invalid):
     rules = load_rules(tmp_path)
     with pytest.raises(ValueError, match="not owner/name"):
         rules.check_release_off(invalid)
+
+
+def test_release_off_setting_accepts_50_entries(tmp_path, monkeypatch):
+    """Fifty entries, the bound, parse to the casefolded set."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    entries = [f"fleet/repo-{number}" for number in range(50)]
+    assert train_mod.MAX_RELEASE_OFF == 50
+    assert train_mod.release_off_setting(" ".join(entries)) == frozenset(entries)
+
+
+def test_release_off_setting_refuses_51_entries(tmp_path, monkeypatch):
+    """Fifty-one entries are refused with the setting error."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    raw = " ".join(f"fleet/repo-{number}" for number in range(51))
+    with pytest.raises(train_mod.InvalidSettingError, match="release_off.*50"):
+        train_mod.release_off_setting(raw)
+
+
+def test_release_off_setting_counts_repeated_entries(tmp_path, monkeypatch):
+    """The bound counts entries before deduplication, so 51 copies of one name are refused."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    raw = " ".join(["fleet/app"] * 51)
+    with pytest.raises(train_mod.InvalidSettingError, match="release_off.*50"):
+        train_mod.release_off_setting(raw)
+
+
+def test_release_off_over_the_bound_stops_before_any_forge_call(tmp_path):
+    """A release_off over the bound is a setting error: exit 3, no token minted, no call."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    raw = " ".join(f"fleet/repo-{number}" for number in range(51))
+    done, _ = train(tmp_path, forge, release_off=raw)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert "release_off accepts at most 50 entries" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
 
 
 @pytest.mark.parametrize(
