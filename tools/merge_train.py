@@ -5,7 +5,8 @@
 The step "Land or update one pull request in every repository of the app" of
 .github/workflows/merge-train.yml runs this file from a checkout of the
 workflow's own commit; the step before it writes train_rules.py into
-RUNNER_TEMP. The header of the workflow describes what a run does.
+RUNNER_TEMP. Review settling and the bot dependency exemption live in
+tools/review_state.py. The header of the workflow describes what a run does.
 """
 
 import base64
@@ -30,7 +31,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
-from review_state import review_evidence, review_incomplete
+from review_state import is_bot_dependency, review_evidence, review_incomplete
 from train_rules import (
     RED,
     REFRESH_LABEL,
@@ -46,7 +47,6 @@ from train_rules import (
     has_red_code_scanning,
     head_since,
     in_flight,
-    is_bot_dependency,
     is_red,
     is_security,
     issues_to_close,

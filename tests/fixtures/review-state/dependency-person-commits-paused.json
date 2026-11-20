@@ -1,0 +1,142 @@
+{
+  "number": 1,
+  "headRefName": "renovate/example-1.x",
+  "headRefOid": "5555555555555555555555555555555555555555",
+  "author": {
+    "login": "renovate",
+    "__typename": "Bot"
+  },
+  "commits": {
+    "totalCount": 5,
+    "nodes": [
+      {
+        "commit": {
+          "oid": "1111111111111111111111111111111111111111",
+          "committedDate": "2026-11-17T02:20:32Z",
+          "message": "Update dependencies",
+          "author": {
+            "user": {
+              "login": "renovate[bot]"
+            }
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "2222222222222222222222222222222222222222",
+          "committedDate": "2026-11-17T02:21:32Z",
+          "message": "Update dependencies",
+          "author": {
+            "user": {
+              "login": "a-person"
+            }
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "3333333333333333333333333333333333333333",
+          "committedDate": "2026-11-17T02:22:32Z",
+          "message": "Update dependencies",
+          "author": {
+            "user": {
+              "login": "a-person"
+            }
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "4444444444444444444444444444444444444444",
+          "committedDate": "2026-11-17T02:23:32Z",
+          "message": "Update dependencies",
+          "author": {
+            "user": {
+              "login": "a-person"
+            }
+          }
+        }
+      },
+      {
+        "commit": {
+          "oid": "5555555555555555555555555555555555555555",
+          "committedDate": "2026-11-17T02:24:32Z",
+          "message": "Update dependencies",
+          "author": {
+            "user": {
+              "login": "a-person"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "authors": {
+    "totalCount": 5,
+    "nodes": [
+      {
+        "commit": {
+          "author": {
+            "user": {
+              "login": "renovate[bot]"
+            }
+          }
+        }
+      },
+      {
+        "commit": {
+          "author": {
+            "user": {
+              "login": "a-person"
+            }
+          }
+        }
+      },
+      {
+        "commit": {
+          "author": {
+            "user": {
+              "login": "a-person"
+            }
+          }
+        }
+      },
+      {
+        "commit": {
+          "author": {
+            "user": {
+              "login": "a-person"
+            }
+          }
+        }
+      },
+      {
+        "commit": {
+          "author": {
+            "user": {
+              "login": "a-person"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "comments": {
+    "totalCount": 1,
+    "nodes": [
+      {
+        "author": {
+          "login": "coderabbitai",
+          "__typename": "Bot"
+        },
+        "createdAt": "2026-11-17T02:20:00Z",
+        "updatedAt": "2026-11-17T02:57:17Z",
+        "body": "<!-- This is an auto-generated comment: review paused by coderabbit.ai -->\n> [!NOTE]\n> ## Reviews paused\n> It looks like this branch is under active development. To avoid overwhelming you with review comments due to an influx of new commits, CodeRabbit has automatically paused this review.\n> - Last reviewed commit: 1111111111111111111111111111111111111111\n> Use the following commands to manage reviews:\n> - `@coderabbitai resume` to resume automatic reviews.\n> - `@coderabbitai review` to trigger a single review.\n<!-- end of auto-generated comment: review paused by coderabbit.ai -->\n## Summary\nDependency update with follow-up changes."
+      }
+    ]
+  },
+  "reviews": {
+    "totalCount": 0,
+    "nodes": []
+  }
+}
