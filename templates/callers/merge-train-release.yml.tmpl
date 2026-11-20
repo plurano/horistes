@@ -44,7 +44,7 @@ jobs:
   release:
     name: Merge train releases
     permissions:
-      actions: read
+      actions: read # the plan job downloads the release list artifact of the train run
     uses: <% .Shared.Repository %>/.github/workflows/merge-train-release.yml@<% .Shared.Commit %> # <% .Shared.Version %>
     with:
       runner: <% .RunnerTag %>

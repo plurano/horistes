@@ -32,7 +32,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
     permissions:
-      actions: read
+      actions: read # downloads the release list artifact of the train run
     outputs:
       releases: ${{ steps.plan.outputs.releases }}
       hold_labels: ${{ steps.plan.outputs.hold_labels }}
