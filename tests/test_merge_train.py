@@ -1248,7 +1248,10 @@ CHECKOUT = {
     "ref": "${{ job.workflow_sha }}",
     "path": "merge-train-source",
     "persist-credentials": False,
-    "sparse-checkout": "tools/merge_train.py\ntools/review_state.py\ntools/release_workflows.py\n",
+    "sparse-checkout": (
+        "tools/merge_train.py\ntools/review_state.py\ntools/release_workflows.py\n"
+        "tools/release_labels.py\n"
+    ),
 }
 
 
@@ -2061,10 +2064,10 @@ def test_app_is_public_so_every_fleet_account_can_install_it():
     assert manifest["public"] is True
 
 
-def test_github_token_gets_no_permission():
+def test_github_token_gets_only_dispatch_permission():
     doc = ciwf.load(TRAIN)
     assert doc["permissions"] == {}
-    assert doc["jobs"]["train"]["permissions"] == {}
+    assert doc["jobs"]["train"]["permissions"] == {"actions": "write"}
 
 
 def sweep_forge() -> Forge:

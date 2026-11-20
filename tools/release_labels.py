@@ -103,9 +103,10 @@ def _read_once(req, method, url, status_only):
                 return resp.status, raw
             return resp.status, json.loads(raw.decode("utf-8")) if raw else {}
     except urllib.error.HTTPError as err:
-        if status_only:
-            return err.code, b""
-        raw = err.read(MAX_BYTES + 1)
+        with err:
+            if status_only:
+                return err.code, b""
+            raw = err.read(MAX_BYTES + 1)
         detail = raw.decode("utf-8", errors="replace")[:200]
         raise CallError(f"{method} {url}: HTTP {err.code}: {detail}", err.code) from err
     except (urllib.error.URLError, TimeoutError) as err:
@@ -543,18 +544,66 @@ def read_release_plan(path):
         raise CallError(f"read release list: {err}") from err
 
 
+def check_train_inputs(env, workflow_key):
+    """Refuse ambiguous run ids and workflow paths before any request."""
+    run_id = env.get("TRAIN_RUN_ID", "")
+    workflow = env.get(workflow_key, "")
+    if not re.fullmatch(r"[1-9][0-9]*", run_id):
+        raise CallError("TRAIN_RUN_ID must be ASCII digits with no leading zero")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml", workflow):
+        raise CallError(f"{workflow_key} must be one .yml or .yaml file name, without a path")
+    return run_id, workflow
+
+
+def cmd_dispatch(env):
+    """Start one release run; retrying a dispatch could start a duplicate."""
+    run_id, workflow = check_train_inputs(env, "RELEASE_WORKFLOW")
+    api_url = env.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+    repo, token = env["REPOSITORY"], env.get("GITHUB_TOKEN", "")
+    branch = read_default_branch(api_url, repo, token)
+    url = f"{api_url}/repos/{repo}/actions/workflows/{workflow}/dispatches"
+    body = {"ref": branch, "inputs": {"train_run_id": run_id}}
+    try:
+        status, _ = call(url, token, method="POST", body=body)
+    except CallError as err:
+        if err.status == 404:
+            raise CallError(
+                f"add .github/workflows/{workflow} on the default branch from "
+                "templates/callers/merge-train-release.yml.tmpl",
+                err.status,
+            ) from err
+        raise
+    if status not in {200, 204}:
+        raise CallError(f"dispatch release workflow: unexpected HTTP {status}", status)
+    return 0
+
+
+def check_train_run(run, workflow, default_branch, repo):
+    """Validate the referenced run before its artifact is read or any app token minted."""
+    if run.get("path") != f".github/workflows/{workflow}":
+        raise CallError("train run path must match the train workflow file")
+    if run.get("event") not in {"schedule", "workflow_dispatch"}:
+        raise CallError("train run event must be schedule or workflow_dispatch")
+    if run.get("head_branch") != default_branch:
+        raise CallError("train run head branch must be the default branch")
+    if str((run.get("repository") or {}).get("full_name") or "").casefold() != repo.casefold():
+        raise CallError("train run repository must be the caller repository")
+    if run.get("status") not in {"in_progress", "completed"}:
+        raise CallError("train run status must be in_progress or completed")
+
+
 def cmd_plan(env):
-    """Accept only completed default-branch train runs before consuming their artifact."""
-    conclusion = env["RUN_CONCLUSION"]
-    if conclusion not in {"success", "failure"}:
+    """Accept only default-branch train runs before consuming their artifact."""
+    run_id, workflow = check_train_inputs(env, "TRAIN_WORKFLOW")
+    api_url = env.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+    repo, token = env["REPOSITORY"], env.get("GITHUB_TOKEN", "")
+    _, run = call(f"{api_url}/repos/{repo}/actions/runs/{run_id}", token)
+    branch = read_default_branch(api_url, repo, token)
+    check_train_run(run, workflow, branch, repo)
+    conclusion = run.get("conclusion")
+    if run["status"] == "completed" and conclusion not in {"success", "failure"}:
         sys.stdout.write(f"::notice::train run conclusion {conclusion!r}; no release legs\n")
         return write_plan_output(env, [], "")
-    if env["RUN_EVENT"] not in {"schedule", "workflow_dispatch"}:
-        raise CallError("train run event must be schedule or workflow_dispatch")
-    if env["RUN_HEAD_BRANCH"] != env["DEFAULT_BRANCH"]:
-        raise CallError("train run head branch must be the default branch")
-    if env["RUN_REPOSITORY"].casefold() != env["REPOSITORY"].casefold():
-        raise CallError("train run repository must be the caller repository")
     try:
         check_release_parallel(env["MAX_PARALLEL"])
     except ValueError as err:
@@ -573,11 +622,16 @@ def cmd_plan(env):
 
 
 def main(argv, env):
-    """Dispatch plan, settings or after command."""
+    """Dispatch plan, dispatch, settings or after command."""
     if len(argv) < 2:
-        sys.stderr.write("usage: release_labels.py <plan|settings|after>\n")
+        sys.stderr.write("usage: release_labels.py <plan|dispatch|settings|after>\n")
         return 2
-    commands = {"plan": cmd_plan, "settings": cmd_settings, "after": cmd_after}
+    commands = {
+        "plan": cmd_plan,
+        "dispatch": cmd_dispatch,
+        "settings": cmd_settings,
+        "after": cmd_after,
+    }
     if argv[1] not in commands:
         sys.stderr.write(f"unknown command: {argv[1]}\n")
         return 2

@@ -23,9 +23,10 @@ runs no hosted runner minutes for this.
 Off switch: the variable MERGE_TRAIN set to `off` makes every run report only,
 with read rights. Unset, the train runs.
 
-Scopes: none. The called jobs write with the app's tokens, one per
-repository, minted for that repository alone and revoked after it;
-GITHUB_TOKEN gets no permission. The separate release caller in
+Scopes: GITHUB_TOKEN gets actions: write only, to start the release caller
+with workflow_dispatch from the train job that already holds the app key.
+The called jobs write with the app's tokens, one per repository, minted for
+that repository alone and revoked after it. The separate release caller in
 templates/callers/merge-train-release.yml.tmpl reads the sweep artifact with
 actions: read and runs release-please in its own workflow run (record 0098).
 
@@ -69,7 +70,8 @@ concurrency:
 jobs:
   train:
     name: Merge train
-    permissions: {}
+    permissions:
+      actions: write # starts the release caller with workflow_dispatch
     uses: <% .Shared.Repository %>/.github/workflows/merge-train.yml@<% .Shared.Commit %> # <% .Shared.Version %>
     with:
       runner: <% .RunnerTag %>

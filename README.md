@@ -138,7 +138,8 @@ job mints a token limited to that repository, with `contents: write`,
 `pull_requests: write`, `workflows: write` and `checks: read`, and revokes
 it when the repository is done; only when an issue is to be closed, a
 second token for that repository carries `issues: write` alone.
-GITHUB_TOKEN gets no scope. A run lands at most one pull request per
+GITHUB_TOKEN gets `actions: write` only, to dispatch the release caller from the
+train job that already holds the app key. A run lands at most one pull request per
 repository: the oldest the forge reports CLEAN, through the merge call with
 the head commit it read, so a red or blocked pull request is refused by the
 forge itself and the app has no bypass. With none CLEAN and no armed one in
@@ -157,8 +158,9 @@ issues that its recent merges name as closed, which the forge leaves open when
 the app merges. It leaves alone drafts, forks, other bases, the hold labels,
 release branches (`release-please--`, a release is a person's act), dependency
 updates younger than the minimum age and archived repositories. After the
-sweep, the separate [release caller](templates/callers/merge-train-release.yml.tmpl)
-starts release-please in its own workflow run with release creation and release pull request updates
+sweep, the train job starts the separate [release caller](templates/callers/merge-train-release.yml.tmpl)
+by `workflow_dispatch` with its run id; the plan checks that train run before starting
+release-please in its own workflow run with release creation and release pull request updates
 split into separate steps: a repository that writes its own release skips
 release creation and has its labels moved once the tag is on the merge commit,
 while a pre-existing release is verified
@@ -169,8 +171,10 @@ the train; each repository releases one leg at a time across runs
 ([ADR-0098](docs/adr/0098-the-release-fan-out-runs-in-its-own-workflow-run.md)).
 Add both callers when migrating; remove `release_runner` and `release_max_parallel`
 from the train call and configure the release call instead. The release caller
-grants `actions: read` to read the train artifact; its release legs use the app
-token limited to each repository.
+uses `workflow_dispatch` with a required string `train_run_id` input and grants
+`actions: read` to read the train run and artifact; a person with write access may
+dispatch it by hand with a train run id, and its release legs use the app token
+limited to each repository.
 A push trigger counts only when its branch and tag filters admit the default
 branch ([ADR-0088](docs/adr/0088-a-push-trigger-counts-only-for-the-default-branch.md)).
 The app is one public app installed on every account

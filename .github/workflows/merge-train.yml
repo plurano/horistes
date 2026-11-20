@@ -86,7 +86,8 @@
 # RELEASES. A repository with release-please-config.json and
 # .release-please-manifest.json on its default branch is handed to
 # .github/workflows/merge-train-release.yml in its own workflow run after the
-# sweep (decision records 0031, 0040, 0098): release-please with a token of the
+# sweep. The train job starts the release caller by workflow_dispatch with its
+# run id (decision records 0031, 0040, 0098): release-please with a token of the
 # app limited to that repository, contents, pull requests and workflows write.
 # The job splits release creation and release pull request updates into separate
 # steps: a repository that writes its own release skips release creation and has
@@ -117,8 +118,10 @@
 # Workflows write is there because the forge refuses a merge or an
 # update-branch that changes a file under .github/workflows without it: pin
 # updates do, and so does an update after the default branch changed a
-# workflow. Events GITHUB_TOKEN causes start no workflow run, so a head it
-# updated would never get its checks. GITHUB_TOKEN gets no permission at all.
+# workflow. Events GITHUB_TOKEN causes start no workflow run, except
+# workflow_dispatch and repository_dispatch, so a head it updated would never
+# get its checks. GITHUB_TOKEN gets actions: write only, used for the release
+# dispatch, in the same job that already holds the app key.
 #
 # A refusal in one repository is reported and the sweep goes on; the run ends
 # red when any repository refused. Repositories not reached within 25 minutes
@@ -182,6 +185,13 @@ on:
         type: string
         required: false
         default: ""
+      release_workflow:
+        description: >-
+          File name (no path) of the release caller under .github/workflows
+          that the train job starts.
+        type: string
+        required: false
+        default: merge-train-release.yml
       security_labels:
         description: Labels that exempt a dependency update from the minimum age, comma-separated.
         type: string
@@ -229,7 +239,8 @@ jobs:
     concurrency:
       group: horistes-merge-train-${{ inputs.app_client_id }}
       cancel-in-progress: false
-    permissions: {}
+    permissions:
+      actions: write # starts the release caller with workflow_dispatch
     steps:
       # The train's pure rules (which pull request it lands, updates or leaves
       # alone, which issues it closes, and the squash message) and its pull query,
@@ -862,8 +873,8 @@ jobs:
       # The sweep uses tools/merge_train.py and tools/review_state.py from this
       # workflow's own commit: a caller pinned to a commit runs that commit's
       # script and reader. Inline, the script would exceed the engine's cap of 4096
-      # fields per run script. The job's token has no permission; the repository
-      # is public, so the checkout needs none.
+      # fields per run script. The public checkout needs no contents permission;
+      # actions: write is used only to start the separate release run.
       - name: Check out the train script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -875,6 +886,7 @@ jobs:
             tools/merge_train.py
             tools/review_state.py
             tools/release_workflows.py
+            tools/release_labels.py
           sparse-checkout-cone-mode: false
 
       # Merge train of every repository the app is installed on.
@@ -912,6 +924,7 @@ jobs:
         run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/merge_train.py"
 
       - name: Hand the release list to its own workflow run
+        id: upload
         if: ${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -919,3 +932,15 @@ jobs:
           path: ${{ runner.temp }}/merge-train-releases.json
           retention-days: 1
           if-no-files-found: error
+
+      - name: Start the release run
+        if: >-
+          ${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != ''
+          && steps.upload.outcome == 'success' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TRAIN_RUN_ID: ${{ github.run_id }}
+          RELEASE_WORKFLOW: ${{ inputs.release_workflow }}
+        run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py" dispatch

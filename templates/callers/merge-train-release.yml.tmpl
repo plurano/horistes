@@ -10,13 +10,15 @@ repository, named by commit (decision record 0098).
 Runner: a runner with python3. Set .RunnerTag independently of the train
 caller when release legs should use a separate runner set.
 
-Scopes: GITHUB_TOKEN gets actions: read only, to read the train run's artifact.
+Scopes: GITHUB_TOKEN gets actions: read only, to read the train run and its artifact.
 Release legs use repository-limited app tokens. The merge-train environment
 holds MERGE_TRAIN_APP_KEY; MERGE_TRAIN_APP_CLIENT_ID holds the app's client id,
 as described by templates/callers/merge-train.yml.tmpl.
 
-Trigger: completion of Merge train, including failed sweeps with a release
-list. The plan checks the train event, branch, repository and conclusion.
+Trigger: the train job's workflow_dispatch with its run id, including failed
+sweeps with a release list. A person with write access may dispatch by hand
+with a train run id. The plan checks that run's workflow path, event, branch,
+repository, status and conclusion.
 No workflow-level concurrency on purpose: queued release legs must not hold
 the train. The reusable workflow serializes each repository's legs across runs.
 
@@ -34,9 +36,12 @@ licence check from reading the template lines as tags.
 name: Merge train releases
 
 on:
-  workflow_run:
-    workflows: ["Merge train"]
-    types: [completed]
+  workflow_dispatch:
+    inputs:
+      train_run_id:
+        description: Train run whose release list is read.
+        type: string
+        required: true
 
 permissions: {}
 
@@ -44,9 +49,10 @@ jobs:
   release:
     name: Merge train releases
     permissions:
-      actions: read # the plan job downloads the release list artifact of the train run
+      actions: read # the plan reads the train run and downloads its release list artifact
     uses: <% .Shared.Repository %>/.github/workflows/merge-train-release.yml@<% .Shared.Commit %> # <% .Shared.Version %>
     with:
+      train_run_id: ${{ inputs.train_run_id }}
       runner: <% .RunnerTag %>
       app_client_id: ${{ vars.MERGE_TRAIN_APP_CLIENT_ID }}
     secrets:

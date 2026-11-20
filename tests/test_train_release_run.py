@@ -123,7 +123,7 @@ def test_planted_concurrency_mutants_are_refused(name):
 def check_handoff(train, release):
     assert "release" not in train["jobs"]
     job = train["jobs"]["train"]
-    assert job["permissions"] == {} and "outputs" not in job
+    assert job["permissions"] == {"actions": "write"} and "outputs" not in job
     upload = next(
         s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/upload-artifact@")
     )
@@ -137,6 +137,7 @@ def check_handoff(train, release):
         "retention-days": 1,
         "if-no-files-found": "error",
     }
+    check_dispatch_wiring(job, upload)
     sweep = next(s for s in job["steps"] if s.get("id") == "sweep")
     assert sweep["env"]["TRAIN_RELEASE_FILE"] == upload["with"]["path"]
     plan = release["jobs"]["plan"]
@@ -149,22 +150,43 @@ def check_handoff(train, release):
         "pattern": "merge-train-releases",
         "merge-multiple": True,
         "path": "${{ runner.temp }}/merge-train-plan",
-        "run-id": "${{ github.event.workflow_run.id }}",
+        "run-id": "${{ inputs.train_run_id }}",
         "repository": "${{ github.repository }}",
         "github-token": "${{ github.token }}",
     }
     check_plan_wiring(plan, release["jobs"]["release"])
 
 
+def check_dispatch_wiring(job, upload):
+    dispatch = next(s for s in job["steps"] if s.get("name") == "Start the release run")
+    assert upload["id"] == "upload"
+    assert job["steps"].index(dispatch) == job["steps"].index(upload) + 1
+    assert dispatch["if"] == (
+        "${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != '' "
+        "&& steps.upload.outcome == 'success' }}"
+    )
+    assert dispatch["env"] == {
+        "GITHUB_TOKEN": "${{ github.token }}",
+        "REPOSITORY": "${{ github.repository }}",
+        "TRAIN_RUN_ID": "${{ github.run_id }}",
+        "RELEASE_WORKFLOW": "${{ inputs.release_workflow }}",
+    }
+    assert dispatch["run"] == (
+        'python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py" dispatch'
+    )
+    checkout = next(s for s in job["steps"] if "sparse-checkout" in s.get("with", {}))
+    assert {"tools/release_labels.py", "tools/release_workflows.py"} <= set(
+        checkout["with"]["sparse-checkout"].splitlines()
+    )
+
+
 def check_plan_wiring(plan, leg):
     step = next(s for s in plan["steps"] if s.get("id") == "plan")
     assert step["run"].endswith('release_labels.py" plan')
     assert step["env"] == {
-        "RUN_EVENT": "${{ github.event.workflow_run.event }}",
-        "RUN_HEAD_BRANCH": "${{ github.event.workflow_run.head_branch }}",
-        "RUN_REPOSITORY": "${{ github.event.workflow_run.repository.full_name }}",
-        "RUN_CONCLUSION": "${{ github.event.workflow_run.conclusion }}",
-        "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+        "GITHUB_TOKEN": "${{ github.token }}",
+        "TRAIN_RUN_ID": "${{ inputs.train_run_id }}",
+        "TRAIN_WORKFLOW": "${{ inputs.train_workflow }}",
         "REPOSITORY": "${{ github.repository }}",
         "MAX_PARALLEL": "${{ inputs.release_max_parallel }}",
         "FILE": "${{ runner.temp }}/merge-train-plan/merge-train-releases.json",
@@ -189,21 +211,34 @@ def test_artifact_handoff_contract():
 
 @pytest.mark.parametrize(
     "where",
-    ["upload-switch", "upload-missing", "download-run", "plan-event", "plan-output", "leg-list"],
+    [
+        "upload-switch",
+        "upload-missing",
+        "download-run",
+        "plan-run",
+        "plan-output",
+        "leg-list",
+        "dispatch-guard",
+        "train-permission",
+    ],
 )
 def test_planted_handoff_mutants_are_refused(where):
     train = ciwf.load(ROOT / ".github/workflows/merge-train.yml")
     release = ciwf.load(ROOT / ".github/workflows/merge-train-release.yml")
-    upload = train["jobs"]["train"]["steps"][-1]
+    upload = train["jobs"]["train"]["steps"][-2]
     plan = release["jobs"]["plan"]
     if where == "upload-switch":
         upload["if"] = "${{ !cancelled() }}"
     elif where == "upload-missing":
         upload["with"]["if-no-files-found"] = "ignore"
     elif where == "download-run":
-        plan["steps"][1]["with"].pop("run-id")
-    elif where == "plan-event":
-        plan["steps"][2]["env"]["RUN_EVENT"] = "schedule"
+        plan["steps"][1]["with"]["run-id"] = "${{ github.run_id }}"
+    elif where == "plan-run":
+        plan["steps"][2]["env"]["TRAIN_RUN_ID"] = "${{ github.run_id }}"
+    elif where == "dispatch-guard":
+        train["jobs"]["train"]["steps"][-1]["if"] = upload["if"]
+    elif where == "train-permission":
+        train["jobs"]["train"]["permissions"] = {}
     elif where == "plan-output":
         plan["outputs"].pop("hold_labels")
     else:
@@ -215,22 +250,48 @@ def test_planted_handoff_mutants_are_refused(where):
 def check_release_caller(spec):
     caller = spec["caller"]
     assert caller["name"] == "Merge train releases"
-    assert caller["on"] == {"workflow_run": {"workflows": ["Merge train"], "types": ["completed"]}}
+    assert caller["on"] == {
+        "workflow_dispatch": {
+            "inputs": {
+                "train_run_id": {
+                    "description": "Train run whose release list is read.",
+                    "type": "string",
+                    "required": True,
+                }
+            }
+        }
+    }
+    assert caller["jobs"]["release"]["with"].get("train_run_id") == "${{ inputs.train_run_id }}"
     assert caller["permissions"] == {} and "concurrency" not in caller
     assert caller["jobs"]["release"]["permissions"] == {"actions": "read"}
     assert "concurrency" not in spec["workflow"]
     inputs = spec["workflow"]["on"]["workflow_call"]["inputs"]
-    assert set(inputs) == {"runner", "app_client_id", "release_max_parallel"}
+    assert set(inputs) == {
+        "runner",
+        "app_client_id",
+        "release_max_parallel",
+        "train_run_id",
+        "train_workflow",
+    }
+    assert inputs["train_run_id"]["type"] == "string" and inputs["train_run_id"]["required"]
+    assert inputs["train_workflow"]["default"] == "merge-train.yml"
 
 
 def test_release_caller_has_no_workflow_group():
     check_release_caller(layout(ROOT)[RELEASE])
 
 
-@pytest.mark.parametrize("key", ["concurrency", "permissions", "on"])
+@pytest.mark.parametrize("key", ["concurrency", "permissions", "on", "train-run-id"])
 def test_planted_release_caller_mutants_are_refused(key):
     spec = layout(ROOT)[RELEASE]
-    spec["caller"][key] = {}
+    if key == "train-run-id":
+        spec["caller"]["jobs"]["release"]["with"].pop("train_run_id")
+    else:
+        spec["caller"][key] = {}
+    if key == "on":
+        spec["caller"][key] = {
+            "workflow_run": {"workflows": ["Merge train"], "types": ["completed"]}
+        }
     if key == "permissions":
         spec["caller"][key] = {"contents": "write"}
     with pytest.raises(AssertionError):

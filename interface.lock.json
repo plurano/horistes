@@ -128,6 +128,16 @@
           "default": null,
           "required": true,
           "type": "string"
+        },
+        "train_run_id": {
+          "default": null,
+          "required": true,
+          "type": "string"
+        },
+        "train_workflow": {
+          "default": "merge-train.yml",
+          "required": false,
+          "type": "string"
         }
       },
       "jobs": {
@@ -184,6 +194,11 @@
           "required": false,
           "type": "string"
         },
+        "release_workflow": {
+          "default": "merge-train-release.yml",
+          "required": false,
+          "type": "string"
+        },
         "required_status": {
           "default": "",
           "required": false,
@@ -229,7 +244,9 @@
           "required": true
         }
       },
-      "write_scopes": []
+      "write_scopes": [
+        "actions"
+      ]
     },
     ".github/workflows/release-please.yml": {
       "inputs": {

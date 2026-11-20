@@ -4,7 +4,7 @@
 
 Groups are case-insensitive, with one owner and one replaceable pending entrant.
 A workflow owns its group through queued jobs; a job owns its group while waiting
-for its runner and executing. Completion triggers workflow_run callers. This models
+for its runner and executing. The train job dispatches the release caller. This models
 scheduling, not forge execution or release-please itself (ADR-0098).
 """
 
@@ -47,7 +47,9 @@ def call_inputs(spec: dict, runner: str) -> dict:
     values = {key: value.get("default") for key, value in definitions.items()}
     variables = {"MERGE_TRAIN_APP_CLIENT_ID": "fixture-app", "MERGE_TRAIN": "on"}
     for key, value in call["with"].items():
-        values[key] = evaluate(value, {}, vars=variables) if "${{" in str(value) else value
+        values[key] = (
+            evaluate(value, {"train_run_id": "1"}, vars=variables) if "${{" in str(value) else value
+        )
     values["runner"] = runner
     return values
 
@@ -188,18 +190,22 @@ class Timeline:
                 if job.state == "running" and minute >= job.start + duration:
                     job.state, job.end = "done", minute
                     self.release_group(job)
+                    if job.name == "train":
+                        self.trigger_release(run, minute)
             if run.state == "active" and all(j.state in {"done", "cancelled"} for j in run.jobs):
                 run.state = "done"
                 self.release_group(run)
-                self.trigger_release(run, minute)
 
     def trigger_release(self, run: Run, minute: int) -> None:
         if run.kind != "merge-train" or "merge-train-release" not in self.specs:
             return
-        trigger = self.specs["merge-train-release"]["caller"]["on"].get("workflow_run", {})
-        if run.spec["caller"]["name"] in trigger.get(
-            "workflows", []
-        ) and "completed" in trigger.get("types", []):
+        triggers = self.specs["merge-train-release"]["caller"]["on"]
+        steps = run.spec["workflow"]["jobs"]["train"]["steps"]
+        dispatches = any(
+            str(step.get("run", "")).endswith('release_labels.py" dispatch')
+            for step in steps[:MAX_JOBS]
+        )
+        if dispatches and "workflow_dispatch" in triggers:
             self.add_run("merge-train-release", minute, run.repositories)
 
     def ready(self, job: Job) -> bool:
