@@ -39,6 +39,29 @@ def test_new_ignored_root_name_is_not_named(git_root: Path):
     assert leaked_root_names(git_root, before) == []
 
 
+def test_planted_untracked_root_directory_is_named(git_root: Path):
+    before = set(os.listdir(git_root))
+    directory = git_root / "leak"
+    directory.mkdir()
+    (directory / "out.txt").write_text("leaked output", encoding="utf-8")
+    assert leaked_root_names(git_root, before) == ["leak"]
+
+
+def test_new_self_ignoring_cache_directory_is_not_named(git_root: Path):
+    before = set(os.listdir(git_root))
+    directory = git_root / ".ruff_cache"
+    directory.mkdir()
+    (directory / ".gitignore").write_text("*\n", encoding="utf-8")
+    (directory / "cache").write_text("cached output", encoding="utf-8")
+    assert leaked_root_names(git_root, before) == []
+
+
+def test_new_empty_root_directory_is_not_named(git_root: Path):
+    before = set(os.listdir(git_root))
+    (git_root / "empty").mkdir()
+    assert leaked_root_names(git_root, before) == []
+
+
 def test_no_new_root_name_is_not_a_leak(git_root: Path):
     assert leaked_root_names(git_root, set(os.listdir(git_root))) == []
 

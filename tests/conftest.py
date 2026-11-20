@@ -32,7 +32,9 @@ ROOT = Path(__file__).resolve().parent.parent
 def leaked_root_names(root: Path, before: set[str]) -> list[str]:
     """Name new root entries not ignored by git; fail closed if git is unavailable.
 
-    Outside a git work tree, or on an ignore-check error, every new name is a leak.
+    Use ls-files rather than check-ignore to handle self-ignoring directories.
+    Empty new directories are not named because git cannot record them.
+    Outside a git work tree, or on a listing error, every new name is a leak.
     """
     new = set(os.listdir(root)) - before
     if not new:
@@ -41,8 +43,19 @@ def leaked_root_names(root: Path, before: set[str]) -> list[str]:
     env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     try:
         done = subprocess.run(
-            ["git", "-C", str(root), "check-ignore", "--stdin", "-z"],
-            input=b"\0".join(os.fsencode(name) for name in sorted(new)) + b"\0",
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+                "--",
+                *sorted(new),
+            ],
             capture_output=True,
             check=False,
             timeout=30,
@@ -50,10 +63,12 @@ def leaked_root_names(root: Path, before: set[str]) -> list[str]:
         )
     except (OSError, subprocess.TimeoutExpired):
         return sorted(new)
-    if done.returncode not in (0, 1):
+    if done.returncode != 0:
         return sorted(new)
-    ignored = {os.fsdecode(name) for name in done.stdout.split(b"\0") if name}
-    return sorted(new - ignored)
+    untracked = {
+        os.fsdecode(name).rstrip("/").split("/", 1)[0] for name in done.stdout.split(b"\0") if name
+    }
+    return sorted(new & untracked)
 
 
 @pytest.fixture(autouse=True)
