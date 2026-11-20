@@ -31,7 +31,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
-from release_workflows import MAX_RELEASES
+from release_workflows import MAX_RELEASES, check_hold_labels
 from review_state import is_bot_dependency, review_evidence, review_incomplete
 from train_rules import (
     RED,
@@ -606,15 +606,17 @@ def settings(env):
         raise InvalidSettingError("app_client_id is empty")
     check_app_key(env.get("TRAIN_APP_KEY", ""))
     release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
+    hold = check_hold_labels(env["TRAIN_HOLD_LABELS"], InvalidSettingError)
     required_status = check_required_status(
         env.get("TRAIN_REQUIRED_STATUS", ""), InvalidSettingError
     )
+    hours = check_session_hold_hours(env.get("TRAIN_SESSION_HOLD_HOURS", "4"), InvalidSettingError)
     return {
         "switch": switch,
         "method": method,
         "accept": frozenset(("CLEAN", *accept)),
         "min_age": timedelta(days=int(age)),
-        "hold": frozenset(name for name in env["TRAIN_HOLD_LABELS"].split(",") if name),
+        "hold": frozenset(name for name in hold.split(",") if name),
         "dependency": tuple(env["TRAIN_DEPENDENCY_BRANCHES"].split()),
         "person": tuple(env["TRAIN_PERSON_BRANCHES"].split()),
         "release_off": release_off,
@@ -625,11 +627,7 @@ def settings(env):
         "session_authors": frozenset(
             name.strip() for name in env.get("TRAIN_SESSION_AUTHORS", "").split(",") if name.strip()
         ),
-        "session_hold": timedelta(
-            hours=check_session_hold_hours(
-                env.get("TRAIN_SESSION_HOLD_HOURS", "4"), InvalidSettingError
-            )
-        ),
+        "session_hold": timedelta(hours=hours),
     }
 
 

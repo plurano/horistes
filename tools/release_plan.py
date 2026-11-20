@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from release_labels import MAX_BYTES, CallError, call, read_default_branch
-from release_workflows import MAX_RELEASES
+from release_workflows import MAX_RELEASES, check_hold_labels
 
 MAX_RELEASE_PARALLEL = 3
 PLAN_OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
@@ -40,9 +40,9 @@ def check_plan_repository(item):
 
 def check_plan_hold(hold):
     """A bounded single-line output value, preserved exactly."""
-    if not isinstance(hold, str) or len(hold) > 4096 or "\n" in hold or "\r" in hold:
-        raise CallError("release hold_labels must be a single line of at most 4096 characters")
-    return hold
+    if not isinstance(hold, str):
+        raise CallError("release hold_labels must be a string")
+    return check_hold_labels(hold, CallError)
 
 
 def check_release_plan(data):

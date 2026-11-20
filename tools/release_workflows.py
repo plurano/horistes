@@ -19,6 +19,13 @@ ACTION_STEP_RE = re.compile(r"^(?:-\s+)?uses:\s*[\"']?googleapis/release-please-
 BLOCK_SCALAR_RE = re.compile(r":\s*[|>][-+0-9]*(?:\s*#.*)?$")
 
 
+def check_hold_labels(raw, error):
+    """Preserve hold labels only when bounded and safe for a single output line."""
+    if len(raw) > 4096 or "\n" in raw or "\r" in raw:
+        raise error("hold_labels must be a single line of at most 4096 characters")
+    return raw
+
+
 def is_literal_false(val):
     """Whether an if: condition is a literal false (quoted, expression, or raw)."""
     val = re.sub(r"\s+#.*$", "", val).strip()

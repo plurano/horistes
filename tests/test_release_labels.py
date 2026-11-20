@@ -2184,6 +2184,28 @@ def test_plan_hold_length_boundary(tmp_path, forge, length, rc):
     assert run_plan(plan_env(tmp_path, forge, plan_payload(hold="a" * length))) == rc
 
 
+@pytest.mark.parametrize("error", [ValueError, RuntimeError])
+@pytest.mark.parametrize(
+    "raw,valid",
+    [
+        pytest.param("x" * 4096, True, id="boundary"),
+        pytest.param("x" * 4097, False, id="oversize"),
+        pytest.param("x\ny", False, id="newline"),
+        pytest.param("x\ry", False, id="return"),
+    ],
+)
+def test_check_hold_labels(raw, valid, error):
+    """Share the inclusive bound and line refusal with the caller's error class."""
+    from release_workflows import check_hold_labels
+
+    if valid:
+        assert check_hold_labels(raw, error) is raw
+    else:
+        with pytest.raises(error, match="hold_labels") as caught:
+            check_hold_labels(raw, error)
+        assert type(caught.value) is error
+
+
 def test_plan_accepts_failed_sweep(tmp_path, forge):
     forge.train_run.update(status="completed", conclusion="failure", event="workflow_dispatch")
     env = plan_env(tmp_path, forge, plan_payload())

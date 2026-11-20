@@ -2799,7 +2799,10 @@ def test_no_release_list_without_a_sweep(tmp_path):
 
 
 def test_release_list_is_bounded_by_the_matrix(tmp_path):
-    mutant = script().replace("from release_workflows import MAX_RELEASES", "MAX_RELEASES = 1")
+    mutant = script().replace(
+        "from release_workflows import MAX_RELEASES, check_hold_labels",
+        "from release_workflows import check_hold_labels\nMAX_RELEASES = 1",
+    )
     assert mutant != script()
     done, summary = train(tmp_path, release_forge(), mutant)
     assert done.returncode == 0, done.stdout + done.stderr
