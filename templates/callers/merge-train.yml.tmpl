@@ -18,18 +18,16 @@ read. Without the key or the client id the run stops with exit code 3 and
 writes nothing.
 
 Runner: one of the fleet's own runners with python3 and openssl; the fleet
-runs no hosted runner minutes for this. Optional `release_runner` runs the
-release fan-out jobs on a separate runner set; empty means `runner`.
+runs no hosted runner minutes for this.
 
 Off switch: the variable MERGE_TRAIN set to `off` makes every run report only,
 with read rights. Unset, the train runs.
 
 Scopes: none. The called jobs write with the app's tokens, one per
 repository, minted for that repository alone and revoked after it;
-GITHUB_TOKEN gets no permission. After the sweep, a second called job runs
-release-please in every repository with release-please-config.json and
-.release-please-manifest.json on its default branch (decision record 0031);
-it needs nothing more from this caller.
+GITHUB_TOKEN gets no permission. The separate release caller in
+templates/callers/merge-train-release.yml.tmpl reads the sweep artifact with
+actions: read and runs release-please in its own workflow run (record 0098).
 
 Required check: none. The job runs on a schedule and by hand, never on a pull
 request, and is no check of a pull request (cordanaLLM/praetor#1212 for the

@@ -33,7 +33,7 @@ from conftest import CHECKOUT, ROOT
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
 
-TRAIN = ROOT / ".github/workflows/merge-train.yml"
+TRAIN = ROOT / ".github/workflows/merge-train-release.yml"
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
 TAG_OBJECT = "c" * 40
@@ -2008,3 +2008,180 @@ def test_push_filter_mutations_flip_planted_oracle(
         assert outputs == f"skip={str(not skip).lower()}\npending=[]\nfrozen=false\n"
     else:
         assert outputs == expected
+
+
+# ADR-0098: an untrusted artifact becomes a bounded release plan before token minting.
+def plan_env(tmp_path, payload=None):
+    path = tmp_path / "releases.json"
+    if payload is not None:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "RUN_EVENT": "schedule",
+        "RUN_HEAD_BRANCH": "main",
+        "RUN_REPOSITORY": "Fleet/Operations",
+        "RUN_CONCLUSION": "success",
+        "DEFAULT_BRANCH": "main",
+        "REPOSITORY": "fleet/operations",
+        "MAX_PARALLEL": "3",
+        "FILE": str(path),
+        "GITHUB_OUTPUT": str(tmp_path / "plan-output"),
+    }
+
+
+def plan_payload(releases=None, hold="hold,planted"):
+    return {
+        "format": 1,
+        "hold_labels": hold,
+        "releases": [{"owner": "Fleet", "name": "App"}] if releases is None else releases,
+    }
+
+
+def run_plan(env):
+    import release_labels
+
+    return release_labels.main(["release_labels.py", "plan"], env)
+
+
+def plan_output(env):
+    return dict(line.split("=", 1) for line in Path(env["GITHUB_OUTPUT"]).read_text().splitlines())
+
+
+@pytest.mark.parametrize("releases", [[{"owner": "Fleet", "name": "App"}], []])
+def test_plan_valid_file(tmp_path, releases):
+    env = plan_env(tmp_path, plan_payload(releases))
+    assert run_plan(env) == 0
+    assert plan_output(env) == {
+        "releases": json.dumps(releases, separators=(",", ":")),
+        "hold_labels": "hold,planted",
+    }
+
+
+@pytest.mark.parametrize("conclusion", ["cancelled", "skipped", "timed_out", "neutral", ""])
+def test_plan_ignores_other_conclusions(tmp_path, capsys, conclusion):
+    env = plan_env(tmp_path) | {"RUN_CONCLUSION": conclusion, "RUN_EVENT": "pull_request"}
+    assert run_plan(env) == 0
+    assert plan_output(env) == {"releases": "[]", "hold_labels": ""}
+    assert f"::notice::train run conclusion {conclusion!r}" in capsys.readouterr().out
+
+
+def test_plan_absent_file(tmp_path, capsys):
+    env = plan_env(tmp_path)
+    assert run_plan(env) == 0
+    assert plan_output(env) == {"releases": "[]", "hold_labels": ""}
+    assert "train run uploaded no release list" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("RUN_EVENT", "push"),
+        ("RUN_HEAD_BRANCH", "topic"),
+        ("RUN_REPOSITORY", "other/repo"),
+    ],
+)
+def test_plan_refuses_untrusted_run(tmp_path, capsys, key, value):
+    env = plan_env(tmp_path, plan_payload()) | {key: value}
+    assert run_plan(env) == 1
+    assert "::error" in capsys.readouterr().out
+    assert not Path(env["GITHUB_OUTPUT"]).exists()
+
+
+@pytest.mark.parametrize(
+    "parallel,rc", [("0", 3), ("1", 0), ("3", 0), ("4", 3), ("1.5", 3), ("two", 3), ("", 3)]
+)
+def test_plan_parallel_boundaries(tmp_path, capsys, parallel, rc):
+    env = plan_env(tmp_path, plan_payload()) | {"MAX_PARALLEL": parallel}
+    assert run_plan(env) == rc
+    if rc:
+        assert "release_max_parallel" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"format": 1, "hold_labels": ""},
+        plan_payload() | {"extra": 1},
+        plan_payload() | {"format": 2},
+        plan_payload() | {"format": True},
+        plan_payload() | {"hold_labels": 2},
+        plan_payload(hold="x\ny"),
+        plan_payload(hold="x\ry"),
+        plan_payload() | {"releases": {}},
+        plan_payload(["fleet/app"]),
+        plan_payload([{"owner": "a"}]),
+        plan_payload([{"owner": "a", "name": "b", "extra": 1}]),
+        plan_payload([{"owner": "-a", "name": "b"}]),
+        plan_payload([{"owner": "a", "name": "bad/name"}]),
+        plan_payload([{"owner": "a", "name": "."}]),
+        plan_payload([{"owner": "a", "name": ".."}]),
+        plan_payload([{"owner": 1, "name": "b"}]),
+        plan_payload([{"owner": "a", "name": None}]),
+        plan_payload([{"owner": "A", "name": "B"}, {"owner": "a", "name": "b"}]),
+    ],
+)
+def test_plan_refuses_invalid_payload(tmp_path, capsys, payload):
+    env = plan_env(tmp_path, payload)
+    assert run_plan(env) == 1
+    assert "::error" in capsys.readouterr().out
+    assert not Path(env["GITHUB_OUTPUT"]).exists()
+
+
+@pytest.mark.parametrize("count,rc", [(256, 0), (257, 1)])
+def test_plan_repository_count_boundary(tmp_path, count, rc):
+    env = plan_env(tmp_path, plan_payload([{"owner": "a", "name": f"r{i}"} for i in range(count)]))
+    assert run_plan(env) == rc
+
+
+@pytest.mark.parametrize("length,rc", [(39, 0), (40, 1)])
+def test_plan_owner_length_boundary(tmp_path, length, rc):
+    env = plan_env(tmp_path, plan_payload([{"owner": "a" * length, "name": "b"}]))
+    assert run_plan(env) == rc
+
+
+@pytest.mark.parametrize("length,rc", [(1, 0), (100, 0), (0, 1), (101, 1)])
+def test_plan_name_length_boundary(tmp_path, length, rc):
+    env = plan_env(tmp_path, plan_payload([{"owner": "a", "name": "b" * length}]))
+    assert run_plan(env) == rc
+
+
+@pytest.mark.parametrize("length,rc", [(4096, 0), (4097, 1)])
+def test_plan_hold_length_boundary(tmp_path, length, rc):
+    assert run_plan(plan_env(tmp_path, plan_payload(hold="a" * length))) == rc
+
+
+def test_plan_accepts_failed_sweep(tmp_path):
+    env = plan_env(tmp_path, plan_payload()) | {
+        "RUN_CONCLUSION": "failure",
+        "RUN_EVENT": "workflow_dispatch",
+    }
+    assert run_plan(env) == 0
+    assert json.loads(plan_output(env)["releases"])
+
+
+def test_plan_refuses_malformed_json(tmp_path, capsys):
+    env = plan_env(tmp_path, plan_payload())
+    Path(env["FILE"]).write_text("{")
+    assert run_plan(env) == 1
+    assert "::error" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("damage", ["directory", "encoding", "oversize"])
+def test_plan_read_failures_are_errors(tmp_path, capsys, damage):
+    env = plan_env(tmp_path)
+    path = Path(env["FILE"])
+    if damage == "directory":
+        path.mkdir()
+    elif damage == "encoding":
+        path.write_bytes(b"\xff")
+    else:
+        path.write_text(json.dumps(plan_payload()) + " " * (1024 * 1024))
+    assert run_plan(env) == 1
+    assert "::error" in capsys.readouterr().out
+
+
+def test_plan_empty_list_notice(tmp_path, capsys):
+    env = plan_env(tmp_path, plan_payload([]))
+    assert run_plan(env) == 0
+    assert "::notice::no repository named" in capsys.readouterr().out

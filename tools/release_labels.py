@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from release_workflows import local_release_workflows, workflow_runs_release
+from release_workflows import MAX_RELEASES, local_release_workflows, workflow_runs_release
 
 PENDING_LABEL = "autorelease: pending"
 TAGGED_LABEL = "autorelease: tagged"
@@ -470,12 +470,114 @@ def cmd_after(env):
     return 1
 
 
+MAX_RELEASE_PARALLEL = 3
+PLAN_OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
+PLAN_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
+
+
+def check_release_parallel(raw):
+    """Release jobs at once, a whole number from 1 to 3 (HISS-06)."""
+    if not raw.isascii() or not raw.isdigit() or not 1 <= int(raw) <= MAX_RELEASE_PARALLEL:
+        raise ValueError(
+            f"release_max_parallel is {raw!r}, not a whole number from 1 to {MAX_RELEASE_PARALLEL}"
+        )
+    return int(raw)
+
+
+def check_plan_repository(item):
+    """Allow only repository identifiers safe for a matrix and a token scope."""
+    if not isinstance(item, dict) or set(item) != {"owner", "name"}:
+        raise CallError("release repository must contain exactly owner and name")
+    owner, name = item["owner"], item["name"]
+    if not isinstance(owner, str) or not PLAN_OWNER.fullmatch(owner):
+        raise CallError("release repository owner is invalid (1..39 letters, digits or hyphens)")
+    if not isinstance(name, str) or not PLAN_NAME.fullmatch(name) or name in (".", ".."):
+        raise CallError("release repository name is invalid (1..100 letters, digits, dot, _ or -)")
+    return (owner.casefold(), name.casefold())
+
+
+def check_plan_hold(hold):
+    """A bounded single-line output value, preserved exactly."""
+    if not isinstance(hold, str) or len(hold) > 4096 or "\n" in hold or "\r" in hold:
+        raise CallError("release hold_labels must be a single line of at most 4096 characters")
+    return hold
+
+
+def check_release_plan(data):
+    """Validate the versioned artifact with exact keys and scalar bounds."""
+    if not isinstance(data, dict) or set(data) != {"format", "hold_labels", "releases"}:
+        raise CallError("release list must contain exactly format, hold_labels and releases")
+    if type(data["format"]) is not int or data["format"] != 1:
+        raise CallError("release list format must be 1")
+    hold = check_plan_hold(data["hold_labels"])
+    releases = data["releases"]
+    if not isinstance(releases, list) or len(releases) > MAX_RELEASES:
+        raise CallError(f"release list must be a list of at most {MAX_RELEASES} repositories")
+    seen = set()
+    for item in releases[:MAX_RELEASES]:
+        key = check_plan_repository(item)
+        if key in seen:
+            raise CallError("release list contains a duplicate repository (case-insensitive)")
+        seen.add(key)
+    return releases, hold
+
+
+def write_plan_output(env, releases, hold):
+    """One compact output line per value; validation disallows line injection."""
+    with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+        output.write(
+            f"releases={json.dumps(releases, separators=(',', ':'))}\nhold_labels={hold}\n"
+        )
+    return 0
+
+
+def read_release_plan(path):
+    """Read a bounded local artifact; decode and I/O errors retain their context."""
+    try:
+        with open(path, encoding="utf-8") as source:
+            raw = source.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            raise CallError(f"release list exceeds {MAX_BYTES} characters")
+        return check_release_plan(json.loads(raw))
+    except (OSError, UnicodeError, ValueError) as err:
+        raise CallError(f"read release list: {err}") from err
+
+
+def cmd_plan(env):
+    """Accept only completed default-branch train runs before consuming their artifact."""
+    conclusion = env["RUN_CONCLUSION"]
+    if conclusion not in {"success", "failure"}:
+        sys.stdout.write(f"::notice::train run conclusion {conclusion!r}; no release legs\n")
+        return write_plan_output(env, [], "")
+    if env["RUN_EVENT"] not in {"schedule", "workflow_dispatch"}:
+        raise CallError("train run event must be schedule or workflow_dispatch")
+    if env["RUN_HEAD_BRANCH"] != env["DEFAULT_BRANCH"]:
+        raise CallError("train run head branch must be the default branch")
+    if env["RUN_REPOSITORY"].casefold() != env["REPOSITORY"].casefold():
+        raise CallError("train run repository must be the caller repository")
+    try:
+        check_release_parallel(env["MAX_PARALLEL"])
+    except ValueError as err:
+        sys.stdout.write(f"::error title=Release plan setting::{err}\n")
+        return 3
+    if not Path(env["FILE"]).exists():
+        sys.stdout.write(
+            "::notice::train run uploaded no release list "
+            "(switch off, or the sweep ended before its summary)\n"
+        )
+        return write_plan_output(env, [], "")
+    releases, hold = read_release_plan(env["FILE"])
+    if not releases:
+        sys.stdout.write("::notice::no repository named in the release list\n")
+    return write_plan_output(env, releases, hold)
+
+
 def main(argv, env):
-    """Dispatch settings or after command."""
+    """Dispatch plan, settings or after command."""
     if len(argv) < 2:
-        sys.stderr.write("usage: release_labels.py <settings|after>\n")
+        sys.stderr.write("usage: release_labels.py <plan|settings|after>\n")
         return 2
-    commands = {"settings": cmd_settings, "after": cmd_after}
+    commands = {"plan": cmd_plan, "settings": cmd_settings, "after": cmd_after}
     if argv[1] not in commands:
         sys.stderr.write(f"unknown command: {argv[1]}\n")
         return 2
@@ -484,7 +586,7 @@ def main(argv, env):
     except URLRefusedError as err:
         sys.stderr.write(f"::error title=Release labels::{argv[1]}: {err}\n")
         return 1
-    except (CallError, KeyError, json.JSONDecodeError) as err:
+    except (CallError, KeyError, OSError, json.JSONDecodeError) as err:
         sys.stdout.write(f"::error title=Release labels::{argv[1]}: {err}\n")
         return 1
 

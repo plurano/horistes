@@ -1,0 +1,53 @@
+<%- /*
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+
+Caller of the shared release fan-out, kept as
+.github/workflows/merge-train-release.yml beside the merge train caller.
+The steps live in .github/workflows/merge-train-release.yml of the shared
+repository, named by commit (decision record 0098).
+
+Runner: a runner with python3. Set .RunnerTag independently of the train
+caller when release legs should use a separate runner set.
+
+Scopes: GITHUB_TOKEN gets actions: read only, to read the train run's artifact.
+Release legs use repository-limited app tokens. The merge-train environment
+holds MERGE_TRAIN_APP_KEY; MERGE_TRAIN_APP_CLIENT_ID holds the app's client id,
+as described by templates/callers/merge-train.yml.tmpl.
+
+Trigger: completion of Merge train, including failed sweeps with a release
+list. The plan checks the train event, branch, repository and conclusion.
+No workflow-level concurrency on purpose: queued release legs must not hold
+the train. The reusable workflow serializes each repository's legs across runs.
+
+Required check: none; never a pull request check (cordanaLLM/praetor#1212).
+Fields: .Shared.Repository, .Shared.Commit, .Shared.Version and .RunnerTag
+are supplied by the template renderer (cordanaLLM/praetor#1211).
+
+Licence header: the rendered caller starts with the consumer's own header,
+written from .Licence. Empty notes inside the fields keep this repository's
+licence check from reading the template lines as tags.
+*/ -%>
+# SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>
+---
+name: Merge train releases
+
+on:
+  workflow_run:
+    workflows: ["Merge train"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  release:
+    name: Merge train releases
+    permissions:
+      actions: read
+    uses: <% .Shared.Repository %>/.github/workflows/merge-train-release.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      runner: <% .RunnerTag %>
+      app_client_id: ${{ vars.MERGE_TRAIN_APP_CLIENT_ID }}
+    secrets:
+      app_private_key: ${{ secrets.MERGE_TRAIN_APP_KEY }}

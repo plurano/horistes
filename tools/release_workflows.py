@@ -4,6 +4,9 @@
 
 import re
 
+# Shared matrix bound for the sweep writer and the artifact reader (ADR-0098).
+MAX_RELEASES = 256
+
 KNOWN_RELEASE_WORKFLOWS = (
     "jellysin/release-helper/.github/workflows/release-please.yml@",
     "jellysin/release-helper/.github/workflows/release-please.yaml@",
