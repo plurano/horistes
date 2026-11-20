@@ -71,6 +71,9 @@ RULE = {
     "matchPackageNames",
     "minimumReleaseAge",
     "prBodyNotes",
+    # Shared batching and the later own-release exceptions belong in the preset.
+    "groupName",
+    "schedule",
 }
 # The fleet organisations whose own releases wait for no release age.
 ORGS = (
@@ -240,6 +243,45 @@ def outside_settings_sync(preset: dict) -> list[str]:
 MAX_RULES = 50
 MAX_PATTERNS = 50
 
+# Fixed probes cover each manager, all non-major boundaries, and own releases.
+BATCH_SCHEDULE = ["* 0-3 * * 1"]
+BATCH_OUTSIDE = (
+    ("github-actions", "github-tags", "actions/checkout", "digest"),
+    ("pip-compile", "pypi", "ruff", "patch"),
+    ("gomod", "go", "golang.org/x/net", "minor"),
+    ("npm", "npm", "@types/node", "pin"),
+    ("dockerfile", "docker", "docker.io/library/python", "digest"),
+    ("custom.regex", "github-release-attachments", "rhysd/actionlint", "patch"),
+    ("github-actions", "github-tags", "actions/checkout", "pinDigest"),
+)
+# The pinDigest row is a boundary that majors do not repeat.
+BATCH_MAJOR = BATCH_OUTSIDE[:-1]
+BATCH_OWN = (
+    ("github-actions", "github-tags", "plurano/horistes", "digest"),
+    ("gomod", "go", "github.com/golusoris/x", "minor"),
+    ("dockerfile", "docker", "ghcr.io/vmafx/img", "digest"),
+    ("npm", "npm", "@jellysin/pkg", "patch"),
+    ("github-actions", "github-tags", "lusoris/llama-swap", "minor"),
+)
+BATCH_CASES = (
+    *(
+        (
+            f"outside:{manager}:{kind}",
+            (manager, source, package, kind),
+            (f"{manager} non-major", BATCH_SCHEDULE),
+        )
+        for manager, source, package, kind in BATCH_OUTSIDE
+    ),
+    *(
+        (f"major:{manager}", (manager, source, package, "major"), (None, None))
+        for manager, source, package, _ in BATCH_MAJOR
+    ),
+    *(
+        (f"own:{source}:{package}", (manager, source, package, kind), (None, []))
+        for manager, source, package, kind in BATCH_OWN
+    ),
+)
+
 
 def _glob_to_regex(glob: str) -> str:
     """Convert a segment-aware Renovate glob pattern to an anchored regex."""
@@ -319,6 +361,53 @@ def release_age(
         if "minimumReleaseAge" in rule:
             current_age = rule["minimumReleaseAge"]
     return current_age
+
+
+def _batch_rule_matches(
+    rule: dict, manager: str, datasource: str, package: str, update_type: str
+) -> bool:
+    """Match the selectors used by the batching and own-release rules."""
+    fields = (
+        ("matchManagers", manager),
+        ("matchDatasources", datasource),
+        ("matchUpdateTypes", update_type),
+    )
+    return all(value in rule.get(key, [value]) for key, value in fields) and patterns_match(
+        rule.get("matchPackageNames", ["*"]), package
+    )
+
+
+def batch(
+    preset: dict, manager: str, datasource: str, package: str, update_type: str
+) -> tuple[str | None, list | None]:
+    """Emulate later matching rules overriding groupName and schedule.
+
+    Like release_age, skip rules carrying enabled: the preset uses it only
+    to switch updates off.
+    """
+    rules = preset.get("packageRules", [])
+    if len(rules) > MAX_RULES:
+        raise ValueError(f"preset has {len(rules)} packageRules, at most {MAX_RULES} supported")
+    current = {}
+    for rule in rules[:MAX_RULES]:
+        if "enabled" in rule:
+            continue
+        if not _batch_rule_matches(rule, manager, datasource, package, update_type):
+            continue
+        for key in ("groupName", "schedule"):
+            if key in rule:
+                current[key] = rule[key]
+    group = current.get("groupName")
+    if group is not None:
+        group = group.replace("{{manager}}", manager)
+    return group, current.get("schedule")
+
+
+def batch_problems(preset: dict) -> list[str]:
+    """Named dependencies whose batching differs from the fixed probe table."""
+    return [
+        name for name, dependency, expected in BATCH_CASES if batch(preset, *dependency) != expected
+    ]
 
 
 def disabled_package_rules(
@@ -1109,6 +1198,89 @@ def test_planted_makefile_tool_pin_is_not_read(old, new):
     assert matches == []
 
 
+def test_preset_batches_non_major_updates_per_manager():
+    assert batch_problems(PRESET) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "dependency", "expected"), BATCH_CASES, ids=[case[0] for case in BATCH_CASES]
+)
+def test_batch_positive_negative_and_boundary_cases(name, dependency, expected):
+    assert batch(PRESET, *dependency) == expected, name
+
+
+def test_two_managers_have_different_batch_groups():
+    first = batch(PRESET, *BATCH_OUTSIDE[0])
+    second = batch(PRESET, *BATCH_OUTSIDE[1])
+    assert first == ("github-actions non-major", BATCH_SCHEDULE)
+    assert second == ("pip-compile non-major", BATCH_SCHEDULE)
+    assert first[0] != second[0]
+
+
+@pytest.mark.parametrize(
+    ("case", "problems"),
+    [
+        ("a-no-schedule", [row[0] for row in BATCH_CASES[:7]]),
+        ("b-one-group", [row[0] for row in BATCH_CASES[:7]]),
+        ("c-majors-grouped", [row[0] for row in BATCH_CASES[7:13]]),
+        ("d-own-group-inherited", [BATCH_CASES[13][0], BATCH_CASES[17][0]]),
+        ("e-batch-after-own", [row[0] for row in BATCH_CASES[13:18]]),
+        ("g-no-batch", [row[0] for row in BATCH_CASES[:7]]),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_planted_batch_defect_is_refused(case, problems):
+    planted = copy.deepcopy(PRESET)
+    rules = planted["packageRules"]
+    match case:
+        case "a-no-schedule":
+            rules[1].pop("schedule")
+        case "b-one-group":
+            rules[1]["groupName"] = "non-major"
+        case "c-majors-grouped":
+            rules[1]["matchUpdateTypes"].append("major")
+        case "d-own-group-inherited":
+            rules[2].pop("groupName")
+        case "e-batch-after-own":
+            rules.insert(5, rules.pop(1))
+        case "g-no-batch":
+            rules.pop(1)
+        case _:
+            pytest.fail(f"unknown planted case: {case}")
+    assert batch_problems(planted) == problems
+
+
+def test_planted_batch_f_vulnerability_group_is_refused():
+    planted = copy.deepcopy(PRESET)
+    planted["vulnerabilityAlerts"]["groupName"] = "security"
+    assert outside_the_preset(planted) == ["vulnerabilityAlerts.groupName"]
+
+
+@pytest.mark.parametrize(
+    "selector", ["matchManagers", "matchDatasources", "matchUpdateTypes", "matchPackageNames"]
+)
+def test_batch_skips_rules_with_a_nonmatching_selector(selector):
+    planted = {"packageRules": [{selector: ["other"], "groupName": "wrong", "schedule": []}]}
+    assert batch(planted, *BATCH_OUTSIDE[0]) == (None, None)
+
+
+def test_batch_skips_enabled_rules():
+    planted = {"packageRules": [{"enabled": False, "groupName": "wrong", "schedule": []}]}
+    assert batch(planted, *BATCH_OUTSIDE[0]) == (None, None)
+
+
+def test_batch_rule_count_boundaries():
+    assert batch({}, *BATCH_OUTSIDE[0]) == (None, None)
+    rules = [{} for _ in range(MAX_RULES - 1)]
+    rules.append({"groupName": "{{manager}} non-major", "schedule": BATCH_SCHEDULE})
+    assert batch({"packageRules": rules}, *BATCH_OUTSIDE[0]) == (
+        "github-actions non-major",
+        BATCH_SCHEDULE,
+    )
+    with pytest.raises(ValueError, match="preset has 51 packageRules, at most 50 supported"):
+        batch({"packageRules": [*rules, {}]}, *BATCH_OUTSIDE[0])
+
+
 @pytest.mark.parametrize("org", ORGS)
 @pytest.mark.parametrize(
     ("datasource", "template"),
@@ -1303,8 +1475,8 @@ def test_planted_fork_rule_before_own_rules_leaves_fork_unheld():
 
 def test_planted_unanchored_own_rule_is_refused():
     planted = copy.deepcopy(PRESET)
-    patterns = planted["packageRules"][1]["matchPackageNames"]
-    planted["packageRules"][1]["matchPackageNames"] = [p.replace("/^", "/") for p in patterns]
+    patterns = planted["packageRules"][2]["matchPackageNames"]
+    planted["packageRules"][2]["matchPackageNames"] = [p.replace("/^", "/") for p in patterns]
     problems = own_pattern_problems(planted)
     assert "github-tags:evilplurano/x" in problems
     assert release_age(planted, "github-tags", "evilplurano/x") is None

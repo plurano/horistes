@@ -687,6 +687,7 @@ and reports to the forge's code scanning ([ADR-0043](docs/adr/0043-codeql-report
 | base | `config:recommended` |
 | commits of the bot | carry the sign-off line (`:gitSignOff`) |
 | waiting time after a release | three days; none for a fix of a known vulnerability, own releases or container image digest updates; forks of outside projects keep three days |
+| update batching | non-major updates share one weekly batch per manager (Monday before 04:00 UTC). A major update, a vulnerability fix and an own release stay their own proposals (`batch_problems` in `tests/test_update_bot.py`; [ADR-0099](docs/adr/0099-non-major-updates-wait-for-a-weekly-batch-per-manager.md)). |
 | merge by the bot | never |
 | after a Go module update | `go mod tidy` (`gomodTidy`) |
 | pull request body | `prHeader` adds the description and verification checklist; every box stays unticked, and every heading carries text beyond blanks and HTML comments (`pr_header_problems` in `tests/test_update_bot.py`). The header matches the template that `praetorctl adopt` ships. A repository with a different template sets its own `prHeader` in its `renovate.json`. |
