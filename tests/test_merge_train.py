@@ -9152,11 +9152,12 @@ def test_dependency_pull_held_by_required_status_commits_generated_files(tmp_pat
     assert "### fleet/app: committed generated files to #1" in summary
 
 
-# workflow_call inputs the job reads itself, not the train script.
+# workflow_call inputs the job reads itself, not the train script. release_workflow feeds the
+# "Start the release run" step, pinned by check_dispatch_wiring in tests/test_train_release_run.py.
 JOB_RUNNER_INPUTS = {
     "train": "${{ inputs.runner }}",
 }
-INPUTS_OFF_TRAIN = frozenset({"runner"})
+INPUTS_OFF_TRAIN = frozenset({"runner", "release_workflow"})
 
 
 def input_wiring_findings(doc: dict, source: str) -> list[str]:
