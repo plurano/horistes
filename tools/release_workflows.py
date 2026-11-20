@@ -351,7 +351,7 @@ def jobs_sections(content):
     section = []
     for line in content.splitlines()[:5000]:
         stripped = line.strip()
-        if not stripped:
+        if not stripped or stripped.startswith("#"):
             if in_jobs:
                 section.append(line)
             continue
