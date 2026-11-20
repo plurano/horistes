@@ -52,6 +52,10 @@ these repositories again; turning this recoverable omission red obscures the
 work the rest of the fleet completed. The initial `/app/installations` read
 still fails the job when exhausted because no sweep can proceed without it.
 
+A read exhausted inside a hold keeps that hold and also names the repository
+as not read, once per sweep. The repository still counts as served and keeps
+its existing release eligibility.
+
 The inline `QUERY` in `.github/workflows/merge-train.yml` reads 10 open pull
 requests per page; its derived `STATUS_QUERY` inherits that size. Ten pages in
 `pull_pages()` preserve the 100-pull-request cap. `PULL_LIMIT` bounds row loops

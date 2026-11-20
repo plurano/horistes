@@ -29,6 +29,7 @@ import urllib.request
 import zipfile
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from typing import NamedTuple
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
 from review_state import is_bot_dependency, review_evidence, review_incomplete
@@ -941,7 +942,7 @@ def prepare_update(env, conf, pull, notes, arming):
     return True
 
 
-def advance(env, conf, repo, rows, notes, check_retry=None):
+def advance(env, conf, repo, rows, notes, unread, check_retry=None):
     """Update the first pull request `updatable` names, arming it first where it says.
 
     While `required_status` or `review_bots` is set an armed pull request is disarmed
@@ -959,7 +960,7 @@ def advance(env, conf, repo, rows, notes, check_retry=None):
         if hold:
             notes[pull["number"]] = hold
             continue
-        if arming and late_review_hold(env, conf, pull, notes, arming=True):
+        if arming and late_review_hold(env, conf, pull, notes, unread, arming=True):
             continue
         if not prepare_update(env, conf, pull, notes, arming):
             continue
@@ -1316,7 +1317,22 @@ def is_candidate(pull, reason, default_branch, conf):
     return reason != "release or reserved branch: a person lands it"
 
 
-def regenerate(env, conf, repo, rows, notes):
+def read_generated_files(env, pull, allowlist, notes, unread):
+    """Read candidate artifacts; an exhausted read keeps its note and records the omission."""
+    try:
+        art = find_artifact(env, pull)
+        if not art:
+            return None, None
+        data = download_artifact(env, art)
+        _, file_bytes = validate_artifact(env, pull, data, allowlist)
+        return art, filter_changed_files(env, pull, file_bytes)
+    except RefusedError as err:
+        record_unread(unread, err)
+        notes[pull["number"]] = f"generated files refused: {err}"[:200]
+        return None, None
+
+
+def regenerate(env, conf, repo, rows, notes, unread):
     """Commit regenerated files for one candidate dependency update, or None.
 
     Security updates go first, then the head that has waited longest: a head the
@@ -1348,16 +1364,7 @@ def regenerate(env, conf, repo, rows, notes):
         if armed:
             notes[pull["number"]] = f"regenerate waits: #{armed[0]['number']} is armed"
             continue
-        try:
-            art = find_artifact(env, pull)
-            if not art:
-                continue
-            data = download_artifact(env, art)
-            _, file_bytes = validate_artifact(env, pull, data, allowlist)
-            changed = filter_changed_files(env, pull, file_bytes)
-        except RefusedError as err:
-            notes[pull["number"]] = f"generated files refused: {err}"[:200]
-            continue
+        art, changed = read_generated_files(env, pull, allowlist, notes, unread)
         if not changed:
             continue
         state = pull_merge_state(env, pull["number"])
@@ -1373,9 +1380,9 @@ def regenerate(env, conf, repo, rows, notes):
     return None
 
 
-def re_arm_after_review(env, conf, pull, notes):
+def re_arm_after_review(env, conf, pull, notes, unread):
     """Read reviews before disarming and re-arming a drifted headline; unread stays armed."""
-    if late_review_hold(env, conf, pull, notes, arming=True):
+    if late_review_hold(env, conf, pull, notes, unread, arming=True):
         if notes[pull["number"]].startswith("disarmed: "):
             return f"disarmed #{pull['number']}"
         return None
@@ -1389,7 +1396,7 @@ def re_arm_after_review(env, conf, pull, notes):
     return f"re-armed #{pull['number']}"
 
 
-def re_arm_drifted(env, conf, served, held, notes):
+def re_arm_drifted(env, conf, served, held, notes, unread):
     """Re-arm an armed squash pull request whose headline drifted from its title.
 
     With required_status or review_bots, disarm for direct landing by the train.
@@ -1410,7 +1417,7 @@ def re_arm_drifted(env, conf, served, held, notes):
                 "disarmed: title changed after arming, the train lands it directly"
             )
             return f"disarmed #{pull['number']}"
-        outcome = re_arm_after_review(env, conf, pull, notes)
+        outcome = re_arm_after_review(env, conf, pull, notes, unread)
         if outcome:
             return outcome
     return None
@@ -1728,11 +1735,18 @@ def collaborator_right(env, login):
     return answer.get("permission") in ("admin", "write")
 
 
-def read_review_hold(env, pull, review_bots=frozenset()):
+def record_unread(unread, err):
+    """Keep only the first exhausted read in this repository's sweep."""
+    if isinstance(err, UnreadError) and not unread:
+        unread.append(err)
+
+
+def read_review_hold(env, pull, unread, review_bots=frozenset()):
     """The review-body hold of one pull request, or None; a failed read holds it."""
     try:
         detail = pull_review_bodies(env, pull["number"])
     except RefusedError as err:
+        record_unread(unread, err)
         return f"{REVIEW_BODY}cannot read: {err}"[:200]
     if not detail:
         return f"{REVIEW_BODY}cannot read: the forge returned no pull request"
@@ -1747,7 +1761,7 @@ def review_body_eligible(pull, reason, conf):
     return served and not is_bot_dependency(pull, conf)
 
 
-def hold_review_bodies(env, conf, rows):
+def hold_review_bodies(env, conf, rows, unread):
     """Replace verdict reasons with review-body holds; read at most REVIEW_READS pull requests.
 
     Reads go in serving order, security updates and the oldest first. An eligible pull
@@ -1759,20 +1773,20 @@ def hold_review_bodies(env, conf, rows):
         if review_body_eligible(pull, reason, conf)
     ]
     holds = {
-        pull["number"]: read_review_hold(env, pull, conf.get("review_bots", frozenset()))
+        pull["number"]: read_review_hold(env, pull, unread, conf.get("review_bots", frozenset()))
         for pull in eligible[:REVIEW_READS]
     }
     conf["review_reads"] = len(holds)
-    unread = frozenset(pull["number"] for pull in eligible[REVIEW_READS:PULL_LIMIT])
+    deferred = frozenset(pull["number"] for pull in eligible[REVIEW_READS:PULL_LIMIT])
     over = f"{REVIEW_BODY}not read: more than {REVIEW_READS} pull requests to read in one run"
     updated = []
     for pull, reason in rows[:PULL_LIMIT]:
         number = pull["number"]
-        updated.append((pull, over if number in unread else holds.get(number) or reason))
+        updated.append((pull, over if number in deferred else holds.get(number) or reason))
     return updated
 
 
-def late_review_hold(env, conf, pull, notes, *, arming=False):
+def late_review_hold(env, conf, pull, notes, unread, *, arming=False):
     """Re-read before landing or arming; True holds, disarmed if already armed."""
     if is_bot_dependency(pull, conf):
         return False
@@ -1781,7 +1795,7 @@ def late_review_hold(env, conf, pull, notes, *, arming=False):
         notes[pull["number"]] = f"{REVIEW_BODY}not armed: review read budget spent this sweep"
         return True
     conf[counter] = conf.get(counter, 0) + 1
-    hold = read_review_hold(env, pull, conf.get("review_bots", frozenset()))
+    hold = read_review_hold(env, pull, unread, conf.get("review_bots", frozenset()))
     if not hold:
         return False
     if pull.get("autoMergeRequest"):
@@ -1791,11 +1805,11 @@ def late_review_hold(env, conf, pull, notes, *, arming=False):
     return True
 
 
-def land_clean(env, conf, repo, served, notes):
+def land_clean(env, conf, repo, served, notes, unread):
     """Land or enqueue the oldest clean pull request, or None."""
     for pull, reason in served:
-        if reason == "land" and not late_review_hold(env, conf, pull, notes):
-            hold = late_lander_lease(env, conf, repo, pull)
+        if reason == "land" and not late_review_hold(env, conf, pull, notes, unread):
+            hold = late_lander_lease(env, conf, repo, pull, unread)
             if hold:
                 notes[pull["number"]] = hold
                 return hold
@@ -1808,7 +1822,7 @@ def land_clean(env, conf, repo, served, notes):
     return None
 
 
-def late_lander_lease(env, conf, repo, pull):
+def late_lander_lease(env, conf, repo, pull, unread):
     """Refuse this sweep's landings if the lease changed; security remains exempt."""
     if is_security(pull, conf):
         return None
@@ -1821,6 +1835,7 @@ def late_lander_lease(env, conf, repo, pull):
         if label != repo.get("landerLease"):
             return "lander lease changed since the page read"
     except (RefusedError, KeyError, TypeError) as err:
+        record_unread(unread, err)
         return f"lander lease unreadable: {type(err).__name__}: {err}"
     return None
 
@@ -1906,7 +1921,7 @@ def retry_exempt(pull, conf):
     return is_security(pull, conf) or URGENT_LABEL in label_names(pull)
 
 
-def read_retry(env, conf, now, reads, pull):
+def read_retry(env, conf, now, reads, unread, pull):
     """Cache one history result per pull in this sweep; defer uncached reads past the cap."""
     if retry_exempt(pull, conf):
         return None
@@ -1914,11 +1929,11 @@ def read_retry(env, conf, now, reads, pull):
     if number not in reads:
         if len(reads) >= RETRY_READ_LIMIT:
             return RETRY_DEFERRED
-        reads[number] = retry_hold(env, conf, pull, now)
+        reads[number] = retry_hold(env, conf, pull, now, unread)
     return reads[number]
 
 
-def retry_hold(env, conf, pull, now):
+def retry_hold(env, conf, pull, now, unread):
     """Recover the latest completed attempt from forge history; unreadable history holds."""
     if retry_exempt(pull, conf):
         return None
@@ -1945,6 +1960,7 @@ def retry_hold(env, conf, pull, now):
         expiry = until.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         return f"held for retry: diff unchanged since {oid[:12]} failed {names}; until {expiry}"
     except (RefusedError, AttributeError, KeyError, TypeError, ValueError) as err:
+        record_unread(unread, err)
         return f"held for retry: history unreadable: {err}"
 
 
@@ -1954,14 +1970,14 @@ def retry_workflow(suite):
     return run["workflow"]["name"] if run else (suite["app"] or {}).get("slug", "unknown app")
 
 
-def hold_retries(env, conf, repo, served, notes, now, reads):
+def hold_retries(env, conf, repo, served, notes, now, reads, unread):
     """Hold retries before the first unheld candidate, within a scalar read budget."""
     candidates = [p for p, reason in served if in_flight(p, reason)]
     candidates += [pull for pull, _ in updatable(repo, served, {}, conf)]
     holds = {}
     unheld = False
     for pull in candidates:
-        hold = read_retry(env, conf, now, reads, pull)
+        hold = read_retry(env, conf, now, reads, unread, pull)
         if hold is RETRY_DEFERRED:
             break
         if not hold:
@@ -2026,14 +2042,14 @@ def lander_lease(repo, now):
         raise RefusedError(f"{err}") from err
 
 
-def run(env, conf, repo, now, notes=None):
+def run(env, conf, repo, now, unread, notes=None):
     """Execute one merge train cycle across served pull requests."""
     if notes is None:
         notes = {}
     pulls = repo["pullRequests"]["nodes"]
     replaced = superseded(pulls)
     verdicts = [(pull, verdict(pull, repo, conf, now, replaced)) for pull in pulls]
-    rows = hold_review_bodies(env, conf, verdicts)
+    rows = hold_review_bodies(env, conf, verdicts, unread)
     notes.update({pull["number"]: reason for pull, reason in rows})
     if conf["switch"] == "off":
         return rows, notes, "switched off: nothing landed or updated"
@@ -2054,7 +2070,9 @@ def run(env, conf, repo, now, notes=None):
     hold = write_hold(served, conf, now)
     if hold:
         served = yield_to_write(served, notes, conf, hold)
-    outcome = serve_cycle(env, conf, repo, served, notes, now, held, lease)
+    outcome = serve_cycle(env, conf, repo, served, notes, held, unread)
+    if not outcome:
+        outcome = serve_pending(env, conf, repo, served, notes, now, lease, unread)
     if lease and planned is not None:
         outcome = f"{outcome}; {lease_note}"
     elif lease and outcome == "no pull request at a mergeable state":
@@ -2062,26 +2080,28 @@ def run(env, conf, repo, now, notes=None):
     return rows, notes, outcome
 
 
-def serve_cycle(env, conf, repo, served, notes, now, held, lease):
+def serve_cycle(env, conf, repo, served, notes, held, unread):
     """Try a write or landing before reading retry history for pending updates."""
-    outcome = regenerate(env, conf, repo, served, notes)
+    outcome = regenerate(env, conf, repo, served, notes, unread)
     if outcome:
         return outcome
-    re_armed = re_arm_drifted(env, conf, served, held, notes)
+    re_armed = re_arm_drifted(env, conf, served, held, notes, unread)
     if re_armed:
         return re_armed
-    landed_pr = land_clean(env, conf, repo, served, notes)
+    landed_pr = land_clean(env, conf, repo, served, notes, unread)
     if landed_pr:
         return landed_pr
-    return serve_pending(env, conf, repo, served, notes, now, lease)
+    return None
 
 
-def serve_pending(env, conf, repo, served, notes, now, lease):
+def serve_pending(env, conf, repo, served, notes, now, lease, unread):
     """Hold unchanged failed retries before checking in-flight heads or updating one."""
     reads = {}
-    check_retry = None if lease else partial(read_retry, env, conf, now, reads)
+    check_retry = None if lease else partial(read_retry, env, conf, now, reads, unread)
     served, released = (
-        (served, None) if lease else hold_retries(env, conf, repo, served, notes, now, reads)
+        (served, None)
+        if lease
+        else hold_retries(env, conf, repo, served, notes, now, reads, unread)
     )
     if released:
         notes[released[0]] = released[1]
@@ -2092,7 +2112,7 @@ def serve_pending(env, conf, repo, served, notes, now, lease):
         served, notes, lambda run: run_jobs(env, run), lambda pull: toggle_refresh(env, pull), conf
     )
     if not outcome:
-        advance(env, conf, repo, served, notes, check_retry)
+        advance(env, conf, repo, served, notes, unread, check_retry)
     if released and notes[released[0]] != released[1]:
         notes[released[0]] += f"; {released[1]}"
     return outcome or "no pull request at a mergeable state"
@@ -2253,10 +2273,10 @@ def one(env, conf, installation, target, now):
     token = mint(env, conf, installation, rights, [target["name"]])
     local = {**env, "GITHUB_REPOSITORY": target["full_name"], "TRAIN_TOKEN": token}
     closed = []
-    notes = {}
+    notes, unread = {}, []
     try:
         repo = fetch(local, conf)
-        rows, notes, outcome = run(local, conf, repo, now, notes)
+        rows, notes, outcome = run(local, conf, repo, now, unread, notes)
         if conf["switch"] == "on":
             closed = close_issues(local, conf, installation, target, now)
     except RefusedError as err:
@@ -2291,6 +2311,7 @@ def one(env, conf, installation, target, now):
         moved,
         bool(repo["releaseConfig"] and repo["releaseManifest"]),
         unsigned_bots,
+        unread,
     )
 
 
@@ -2298,6 +2319,12 @@ def note_unread(unread, name, err, unsigned_bots):
     """Keep the target and first error line, plus any unsigned bots seen before it failed."""
     unread.append(f"{name}: {str(err).splitlines()[0]}")
     unsigned_bots.extend(err.unsigned_bots)
+
+
+def note_held_unread(unread, name, errors, unsigned_bots):
+    """Report collected hold reads without changing the repository's served result."""
+    for index in range(len(errors)):
+        note_unread(unread, name, errors[index], unsigned_bots)
 
 
 def record_release(account, target, release, conf, releases, off):
@@ -2308,6 +2335,19 @@ def record_release(account, target, release, conf, releases, off):
         off.append(target["full_name"])
     else:
         releases.append({"owner": account, "name": target["name"]})
+
+
+class SweepResult(NamedTuple):
+    """The served fleet, refusals, and unread targets of one sweep."""
+
+    accounts: dict
+    sections: list
+    refusals: list
+    skipped: list
+    releases: list
+    off: list
+    unsigned_bots: list
+    unread: list
 
 
 def sweep(env, conf, started):
@@ -2338,7 +2378,7 @@ def sweep(env, conf, started):
             tally["repositories"] += 1
             try:
                 now = datetime.now(UTC)
-                outcome, section, moved, release, unsigned = one(
+                outcome, section, moved, release, unsigned, held_unread = one(
                     env, {**conf, **identity}, installation, target, now
                 )
             except UngrantedError as err:
@@ -2362,9 +2402,10 @@ def sweep(env, conf, started):
             tally["updated"] += moved
             sections.append(section)
             unsigned_bots.extend(unsigned)
+            note_held_unread(unread, target["full_name"], held_unread, unsigned_bots)
             record_release(account, target, release, conf, releases, off)
     sections = [s for s in sections if s]
-    return accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread
+    return SweepResult(accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread)
 
 
 def append(path, text):
@@ -2382,7 +2423,7 @@ def review_bots_note(env):
     )
 
 
-def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread=()):
+def summary(env, result):
     """Render the sweep report to standard output and the job step summary."""
     lines = [
         "## Merge train sweep",
@@ -2392,7 +2433,7 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
         "| Account | Repositories | Landed | Updated | Refused |",
         "|---|---|---|---|---|",
     ]
-    for account, tally in sorted(accounts.items(), key=lambda item: item[0].lower()):
+    for account, tally in sorted(result.accounts.items(), key=lambda item: item[0].lower()):
         if isinstance(tally, str):
             lines.append(f"| {account} | {tally} | | | |")
         else:
@@ -2400,32 +2441,32 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
                 f"| {account} | {tally['repositories']} | {tally['landed']} "
                 f"| {tally['updated']} | {tally['refused']} |"
             )
-    if refusals:
-        lines += ["", "Refused:", ""] + [f"- {line}" for line in refusals]
-    if unread:
+    if result.refusals:
+        lines += ["", "Refused:", ""] + [f"- {line}" for line in result.refusals]
+    if result.unread:
         lines += ["", f"Not read after {READ_ATTEMPTS} tries, the next run reads them again:", ""]
-        lines += [f"- {line}" for line in unread]
-    if unsigned_bots:
+        lines += [f"- {line}" for line in result.unread]
+    if result.unsigned_bots:
         lines += [
             "",
             "Bot pull requests without Signed-off-by, their producers sign them:",
             "",
-            *(f"- {entry}" for entry in unsigned_bots),
+            *(f"- {entry}" for entry in result.unsigned_bots),
         ]
-    if skipped:
-        lines += ["", f"Not reached within {SWEEP_SECONDS} s: {', '.join(skipped)}"]
-    if len(releases) > MAX_RELEASES:
-        late = ", ".join(f"{r['owner']}/{r['name']}" for r in releases[MAX_RELEASES:])
+    if result.skipped:
+        lines += ["", f"Not reached within {SWEEP_SECONDS} s: {', '.join(result.skipped)}"]
+    if len(result.releases) > MAX_RELEASES:
+        late = ", ".join(f"{r['owner']}/{r['name']}" for r in result.releases[MAX_RELEASES:])
         lines += ["", f"No release run, the job matrix holds {MAX_RELEASES}: {late}"]
-        del releases[MAX_RELEASES:]
-    if off:
-        lines += ["", f"Release train off: {', '.join(off)}"]
-    named = ", ".join(f"{r['owner']}/{r['name']}" for r in releases) or "none"
+        del result.releases[MAX_RELEASES:]
+    if result.off:
+        lines += ["", f"Release train off: {', '.join(result.off)}"]
+    named = ", ".join(f"{r['owner']}/{r['name']}" for r in result.releases) or "none"
     lines += ["", f"Release pull requests and releases next: {named}"]
-    text = "\n".join([*lines, "", *sections]) + "\n"
+    text = "\n".join([*lines, "", *result.sections]) + "\n"
     sys.stdout.write(text)
     append(env["GITHUB_STEP_SUMMARY"], text)
-    append(env["GITHUB_OUTPUT"], f"releases={json.dumps(releases, separators=(',', ':'))}\n")
+    append(env["GITHUB_OUTPUT"], f"releases={json.dumps(result.releases, separators=(',', ':'))}\n")
 
 
 def main(env):
@@ -2436,20 +2477,20 @@ def main(env):
         sys.stdout.write(f"::error title=Merge train setting::{err}\n")
         return 3
     try:
-        accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread = sweep(
-            env, conf, time.monotonic()
-        )
+        result = sweep(env, conf, time.monotonic())
     except RefusedError as err:
         sys.stdout.write(f"::error title=Merge train refused::{err}\n")
         return 1
-    summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread)
-    for line in refusals:
+    summary(env, result)
+    for line in result.refusals:
         sys.stdout.write(f"::error title=Merge train refused::{line}\n")
-    for line in unread:
+    for line in result.unread:
         sys.stdout.write(f"::warning title=Merge train not read::{line}\n")
-    if skipped:
-        sys.stdout.write(f"::warning title=Merge train::{len(skipped)} repositories not reached\n")
-    return 1 if refusals else 0
+    if result.skipped:
+        sys.stdout.write(
+            f"::warning title=Merge train::{len(result.skipped)} repositories not reached\n"
+        )
+    return 1 if result.refusals else 0
 
 
 if __name__ == "__main__":
