@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import ast
+import re
+from pathlib import Path
+
 import pytest
 from expressions import evaluate, interpolate
 
@@ -31,7 +35,7 @@ def test_expression_reader(text, inputs, value):
 
 @pytest.mark.parametrize(
     "text",
-    ["github.event_name == 'push'", "format('{0}{1}', inputs.a, inputs.b)", "inputs.a != 'b'"],
+    ["github.event_name == 'push'", "format('{0}{1}', inputs.a, inputs.b)", "inputs.a >= 'b'"],
 )
 def test_expression_reader_refuses_what_it_does_not_read(text):
     with pytest.raises(ValueError, match="not read here"):
@@ -65,3 +69,60 @@ def test_interpolation_refuses_unknown_forms(text):
             evaluate(text, {}, matrix={"repository": {"owner": "a"}})
         else:
             interpolate(text, {}, matrix={"repository": {"owner": "a"}})
+
+
+@pytest.mark.parametrize(
+    "text,value",
+    [
+        ("true", True),
+        ("false", False),
+        ("cancelled()", False),
+        ("!cancelled()", True),
+        ("inputs.a != 'X'", False),
+        ("inputs.a != 'y'", True),
+        ("inputs.a != 'b'", True),
+        ("needs.plan.outputs.releases != '[]'", True),
+        ("vars.a_b.c1", "value"),
+    ],
+)
+def test_job_guard_forms(text, value):
+    assert (
+        evaluate(
+            text,
+            {"a": "x"},
+            needs={"plan": {"outputs": {"releases": '[{"owner":"a"}]'}}},
+            vars={"a_b": {"c1": "value"}},
+        )
+        == value
+    )
+
+
+def test_cancelled_status_context():
+    assert evaluate("cancelled()", {}, cancelled=True) is True
+
+
+@pytest.mark.parametrize("text", ["secrets.a", "inputs.1a", "inputs.a..b", "inputs.a-b"])
+def test_context_segments_refuse_invalid_forms(text):
+    with pytest.raises(ValueError, match="not read here"):
+        evaluate(text, {"a": "x"})
+
+
+def test_unreadable_short_circuited_guard_is_refused():
+    with pytest.raises(ValueError, match="not read here"):
+        evaluate("false && unsupported()", {})
+
+
+def test_expression_patterns_have_no_nested_repetition():
+    source = Path(__file__).with_name("expressions.py").read_text()
+    patterns = [
+        node.args[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compile"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    assert patterns
+    for pattern in patterns[: len(source)]:
+        assert not re.search(r"\([^)]*[+*][^)]*\)[+*]", pattern), pattern

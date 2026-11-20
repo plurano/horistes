@@ -119,6 +119,11 @@
           "required": true,
           "type": "string"
         },
+        "artifact_id": {
+          "default": "",
+          "required": false,
+          "type": "string"
+        },
         "release_max_parallel": {
           "default": 3,
           "required": false,

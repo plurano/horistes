@@ -220,3 +220,35 @@ def test_base_without_lock_counts_every_entry_as_new(tree):
 def test_missing_lock_is_an_error(tree):
     tree.write({WORKFLOW: REUSABLE})
     assert tree.tool("interface.py", "check").returncode == 3
+
+
+def check_readme_interfaces(root, text):
+    import ciwf
+
+    workflows = sorted((root / ".github/workflows").glob("*.yml"))
+    assert len(workflows) <= 256
+    for path in workflows[:256]:
+        call = ciwf.load(path).get("on", {}).get("workflow_call")
+        if call is None:
+            continue
+        relative = path.relative_to(root).as_posix()
+        rows = [line for line in text.splitlines() if line.startswith(f"| `{relative}` |")]
+        assert len(rows) == 1, relative
+        names = {*call.get("inputs", {}), *call.get("secrets", {})}
+        missing = sorted(name for name in names if f"`{name}`" not in rows[0])
+        assert not missing, f"{relative}: missing {', '.join(missing)}"
+
+
+def test_readme_names_every_reusable_input_and_secret():
+    from conftest import ROOT
+
+    check_readme_interfaces(ROOT, (ROOT / "README.md").read_text())
+
+
+def test_planted_readme_input_omission_names_the_input():
+    from conftest import ROOT
+
+    text = (ROOT / "README.md").read_text()
+    text = text.replace("`train_run_id`", "train run id")
+    with pytest.raises(AssertionError, match="train_run_id"):
+        check_readme_interfaces(ROOT, text)

@@ -2053,9 +2053,9 @@ def plan_payload(releases=None, hold="hold,planted"):
 
 
 def run_plan(env):
-    import release_labels
+    import release_plan
 
-    return release_labels.main(["release_labels.py", "plan"], env)
+    return release_plan.main(["release_plan.py", "plan"], env)
 
 
 def plan_output(env):
@@ -2235,13 +2235,14 @@ def dispatch_env(forge):
         "REPOSITORY": "fleet/app",
         "TRAIN_RUN_ID": "123",
         "RELEASE_WORKFLOW": "merge-train-release.yml",
+        "ARTIFACT_ID": "456",
     }
 
 
 def run_dispatch(env):
-    import release_labels
+    import release_plan
 
-    return release_labels.main(["release_labels.py", "dispatch"], env)
+    return release_plan.main(["release_plan.py", "dispatch"], env)
 
 
 @pytest.mark.parametrize("status", [204, 200])
@@ -2253,7 +2254,7 @@ def test_dispatch_starts_one_release_run(forge, status):
     assert forge.dispatches == [
         (
             "/repos/fleet/app/actions/workflows/merge-train-release.yml/dispatches",
-            {"ref": "trunk", "inputs": {"train_run_id": "123"}},
+            {"ref": "trunk", "inputs": {"train_run_id": "123", "artifact_id": "456"}},
         )
     ]
 
@@ -2310,3 +2311,35 @@ def test_dispatch_accepts_workflow_filename_boundaries(forge, name):
     env = dispatch_env(forge) | {"RELEASE_WORKFLOW": name}
     assert run_dispatch(env) == 0
     assert forge.dispatches[0][0].endswith(f"/{name}/dispatches")
+
+
+def test_plan_missing_identified_artifact_is_error(tmp_path, forge, capsys):
+    env = plan_env(tmp_path, forge) | {"ARTIFACT_ID": "456"}
+    assert run_plan(env) == 1
+    output = capsys.readouterr().out
+    assert "::error" in output and "456" in output
+    assert not Path(env["GITHUB_OUTPUT"]).exists()
+
+
+@pytest.mark.parametrize(
+    "command,artifact_id",
+    [
+        ("dispatch", ""),
+        ("dispatch", "01"),
+        ("plan", "01"),
+        ("dispatch", "0"),
+        ("dispatch", "١"),
+        ("plan", "1\n"),
+    ],
+)
+def test_artifact_id_refused_before_requests(tmp_path, forge, command, artifact_id):
+    env = dispatch_env(forge) if command == "dispatch" else plan_env(tmp_path, forge)
+    env["ARTIFACT_ID"] = artifact_id
+    assert (run_dispatch(env) if command == "dispatch" else run_plan(env)) == 1
+    assert forge.requests == [] and forge.dispatches == []
+
+
+def test_plan_identified_empty_list_is_valid(tmp_path, forge):
+    env = plan_env(tmp_path, forge, plan_payload([])) | {"ARTIFACT_ID": "1"}
+    assert run_plan(env) == 0
+    assert plan_output(env)["releases"] == "[]"

@@ -10,17 +10,18 @@ scheduling, not forge execution or release-please itself (ADR-0098).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import ciwf
 import render
-import yaml
 from expressions import evaluate, interpolate
 
 HORIZON = 160
 MAX_RUNS = 32
-MAX_JOBS = 256
+MAX_MATRIX = 256
+MAX_JOBS = MAX_MATRIX + 8
 
 
 def layout(root: Path) -> dict:
@@ -28,9 +29,7 @@ def layout(root: Path) -> dict:
     result = {}
     for name in ("merge-train", "merge-train-release"):
         template = root / f"templates/callers/{name}.yml.tmpl"
-        caller = yaml.load(
-            render.render(template.read_text(), render.SAMPLE, name), ciwf.StrictLoader
-        )
+        caller = ciwf.loads(render.render(template.read_text(), render.SAMPLE, name), template)
         result[name] = {
             "caller": caller,
             "workflow": ciwf.load(root / f".github/workflows/{name}.yml"),
@@ -48,7 +47,9 @@ def call_inputs(spec: dict, runner: str) -> dict:
     variables = {"MERGE_TRAIN_APP_CLIENT_ID": "fixture-app", "MERGE_TRAIN": "on"}
     for key, value in call["with"].items():
         values[key] = (
-            evaluate(value, {"train_run_id": "1"}, vars=variables) if "${{" in str(value) else value
+            evaluate(value, {"train_run_id": "1", "artifact_id": ""}, vars=variables)
+            if "${{" in str(value)
+            else value
         )
     values["runner"] = runner
     return values
@@ -79,6 +80,7 @@ class Job:
     end: int | None = None
     group: str = ""
     runner: str = ""
+    outputs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -116,12 +118,13 @@ def expand_jobs(run: Run) -> list[Job]:
                 "${{ fromJSON(needs.train.outputs.releases) }}",
             )
             repositories = run.repositories
-        assert len(repositories) <= MAX_JOBS
-        for repository in repositories[:MAX_JOBS]:
+        assert len(repositories) <= MAX_MATRIX
+        for repository in repositories[:MAX_MATRIX]:
             job = Job(run, name, config, repository)
             job.runner = str(evaluate(config["runs-on"], run.inputs))
             job.group = group_name(config, run, repository)
             jobs.append(job)
+    assert len(jobs) <= MAX_JOBS
     return jobs
 
 
@@ -189,10 +192,13 @@ class Timeline:
                 duration = self.leg_minutes if job.repository else 8 if job.name == "train" else 0
                 if job.state == "running" and minute >= job.start + duration:
                     job.state, job.end = "done", minute
+                    job.outputs["releases"] = json.dumps(run.repositories, separators=(",", ":"))
                     self.release_group(job)
                     if job.name == "train":
                         self.trigger_release(run, minute)
-            if run.state == "active" and all(j.state in {"done", "cancelled"} for j in run.jobs):
+            if run.state == "active" and all(
+                j.state in {"done", "cancelled", "skipped"} for j in run.jobs
+            ):
                 run.state = "done"
                 self.release_group(run)
 
@@ -202,7 +208,7 @@ class Timeline:
         triggers = self.specs["merge-train-release"]["caller"]["on"]
         steps = run.spec["workflow"]["jobs"]["train"]["steps"]
         dispatches = any(
-            str(step.get("run", "")).endswith('release_labels.py" dispatch')
+            str(step.get("run", "")).endswith('release_plan.py" dispatch')
             for step in steps[:MAX_JOBS]
         )
         if dispatches and "workflow_dispatch" in triggers:
@@ -212,7 +218,7 @@ class Timeline:
         needs = job.config.get("needs", [])
         needs = [needs] if isinstance(needs, str) else needs
         dependencies = [j for j in job.run.jobs if j.name in needs]
-        if not all(j.state == "done" for j in dependencies):
+        if not all(j.state in {"done", "skipped"} for j in dependencies):
             return False
         strategy = job.config.get("strategy", {})
         maximum = strategy.get("max-parallel", MAX_JOBS)
@@ -226,11 +232,17 @@ class Timeline:
         for job in run.jobs[:MAX_JOBS]:
             if job.state not in {"new", "queued"} or not self.ready(job):
                 continue
+            needs = {j.name: {"outputs": j.outputs} for j in run.jobs if j.end is not None}
+            guard = job.config.get("if", "${{ true }}")
+            if not evaluate(guard, run.inputs, needs=needs, cancelled=run.state == "cancelled"):
+                job.state, job.end = "skipped", minute
+                self.events.append(("skipped", run.number, job.name, minute))
+                continue
             if not self.acquire(job, job.config, minute):
                 continue
             job.state = "queued"
-            # Real labels decide runner availability, even in the planted old layout.
-            if job.runner == "arc-cauda" and not self.release_free:
+            # Held release capacity queues only repository legs; planning still runs.
+            if job.repository and not self.release_free:
                 continue
             job.state, job.start = "running", minute
             self.events.append(("start", run.number, job.name, minute))

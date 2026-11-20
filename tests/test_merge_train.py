@@ -11129,3 +11129,21 @@ def test_report_writer_open_allow_list_refuses_other_files(mutation):
         )
     assert not allowed_report_opens(source)
     assert key_on_disk(source) == ["open() outside the summary and release file writers"]
+
+
+@pytest.mark.parametrize(
+    "hold", ["x\ny", "x\ry", "x" * 4097], ids=["newline", "return", "oversize"]
+)
+def test_hold_labels_setting_refused_before_requests(tmp_path, hold):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, hold_labels=hold)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "hold_labels" in done.stdout
+    assert (forge.minted, forge.writes) == ([], [])
+
+
+def test_hold_labels_setting_boundary(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, hold_labels="x" * 4096)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]

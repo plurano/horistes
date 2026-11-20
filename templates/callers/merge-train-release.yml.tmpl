@@ -44,6 +44,12 @@ on:
         type: string
         required: true
 
+      artifact_id:
+        description: Set by the train; empty for a request by hand.
+        type: string
+        required: false
+        default: ""
+
 permissions: {}
 
 jobs:
@@ -54,6 +60,7 @@ jobs:
     uses: <% .Shared.Repository %>/.github/workflows/merge-train-release.yml@<% .Shared.Commit %> # <% .Shared.Version %>
     with:
       train_run_id: ${{ inputs.train_run_id }}
+      artifact_id: ${{ inputs.artifact_id }}
       runner: <% .RunnerTag %>
       app_client_id: ${{ vars.MERGE_TRAIN_APP_CLIENT_ID }}
     secrets:

@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import copy
-
 import ciwf
 import pytest
 from conftest import ROOT
@@ -23,11 +21,14 @@ def check_train_progress(specs):
     arrivals = [(first + cycle * i, TRAIN, [A, B, C]) for i in range(6)]
     timeline = Timeline(specs, release_free=False).play(arrivals)
     trains = [run for run in timeline.runs if run.kind == TRAIN]
-    for run in trains[1:3]:
+    for run in trains[1:]:
         train = next(job for job in run.jobs if job.name == "train")
         assert train.start is not None and train.start <= run.scheduled + cycle, "train stalled"
-    first_legs = [job for job in timeline.legs() if job.run.repositories == [A, B, C]]
-    assert first_legs and all(job.start is None for job in first_legs)
+    release_run = next(run for run in timeline.runs if run.kind == RELEASE)
+    assert next(job for job in release_run.jobs if job.name == "plan").state == "done"
+    first_legs = [job for job in release_run.jobs if job.repository]
+    assert any(job.state == "queued" for job in first_legs)
+    assert all(job.start is None for job in first_legs)
     return timeline
 
 
@@ -35,20 +36,85 @@ def test_queued_release_legs_do_not_hold_the_train():
     check_train_progress(layout(ROOT))
 
 
-def test_planted_old_layout_stalls_the_next_train():
+def old_layout():
     specs = layout(ROOT)
-    old_release = copy.deepcopy(specs[RELEASE]["workflow"]["jobs"]["release"])
-    old_release.update(needs="train", **{"runs-on": "${{ inputs.release_runner }}"})
-    old_release.pop("concurrency")
-    old_release["strategy"]["matrix"]["repository"] = (
-        "${{ fromJSON(needs.train.outputs.releases) }}"
-    )
-    specs[TRAIN]["workflow"]["jobs"]["release"] = old_release
+    specs[TRAIN]["workflow"]["jobs"]["release"] = {
+        "needs": "train",
+        "if": "${{ !cancelled() && inputs.switch == 'on' && "
+        "needs.train.outputs.releases != '' && needs.train.outputs.releases != '[]' }}",
+        "runs-on": "${{ inputs.release_runner || inputs.runner }}",
+        "environment": "merge-train",
+        "timeout-minutes": 15,
+        "permissions": {},
+        "strategy": {
+            "fail-fast": False,
+            "max-parallel": "${{ inputs.release_max_parallel }}",
+            "matrix": {"repository": "${{ fromJSON(needs.train.outputs.releases) }}"},
+        },
+        "steps": specs[RELEASE]["workflow"]["jobs"]["release"]["steps"],
+    }
     definitions = specs[TRAIN]["workflow"]["on"]["workflow_call"]["inputs"]
     definitions.update(release_runner={"default": "arc-cauda"}, release_max_parallel={"default": 3})
     specs.pop(RELEASE)
-    with pytest.raises(AssertionError, match="train stalled"):
-        check_train_progress(specs)
+    return specs
+
+
+def test_planted_old_layout_stalls_the_next_train():
+    specs = old_layout()
+    first, cycle = cadence(specs[TRAIN])
+    timeline = Timeline(specs, release_free=False).play(
+        [(first, TRAIN, [A]), (first + cycle, TRAIN, [A])]
+    )
+    assert timeline.legs()[0].state == "queued"
+    assert timeline.runs[1].jobs[0].start is None, "old layout did not stall"
+
+
+def test_planted_false_old_guard_does_not_stall():
+    specs = old_layout()
+    specs[TRAIN]["workflow"]["jobs"]["release"]["if"] = "${{ false }}"
+    timeline = Timeline(specs, release_free=False).play([(0, TRAIN, [A]), (20, TRAIN, [A])])
+    assert timeline.runs[1].jobs[0].start == 20
+    assert all(job.state == "skipped" and job.start is None for job in timeline.legs())
+    assert all(job.end is not None for job in timeline.legs())
+    assert ("skipped", 1, "release", 8) in timeline.events
+    assert all(run.state == "done" for run in timeline.runs)
+
+
+def test_unreadable_job_guard_raises():
+    specs = old_layout()
+    specs[TRAIN]["workflow"]["jobs"]["release"]["if"] = "${{ unsupported() }}"
+    with pytest.raises(ValueError, match="not read here"):
+        Timeline(specs).play([(0, TRAIN, [A])])
+
+
+def test_repository_group_separators_do_not_collide():
+    repositories = [{"owner": "fleet", "name": "a-b"}, {"owner": "fleet-a", "name": "b"}]
+    legs = Timeline(layout(ROOT)).play([(0, RELEASE, repositories)]).legs()
+    assert len({job.group for job in legs}) == 2
+    assert max(job.start for job in legs) < min(job.end for job in legs)
+
+
+@pytest.mark.parametrize("count", [256, 257])
+def test_matrix_job_bound(count):
+    repositories = [{"owner": "fleet", "name": f"r{i}"} for i in range(count)]
+    if count == 257:
+        with pytest.raises(AssertionError):
+            Timeline(layout(ROOT)).play([(0, RELEASE, repositories)])
+        return
+    timeline = Timeline(layout(ROOT), leg_minutes=1).play([(0, RELEASE, repositories)])
+    assert len(timeline.legs()) == 256
+    assert all(job.state == "done" and job.end is not None for job in timeline.legs())
+    assert timeline.runs[0].state == "done"
+
+
+def test_yaml_text_reader_has_one_safe_load_site():
+    needle = "yaml" + ".load("
+    assert needle not in (ROOT / "tests/train_timeline.py").read_text()
+    assert (ROOT / "tools/ciwf.py").read_text().count(needle) == 1
+    assert ciwf.loads("on: true", "fixture") == {"on": True}
+    for text in ("[]", "a: 1\na: 2", "!!python/object:bad {}"):
+        with pytest.raises(ciwf.ReadError, match="fixture"):
+            ciwf.loads(text, "fixture")
 
 
 def race(specs, second):
@@ -143,9 +209,17 @@ def check_handoff(train, release):
     plan = release["jobs"]["plan"]
     assert plan["permissions"] == {"actions": "read"}
     assert plan["timeout-minutes"] == 5
-    download = next(
+    downloads = [
         s for s in plan["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact@")
-    )
+    ]
+    assert len(downloads) == 2
+    identified, download = downloads
+    assert identified["if"] == "${{ inputs.artifact_id != '' }}"
+    assert download["if"] == "${{ inputs.artifact_id == '' }}"
+    assert identified["with"] == {
+        **{key: value for key, value in download["with"].items() if key != "pattern"},
+        "artifact-ids": "${{ inputs.artifact_id }}",
+    }
     assert download["with"] == {
         "pattern": "merge-train-releases",
         "merge-multiple": True,
@@ -165,32 +239,39 @@ def check_dispatch_wiring(job, upload):
         "${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != '' "
         "&& steps.upload.outcome == 'success' }}"
     )
-    assert dispatch["env"] == {
-        "GITHUB_TOKEN": "${{ github.token }}",
-        "REPOSITORY": "${{ github.repository }}",
-        "TRAIN_RUN_ID": "${{ github.run_id }}",
-        "RELEASE_WORKFLOW": "${{ inputs.release_workflow }}",
-    }
+    references = (
+        ("GITHUB_TOKEN", "github.token"),
+        ("REPOSITORY", "github.repository"),
+        ("TRAIN_RUN_ID", "github.run_id"),
+        ("RELEASE_WORKFLOW", "inputs.release_workflow"),
+        ("ARTIFACT_ID", "steps.upload.outputs.artifact-id"),
+    )
+    assert dispatch["env"] == {name: "${{ " + ref + " }}" for name, ref in references}
     assert dispatch["run"] == (
-        'python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py" dispatch'
+        'python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_plan.py" dispatch'
     )
     checkout = next(s for s in job["steps"] if "sparse-checkout" in s.get("with", {}))
-    assert {"tools/release_labels.py", "tools/release_workflows.py"} <= set(
-        checkout["with"]["sparse-checkout"].splitlines()
-    )
+    assert {
+        "tools/release_labels.py",
+        "tools/release_workflows.py",
+        "tools/release_plan.py",
+    } <= set(checkout["with"]["sparse-checkout"].splitlines())
 
 
 def check_plan_wiring(plan, leg):
     step = next(s for s in plan["steps"] if s.get("id") == "plan")
-    assert step["run"].endswith('release_labels.py" plan')
-    assert step["env"] == {
-        "GITHUB_TOKEN": "${{ github.token }}",
-        "TRAIN_RUN_ID": "${{ inputs.train_run_id }}",
-        "TRAIN_WORKFLOW": "${{ inputs.train_workflow }}",
-        "REPOSITORY": "${{ github.repository }}",
-        "MAX_PARALLEL": "${{ inputs.release_max_parallel }}",
-        "FILE": "${{ runner.temp }}/merge-train-plan/merge-train-releases.json",
-    }
+    assert step["run"].endswith('release_plan.py" plan')
+    references = (
+        ("GITHUB_TOKEN", "github.token"),
+        ("TRAIN_RUN_ID", "inputs.train_run_id"),
+        ("ARTIFACT_ID", "inputs.artifact_id"),
+        ("TRAIN_WORKFLOW", "inputs.train_workflow"),
+        ("REPOSITORY", "github.repository"),
+        ("MAX_PARALLEL", "inputs.release_max_parallel"),
+    )
+    expected = {name: "${{ " + ref + " }}" for name, ref in references}
+    expected["FILE"] = "${{ runner.temp }}/merge-train-plan/merge-train-releases.json"
+    assert step["env"] == expected
     assert plan["outputs"] == {
         "releases": "${{ steps.plan.outputs.releases }}",
         "hold_labels": "${{ steps.plan.outputs.hold_labels }}",
@@ -232,9 +313,9 @@ def test_planted_handoff_mutants_are_refused(where):
     elif where == "upload-missing":
         upload["with"]["if-no-files-found"] = "ignore"
     elif where == "download-run":
-        plan["steps"][1]["with"]["run-id"] = "${{ github.run_id }}"
+        plan["steps"][2]["with"]["run-id"] = "${{ github.run_id }}"
     elif where == "plan-run":
-        plan["steps"][2]["env"]["TRAIN_RUN_ID"] = "${{ github.run_id }}"
+        plan["steps"][3]["env"]["TRAIN_RUN_ID"] = "${{ github.run_id }}"
     elif where == "dispatch-guard":
         train["jobs"]["train"]["steps"][-1]["if"] = upload["if"]
     elif where == "train-permission":
@@ -257,11 +338,18 @@ def check_release_caller(spec):
                     "description": "Train run whose release list is read.",
                     "type": "string",
                     "required": True,
-                }
+                },
+                "artifact_id": {
+                    "description": "Set by the train; empty for a request by hand.",
+                    "type": "string",
+                    "required": False,
+                    "default": "",
+                },
             }
         }
     }
     assert caller["jobs"]["release"]["with"].get("train_run_id") == "${{ inputs.train_run_id }}"
+    assert caller["jobs"]["release"]["with"]["artifact_id"] == "${{ inputs.artifact_id }}"
     assert caller["permissions"] == {} and "concurrency" not in caller
     assert caller["jobs"]["release"]["permissions"] == {"actions": "read"}
     assert "concurrency" not in spec["workflow"]
@@ -272,9 +360,12 @@ def check_release_caller(spec):
         "release_max_parallel",
         "train_run_id",
         "train_workflow",
+        "artifact_id",
     }
     assert inputs["train_run_id"]["type"] == "string" and inputs["train_run_id"]["required"]
     assert inputs["train_workflow"]["default"] == "merge-train.yml"
+    artifact = inputs["artifact_id"]
+    assert (artifact["type"], artifact["required"], artifact["default"]) == ("string", False, "")
 
 
 def test_release_caller_has_no_workflow_group():
@@ -296,3 +387,28 @@ def test_planted_release_caller_mutants_are_refused(key):
         spec["caller"][key] = {"contents": "write"}
     with pytest.raises(AssertionError):
         check_release_caller(spec)
+
+
+def test_handoff_module_keeps_label_module_bounded():
+    labels = (ROOT / "tools/release_labels.py").read_text()
+    assert sum(bool(line.strip()) for line in labels.splitlines()) <= 450
+    plan = (ROOT / "tools/release_plan.py").read_text()
+    assert "ADR-0098" in plan
+    for command in ("plan", "dispatch"):
+        assert f"def cmd_{command}(" in plan
+        assert f"def cmd_{command}(" not in labels
+
+
+@pytest.mark.parametrize("nonmatrix", [8, 9])
+def test_total_job_bound_includes_nonmatrix_jobs(nonmatrix):
+    specs = layout(ROOT)
+    for index in range(nonmatrix - 1):
+        specs[RELEASE]["workflow"]["jobs"][f"extra{index}"] = {"runs-on": "${{ inputs.runner }}"}
+    repositories = [{"owner": "fleet", "name": f"r{i}"} for i in range(256)]
+    if nonmatrix == 9:
+        with pytest.raises(AssertionError):
+            Timeline(specs).play([(0, RELEASE, repositories)])
+        return
+    timeline = Timeline(specs, leg_minutes=1).play([(0, RELEASE, repositories)])
+    assert len(timeline.runs[0].jobs) == 264
+    assert timeline.runs[0].state == "done"

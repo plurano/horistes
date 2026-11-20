@@ -164,7 +164,9 @@ on:
         required: false
         default: "3"
       hold_labels:
-        description: Labels that keep a pull request out of the train, comma-separated.
+        description: >-
+          Labels that keep a pull request out of the train, comma-separated;
+          one line of at most 4096 characters.
         type: string
         required: false
         default: hold,do-not-merge,planted
@@ -887,6 +889,7 @@ jobs:
             tools/review_state.py
             tools/release_workflows.py
             tools/release_labels.py
+            tools/release_plan.py
           sparse-checkout-cone-mode: false
 
       # Merge train of every repository the app is installed on.
@@ -943,4 +946,5 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TRAIN_RUN_ID: ${{ github.run_id }}
           RELEASE_WORKFLOW: ${{ inputs.release_workflow }}
-        run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py" dispatch
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_plan.py" dispatch
