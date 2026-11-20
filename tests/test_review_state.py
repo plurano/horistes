@@ -718,6 +718,30 @@ def test_adr92_unfinished_allowance_review_keeps_notice(state):
     assert adr92_reader().review_incomplete(adr92_pull(reviews=[review]))
 
 
+def adr93_second_summary_cases(pr, notice):
+    """Only a later same-reviewer pause proving the full head clears the old pause."""
+    summary = copy.deepcopy(notice)
+    summary["updatedAt"] = "2026-11-17T03:00:00Z"
+    summary["body"] = summary["body"].replace("1" * 40, pr["headRefOid"])
+    pr = copy.deepcopy(pr)
+    pr["comments"]["nodes"] = [copy.deepcopy(notice), summary]
+    cases = [_case("second-summary-proves-head", pr, False)]
+    summary["author"]["login"] = "other-reviewer"
+    cases.append(_case("second-summary-other-reviewer", pr, True))
+    summary["author"]["login"] = "coderabbitai"
+    summary["updatedAt"] = "2026-11-17T02:22:00Z"
+    cases.append(_case("second-summary-before-push", pr, True))
+    summary["updatedAt"] = "2026-11-17T03:00:00Z"
+    body = summary["body"]
+    summary["body"] = body.replace(pr["headRefOid"], pr["headRefOid"][:7])
+    cases.append(_case("second-summary-short-head", pr, True))
+    summary["body"] = body + "\n## Rate limit exceeded\n"
+    cases.append(_case("second-summary-mixed-notice", pr, True))
+    summary["body"] = body.replace("> - Last reviewed commit: " + pr["headRefOid"], "")
+    cases.append(_case("second-summary-missing-last-reviewed", pr, True))
+    return cases
+
+
 def adr93_paused_cases():
     """A persistent pause needs same-reviewer head evidence after a later push."""
     pr = _fixture("dependency-person-commits-paused.json")
@@ -756,6 +780,7 @@ def adr93_paused_cases():
     )
     cases.append(_case("head-range", pr, False))
     pr["comments"]["nodes"] = [notice]
+    cases.extend(adr93_second_summary_cases(pr, notice))
     notice["body"] = notice["body"].replace("1" * 40, pr["headRefOid"])
     cases.append(_case("pause-names-head", pr, False))
     return cases

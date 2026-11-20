@@ -182,7 +182,9 @@ Incomplete-review notices and unanswered findings still hold independently
 The dependency review exemption requires a bot PR author and a complete read of
 every commit author as a bot, up to 50 commits. A person commit or an unreadable
 author history applies the full review rules. A paused review holds across later
-pushes until the same reviewer covers the head
+pushes until the same reviewer covers the head with a completed formal review of
+the head, a reviewed range ending at the head, or a later pause summary naming
+the full head as last reviewed commit
 ([ADR-0093](docs/adr/0093-a-person-commit-ends-the-dependency-exemption.md)).
 
 Review settling and the dependency exemption live in `tools/review_state.py`;

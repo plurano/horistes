@@ -53,12 +53,19 @@ an interior person commit, absent users, malformed reads, truncation, and the
 B. A paused notice persists across later pushes regardless of its edit instant.
 It clears when its existing paused block proves the head reviewed, or when the
 same reviewer supplies later completed head evidence after the push: a completed
-formal review on the full head, or an exact reviewed range ending at that head.
+formal review on the full head, an exact reviewed range ending at that head, or
+a later pause summary naming the full head as last reviewed commit. A pause
+summary must carry only pause notices and unambiguous block-local head evidence.
 A later review on an older commit, another reviewer's evidence, or a generic
 pre-merge table cannot clear it. The canonical reader remains
 [tools/review_state.py](../../tools/review_state.py);
 `test_adr93_paused_notice` in
 [tests/test_review_state.py](../../tests/test_review_state.py) covers these cases.
+Its `second-summary-proves-head` case covers clearance by a later pause summary;
+`second-summary-other-reviewer`, `second-summary-before-push`,
+`second-summary-short-head`, `second-summary-mixed-notice`, and
+`second-summary-missing-last-reviewed` keep reviewer scope, ordering, full-head
+proof, notice type, and the last-reviewed field mandatory.
 
 ## Consequences
 

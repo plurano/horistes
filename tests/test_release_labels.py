@@ -411,6 +411,24 @@ def test_module_passes_ruff():
         assert done.returncode == 0, done.stdout + done.stderr
 
 
+def test_release_modules_complexity_bounds():
+    """Both release modules obey McCabe 10, including the extracted parser."""
+    from conftest import Tree
+    from test_lint import ruff
+
+    paths = [ROOT / "tools" / f"{name}.py" for name in ("release_labels", "release_workflows")]
+    done = ruff(
+        Tree(ROOT / "tools"),
+        "check",
+        "--select",
+        "C901",
+        "--config",
+        "lint.mccabe.max-complexity=10",
+        *map(str, paths),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
 def test_settings_refuses_file_url_before_read(tmp_path, forge):
     canary_root = tmp_path / "canary"
     canary = canary_root / "repos/fleet/app/contents/release-please-config.json"
