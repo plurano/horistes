@@ -224,9 +224,20 @@ def build_commit_node(number: int, suites: list, **fields) -> dict:
     }
 
 
+def build_commit_authors(commit_node, logins):
+    """Use live commit-user shapes, defaulting to the latest commit's author."""
+    users = (
+        [commit_node["author"].get("user")]
+        if logins is _ABSENT
+        else [{"login": login} if login is not None else None for login in logins[:51]]
+    )
+    return {"totalCount": len(users), "nodes": [{"commit": {"author": {"user": u}}} for u in users]}
+
+
 def pull(number: int, state: str, **fields) -> dict:
     """One open pull request as the query reads it."""
     commits = fields.pop("commits", None)
+    commit_authors = fields.pop("commit_authors", _ABSENT)
     suites = fields.pop("suites", ["SUCCESS"])
     labels = fields.pop("labels", ())
     created_at = fields.get("createdAt", OLD)
@@ -270,6 +281,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "refreshes": {"nodes": []},
         "holds": {"nodes": []},
         "latest": {"nodes": [{"commit": commit_node}]},
+        "authors": build_commit_authors(commit_node, commit_authors),
     }
     if commits is not None:
         node["history"] = {
@@ -4407,6 +4419,13 @@ def test_switched_off_closes_nothing(tmp_path):
     assert forge.writes == []
 
 
+def load_review_state():
+    """Load the matching reader for live or explicit offline rule sources."""
+    from test_review_state import adr92_reader
+
+    return adr92_reader()
+
+
 def load_rules(tmp_path: Path, text: str | None = None):
     """The train rules module, written from the step text and imported from a file."""
     path = tmp_path / "train_rules_under_test.py"
@@ -6681,6 +6700,7 @@ def test_planted_review_settle_skips_bot_pr(tmp_path):
         headRefName="renovate/something",
         author={"login": "renovate[bot]"},
         createdAt=OLD,
+        user="renovate[bot]",
         committedDate=head_time,
         reviews=[
             {
@@ -6999,7 +7019,7 @@ def test_app_pr_person_reply_before_bot_review_holds(tmp_path):
 
 def test_is_bot_author_shapes(tmp_path):
     """Bot detection accepts the GraphQL type and legacy suffix, including missing authors."""
-    rules = load_rules(tmp_path)
+    rules = load_review_state()
     assert rules._is_bot_author(None) is False
     assert rules._is_bot_author({"login": "x"}) is False
     assert rules._is_bot_author({"login": "renovate[bot]"}) is True
@@ -7416,7 +7436,7 @@ def test_app_pr_standalone_review_answered_by_reply_settles(tmp_path):
 
 def test_person_reply_shapes(tmp_path):
     """Only a User approval or a review consisting entirely of thread replies answers."""
-    rules = load_rules(tmp_path)
+    rules = load_review_state()
     assert (
         rules._person_reply(_head_review("alice", "User", "2026-11-13T15:47:00+00:00", "APPROVED"))
         is True
@@ -7484,6 +7504,7 @@ def test_planted_review_settle_skips_live_bot_pr(tmp_path):
         headRefName="renovate/x",
         author={"login": "renovate", "__typename": "Bot"},
         createdAt=OLD,
+        user="renovate[bot]",
         committedDate=head_time,
         reviews=[
             {
@@ -7935,6 +7956,7 @@ def test_bot_dependency_pr_skips_review_bodies_fetch_and_lands(tmp_path):
         headRefName="renovate/pkg-1.x",
         author={"login": "renovate", "__typename": "Bot"},
         createdAt=OLD,
+        user="renovate[bot]",
     )
     forge = Forge(repository(p))
     forge.review_details[1] = _detail(
@@ -10629,9 +10651,7 @@ def test_incomplete_review_priority_and_connection_guard(tmp_path, monkeypatch):
 
 def adr92_train(tmp_path, monkeypatch):
     """Load either live modules or the explicit offline baseline for regression replay."""
-    from test_review_state import adr92_reader
-
-    reader = adr92_reader()
+    reader = load_review_state()
     monkeypatch.setitem(sys.modules, "review_state", reader)
     root = Path(os.environ.get("HORISTES_READER_SOURCE", ROOT))
     monkeypatch.setattr(sys.modules[__name__], "SCRIPT", root / "tools/merge_train.py")
@@ -10855,7 +10875,12 @@ def adr92_offline_source(monkeypatch):
     """An explicit baseline root redirects only module loading, never repository state."""
     source = os.environ.get("HORISTES_READER_SOURCE")
     if source:
+        monkeypatch.setitem(sys.modules, "review_state", load_review_state())
+        monkeypatch.delitem(sys.modules, "train_rules", raising=False)
         monkeypatch.setattr(sys.modules[__name__], "SCRIPT", Path(source) / "tools/merge_train.py")
+        workflow = Path(source) / ".github/workflows/merge-train.yml"
+        if workflow.is_file():
+            monkeypatch.setattr(sys.modules[__name__], "TRAIN", workflow)
 
 
 def adr92_body_hold(mod, p, detail, review_bots):
@@ -10925,7 +10950,7 @@ def adr92_mutations():
             "review_state",
             'updated = _instant(comment["updatedAt"])',
             "updated = created",
-            "C-edited-notice",
+            "C-edited-ordinary-notice",
         ),
         (
             "D",
@@ -10937,8 +10962,8 @@ def adr92_mutations():
         (
             "E",
             "review_state",
-            "return allowance or names_head or when >= last_commit",
-            "return allowance or names_head or when > last_commit",
+            "return allowance or paused or names_head or when >= last_commit",
+            "return allowance or paused or names_head or when > last_commit",
             "E-equal-notice",
         ),
         (
@@ -11091,3 +11116,157 @@ def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
     }
     mod.summary(env, {}, [], [], [], [], [], [])
     assert capsys.readouterr().out.count("review bots: none set, zero-review hold off") == 1
+
+
+@pytest.mark.parametrize("all_bot", [False, True], ids=["person-holds", "bots-land"])
+def test_adr93_dependency_paused_train(tmp_path, all_bot):
+    """A bot PR with person commits reaches the reader; a pure bot update stays exempt."""
+    node = json.loads((REVIEW_STATE_FIXTURES / "dependency-person-commits-paused.json").read_text())
+    p = pull(
+        1,
+        "CLEAN",
+        author=node["author"],
+        headRefName=node["headRefName"],
+        headRefOid=node["headRefOid"],
+        authors=node["authors"],
+        committedDate="2026-11-17T02:24:32Z",
+    )
+    if all_bot:
+        p["authors"] = build_commit_authors({}, ["renovate[bot]"] * 5)
+    forge = Forge(repository(p))
+    forge.review_details[1] = {
+        key: node[key] for key in ("headRefOid", "author", "comments", "reviews", "commits")
+    }
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    if all_bot:
+        assert forge.writes == [("merge", "PR_1", p["headRefOid"], "SQUASH")]
+        assert forge.review_body_calls == []
+        assert "### fleet/app: landed #1" in summary
+    else:
+        assert forge.writes == []
+        assert forge.review_body_calls == [1]
+        assert "review incomplete: coderabbitai limit reached" in summary
+
+
+@pytest.mark.parametrize(
+    ("logins", "exempt"),
+    [
+        pytest.param(["renovate[bot]", "plurano-merge-train[bot]"], True, id="all-bot"),
+        pytest.param(["renovate[bot]", "a-person", "renovate[bot]"], False, id="interior-person"),
+        pytest.param(["renovate[bot]", "a-person"], False, id="head-person"),
+        pytest.param([None], False, id="null-user"),
+        pytest.param(["renovate[bot]"] * 50, True, id="fifty"),
+    ],
+)
+def test_adr93_bot_commit_authors(tmp_path, logins, exempt):
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/x",
+        author={"login": "renovate", "__typename": "Bot"},
+        commit_authors=logins,
+    )
+    assert rules.is_bot_dependency(p, {"dependency": ("renovate/",)}) is exempt
+
+
+@pytest.mark.parametrize(
+    "authors",
+    [
+        pytest.param(_ABSENT, id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="not-mapping"),
+        pytest.param(
+            {"totalCount": 51, "nodes": build_commit_authors({}, ["renovate[bot]"] * 50)["nodes"]},
+            id="truncated-51",
+        ),
+        pytest.param({"totalCount": 0, "nodes": []}, id="zero"),
+        pytest.param({"totalCount": True, "nodes": [{}]}, id="bool-count"),
+        pytest.param({"totalCount": "1", "nodes": [{}]}, id="string-count"),
+        pytest.param({"totalCount": -1, "nodes": []}, id="negative-count"),
+        pytest.param({"totalCount": 1, "nodes": []}, id="short-nodes"),
+        pytest.param({"totalCount": 1, "nodes": {}}, id="mapping-nodes"),
+        pytest.param({"totalCount": 1, "nodes": [None]}, id="null-node"),
+        pytest.param({"totalCount": 1, "nodes": [{"commit": None}]}, id="null-commit"),
+        pytest.param({"totalCount": 1, "nodes": [{"commit": {"author": []}}]}, id="bad-author"),
+        pytest.param(
+            {"totalCount": 1, "nodes": [{"commit": {"author": {"user": {"login": 3}}}}]},
+            id="bad-login",
+        ),
+    ],
+)
+def test_adr93_unreadable_authors(tmp_path, authors):
+    rules = load_rules(tmp_path)
+    p = pull(
+        1, "CLEAN", headRefName="renovate/x", author={"login": "renovate", "__typename": "Bot"}
+    )
+    if authors is _ABSENT:
+        p.pop("authors")
+    else:
+        p["authors"] = authors
+    assert rules.is_bot_dependency(p, {"dependency": ("renovate/",)}) is False
+
+
+def test_adr93_author_query_bound(tmp_path):
+    rules = load_rules(tmp_path)
+    bound = load_review_state().BOT_COMMIT_READS
+    assert bound == 50
+    expected = (
+        f"authors: commits(last: {bound}) {{\n"
+        "          totalCount nodes { commit { author { user { login } } } } }"
+    )
+    assert expected in rules.QUERY
+    assert expected in rules.STATUS_QUERY
+
+
+def adr93_mutations():
+    return [
+        (
+            "A1",
+            "review_state",
+            "return all(_is_bot_author(_commit_user(node)) for node in nodes[:BOT_COMMIT_READS])",
+            "return True",
+            "test_adr93_dependency_paused_train[person-holds]",
+        ),
+        (
+            "A2",
+            "review_state",
+            "nodes[:BOT_COMMIT_READS]",
+            "nodes[-1:]",
+            "test_adr93_bot_commit_authors[interior-person]",
+        ),
+        (
+            "B1",
+            "review_state",
+            "allowance or paused or names_head",
+            "allowance or names_head",
+            "test_adr93_paused_notice[stale]",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("section", "module_name", "old", "new", "selector"),
+    adr93_mutations(),
+    ids=[row[0] for row in adr93_mutations()[:3]],
+)
+def test_adr93_mutations_reject_defects(tmp_path, section, module_name, old, new, selector):
+    """Restore each defect only in temporary source copies, after an unmutated pass."""
+    root = tmp_path / "mutation"
+    (root / "tools").mkdir(parents=True)
+    workflow = root / ".github/workflows/merge-train.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(TRAIN.read_text())
+    for name in ("review_state", "merge_train"):
+        (root / "tools" / f"{name}.py").write_text((ROOT / "tools" / f"{name}.py").read_text())
+    path = workflow if module_name == "rules" else root / "tools" / f"{module_name}.py"
+    source = path.read_text()
+    expected_count = 2 if section == "B1" else 1
+    assert source.count(old) == expected_count, (section, old)
+    control = adr92_mutation_run(root, selector, tmp_path / "control.log")
+    assert control.returncode == 0, control.stdout + control.stderr
+    path.write_text(source.replace(old, new))
+    mutated = adr92_mutation_run(root, selector, tmp_path / "mutated.log")
+    assert mutated.returncode == 1, mutated.stdout + mutated.stderr
+    assert "1 failed" in mutated.stdout, mutated.stdout
