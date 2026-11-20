@@ -779,8 +779,8 @@ class Forge:
         elif "pullRequests(" in query and "states: MERGED" not in query:
             self.read_calls.append((full, dict(variables)))
             size = int(re.search(r"pullRequests\(states: OPEN, first: (\d+)", query)[1])
-            if size > 25:
-                return 502, {"message": "stand-in forge: read page size exceeds 25"}
+            if size > 10:
+                return 502, {"message": "stand-in forge: read page size exceeds 10"}
             statuses = self.read_statuses.get(full, [])
             body = None
         elif "mergeStateStatus" in query and "pullRequest(" in query:
@@ -1003,11 +1003,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.answer(200, {"id": 123456, "login": path.removeprefix("/users/")})
             return True
         if path == "/app/installations":
-            if not self.app_call():
+            if not self.app_call() and not self.fault("installations"):
                 self.answer(200, self.server.forge.installation_list())
             return True
         if path == "/installation/repositories":
-            self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
+            if not self.fault("repositories"):
+                self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
             return True
         return False
 
@@ -1470,7 +1471,7 @@ def test_clean_pull_request_on_second_page_lands(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(30)]
-    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25"]
+    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-10", "cursor-20"]
 
 
 @pytest.mark.parametrize("status", [502, 504])
@@ -1483,12 +1484,51 @@ def test_transient_read_error_is_retried(tmp_path, status):
     assert len(forge.read_calls) == 2
 
 
+def assert_not_read(done, summary, name):
+    """A failed read warns once, names its target, and leaves the sweep green."""
+    assert done.returncode == 0, done.stdout + done.stderr
+    section = summary.split("Not read after 3 tries, the next run reads them again:\n\n", 1)[1]
+    assert section.splitlines()[0].startswith(f"- {name}: ")
+    assert done.stdout.count("::warning title=Merge train not read::") == 1
+    assert f"::warning title=Merge train not read::{name}: " in done.stdout
+    assert "::error" not in done.stdout
+    assert "Refused:" not in summary
+
+
+@pytest.mark.parametrize("fault", ["502", "cut"])
+def test_planted_unread_repository_does_not_fail_the_fleet(tmp_path, fault):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.installations[0]["repos"].append("next")
+    forge.reads["fleet/next"] = [repository(pull(2, "CLEAN"))]
+    if fault == "502":
+        forge.read_statuses["fleet/app"] = [502] * 4
+    else:
+        forge.graphql_cuts["read"] = 3
+    done, summary = train(tmp_path, forge)
+    assert_not_read(done, summary, "fleet/app")
+    assert forge.where == [("fleet/next", landed(2))]
+    assert [full for full, _ in forge.read_calls].count("fleet/app") == 3
+    assert "### fleet/next: landed #2" in summary
+    assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_third_read_answer_lands_without_not_read_entry(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.read_statuses["fleet/app"] = [502, 502]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert len(forge.read_calls) == 3
+    assert "Not read after" not in summary
+    assert "::warning title=Merge train not read::" not in done.stdout
+
+
 @pytest.mark.parametrize("status", [502, 504])
 def test_exhausted_read_retries_fail_closed(tmp_path, status):
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.read_statuses["fleet/app"] = [status] * 4
-    done, _ = train(tmp_path, forge)
-    assert done.returncode != 0
+    done, summary = train(tmp_path, forge)
+    assert_not_read(done, summary, "fleet/app")
     assert f"HTTP {status}" in done.stdout + done.stderr
     assert forge.writes == []
     assert [full for full, _ in forge.read_calls] == ["fleet/app"] * 3
@@ -1499,7 +1539,8 @@ def test_read_500_is_not_retried(tmp_path):
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.read_statuses["fleet/app"] = [500]
     done, _ = train(tmp_path, forge)
-    assert done.returncode != 0
+    assert done.returncode == 1
+    assert "::error title=Merge train refused::fleet/app:" in done.stdout
     assert "HTTP 500" in done.stdout + done.stderr
     assert forge.writes == []
     assert len(forge.read_calls) == 1
@@ -1520,7 +1561,7 @@ def test_mutation_502_is_not_retried(tmp_path, state, operation, write):
 
 
 @pytest.mark.parametrize(
-    "count, pages, truncated", [(25, 1, False), (100, 4, False), (120, 4, True)]
+    "count, pages, truncated", [(10, 1, False), (100, 10, False), (120, 10, True)]
 )
 def test_pull_pages_stop_at_cap(tmp_path, count, pages, truncated):
     forge = Forge(
@@ -1537,14 +1578,26 @@ def test_pull_pages_stop_at_cap(tmp_path, count, pages, truncated):
 
 def test_page_size_100_is_refused_by_forge(tmp_path):
     source = module()
-    mutant = source.replace("first: 25, after:", "first: 100, after:")
+    mutant = source.replace("first: 10, after:", "first: 100, after:")
     assert mutant != source
     forge = Forge(repository(pull(1, "CLEAN")))
-    done, _ = train(tmp_path, forge, helper=mutant)
-    assert done.returncode != 0
+    done, summary = train(tmp_path, forge, helper=mutant)
+    assert_not_read(done, summary, "fleet/app")
     assert "HTTP 502" in done.stdout + done.stderr
-    assert "read page size exceeds 25" in done.stdout + done.stderr
+    assert "read page size exceeds 10" in done.stdout + done.stderr
     assert forge.writes == []
+    assert len(forge.read_calls) == 3
+
+
+@pytest.mark.parametrize("required_status", ["", "quality"])
+def test_open_pull_query_uses_small_pages_and_lands(tmp_path, required_status):
+    p = pull(1, "CLEAN", status={"contexts": [{"context": "quality", "state": "SUCCESS"}]})
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge, required_status=required_status)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert len(forge.read_calls) == 1
+    assert "Not read after" not in summary
 
 
 def test_unknown_state_rereads_all_pull_pages(tmp_path):
@@ -1554,7 +1607,7 @@ def test_unknown_state_rereads_all_pull_pages(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(30)]
-    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25"] * 2
+    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-10", "cursor-20"] * 2
 
 
 def test_second_page_read_retry_keeps_cursor_and_earlier_nodes(tmp_path):
@@ -1563,7 +1616,12 @@ def test_second_page_read_retry_keeps_cursor_and_earlier_nodes(tmp_path):
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(30)]
-    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25", "cursor-25"]
+    assert [v.get("after") for _, v in forge.read_calls] == [
+        None,
+        "cursor-10",
+        "cursor-10",
+        "cursor-20",
+    ]
     assert "| #1 | DIRTY |" in summary
 
 
@@ -7576,6 +7634,71 @@ def test_clean_coderabbit_codacy_and_sourcery_bodies_land(tmp_path):
     assert "### fleet/app: landed #1" in summary
 
 
+def sourcery_no_access_notice(login="person"):
+    """The no-access review body; fixture identities only."""
+    return (
+        f"Hi @{login}! 👋\n\n"
+        "Your private repo does not have access to Sourcery.\n\n"
+        "Please [upgrade](https://app.sourcery.ai/dashboard/billing?connection=github"
+        "&owner=fixture&from_surface=github_bot&intent=private_repo_upsell) "
+        "to continue using Sourcery ✨"
+    )
+
+
+@pytest.mark.parametrize("login", ["person-name", "some-app[bot]"])
+def test_planted_sourcery_no_access_notice_lands(tmp_path, login):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(601, "sourcery-ai[bot]", sourcery_no_access_notice(login))]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Your private repo does not have access to Sourcery.",
+        "  \n" + sourcery_no_access_notice() + "\n<!-- generated -->\n",
+        sourcery_no_access_notice().replace(
+            "?connection=github&owner=fixture&from_surface=github_bot&intent=private_repo_upsell",
+            "?",
+        ),
+    ],
+    ids=["access-only", "comments-and-whitespace", "empty-query"],
+)
+def test_sourcery_no_access_notice_line_boundaries(tmp_path, monkeypatch, body):
+    merge_train = load_train(tmp_path, monkeypatch)
+    assert merge_train._bot_body_has_finding("sourcery-ai", body) is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        sourcery_no_access_notice() + "\n## Overall Comments",
+        sourcery_no_access_notice() + "\nCheck this edge case.",
+        sourcery_no_access_notice().replace("app.sourcery.ai", "other.example"),
+        sourcery_no_access_notice().replace(
+            "Your private repo does not have access to Sourcery.\n", ""
+        ),
+        sourcery_no_access_notice("person.name"),
+        sourcery_no_access_notice().replace("?connection=github", "?connection=git hub"),
+        sourcery_no_access_notice() + "\n### Sourcery assessment\nApproval pending",
+        sourcery_no_access_notice() + "\n### Sourcery assessment\n1 of 2 met",
+    ],
+    ids=["marker", "extra-line", "host", "no-access-line", "login", "space", "pending", "met"],
+)
+def test_planted_sourcery_no_access_with_other_content_holds(tmp_path, body):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    forge.review_details[1] = _detail(reviews=[_bot_review(601, "sourcery-ai", body)])
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review body: sourcery-ai review 601 has findings" in summary
+
+
 @pytest.mark.parametrize(
     ("login", "body"),
     [
@@ -9224,12 +9347,86 @@ def test_transient_rest_read_is_tried_again(tmp_path, fault):
 def test_exhausted_rest_read_retries_refuse_the_repository(tmp_path, fault):
     forge = stopped_forge()
     forge.rest_faults["jobs"] = [fault] * 4
-    done, _ = train(tmp_path, forge)
-    assert done.returncode == 1, done.stdout + done.stderr
-    assert "::error title=Merge train refused::fleet/app: GET " in done.stdout
+    done, summary = train(tmp_path, forge)
+    assert_not_read(done, summary, "fleet/app")
+    assert "::warning title=Merge train not read::fleet/app: GET " in done.stdout
     assert "Traceback" not in done.stderr
     assert forge.rest_faults["jobs"] == [fault]
     assert forge.writes == []
+
+
+def test_exhausted_repositories_read_names_account_as_not_read(tmp_path):
+    forge = sweep_forge()
+    forge.rest_faults["repositories"] = [502] * 3
+    done, summary = train(tmp_path, forge)
+    assert_not_read(done, summary, "fleet")
+    assert "| fleet | not read | | | |" in summary
+    assert forge.where == [("other/b", armed(2)), ("other/b", updated(2))]
+    assert forge.rest_faults["repositories"] == []
+    assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_exhausted_installations_read_still_fails_the_sweep(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.rest_faults["installations"] = [502] * 4
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "::error title=Merge train refused::GET " in done.stdout
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert forge.rest_faults["installations"] == [502]
+    assert forge.where == []
+    assert summary == ""
+
+
+def test_unread_summary_keeps_only_first_error_line(tmp_path, monkeypatch):
+    merge_train = load_train(tmp_path, monkeypatch)
+    cause = http.client.IncompleteRead(b"", 10)
+    error = merge_train.UnreadError("HTTP 502 <html>\nsecond line</html>")
+    error.__cause__ = cause
+    error.unsigned_bots = ["fleet/app #1"]
+    monkeypatch.setattr(merge_train, "app_jwt", lambda *args: "fixture")
+    monkeypatch.setattr(
+        merge_train, "pages", lambda *args: [{"id": 7, "account": {"login": "fleet"}}]
+    )
+    monkeypatch.setattr(
+        merge_train, "repositories", lambda *args: [{"full_name": "fleet/app", "name": "app"}]
+    )
+
+    def unread(*args):
+        raise error
+
+    monkeypatch.setattr(merge_train, "one", unread)
+    env = {"GITHUB_STEP_SUMMARY": str(tmp_path / "summary"), "GITHUB_OUTPUT": str(tmp_path / "out")}
+    result = merge_train.sweep(env, {}, time.monotonic())
+    merge_train.summary(env, *result)
+    assert result[-1] == ["fleet/app: HTTP 502 <html>"]
+    assert result[-2] == ["fleet/app #1"]
+    summary = (tmp_path / "summary").read_text()
+    assert "second line" not in summary
+    assert "- fleet/app #1" in summary
+
+
+@pytest.mark.parametrize("method", ["GET", "GraphQL"])
+def test_unread_error_preserves_transient_cause(tmp_path, monkeypatch, method):
+    merge_train = load_train(tmp_path, monkeypatch)
+    cause = http.client.IncompleteRead(b"", 10)
+    calls = []
+
+    def refused(*args):
+        calls.append(args)
+        raise merge_train.RefusedError("body cut: 0 of 10 bytes") from cause
+
+    monkeypatch.setattr(merge_train, "request_once" if method == "GET" else "graphql", refused)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    with pytest.raises(merge_train.UnreadError) as caught:
+        if method == "GET":
+            merge_train.call("https://forge.test", method="GET")
+        else:
+            merge_train.read_graphql({}, "query", {})
+    assert str(caught.value) == "body cut: 0 of 10 bytes"
+    assert caught.value.__cause__ is cause
+    assert merge_train.transient(caught.value)
+    assert len(calls) == merge_train.READ_ATTEMPTS
 
 
 def test_rest_read_500_is_not_tried_again(tmp_path):
@@ -9242,15 +9439,16 @@ def test_rest_read_500_is_not_tried_again(tmp_path):
 
 
 def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
-    """Mutation: a GET that runs once turns the planted 502 on the jobs read red."""
+    """Mutation: skipping the GET retry leaves the repository unread without refreshing."""
     text = script()
     old = 'retries = READ_ATTEMPTS - 1 if method == "GET" else 0'
     assert text.count(old) == 1
     forge = stopped_forge()
     forge.rest_faults["jobs"] = [502]
-    done, _ = train(tmp_path, forge, text.replace(old, "retries = 0"))
-    assert done.returncode == 1, done.stdout + done.stderr
+    done, summary = train(tmp_path, forge, text.replace(old, "retries = 0"))
+    assert_not_read(done, summary, "fleet/app")
     assert forge.writes == []
+    assert forge.rest_faults["jobs"] == []
 
 
 @pytest.mark.parametrize("fault", [DROP, 502])
@@ -9379,16 +9577,17 @@ def test_moved_state_read_is_tried_again(tmp_path, fault):
 
 
 def test_exhausted_moved_state_reads_refuse_the_repository(tmp_path):
-    """Boundary: three failed state reads refuse the repository; the fourth is never sent."""
+    """Boundary: three failed state reads leave the repository unread; no fourth attempt."""
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.merge_errors = [NOT_MERGEABLE]
     forge.merge_states[1] = "BEHIND"
     forge.merge_state_statuses = [502] * 4
     done, summary = train(tmp_path, forge)
-    assert done.returncode == 1, done.stdout + done.stderr
+    assert_not_read(done, summary, "fleet/app")
     assert "HTTP 502" in done.stdout
     assert forge.merge_state_statuses == [502]
     assert "not landed: the merge state moved" not in summary
+    assert forge.writes == [landed(1)]
 
 
 def test_without_the_read_wrapper_the_state_read_refuses(tmp_path):

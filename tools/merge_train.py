@@ -72,7 +72,8 @@ TIMEOUT = 30
 ERROR_TEXT = 500
 SETTLE_ROUNDS = 3
 SETTLE_SECONDS = 5
-PULL_PAGES = 4
+PULL_PAGES = 10
+PULL_LIMIT = 100
 # Page sizes of the pull query's check suites and label events; a full page may hide more.
 SUITE_PAGE = 30
 RETRY_HOLD_DAYS = 7
@@ -323,6 +324,13 @@ _SOURCERY_CLEAN_OPENERS = (
     "Hey - I've reviewed your changes",
     "### Sourcery assessment",
 )
+_SOURCERY_ACCESS_SENTENCE = "Your private repo does not have access to Sourcery."
+_SOURCERY_NO_ACCESS_LINE = re.compile(
+    r"Hi @[A-Za-z0-9-]+(?:\[bot\])?! 👋|"
+    + re.escape(_SOURCERY_ACCESS_SENTENCE)
+    + r"|Please \[upgrade\]\(https://app\.sourcery\.ai/dashboard/billing\?[^\s)]*\) "
+    r"to continue using Sourcery ✨"
+)
 _UNCHECKED_BOX = re.compile(r"^- \[ \] ", re.M)
 _BODY_REVIEW_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED", "APPROVED"})
 
@@ -331,6 +339,10 @@ class RefusedError(Exception):
     """A forge call that failed or was refused."""
 
     unsigned_bots = ()
+
+
+class UnreadError(RefusedError):
+    """A transient read that still failed after READ_ATTEMPTS tries."""
 
 
 class UnsignedBotError(RefusedError):
@@ -668,7 +680,12 @@ def call(url, token=None, method="POST", body=None, raw=False, redirect=True):
             if not transient(err):
                 raise
         time.sleep(READ_BACKOFF_SECONDS)
-    return request_once(url, token, method, body, raw, redirect)
+    try:
+        return request_once(url, token, method, body, raw, redirect)
+    except RefusedError as err:
+        if method == "GET" and transient(err):
+            raise UnreadError(str(err)) from err.__cause__
+        raise
 
 
 def request_once(url, token, method, body, raw, redirect):
@@ -736,8 +753,10 @@ def read_graphql(env, query, variables):
         try:
             return graphql(env, query, variables)
         except RefusedError as err:
-            if not transient(err) or attempt == READ_ATTEMPTS:
+            if not transient(err):
                 raise
+            if attempt == READ_ATTEMPTS:
+                raise UnreadError(str(err)) from err.__cause__
             time.sleep(READ_BACKOFF_SECONDS)
 
 
@@ -929,7 +948,7 @@ def advance(env, conf, repo, rows, notes, check_retry=None):
     before its update: auto-merge would otherwise land the new head before the train
     reads its status or listed review (decision records 0076 and 0092).
     """
-    for pull, arming in updatable(repo, rows, notes, conf)[: PULL_PAGES * 100]:
+    for pull, arming in updatable(repo, rows, notes, conf)[:PULL_LIMIT]:
         if arming and has_red_code_scanning(pull):
             notes[pull["number"]] = "not armed: code-scanning check failed"
             continue
@@ -1377,7 +1396,7 @@ def re_arm_drifted(env, conf, served, held, notes):
     Otherwise read reviews again before disarming and re-arming; a held review or
     lack of sign-off ends the run disarmed, so later steps do not read it as armed.
     """
-    for pull, reason in served[: PULL_PAGES * 100]:
+    for pull, reason in served[:PULL_LIMIT]:
         if reason.startswith(REVIEW_BODY) or required_status_hold(pull, conf):
             continue
         if pull["number"] in held or not drifted(pull, conf):
@@ -1471,12 +1490,22 @@ def _coderabbit_finding(body):
     return "Actionable comments posted:" not in body and not _has_review_info(body)
 
 
+def _sourcery_no_access(body):
+    """Only allow-listed notice lines, with the exact no-access sentence present."""
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    return _SOURCERY_ACCESS_SENTENCE in lines and all(
+        _SOURCERY_NO_ACCESS_LINE.fullmatch(line) for line in lines
+    )
+
+
 def _sourcery_finding(body):
     """Whether a non-empty comment-stripped Sourcery review body carries a finding."""
     if _SOURCERY_MARKERS.search(body):
         return True
     if any(int(m.group(1)) < int(m.group(2)) for m in _SOURCERY_LINKED_MET.finditer(body)):
         return True
+    if _sourcery_no_access(body):
+        return False
     return not any(opener in body for opener in _SOURCERY_CLEAN_OPENERS)
 
 
@@ -1726,7 +1755,7 @@ def hold_review_bodies(env, conf, rows):
     """
     eligible = [
         pull
-        for pull, reason in serving_order(rows, conf)[: PULL_PAGES * 100]
+        for pull, reason in serving_order(rows, conf)[:PULL_LIMIT]
         if review_body_eligible(pull, reason, conf)
     ]
     holds = {
@@ -1734,10 +1763,10 @@ def hold_review_bodies(env, conf, rows):
         for pull in eligible[:REVIEW_READS]
     }
     conf["review_reads"] = len(holds)
-    unread = frozenset(pull["number"] for pull in eligible[REVIEW_READS : PULL_PAGES * 100])
+    unread = frozenset(pull["number"] for pull in eligible[REVIEW_READS:PULL_LIMIT])
     over = f"{REVIEW_BODY}not read: more than {REVIEW_READS} pull requests to read in one run"
     updated = []
-    for pull, reason in rows[: PULL_PAGES * 100]:
+    for pull, reason in rows[:PULL_LIMIT]:
         number = pull["number"]
         updated.append((pull, over if number in unread else holds.get(number) or reason))
     return updated
@@ -2265,10 +2294,26 @@ def one(env, conf, installation, target, now):
     )
 
 
+def note_unread(unread, name, err, unsigned_bots):
+    """Keep the target and first error line, plus any unsigned bots seen before it failed."""
+    unread.append(f"{name}: {str(err).splitlines()[0]}")
+    unsigned_bots.extend(err.unsigned_bots)
+
+
+def record_release(account, target, release, conf, releases, off):
+    """Keep release eligibility only for repositories the train successfully served."""
+    if not release:
+        return
+    if target["full_name"].lower() in conf["release_off"]:
+        off.append(target["full_name"])
+    else:
+        releases.append({"owner": account, "name": target["name"]})
+
+
 def sweep(env, conf, started):
     """Run the train in every repository; the per-account tally, the sections, the refusals."""
     accounts, sections, refusals, skipped, releases, off, identity = {}, [], [], [], [], [], {}
-    unsigned_bots = []
+    unsigned_bots, unread = [], []
     for installation in pages(env, app_jwt(env, conf), "/app/installations"):
         account = installation["account"]["login"]
         if installation.get("suspended_at"):
@@ -2276,6 +2321,10 @@ def sweep(env, conf, started):
             continue
         try:
             targets = repositories(env, conf, installation, identity)
+        except UnreadError as err:
+            note_unread(unread, account, err, unsigned_bots)
+            accounts[account] = "not read"
+            continue
         except RefusedError as err:
             refusals.append(f"{account}: {err}")
             accounts[account] = "refused"
@@ -2301,6 +2350,9 @@ def sweep(env, conf, started):
                     f"the train asks for; {rest} repositories skipped: {err}"
                 )
                 break
+            except UnreadError as err:
+                note_unread(unread, target["full_name"], err, unsigned_bots)
+                continue
             except RefusedError as err:
                 tally["refused"] += 1
                 refusals.append(f"{target['full_name']}: {err}")
@@ -2310,12 +2362,9 @@ def sweep(env, conf, started):
             tally["updated"] += moved
             sections.append(section)
             unsigned_bots.extend(unsigned)
-            if release:
-                if target["full_name"].lower() in conf["release_off"]:
-                    off.append(target["full_name"])
-                else:
-                    releases.append({"owner": account, "name": target["name"]})
-    return accounts, [s for s in sections if s], refusals, skipped, releases, off, unsigned_bots
+            record_release(account, target, release, conf, releases, off)
+    sections = [s for s in sections if s]
+    return accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread
 
 
 def append(path, text):
@@ -2333,7 +2382,7 @@ def review_bots_note(env):
     )
 
 
-def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots):
+def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread=()):
     """Render the sweep report to standard output and the job step summary."""
     lines = [
         "## Merge train sweep",
@@ -2353,6 +2402,9 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
             )
     if refusals:
         lines += ["", "Refused:", ""] + [f"- {line}" for line in refusals]
+    if unread:
+        lines += ["", f"Not read after {READ_ATTEMPTS} tries, the next run reads them again:", ""]
+        lines += [f"- {line}" for line in unread]
     if unsigned_bots:
         lines += [
             "",
@@ -2384,15 +2436,17 @@ def main(env):
         sys.stdout.write(f"::error title=Merge train setting::{err}\n")
         return 3
     try:
-        accounts, sections, refusals, skipped, releases, off, unsigned_bots = sweep(
+        accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread = sweep(
             env, conf, time.monotonic()
         )
     except RefusedError as err:
         sys.stdout.write(f"::error title=Merge train refused::{err}\n")
         return 1
-    summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots)
+    summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots, unread)
     for line in refusals:
         sys.stdout.write(f"::error title=Merge train refused::{line}\n")
+    for line in unread:
+        sys.stdout.write(f"::warning title=Merge train not read::{line}\n")
     if skipped:
         sys.stdout.write(f"::warning title=Merge train::{len(skipped)} repositories not reached\n")
     return 1 if refusals else 0
