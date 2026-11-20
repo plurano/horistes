@@ -928,7 +928,9 @@ jobs:
 
       - name: Hand the release list to its own workflow run
         id: upload
-        if: ${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != '' }}
+        if: >-
+          ${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != ''
+          && steps.sweep.outputs.releases != '[]' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: merge-train-releases
@@ -939,7 +941,7 @@ jobs:
       - name: Start the release run
         if: >-
           ${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != ''
-          && steps.upload.outcome == 'success' }}
+          && steps.sweep.outputs.releases != '[]' && steps.upload.outcome == 'success' }}
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}

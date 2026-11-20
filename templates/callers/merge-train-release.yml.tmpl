@@ -17,7 +17,8 @@ holds MERGE_TRAIN_APP_KEY; MERGE_TRAIN_APP_CLIENT_ID holds the app's client id,
 as described by templates/callers/merge-train.yml.tmpl.
 
 Trigger: the train job's workflow_dispatch with its run id, including failed
-sweeps with a release list. A person with write access may dispatch by hand
+sweeps with a nonempty release list. An empty list dispatches nothing.
+A person with write access may dispatch by hand
 with a train run id. The plan checks that run's workflow path, event, branch,
 repository, status and conclusion.
 No workflow-level concurrency on purpose: queued release legs must not hold

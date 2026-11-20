@@ -25,6 +25,7 @@ with read rights. Unset, the train runs.
 
 Scopes: GITHUB_TOKEN gets actions: write only, to start the release caller
 with workflow_dispatch from the train job that already holds the app key.
+An empty release list dispatches nothing.
 The called jobs write with the app's tokens, one per repository, minted for
 that repository alone and revoked after it. The separate release caller in
 templates/callers/merge-train-release.yml.tmpl reads the sweep artifact with

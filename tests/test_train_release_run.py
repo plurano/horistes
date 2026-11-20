@@ -7,6 +7,7 @@ from __future__ import annotations
 import ciwf
 import pytest
 from conftest import ROOT
+from expressions import evaluate
 from train_timeline import Timeline, cadence, layout
 
 A = {"owner": "fleet", "name": "A"}
@@ -195,7 +196,8 @@ def check_handoff(train, release):
     )
     assert (
         upload["if"]
-        == "${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != '' }}"
+        == "${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != '' "
+        "&& steps.sweep.outputs.releases != '[]' }}"
     )
     assert upload["with"] == {
         "name": "merge-train-releases",
@@ -237,7 +239,7 @@ def check_dispatch_wiring(job, upload):
     assert job["steps"].index(dispatch) == job["steps"].index(upload) + 1
     assert dispatch["if"] == (
         "${{ !cancelled() && inputs.switch == 'on' && steps.sweep.outputs.releases != '' "
-        "&& steps.upload.outcome == 'success' }}"
+        "&& steps.sweep.outputs.releases != '[]' && steps.upload.outcome == 'success' }}"
     )
     references = (
         ("GITHUB_TOKEN", "github.token"),
@@ -256,6 +258,23 @@ def check_dispatch_wiring(job, upload):
         "tools/release_workflows.py",
         "tools/release_plan.py",
     } <= set(checkout["with"]["sparse-checkout"].splitlines())
+
+
+@pytest.mark.parametrize("step", ["upload", "dispatch"])
+@pytest.mark.parametrize(
+    "releases,expected",
+    [
+        pytest.param('[{"owner":"fleet","name":"A"}]', True, id="nonempty"),
+        pytest.param("[]", False, id="empty-list"),
+        pytest.param("", False, id="empty-string"),
+    ],
+)
+def test_handoff_guards_require_releases(step, releases, expected):
+    train = ciwf.load(ROOT / ".github/workflows/merge-train.yml")
+    upload, dispatch = train["jobs"]["train"]["steps"][-2:]
+    guard = upload["if"] if step == "upload" else dispatch["if"]
+    steps = {"sweep": {"outputs": {"releases": releases}}, "upload": {"outcome": "success"}}
+    assert evaluate(guard, {"switch": "on"}, steps=steps) is expected
 
 
 def check_plan_wiring(plan, leg):

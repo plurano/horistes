@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: EUPL-1.2
 """A reader of the workflow expressions the shared workflows use.
 
-It reads inputs and explicit matrix, github, vars and needs context mappings,
+It reads inputs and explicit matrix, github, vars, needs and steps context mappings,
 including needs.<job>.outputs.<name>, quoted literals, true/false, cancelled(),
 `!`, `==`, `!=`, `&&`, `||` and `format` with one input. cancelled() is false
 unless the run was cancelled. Interpolation reads several expression parts;
-comparisons ignore string case. Any other form
+comparisons ignore string case and refuse mixed or unsupported operand types. Any other form
 is an error, so a test never reads an expression it cannot read.
 """
 
@@ -16,7 +16,7 @@ import re
 
 BRACES = re.compile(r"^\$\{\{(.*)\}\}$", re.DOTALL)
 FORMAT = re.compile(r"^format\(\s*'([^']*)'\s*,\s*inputs\.(\w+)\s*\)$")
-CONTEXTS = {"inputs", "matrix", "github", "vars", "needs"}
+CONTEXTS = {"inputs", "matrix", "github", "vars", "needs", "steps"}
 SEGMENT = re.compile(r"[A-Za-z_]\w*")
 
 
@@ -43,6 +43,17 @@ def _operand(text: str, inputs: dict, contexts: dict) -> object:
     raise ValueError(f"expression part not read here: {text!r}")
 
 
+def _equal(left: object, right: object, text: str) -> bool:
+    """Compare supported same-type operands; refuse all other pairs."""
+    if isinstance(left, str) and isinstance(right, str):
+        return left.casefold() == right.casefold()
+    if type(left) is type(right) and type(left) in (bool, int, float):
+        return left == right
+    raise ValueError(
+        f"comparison not read here: {text!r} ({type(left).__name__}, {type(right).__name__})"
+    )
+
+
 def _atom(text: str, inputs: dict, contexts: dict) -> object:
     """One operand or one comparison, with any leading `!`."""
     text = text.strip()
@@ -51,8 +62,10 @@ def _atom(text: str, inputs: dict, contexts: dict) -> object:
     operator = "!=" if "!=" in text else "=="
     if operator in text:
         left, right = text.split(operator, 1)
-        sides = [str(_operand(side, inputs, contexts)).casefold() for side in (left, right)]
-        value: object = (sides[0] == sides[1]) if operator == "==" else (sides[0] != sides[1])
+        sides = [_operand(side, inputs, contexts) for side in (left, right)]
+        value: object = _equal(sides[0], sides[1], text)
+        if operator == "!=":
+            value = not value
     else:
         value = _operand(text, inputs, contexts)
     for _ in range(negations):

@@ -34,6 +34,39 @@ def test_expression_reader(text, inputs, value):
 
 
 @pytest.mark.parametrize(
+    "text,inputs,left_type,right_type",
+    [
+        ("inputs.flag != 'true'", {"flag": True}, "bool", "str"),
+        ("'true' == inputs.flag", {"flag": True}, "str", "bool"),
+        ("inputs.a == inputs.b", {"a": 1, "b": 1.0}, "int", "float"),
+        ("inputs.a == inputs.b", {"a": True, "b": 1}, "bool", "int"),
+        ("inputs.a == inputs.b", {"a": [], "b": []}, "list", "list"),
+    ],
+)
+def test_comparison_refuses_mixed_or_unsupported_types(text, inputs, left_type, right_type):
+    with pytest.raises(ValueError) as error:
+        evaluate(text, inputs)
+    assert text in str(error.value)
+    assert left_type in str(error.value) and right_type in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "text,inputs,expected",
+    [
+        ("inputs.word == 'TRUE'", {"word": "true"}, True),
+        ("inputs.word != 'TRUE'", {"word": "true"}, False),
+        ("inputs.flag == true", {"flag": True}, True),
+        ("inputs.flag == true", {"flag": False}, False),
+        ("inputs.flag != false", {"flag": True}, True),
+        ("inputs.a == inputs.b", {"a": 1, "b": 1}, True),
+        ("inputs.a != inputs.b", {"a": 1.5, "b": 2.5}, True),
+    ],
+)
+def test_comparison_preserves_supported_types(text, inputs, expected):
+    assert evaluate(text, inputs) is expected
+
+
+@pytest.mark.parametrize(
     "text",
     ["github.event_name == 'push'", "format('{0}{1}', inputs.a, inputs.b)", "inputs.a >= 'b'"],
 )
