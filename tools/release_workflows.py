@@ -302,11 +302,8 @@ def job_key(clean, own_level, flags):
     return False
 
 
-def job_runs_release(job_lines, local):
-    """Whether a single job runs release-please action or reusable workflow."""
-    direct_indent = job_direct_indent(job_lines)
-    if direct_indent is None:
-        return False
+def job_release_flags(job_lines, local, direct_indent):
+    """Collect one job's release flags, respecting scalar and with-block boundaries."""
     flags = {"dormant": False, "reusable": False, "action": False, "custom": False}
     flags["local"] = local
     block_indent = None
@@ -333,6 +330,15 @@ def job_runs_release(job_lines, local):
         clean = re.sub(r"\s+#.*$", "", stripped)
         if job_key(clean, indent == direct_indent, flags):
             in_with = True
+    return flags, with_lines
+
+
+def job_runs_release(job_lines, local):
+    """Whether a single job runs release-please action or reusable workflow."""
+    direct_indent = job_direct_indent(job_lines)
+    if direct_indent is None:
+        return False
+    flags, with_lines = job_release_flags(job_lines, local, direct_indent)
     custom_config = flags["custom"] or has_custom_config(with_lines)
     reusable_call = flags["reusable"]
     if flags["dormant"]:
@@ -349,35 +355,40 @@ def workflow_runs_release(content, local, default_branch):
     return jobs_run_release(content, local)
 
 
-def jobs_run_release(content, local):
-    """Whether a job of the workflow runs release-please, triggers aside.
-
-    local names the workflow files of this repository that run it themselves,
-    so a job-level call of ./.github/workflows/<name> counts too.
-    """
+def jobs_sections(content):
+    """Yield jobs-section lines within the workflow's existing 5000-line bound."""
     in_jobs = False
+    section = []
+    for line in content.splitlines()[:5000]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            if in_jobs:
+                section.append(line)
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            if in_jobs:
+                yield section
+            section = []
+            in_jobs = bool(re.match(r"^jobs:\s*(?:#.*)?$", stripped))
+            continue
+        if in_jobs:
+            section.append(line)
+    if in_jobs:
+        yield section
+
+
+def jobs_section_runs_release(lines, local):
+    """Judge jobs in one top-level section in their original order."""
     job_indent = None
     current_job = []
-    lines = content.splitlines()[:5000]
-    for line in lines:
+    for line in lines[:5000]:
         stripped = line.strip()
         if not stripped:
             if current_job:
                 current_job.append(line)
             continue
         indent = len(line) - len(line.lstrip(" "))
-        if indent == 0:
-            if in_jobs:
-                if current_job and job_runs_release(current_job, local):
-                    return True
-                current_job = []
-                in_jobs = False
-            if re.match(r"^jobs:\s*(?:#.*)?$", stripped):
-                in_jobs = True
-                job_indent = None
-            continue
-        if not in_jobs:
-            continue
         if stripped.startswith("#"):
             if current_job:
                 current_job.append(line)
@@ -390,7 +401,16 @@ def jobs_run_release(content, local):
             current_job = []
         elif current_job is not None:
             current_job.append(line)
-    return bool(in_jobs and current_job and job_runs_release(current_job, local))
+    return bool(current_job and job_runs_release(current_job, local))
+
+
+def jobs_run_release(content, local):
+    """Whether a job of the workflow runs release-please, triggers aside.
+
+    local names the workflow files of this repository that run it themselves,
+    so a job-level call of ./.github/workflows/<name> counts too.
+    """
+    return any(jobs_section_runs_release(lines, local) for lines in jobs_sections(content))
 
 
 def local_release_workflows(contents):

@@ -32,6 +32,7 @@ from conftest import CHECKOUT, ROOT
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
+from release_workflows import jobs_sections
 
 TRAIN = ROOT / ".github/workflows/merge-train-release.yml"
 COMMIT_A = "a" * 40
@@ -427,6 +428,24 @@ def test_module_passes_ruff():
             timeout=60,
         )
         assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_release_modules_complexity_bounds():
+    """Both release modules obey McCabe 10, including the extracted parser."""
+    from conftest import Tree
+    from test_lint import ruff
+
+    paths = [ROOT / "tools" / f"{name}.py" for name in ("release_labels", "release_workflows")]
+    done = ruff(
+        Tree(ROOT / "tools"),
+        "check",
+        "--select",
+        "C901",
+        "--config",
+        "lint.mccabe.max-complexity=10",
+        *map(str, paths),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 def test_settings_refuses_file_url_before_read(tmp_path, forge):
@@ -984,6 +1003,67 @@ def test_planted_own_release_workflow_skips_release(tmp_path, forge, mutated):
         "::notice::fleet/app runs release-please in its own workflow release-please.yml; "
         "the train creates no release\n" in done.stdout
     ) is not mutated
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        pytest.param(
+            PLANTED_WORKFLOW.replace("jobs:\n", "jobs:\n# release jobs\n"),
+            id="after-jobs",
+        ),
+        pytest.param(
+            PLANTED_WORKFLOW.replace(
+                "jobs:\n",
+                "jobs:\n" + UNRELATED_WORKFLOW.split("jobs:\n", 1)[1] + "# release jobs\n",
+            ),
+            id="between-jobs",
+        ),
+        pytest.param(PLANTED_WORKFLOW + "# end of workflow", id="at-eof"),
+        pytest.param(
+            PLANTED_WORKFLOW.replace("jobs:\n", "# release jobs\njobs:\n"),
+            id="before-jobs",
+        ),
+    ],
+)
+def test_planted_jobs_comments_skip_release(tmp_path, forge, workflow):
+    """Column-zero comments leave the repository's release job visible."""
+    forge.config = {}
+    forge.workflows = {"release-please.yml": workflow}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=true\npending=[]\nfrozen=false\n"
+    assert (
+        "::notice::fleet/app runs release-please in its own workflow release-please.yml; "
+        "the train creates no release\n" in done.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        pytest.param(key + ":\n" + PLANTED_WORKFLOW.split("jobs:\n", 1)[1], id=key)
+        for key in ("env", "permissions", "concurrency")
+    ]
+    + [pytest.param("# uses: googleapis/release-please-action@v4\n", id="comment-only-action")],
+)
+def test_jobs_comments_do_not_create_release_jobs(tmp_path, forge, suffix):
+    """A real top-level boundary and comment text cannot create a release job."""
+    forge.config = {}
+    forge.workflows = {"ci.yml": UNRELATED_WORKFLOW + suffix}
+    done, outputs = settings(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert outputs == "skip=false\npending=[]\nfrozen=false\n"
+    assert "runs release-please in its own workflow" not in done.stdout
+
+
+@pytest.mark.parametrize("key", ["env", "permissions", "concurrency", "jobs"])
+def test_jobs_sections_comments_and_boundaries(key):
+    """Comments stay inside sections; every real top-level key ends one."""
+    lines = ["# release jobs", "  release:", "    runs-on: ubuntu-latest", "# end"]
+    content = "# before\njobs:\n" + "\n".join(lines) + f"\n{key}:\n  next: value\n"
+    expected = [lines, ["  next: value"]] if key == "jobs" else [lines]
+    assert list(jobs_sections(content)) == expected
 
 
 @pytest.mark.parametrize("mutated", [False, True])

@@ -270,9 +270,10 @@ def review_evidence(node: dict, me: str = "") -> list[tuple[str, datetime | None
         if not _can_complete(comment):
             continue
         body = str(comment.get("body") or "")
-        if _non_allowance_notice(body):
+        paused_head = _paused_head_reviewed(body, head)
+        if _non_allowance_notice(body) and not paused_head:
             continue
-        on_head = _head_evidence(comment, head)
+        on_head = paused_head or _head_evidence(comment, head)
         if comment.get("state") in COMPLETED_STATES or pre_merge_rows(body) or on_head:
             evidence.append((login, _body_at(comment), on_head))
     return evidence

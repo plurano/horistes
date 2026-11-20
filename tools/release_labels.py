@@ -371,6 +371,19 @@ def cmd_settings(env):
     return 0
 
 
+def matching_tag_entry(entries, tag):
+    """Select the exact tag ref after checking the matching-ref page bound."""
+    if not isinstance(entries, list):
+        return None
+    if len(entries) >= 30:
+        raise CallError(f"matching-refs for {tag}: {len(entries)} entries (>= 30)")
+    exact = f"refs/tags/{tag}"
+    for item in entries[:30]:
+        if item.get("ref") == exact:
+            return item
+    return None
+
+
 def get_tag_commit(api_url, repo, token, tag):
     """Resolve the commit SHA for a tag ref, unwrapping annotated tags once."""
     tag_quoted = urllib.parse.quote(tag, safe="")
@@ -381,16 +394,7 @@ def get_tag_commit(api_url, repo, token, tag):
         if err.status == 404:
             return None
         raise
-    if not isinstance(entries, list):
-        return None
-    if len(entries) >= 30:
-        raise CallError(f"matching-refs for {tag}: {len(entries)} entries (>= 30)")
-    exact = f"refs/tags/{tag}"
-    entry = None
-    for item in entries[:30]:
-        if item.get("ref") == exact:
-            entry = item
-            break
+    entry = matching_tag_entry(entries, tag)
     if not entry:
         return None
     obj = entry.get("object", {})

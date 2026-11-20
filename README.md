@@ -183,9 +183,11 @@ equal to what the train asks the forge for.
 
 When `review_bots` lists comma-separated reviewer logins, an eligible pull request
 needs a completed review on its current head from at least one listed reviewer.
-Logins are case-insensitive and may end in `[bot]`. A completed formal review must
-name the head commit; a summary must carry a reviewed range ending at that full
-head. Empty is the default and turns off only the zero-review hold; the sweep
+Logins are case-insensitive and may end in `[bot]`. Head evidence may be a completed
+formal review naming the full head commit, a summary carrying a reviewed range
+ending at that full head, or a completed pause summary from a listed reviewer
+carrying only pause notices whose block names the full head commit as last
+reviewed. Empty is the default and turns off only the zero-review hold; the sweep
 summary names that state. Repositories without a review bot can keep it empty.
 Incomplete-review notices and unanswered findings still hold independently
 ([ADR-0092](docs/adr/0092-the-train-requires-a-completed-review-on-the-head.md)).
@@ -193,7 +195,9 @@ Incomplete-review notices and unanswered findings still hold independently
 The dependency review exemption requires a bot PR author and a complete read of
 every commit author as a bot, up to 50 commits. A person commit or an unreadable
 author history applies the full review rules. A paused review holds across later
-pushes until the same reviewer covers the head
+pushes until the same reviewer covers the head with a completed formal review of
+the head, a reviewed range ending at the head, or a later pause summary naming
+the full head as last reviewed commit
 ([ADR-0093](docs/adr/0093-a-person-commit-ends-the-dependency-exemption.md)).
 
 Review settling and the dependency exemption live in `tools/review_state.py`;
