@@ -176,6 +176,15 @@ uses `workflow_dispatch` with a required string `train_run_id` input and grants
 `actions: read` to read the train run and artifact; a person with write access may
 dispatch it by hand with a train run id, and its release legs use the app token
 limited to each repository.
+The `release_off` input accepts at most 50 space-separated `owner/name` entries.
+Opt-outs follow repository transfers and renames through forge metadata; the
+summary names each opted-out repository by its current full name. Once another
+repository takes a moved repository's former name, the forge drops the redirect
+and an entry under that name matches the new repository, so callers rename the
+entry to the current full name before the former name is reused. If resolution
+fails, that installation receives no release runs for this sweep and the summary
+warns with the entry and reason
+([ADR-0100](docs/adr/0100-release-off-follows-a-moved-repository.md)).
 A push trigger counts only when its branch and tag filters admit the default
 branch ([ADR-0088](docs/adr/0088-a-push-trigger-counts-only-for-the-default-branch.md)).
 The app is one public app installed on every account
