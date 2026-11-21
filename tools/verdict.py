@@ -578,8 +578,8 @@ def _events(doc: dict) -> set[str]:
     return events
 
 
-def _secrets(job: dict) -> set[str]:
-    if job.get("secrets") == "inherit":
+def _credential_names(job: dict) -> set[str]:
+    if job.get(ciwf.CREDENTIAL_NAMES_KEY) == "inherit":
         return {"<inherit>"}
     return {name for text in ciwf.strings(job) for name in SECRET.findall(text)}
 
@@ -604,7 +604,7 @@ def side_conditions(pair: Pair, root: Path, called_root: Path) -> tuple[list[str
 
     for scope in sorted(scopes(new_doc, caller) - scopes(old_doc, old)):
         problems.append(f"{name}: the new job asks to write {scope}, the old one did not")
-    for secret in sorted(_secrets(caller) - _secrets(old)):
+    for secret in sorted(_credential_names(caller) - _credential_names(old)):
         problems.append(f"{name}: the new job receives the secret {secret}, the old one did not")
     for event in sorted(_events(old_doc) - _events(new_doc)):
         problems.append(f"{name}: the new workflow does not run on {event}")
