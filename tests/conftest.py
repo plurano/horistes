@@ -33,6 +33,8 @@ def leaked_root_names(root: Path, before: set[str]) -> list[str]:
     """Name new root entries not ignored by git; fail closed if git is unavailable.
 
     Use ls-files rather than check-ignore to handle self-ignoring directories.
+    Root names go to git as literal pathspecs, so a name starting with a colon or
+    holding glob characters is matched as written.
     Empty new directories are not named because git cannot record them.
     Outside a git work tree, or on a listing error, every new name is a leak.
     """
@@ -47,6 +49,7 @@ def leaked_root_names(root: Path, before: set[str]) -> list[str]:
                 "git",
                 "-C",
                 str(root),
+                "--literal-pathspecs",
                 "ls-files",
                 "-z",
                 "--others",

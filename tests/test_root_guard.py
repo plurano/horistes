@@ -6,22 +6,31 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from conftest import leaked_root_names
 
+COLON_NAMES = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows file names cannot hold a colon"
+)
+
+
+def _git_env() -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    return env
+
 
 @pytest.fixture
 def git_root(tmp_path: Path) -> Path:
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     subprocess.run(
         ["git", "init", str(tmp_path)],
         capture_output=True,
         check=True,
         timeout=30,
-        env=env,
+        env=_git_env(),
     )
     return tmp_path
 
@@ -30,6 +39,39 @@ def test_planted_untracked_root_file_is_named(git_root: Path):
     before = set(os.listdir(git_root))
     (git_root / "planted.txt").write_text("leaked output", encoding="utf-8")
     assert leaked_root_names(git_root, before) == ["planted.txt"]
+
+
+@COLON_NAMES
+@pytest.mark.parametrize("name", [":(literal)planted.txt", ":x"])
+def test_planted_pathspec_magic_root_name_is_named(git_root: Path, name: str):
+    before = set(os.listdir(git_root))
+    (git_root / name).write_text("leaked output", encoding="utf-8")
+    assert leaked_root_names(git_root, before) == [name]
+
+
+@COLON_NAMES
+@pytest.mark.parametrize("name", [":(literal)planted.txt", ":x"])
+def test_new_ignored_pathspec_magic_root_name_is_not_named(git_root: Path, name: str):
+    (git_root / ".gitignore").write_text(f"{name}\n", encoding="utf-8")
+    before = set(os.listdir(git_root))
+    (git_root / name).write_text("ignored output", encoding="utf-8")
+    ignored = subprocess.run(
+        ["git", "-C", str(git_root), "check-ignore", "-v", "--", f"./{name}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env=_git_env(),
+    )
+    assert ignored.returncode == 0
+    assert ignored.stdout == f".gitignore:1:{name}\t./{name}\n"
+    assert leaked_root_names(git_root, before) == []
+
+
+def test_planted_glob_character_root_name_is_named(git_root: Path):
+    before = set(os.listdir(git_root))
+    (git_root / "a[b]").write_text("leaked output", encoding="utf-8")
+    assert leaked_root_names(git_root, before) == ["a[b]"]
 
 
 def test_new_ignored_root_name_is_not_named(git_root: Path):
