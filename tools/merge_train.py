@@ -265,7 +265,21 @@ MERGE_IN_PROGRESS = "Merge already in progress"
 NOT_MERGEABLE = "pull request is not mergeable"
 UNGRANTED = "The permissions requested are not granted"
 SKIP_UNSIGNED = "skipped: dependency update without Signed-off-by, a person lands it"
+SKIP_UNSIGNED_ASKED = (
+    "skipped: dependency update without Signed-off-by, asked its update bot to recreate it"
+)
+SKIP_UNSIGNED_WOULD_ASK = (
+    "would ask: dependency update without Signed-off-by, would ask its update bot to recreate it"
+)
+SKIP_UNSIGNED_WAITING = (
+    "skipped: dependency update without Signed-off-by, waiting for its update bot to recreate it"
+)
+SKIP_UNSIGNED_STILL = (
+    "skipped: dependency update still without Signed-off-by after its update bot "
+    "recreated it; that bot's config adds none"
+)
 SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its producer signs it"
+REGENERATION_REQUESTED_LABEL = "merge-train: regeneration requested"
 REVIEW_BODY = "review body: "
 # Pull requests whose review bodies one run reads in one repository (ADR-0070).
 REVIEW_READS = 10
@@ -567,6 +581,20 @@ def check_app_key(key):
         )
 
 
+def check_regenerate_label(raw, error_cls=InvalidSettingError):
+    """The label that asks the update bot to recreate an unsigned dependency update."""
+    if "," in raw or "\n" in raw:
+        raise error_cls(f"regenerate_label is {raw!r}, must not contain a comma or newline")
+    if len(raw) > 50:
+        raise error_cls(f"regenerate_label is {len(raw)} characters, at most 50 are allowed")
+    return raw
+
+
+def check_onboarding_branches(raw):
+    """Exact head names of update-bot onboarding pull requests."""
+    return tuple(name for name in raw.split() if name)
+
+
 def check_review_bots(value):
     """Allow only comma-separated forge logins, normalizing optional bot suffixes."""
     names = value.split(",")
@@ -626,6 +654,12 @@ def settings(env):
             hours=check_session_hold_hours(
                 env.get("TRAIN_SESSION_HOLD_HOURS", "4"), InvalidSettingError
             )
+        ),
+        "regenerate": check_regenerate_label(
+            env.get("TRAIN_REGENERATE_LABEL", "rebase"), InvalidSettingError
+        ),
+        "onboarding": check_onboarding_branches(
+            env.get("TRAIN_ONBOARDING_BRANCHES", "renovate/configure")
         ),
     }
 
@@ -806,6 +840,63 @@ def is_bot(pull):
     return isinstance(author, dict) and author.get("__typename") == "Bot"
 
 
+def add_pull_labels(pull, *names):
+    """Record labels on the in-memory pull request after a successful write."""
+    nodes = pull.setdefault("labels", {"nodes": []})["nodes"]
+    present = {item["name"] for item in nodes}
+    for name in names:
+        if name not in present:
+            nodes.append({"name": name})
+            present.add(name)
+
+
+def unsigned_update_note(env, conf, pull):
+    """The skip note for an unsigned dependency update; may ask the update bot once."""
+    head = pull["headRefName"]
+    if head in conf["onboarding"] or not is_bot(pull) or not conf["regenerate"]:
+        return SKIP_UNSIGNED
+    names = set(label_names(pull))
+    guard = REGENERATION_REQUESTED_LABEL
+    regen = conf["regenerate"]
+    if guard not in names:
+        if conf["switch"] != "on":
+            return SKIP_UNSIGNED_WOULD_ASK
+        api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
+        url = f"{api}/issues/{pull['number']}/labels"
+        try:
+            call(url, env["TRAIN_TOKEN"], "POST", {"labels": [regen, guard]})
+        except RefusedError as err:
+            msg = f"#{pull['number']}: could not ask the update bot to recreate it"
+            raise RefusedError(msg) from err
+        add_pull_labels(pull, regen, guard)
+        return SKIP_UNSIGNED_ASKED
+    if regen in names:
+        return SKIP_UNSIGNED_WAITING
+    return SKIP_UNSIGNED_STILL
+
+
+def dependency_unsigned_note(env, conf, pull):
+    """The skip note for an unsigned dependency head, or None when signed or not a dependency."""
+    if not pull["headRefName"].startswith(conf["dependency"]):
+        return None
+    messages = pull_commits(env, pull["number"])
+    try:
+        squash_message(pull["title"], pull["number"], messages)
+    except NoSignOffError:
+        return unsigned_update_note(env, conf, pull)
+    return None
+
+
+def dry_note_unsigned_dependencies(env, conf, rows, notes):
+    """When `switch` is off, report what the train would ask without forge writes."""
+    for pull, reason in rows:
+        if reason not in ("land", "behind"):
+            continue
+        note = dependency_unsigned_note(env, conf, pull)
+        if note:
+            notes[pull["number"]] = note
+
+
 def signed_message(env, conf, pull):
     """The headline and body for a signed pull request; raises when unsigned or invalid."""
     messages = pull_commits(env, pull["number"])
@@ -813,7 +904,8 @@ def signed_message(env, conf, pull):
         return squash_message(pull["title"], pull["number"], messages)
     except NoSignOffError as err:
         if pull["headRefName"].startswith(conf["dependency"]):
-            raise UnsignedBotError(f"#{pull['number']}: {err}", SKIP_UNSIGNED) from err
+            note = unsigned_update_note(env, conf, pull)
+            raise UnsignedBotError(f"#{pull['number']}: {err}", note) from err
         if is_bot(pull):
             raise UnsignedBotError(f"#{pull['number']}: {err}", SKIP_UNSIGNED_BOT) from err
         raise RefusedError(f"#{pull['number']}: {err}") from err
@@ -2007,6 +2099,7 @@ def run(env, conf, repo, now, notes=None):
     rows = hold_review_bodies(env, conf, verdicts)
     notes.update({pull["number"]: reason for pull, reason in rows})
     if conf["switch"] == "off":
+        dry_note_unsigned_dependencies(env, conf, rows, notes)
         return rows, notes, "switched off: nothing landed or updated"
     # Taking auto-merge off a red pull request lands nothing, so it precedes the lease check.
     disarm_red_scanning(env, rows, notes, conf)
