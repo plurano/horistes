@@ -341,7 +341,7 @@ def test_self_test_passes_and_catches_planted_judge_defects(
     out = io.StringIO()
     assert self_test(out) == 0
     lines = out.getvalue().splitlines()
-    assert len(lines) == 9
+    assert len(lines) == 11
     assert all(line.startswith("ok ") for line in lines)
 
     # Planted 1: accepting skipped on owed checks breaks self_test.
@@ -369,6 +369,17 @@ def test_self_test_passes_and_catches_planted_judge_defects(
     # Planted 5: ignoring rate-limit budget bound breaks self_test.
     monkeypatch.setattr(
         required_checks.ApiSession, "_within_rate_limit_bounds", lambda self, d, w: True
+    )
+    assert self_test(io.StringIO()) == 1
+    monkeypatch.undo()
+
+    # Planted 6: exempting pull-request-only on pull_request_target breaks self_test.
+    monkeypatch.setattr(
+        required_checks,
+        "exempt_reason",
+        lambda name, cfg: (
+            "exempt" if name in cfg.pull_request_only and cfg.event_name != "pull_request" else ""
+        ),
     )
     assert self_test(io.StringIO()) == 1
 
@@ -803,6 +814,107 @@ def test_pull_request_only_on_pr_and_failed_exemptions_fail(
     )
     assert rc_sfail == 1
     assert "Optional: status error (reported although not owed)" in err_sfail
+
+
+def test_pull_request_target_sha_resolution_3d() -> None:
+    cfg_sha1 = parse_config(
+        repository=REPO,
+        event_name="pull_request_target",
+        ref="refs/heads/main",
+        commit_sha="0" * 40,
+        pr_head_sha=SHA,
+        required_json='["Build"]',
+    )
+    assert cfg_sha1.sha == SHA
+
+    cfg_sha256 = parse_config(
+        repository=REPO,
+        event_name="pull_request_target",
+        commit_sha="0" * 40,
+        pr_head_sha=f"  {SHA256}\n",
+        required_json='["Build"]',
+    )
+    assert cfg_sha256.sha == SHA256
+
+    cfg_explicit = parse_config(
+        repository=REPO,
+        event_name="pull_request_target",
+        sha="f" * 40,
+        commit_sha="0" * 40,
+        pr_head_sha=SHA,
+        required_json='["Build"]',
+    )
+    assert cfg_explicit.sha == "f" * 40
+
+    with pytest.raises(InputError, match="sha: invalid commit SHA ''") as err_pr:
+        parse_config(
+            repository=REPO,
+            event_name="pull_request",
+            commit_sha=SHA,
+            pr_head_sha="",
+            required_json='["Build"]',
+        )
+    for empty_head in ("", "   "):
+        with pytest.raises(InputError, match="sha: invalid commit SHA ''") as err_prt:
+            parse_config(
+                repository=REPO,
+                event_name="pull_request_target",
+                commit_sha=SHA,
+                pr_head_sha=empty_head,
+                required_json='["Build"]',
+            )
+        assert str(err_prt.value) == str(err_pr.value)
+
+
+def test_pull_request_target_cli_and_pr_only_3d(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answers = base_answers(
+        checks=[check_item(1, "Build", "success"), check_item(2, "PR-Only", "success")]
+    )
+    for name, value in tree.forge(answers).items():
+        monkeypatch.setenv(name, value)
+    out, err = io.StringIO(), io.StringIO()
+    rc = main(
+        ["judge"],
+        env={
+            "REPOSITORY": REPO,
+            "EVENT_NAME": "pull_request_target",
+            "REF": "refs/heads/main",
+            "COMMIT_SHA": "0" * 40,
+            "PR_HEAD_SHA": SHA,
+            "REQUIRED_JSON": '["Build", "PR-Only"]',
+            "PULL_REQUEST_ONLY_JSON": '["PR-Only"]',
+        },
+        out=out,
+        err=err,
+    )
+    assert rc == 0, err.getvalue()
+    assert "OK (success): PR-Only" in out.getvalue()
+
+    for pr_event in ("pull_request", "pull_request_target"):
+        rc_abs, _, err_abs, _ = invoke_with_forge(
+            tree,
+            monkeypatch,
+            base_answers(checks=[check_item(1, "Build", "success")]),
+            required=["Build", "PR-Only"],
+            pull_request_only=["PR-Only"],
+            event=pr_event,
+            wait_minutes=1,
+        )
+        assert rc_abs == 1
+        assert f"PR-Only: never reported on SHA {SHA}" in err_abs
+
+    rc_mg, out_mg, err_mg, _ = invoke_with_forge(
+        tree,
+        monkeypatch,
+        base_answers(checks=[check_item(1, "Build", "success")]),
+        required=["Build", "PR-Only"],
+        pull_request_only=["PR-Only"],
+        event="merge_group",
+    )
+    assert rc_mg == 0, err_mg
+    assert "OK (pull-request-only on merge_group): PR-Only" in out_mg
 
 
 # ---------------------------------------------------------------------------

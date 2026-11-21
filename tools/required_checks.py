@@ -186,7 +186,7 @@ def _resolve_sha(event_name: str, explicit_sha: str, commit_sha: str, pr_head_sh
     """Select and validate the commit SHA to judge for the current event."""
     if explicit_sha:
         chosen = explicit_sha.strip()
-    elif event_name == "pull_request":
+    elif event_name in PR_EVENTS:
         chosen = pr_head_sha.strip()
     else:
         chosen = commit_sha.strip()
@@ -483,7 +483,7 @@ def exempt_reason(name: str, config: Config) -> str:
     """Exemption reason for `name` on this event, or empty string when `name` is owed."""
     if name in config.not_owed:
         return "not owed"
-    if name in config.pull_request_only and config.event_name != "pull_request":
+    if name in config.pull_request_only and config.event_name not in PR_EVENTS:
         return f"pull-request-only on {config.event_name}"
     return ""
 
@@ -862,6 +862,46 @@ def _self_test_limit_cases(
     )
 
 
+def _self_test_pr_only_cases(
+    base_kw: dict[str, str],
+) -> tuple[tuple[str, Callable[[], int], int], ...]:
+    """Positive and negative self-test cases for pull-request-only contexts across events."""
+    pr_target_kw = {
+        "repository": base_kw["repository"],
+        "event_name": "pull_request_target",
+        "ref": base_kw["ref"],
+        "commit_sha": "0" * 40,
+        "pr_head_sha": base_kw["sha"],
+    }
+    return (
+        (
+            "pull-request-only absent on push passes",
+            lambda: _run_case(
+                parse_config(
+                    **base_kw,
+                    required_json='["Build","PR Gate"]',
+                    pull_request_only_json='["PR Gate"]',
+                ),
+                check_runs=[_check_run(1, "Build", "success")],
+            ),
+            0,
+        ),
+        (
+            "pull-request-only absent on pull_request_target fails",
+            lambda: _run_case(
+                parse_config(
+                    **pr_target_kw,
+                    required_json='["Build","PR Gate"]',
+                    pull_request_only_json='["PR Gate"]',
+                    wait_minutes=1,
+                ),
+                check_runs=[_check_run(1, "Build", "success")],
+            ),
+            1,
+        ),
+    )
+
+
 def self_test(out: TextIO = sys.stdout) -> int:
     """Run planted positive and negative cases in memory; return 0 when all match."""
     base_kw = {
@@ -874,6 +914,7 @@ def self_test(out: TextIO = sys.stdout) -> int:
         *_self_test_outcome_cases(base_kw),
         *_self_test_event_cases(base_kw),
         *_self_test_limit_cases(base_kw),
+        *_self_test_pr_only_cases(base_kw),
     )
     passed = True
     for label, fn, expected in cases[:MAX_SELF_TESTS]:
