@@ -159,6 +159,7 @@ COMMITS = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
+      headRefOid
       commits(first: 100) {
         totalCount
         nodes { commit { message parents { totalCount } } }
@@ -279,6 +280,10 @@ SKIP_UNSIGNED_STILL = (
 )
 SKIP_UNSIGNED_LABELS_INCOMPLETE = (
     "skipped: dependency update without Signed-off-by, labels not fully read, no recreate asked"
+)
+SKIP_UNSIGNED_HEAD_MOVED = (
+    "skipped: dependency update without Signed-off-by, head moved since the sweep read, "
+    "no recreate asked"
 )
 SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its producer signs it"
 REGENERATION_REQUESTED_LABEL = "merge-train: regeneration requested"
@@ -817,17 +822,19 @@ def fetch(env, conf):
 
 
 def pull_commits(env, number):
-    """The non-merge commit messages of one pull request, oldest first."""
+    """The head commit oid and non-merge commit messages of one pull request, oldest first."""
     owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
     data = read_graphql(env, COMMITS, {"owner": owner, "name": name, "number": number})
-    commits = data["repository"]["pullRequest"]["commits"]
+    pull = data["repository"]["pullRequest"]
+    commits = pull["commits"]
     if commits["totalCount"] > 100:
         raise RefusedError(f"#{number}: more than 100 commits, cannot read every sign-off")
-    return [
+    messages = [
         node["commit"]["message"]
         for node in commits["nodes"]
         if node["commit"]["parents"]["totalCount"] == 1
     ]
+    return pull["headRefOid"], messages
 
 
 def pull_merge_state(env, number):
@@ -874,7 +881,19 @@ def labels_complete(pull):
     return total == len(nodes)
 
 
-def unsigned_update_note(env, conf, pull):
+def _ask_update_bot_recreate(env, pull, regen, guard):
+    """Post the recreate and guard labels once and record them on the in-memory pull."""
+    api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
+    url = f"{api}/issues/{pull['number']}/labels"
+    try:
+        call(url, env["TRAIN_TOKEN"], "POST", {"labels": [regen, guard]})
+    except RefusedError as err:
+        msg = f"#{pull['number']}: could not ask the update bot to recreate it"
+        raise RefusedError(msg) from err
+    add_pull_labels(pull, regen, guard)
+
+
+def unsigned_update_note(env, conf, pull, read_head):
     """The skip note for an unsigned dependency update; may ask the update bot once."""
     head = pull["headRefName"]
     if head in conf["onboarding"] or not is_bot_dependency(pull, conf) or not conf["regenerate"]:
@@ -885,16 +904,11 @@ def unsigned_update_note(env, conf, pull):
     if guard not in names:
         if not labels_complete(pull):
             return SKIP_UNSIGNED_LABELS_INCOMPLETE
+        if read_head != pull["headRefOid"]:
+            return SKIP_UNSIGNED_HEAD_MOVED
         if conf["switch"] != "on":
             return SKIP_UNSIGNED_WOULD_ASK
-        api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
-        url = f"{api}/issues/{pull['number']}/labels"
-        try:
-            call(url, env["TRAIN_TOKEN"], "POST", {"labels": [regen, guard]})
-        except RefusedError as err:
-            msg = f"#{pull['number']}: could not ask the update bot to recreate it"
-            raise RefusedError(msg) from err
-        add_pull_labels(pull, regen, guard)
+        _ask_update_bot_recreate(env, pull, regen, guard)
         return SKIP_UNSIGNED_ASKED
     if regen in names:
         return SKIP_UNSIGNED_WAITING
@@ -905,11 +919,11 @@ def dependency_unsigned_note(env, conf, pull):
     """The skip note for an unsigned dependency head, or None when signed or not a dependency."""
     if not pull["headRefName"].startswith(conf["dependency"]):
         return None
-    messages = pull_commits(env, pull["number"])
+    read_head, messages = pull_commits(env, pull["number"])
     try:
         squash_message(pull["title"], pull["number"], messages)
     except NoSignOffError:
-        return unsigned_update_note(env, conf, pull)
+        return unsigned_update_note(env, conf, pull, read_head)
     return None
 
 
@@ -926,7 +940,9 @@ def dry_note_unsigned_dependencies(env, conf, repo, rows, notes):
         for pull, reason in rows
         if reason == "behind" and pull["headRefName"].startswith(conf["dependency"])
     ]
-    for pull, _ in updatable(repo, behind, notes, conf):
+    for pull, arming in updatable(repo, behind, notes, conf)[: PULL_PAGES * 100]:
+        if not arming:
+            continue
         note = dependency_unsigned_note(env, conf, pull)
         if note:
             notes[pull["number"]] = note
@@ -934,12 +950,12 @@ def dry_note_unsigned_dependencies(env, conf, repo, rows, notes):
 
 def signed_message(env, conf, pull):
     """The headline and body for a signed pull request; raises when unsigned or invalid."""
-    messages = pull_commits(env, pull["number"])
+    read_head, messages = pull_commits(env, pull["number"])
     try:
         return squash_message(pull["title"], pull["number"], messages)
     except NoSignOffError as err:
         if pull["headRefName"].startswith(conf["dependency"]):
-            note = unsigned_update_note(env, conf, pull)
+            note = unsigned_update_note(env, conf, pull, read_head)
             raise UnsignedBotError(f"#{pull['number']}: {err}", note) from err
         if is_bot(pull):
             raise UnsignedBotError(f"#{pull['number']}: {err}", SKIP_UNSIGNED_BOT) from err

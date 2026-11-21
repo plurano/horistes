@@ -4114,13 +4114,13 @@ def test_unsigned_dependency_update_lands_after_the_update_bot_recreated_and_sig
 
 def test_unsigned_dependency_regenerate_labels_once_when_signed_message_runs_twice(tmp_path):
     needle = (
-        "            note = unsigned_update_note(env, conf, pull)\n"
+        "            note = unsigned_update_note(env, conf, pull, read_head)\n"
         "            raise UnsignedBotError(f\"#{pull['number']}: {err}\", note) from err"
     )
     flow = script().replace(
         needle,
-        "            note = unsigned_update_note(env, conf, pull)\n"
-        "            unsigned_update_note(env, conf, pull)\n"
+        "            note = unsigned_update_note(env, conf, pull, read_head)\n"
+        "            unsigned_update_note(env, conf, pull, read_head)\n"
         "            raise UnsignedBotError(f\"#{pull['number']}: {err}\", note) from err",
         1,
     )
@@ -4287,22 +4287,53 @@ def test_unsigned_dependency_update_incomplete_labels_precede_head_moved(tmp_pat
 
 
 def test_behind_unsigned_dependency_non_arming_reports_no_would_ask_and_writes_no_label(tmp_path):
+    dry_dir = tmp_path / "dry"
+    dry_dir.mkdir()
     armed_pull = unsigned_dep_pull(1, "BEHIND", autoMergeRequest={"enabledAt": OLD})
     dry_forge = Forge(repository(armed_pull))
     dry_forge.commits[1] = [("chore(deps): update foo to v2", 1)]
-    dry_done, dry_summary = train(tmp_path / "dry", dry_forge, min_age_days="0", switch="off")
+    dry_done, dry_summary = train(dry_dir, dry_forge, min_age_days="0", switch="off")
     assert dry_done.returncode == 0, dry_done.stdout + dry_done.stderr
     assert dry_forge.writes == []
     assert "| #1 | BEHIND | behind |" in dry_summary
     assert WOULD_ASK_NOTE not in dry_summary
 
+    live_dir = tmp_path / "live"
+    live_dir.mkdir()
     live_forge = Forge(repository(armed_pull))
     live_forge.commits[1] = [("chore(deps): update foo to v2", 1)]
-    live_done, live_summary = train(tmp_path / "live", live_forge, min_age_days="0", switch="on")
+    live_done, live_summary = train(live_dir, live_forge, min_age_days="0", switch="on")
     assert live_done.returncode == 0, live_done.stdout + live_done.stderr
     assert live_forge.writes == [updated(1)]
     assert "| #1 | BEHIND | updated from the default branch |" in live_summary
     assert ASKED_NOTE not in live_summary
+
+
+def test_planted_unsigned_head_moved_without_head_check_labels(tmp_path):
+    target = '        if read_head != pull["headRefOid"]:'
+    assert script().count(target) == 1
+    flow = script().replace(target, "        if False:")
+    assert flow != script()
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    forge.commit_heads[1] = "b" * 40
+    done, _ = train(tmp_path, forge, flow, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL)]
+
+
+def test_planted_dry_unsigned_behind_without_arming_skip_reports_would_ask(tmp_path):
+    target = "        if not arming:\n            continue\n"
+    assert script().count(target) == 1
+    flow = script().replace(target, "")
+    assert flow != script()
+    armed_pull = unsigned_dep_pull(1, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(armed_pull))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, flow, min_age_days="0", switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | BEHIND | {WOULD_ASK_NOTE} |" in summary
 
 
 @pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])

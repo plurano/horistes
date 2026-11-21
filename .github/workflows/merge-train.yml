@@ -186,8 +186,8 @@ on:
         default: rebase
       onboarding_branches:
         description: >-
-          Exact head names of the update bot onboarding pull requests; a person
-          lands them, separated by spaces.
+          Exact head names of the update bot onboarding pull requests, separated
+          by spaces; an unsigned head of these is never asked to be recreated.
         type: string
         required: false
         default: renovate/configure
