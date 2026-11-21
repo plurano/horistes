@@ -1525,3 +1525,68 @@ def test_paused_block_does_not_clear_allowance(old_notice, reviewed_head, holds)
         adr92_comment("## Reviews paused\nLast reviewed commit: " + reviewed_head, ADR92_NOTICE),
     )
     assert bool(adr92_reader().review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        pytest.param(
+            "no-evidence",
+            "review incomplete: coderabbitai limit reached at 2026-11-16T16:00:00Z",
+            id="old-mixed-no-evidence",
+        ),
+        pytest.param("check-run", "", id="old-mixed-exact-head-check"),
+        pytest.param("formal-review", "", id="old-mixed-later-formal-head-review"),
+        pytest.param(
+            "short-suite-oid",
+            "review incomplete: coderabbitai limit reached at 2026-11-16T16:00:00Z",
+            id="old-mixed-short-suite-oid",
+        ),
+        pytest.param(
+            "fresh-check-run",
+            f"review incomplete: coderabbitai limit reached at {ADR92_NOTICE}",
+            id="fresh-mixed-exact-head-check",
+        ),
+        pytest.param(
+            "pause-names-head",
+            "review incomplete: coderabbitai limit reached at 2026-11-16T16:00:00Z",
+            id="old-pause-and-allowance-names-head",
+        ),
+    ],
+)
+def test_read_body_mixed_notices(case, expected):
+    """A read body mixing allowance with another notice holds while either part holds."""
+    reader = adr92_reader()
+    old = "2026-11-16T16:00:00Z"
+    mixed = "0 remain after this review\nRate limit reached."
+    pr = completed_head_pull()
+    pr["comments"]["nodes"] = [adr92_comment(mixed, old)]
+    if case in {"check-run", "short-suite-oid", "fresh-check-run"}:
+        run = completed_head_run()
+        if case == "short-suite-oid":
+            run["checkSuite"]["commit"]["oid"] = ADR92_HEAD[:7]
+        pr = completed_head_pull(run)
+        when = ADR92_NOTICE if case == "fresh-check-run" else old
+        pr["comments"]["nodes"] = [adr92_comment(mixed, when)]
+    elif case == "formal-review":
+        pr["reviews"]["nodes"] = [
+            adr92_comment(
+                "",
+                "2026-11-16T17:00:00Z",
+                state="COMMENTED",
+                submittedAt="2026-11-16T17:00:00Z",
+                commit={"oid": ADR92_HEAD},
+            )
+        ]
+    elif case == "pause-names-head":
+        pause_mixed = (
+            f"## Reviews paused\nLast reviewed commit: {ADR92_HEAD}\n0 remain after this review"
+        )
+        pr["comments"]["nodes"] = [adr92_comment(pause_mixed, old)]
+    verdict = reader.review_incomplete(pr)
+    if case == "fresh-check-run":
+        pure = completed_head_pull(completed_head_run())
+        pure["comments"]["nodes"] = [adr92_comment("Rate limit reached.", ADR92_NOTICE)]
+        pure_verdict = reader.review_incomplete(pure)
+        assert verdict == pure_verdict == expected
+    assert verdict == expected

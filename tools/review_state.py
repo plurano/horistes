@@ -463,16 +463,18 @@ def _unread_notice_holds(comment: dict, head: str, last_commit) -> bool:
     return _notice_time_rule(allowance or paused, names_head, when, last_commit)
 
 
-def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> bool:
-    """Apply head coverage, reviewer scope, and ordering to notices in the read prefix."""
-    body = str(comment.get("body") or "")
-    prefix, _cut = _notice_read(body)
-    notices = list(LIMIT_NOTICE_RE.finditer(prefix))[:MAX_LINES]
-    if not notices:
-        return False
+def _notice_part_holds(
+    comment: dict,
+    body: str,
+    head: str,
+    last_commit,
+    evidence: tuple,
+    paused: bool,
+    *,
+    allowance: bool,
+) -> bool:
+    """Apply head coverage, reviewer scope, and ordering to one notice class in a read body."""
     ordinary, formal, completed = evidence
-    allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
-    paused = any(notice.group("paused") for notice in notices[:MAX_LINES])
     login = _login(comment).lower().removesuffix("[bot]")
     if allowance and login in REVIEWER_BOTS and login in completed:
         return False
@@ -486,6 +488,25 @@ def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> boo
     if _later_evidence(later, login, when, last_commit, allowance or paused or names_head):
         return False
     return _notice_time_rule(allowance or paused, names_head, when, last_commit)
+
+
+def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> bool:
+    """Apply head coverage, reviewer scope, and ordering to notices in the read prefix."""
+    body = str(comment.get("body") or "")
+    prefix, _cut = _notice_read(body)
+    notices = list(LIMIT_NOTICE_RE.finditer(prefix))[:MAX_LINES]
+    if not notices:
+        return False
+    any_allowance = any(notice.group("allowance") for notice in notices[:MAX_LINES])
+    all_allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
+    paused = any(notice.group("paused") for notice in notices[:MAX_LINES])
+    if any_allowance and not all_allowance:
+        return _notice_part_holds(
+            comment, body, head, last_commit, evidence, paused, allowance=True
+        ) or _notice_part_holds(comment, body, head, last_commit, evidence, paused, allowance=False)
+    return _notice_part_holds(
+        comment, body, head, last_commit, evidence, paused, allowance=all_allowance
+    )
 
 
 def review_incomplete(pr: dict, me: str = "") -> str:
