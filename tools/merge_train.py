@@ -2206,25 +2206,38 @@ def release_off_repository_id(api, token, entry):
     return repo_id
 
 
-def release_off_ids(env, conf, installation, token, listed):
+def over_budget(started):
+    """Whether the sweep has run past SWEEP_SECONDS."""
+    return time.monotonic() - started > SWEEP_SECONDS
+
+
+def release_off_fallback(installation, listed, entry, reason):
+    """All listed repository IDs and the summary warning when release_off resolution stops."""
+    warning = (
+        f"::warning title=Merge train::release_off entry {entry}: {reason}; "
+        f"release train off for installation {installation['id']}"
+    )
+    return frozenset(target["id"] for target in listed), [warning]
+
+
+def release_off_ids(env, conf, installation, token, listed, started):
     """Resolve at most MAX_RELEASE_OFF unmatched entries; any failure opts out all listed IDs."""
     exact = {target["full_name"].casefold() for target in listed}
     resolved = set()
     for entry in sorted(conf["release_off"] - exact):
+        if over_budget(started):
+            reason = f"sweep budget of {SWEEP_SECONDS} s spent"
+            return release_off_fallback(installation, listed, entry, reason)
         try:
             repo_id = release_off_repository_id(env["GITHUB_API_URL"], token, entry)
         except ValueError as err:
-            warning = (
-                f"::warning title=Merge train::release_off entry {entry}: {err}; "
-                f"release train off for installation {installation['id']}"
-            )
-            return frozenset(target["id"] for target in listed), [warning]
+            return release_off_fallback(installation, listed, entry, err)
         if repo_id is not None:
             resolved.add(repo_id)
     return frozenset(resolved), []
 
 
-def repositories(env, conf, installation, identity):
+def repositories(env, conf, installation, identity, started):
     """Served repositories, resolved release-off IDs and warnings, read with a read-only token.
 
     The first call fills identity with the bot login and id, using that token.
@@ -2234,7 +2247,7 @@ def repositories(env, conf, installation, identity):
         if not identity:
             identity["bot_login"], identity["bot_id"] = bot_identity(env, conf, token)
         listed = pages(env, token, "/installation/repositories", "repositories")
-        resolved, warnings = release_off_ids(env, conf, installation, token, listed)
+        resolved, warnings = release_off_ids(env, conf, installation, token, listed, started)
     finally:
         revoke(env, token)
     targets = [r for r in listed if not r.get("archived") and not r.get("disabled")]
@@ -2344,7 +2357,7 @@ def sweep(env, conf, started):
             accounts[account] = "suspended"
             continue
         try:
-            targets, resolved, warnings = repositories(env, conf, installation, identity)
+            targets, resolved, warnings = repositories(env, conf, installation, identity, started)
         except RefusedError as err:
             refusals.append(f"{account}: {err}")
             accounts[account] = "refused"
@@ -2353,7 +2366,7 @@ def sweep(env, conf, started):
         tally = {"repositories": 0, "landed": 0, "updated": 0, "refused": 0}
         accounts[account] = tally
         for index, target in enumerate(targets):
-            if time.monotonic() - started > SWEEP_SECONDS:
+            if over_budget(started):
                 skipped.append(target["full_name"])
                 continue
             tally["repositories"] += 1

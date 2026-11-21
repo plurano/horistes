@@ -3006,6 +3006,102 @@ def test_release_off_bounds_repository_lookups_per_installation(tmp_path):
     assert "::warning" not in summary
 
 
+def test_release_off_ids_resolves_unmatched_entries_within_budget(tmp_path, monkeypatch):
+    """When started is in budget, release_off_ids resolves each unmatched entry without warning."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+    ids = {"former/a": 101, "former/b": 102, "former/c": 103}
+
+    def fake_lookup(api, token, entry):
+        calls.append((api, token, entry))
+        return ids[entry]
+
+    monkeypatch.setattr(train_mod, "release_off_repository_id", fake_lookup)
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: 100.0)
+    env = {"GITHUB_API_URL": "https://api.example.test"}
+    conf = {"release_off": frozenset(ids)}
+    listed = [{"id": 1, "full_name": "fleet/app"}, {"id": 2, "full_name": "other/d"}]
+    resolved, warnings = train_mod.release_off_ids(env, conf, {"id": 9}, "list-token", listed, 0.0)
+    assert [entry for _, _, entry in calls] == ["former/a", "former/b", "former/c"]
+    assert resolved == frozenset({101, 102, 103})
+    assert warnings == []
+
+
+def test_release_off_ids_closes_installation_when_budget_spent_before_first_lookup(
+    tmp_path, monkeypatch
+):
+    """A spent sweep budget before the first lookup runs 0 lookups and opts out all listed IDs."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        train_mod, "release_off_repository_id", lambda api, token, entry: calls.append(entry)
+    )
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: float(train_mod.SWEEP_SECONDS + 1))
+    env = {"GITHUB_API_URL": "https://api.example.test"}
+    conf = {"release_off": frozenset({"former/a", "former/b", "former/c"})}
+    listed = [{"id": 9001, "full_name": "fleet/app"}, {"id": 9002, "full_name": "other/d"}]
+    resolved, warnings = train_mod.release_off_ids(env, conf, {"id": 9}, "list-token", listed, 0.0)
+    assert calls == []
+    assert resolved == frozenset({9001, 9002})
+    assert warnings == [
+        (
+            f"::warning title=Merge train::release_off entry former/a: "
+            f"sweep budget of {train_mod.SWEEP_SECONDS} s spent; "
+            f"release train off for installation 9"
+        )
+    ]
+
+
+def test_release_off_ids_stops_after_first_lookup_when_budget_becomes_spent(tmp_path, monkeypatch):
+    """When the sweep budget is spent after the first lookup, the second entry triggers fallback."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_lookup(api, token, entry):
+        calls.append(entry)
+        return 101
+
+    ticks = itertools.chain(
+        [float(train_mod.SWEEP_SECONDS - 1)],
+        itertools.repeat(float(train_mod.SWEEP_SECONDS + 1)),
+    )
+    monkeypatch.setattr(train_mod, "release_off_repository_id", fake_lookup)
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: next(ticks))
+    env = {"GITHUB_API_URL": "https://api.example.test"}
+    conf = {"release_off": frozenset({"former/a", "former/b", "former/c"})}
+    listed = [{"id": 9001, "full_name": "fleet/app"}, {"id": 9002, "full_name": "other/d"}]
+    resolved, warnings = train_mod.release_off_ids(env, conf, {"id": 9}, "list-token", listed, 0.0)
+    assert calls == ["former/a"]
+    assert resolved == frozenset({9001, 9002})
+    assert warnings == [
+        (
+            f"::warning title=Merge train::release_off entry former/b: "
+            f"sweep budget of {train_mod.SWEEP_SECONDS} s spent; "
+            f"release train off for installation 9"
+        )
+    ]
+
+
+def test_release_off_ids_allows_lookups_at_exact_sweep_budget_boundary(tmp_path, monkeypatch):
+    """Elapsed time equal to SWEEP_SECONDS is still within budget (> is strict)."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_lookup(api, token, entry):
+        calls.append(entry)
+        return 9002
+
+    monkeypatch.setattr(train_mod, "release_off_repository_id", fake_lookup)
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: float(train_mod.SWEEP_SECONDS))
+    env = {"GITHUB_API_URL": "https://api.example.test"}
+    conf = {"release_off": frozenset({"former/a", "former/b"})}
+    listed = [{"id": 9001, "full_name": "fleet/app"}, {"id": 9002, "full_name": "other/d"}]
+    resolved, warnings = train_mod.release_off_ids(env, conf, {"id": 9}, "list-token", listed, 0.0)
+    assert calls == ["former/a", "former/b"]
+    assert resolved == frozenset({9002})
+    assert warnings == []
+
+
 def test_without_the_manifest_check_a_config_alone_is_named(tmp_path):
     mutant = script().replace(
         'bool(repo["releaseConfig"] and repo["releaseManifest"])', 'bool(repo["releaseConfig"])'

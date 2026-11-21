@@ -35,10 +35,13 @@ absent from this installation also matches nothing.
 
 Every other failure closes release fan-out for that installation for this run:
 all its targets count as release-off. This includes refused requests after the
-existing GET retries, malformed metadata, unsafe locations and a second
-redirect. A warning in the summary names the setting entry, installation and
-sanitized reason. Response bodies and tokens are never included. Other
-installations continue independently, and the off list uses current full names.
+existing GET retries, malformed metadata, unsafe locations, a second redirect
+and a sweep budget spent before a lookup. A lookup already in flight finishes
+within 200 s (two hops of three 30 s attempts and two 5 s backoffs), inside the
+300 s between `SWEEP_SECONDS` (1500 s) and the 30-minute `train` job limit. A
+warning in the summary names the setting entry, installation and sanitized
+reason. Response bodies and tokens are never included. Other installations
+continue independently, and the off list uses current full names.
 
 `MAX_RELEASE_OFF = 50` bounds the setting and resolution loop.
 `release_off_setting` in [tools/merge_train.py](../../tools/merge_train.py)

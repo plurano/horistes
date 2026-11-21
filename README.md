@@ -181,9 +181,11 @@ Opt-outs follow repository transfers and renames through forge metadata; the
 summary names each opted-out repository by its current full name. Once another
 repository takes a moved repository's former name, the forge drops the redirect
 and an entry under that name matches the new repository, so callers rename the
-entry to the current full name before the former name is reused. If resolution
-fails, that installation receives no release runs for this sweep and the summary
-warns with the entry and reason
+entry to the current full name before the former name is reused. A 404 for an
+entry is not a resolution failure: the entry matches nothing, release runs
+continue and no warning is written. If resolution fails for any other reason,
+including a spent sweep budget before a lookup, that installation receives no
+release runs for this sweep and the summary warns with the entry and reason
 ([ADR-0100](docs/adr/0100-release-off-follows-a-moved-repository.md)).
 A push trigger counts only when its branch and tag filters admit the default
 branch ([ADR-0088](docs/adr/0088-a-push-trigger-counts-only-for-the-default-branch.md)).
