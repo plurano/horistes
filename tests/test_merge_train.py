@@ -404,6 +404,7 @@ class Forge:
 
     def _init_pull_reads(self) -> None:
         self.commits: dict[int, list[tuple[str, int]]] = {}
+        self.commit_heads: dict[int, str] = {}
         self.merge_states: dict[int, str] = {}
         self.commit_counts: dict[int, int] = {}
         # One detail per number, or a list read in turn (the last repeats); None reads as
@@ -690,13 +691,24 @@ class Forge:
         default = [(f"change {number}\n\nbody {number}\n\nSigned-off-by: Dev <dev@example.org>", 1)]
         items = self.commits.get(number, default)
         total = self.commit_counts.get(number, len(items))
+        if number in self.commit_heads:
+            head = self.commit_heads[number]
+        else:
+            read_nodes = self.active_reads.get(full, {}).get("pullRequests", {}).get("nodes", [])
+            matches = [p["headRefOid"] for p in read_nodes if p["number"] == number]
+            head = matches[0] if matches else f"{number:040x}"
         nodes = [
             {"commit": {"message": message, "parents": {"totalCount": parents}}}
             for message, parents in items
         ]
         return {
             "data": {
-                "repository": {"pullRequest": {"commits": {"totalCount": total, "nodes": nodes}}}
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": head,
+                        "commits": {"totalCount": total, "nodes": nodes},
+                    }
+                }
             }
         }
 
@@ -4057,6 +4069,10 @@ def unsigned_dep_pull(number: int, state: str, **fields) -> dict:
 LABELS_INCOMPLETE_NOTE = (
     "skipped: dependency update without Signed-off-by, labels not fully read, no recreate asked"
 )
+HEAD_MOVED_NOTE = (
+    "skipped: dependency update without Signed-off-by, head moved since the sweep read, "
+    "no recreate asked"
+)
 SKIP_UNSIGNED_NOTE = "skipped: dependency update without Signed-off-by, a person lands it"
 
 
@@ -4239,6 +4255,54 @@ def test_planted_unsigned_regenerate_without_guard_check_relabels(tmp_path):
     done, _ = train(tmp_path, forge, flow, min_age_days="0")
     assert done.returncode == 0, done.stdout + done.stderr
     assert ("label", 1, "rebase", REGENERATION_LABEL) in forge.writes
+
+
+@pytest.mark.parametrize("switch", ["on", "off"])
+def test_unsigned_dependency_update_head_moved_skips_recreate_ask(tmp_path, switch):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    forge.commit_heads[1] = "b" * 40
+    done, summary = train(tmp_path, forge, min_age_days="0", switch=switch)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {HEAD_MOVED_NOTE} |" in summary
+    assert ASKED_NOTE not in summary
+    assert WOULD_ASK_NOTE not in summary
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["same-head", "moved-head"])
+def test_unsigned_dependency_update_incomplete_labels_precede_head_moved(tmp_path, moved):
+    labels = tuple(f"other-label-{i}" for i in range(50))
+    pull_node = unsigned_dep_pull(1, "CLEAN", labels=labels)
+    pull_node["labels"]["totalCount"] = 51
+    forge = Forge(repository(pull_node))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    if moved:
+        forge.commit_heads[1] = "b" * 40
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {LABELS_INCOMPLETE_NOTE} |" in summary
+    assert HEAD_MOVED_NOTE not in summary
+
+
+def test_behind_unsigned_dependency_non_arming_reports_no_would_ask_and_writes_no_label(tmp_path):
+    armed_pull = unsigned_dep_pull(1, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    dry_forge = Forge(repository(armed_pull))
+    dry_forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    dry_done, dry_summary = train(tmp_path / "dry", dry_forge, min_age_days="0", switch="off")
+    assert dry_done.returncode == 0, dry_done.stdout + dry_done.stderr
+    assert dry_forge.writes == []
+    assert "| #1 | BEHIND | behind |" in dry_summary
+    assert WOULD_ASK_NOTE not in dry_summary
+
+    live_forge = Forge(repository(armed_pull))
+    live_forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    live_done, live_summary = train(tmp_path / "live", live_forge, min_age_days="0", switch="on")
+    assert live_done.returncode == 0, live_done.stdout + live_done.stderr
+    assert live_forge.writes == [updated(1)]
+    assert "| #1 | BEHIND | updated from the default branch |" in live_summary
+    assert ASKED_NOTE not in live_summary
 
 
 @pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
