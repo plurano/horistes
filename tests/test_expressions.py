@@ -4,8 +4,12 @@
 
 from __future__ import annotations
 
+import ast
+import re
+from pathlib import Path
+
 import pytest
-from expressions import evaluate
+from expressions import evaluate, interpolate
 
 
 @pytest.mark.parametrize(
@@ -30,9 +34,128 @@ def test_expression_reader(text, inputs, value):
 
 
 @pytest.mark.parametrize(
+    "text,inputs,left_type,right_type",
+    [
+        ("inputs.flag != 'true'", {"flag": True}, "bool", "str"),
+        ("'true' == inputs.flag", {"flag": True}, "str", "bool"),
+        ("inputs.a == inputs.b", {"a": 1, "b": 1.0}, "int", "float"),
+        ("inputs.a == inputs.b", {"a": True, "b": 1}, "bool", "int"),
+        ("inputs.a == inputs.b", {"a": [], "b": []}, "list", "list"),
+    ],
+)
+def test_comparison_refuses_mixed_or_unsupported_types(text, inputs, left_type, right_type):
+    with pytest.raises(ValueError) as error:
+        evaluate(text, inputs)
+    assert text in str(error.value)
+    assert left_type in str(error.value) and right_type in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "text,inputs,expected",
+    [
+        ("inputs.word == 'TRUE'", {"word": "true"}, True),
+        ("inputs.word != 'TRUE'", {"word": "true"}, False),
+        ("inputs.flag == true", {"flag": True}, True),
+        ("inputs.flag == true", {"flag": False}, False),
+        ("inputs.flag != false", {"flag": True}, True),
+        ("inputs.a == inputs.b", {"a": 1, "b": 1}, True),
+        ("inputs.a != inputs.b", {"a": 1.5, "b": 2.5}, True),
+    ],
+)
+def test_comparison_preserves_supported_types(text, inputs, expected):
+    assert evaluate(text, inputs) is expected
+
+
+@pytest.mark.parametrize(
     "text",
-    ["github.event_name == 'push'", "format('{0}{1}', inputs.a, inputs.b)", "inputs.a != 'b'"],
+    ["github.event_name == 'push'", "format('{0}{1}', inputs.a, inputs.b)", "inputs.a >= 'b'"],
 )
 def test_expression_reader_refuses_what_it_does_not_read(text):
     with pytest.raises(ValueError, match="not read here"):
         evaluate(text, {"a": "x", "b": "y"})
+
+
+@pytest.mark.parametrize("owner,name", [("A", "B"), ("a" * 39, "b" * 100), ("", "")])
+def test_matrix_and_multiple_expression_parts(owner, name):
+    text = "release-${{ inputs.app }}-${{ matrix.repository.owner }}-${{ matrix.repository.name }}"
+    contexts = {"matrix": {"repository": {"owner": owner, "name": name}}}
+    assert interpolate(text, {"app": "123"}, **contexts) == f"release-123-{owner}-{name}"
+    assert evaluate("matrix.repository.owner", {}, **contexts) == owner
+    assert interpolate("literal", {}) == "literal"
+    assert interpolate("${{ github.run_id }}", {}, github={"run_id": 42}) == "42"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "matrix.missing",
+        "matrix.repository[0]",
+        "matrix.",
+        "matrix.repository.owner()",
+        "${{ matrix.repository.owner",
+        "${{ matrix.repository.owner }}}}",
+    ],
+)
+def test_interpolation_refuses_unknown_forms(text):
+    with pytest.raises(ValueError, match="not read here"):
+        if text.startswith("matrix"):
+            evaluate(text, {}, matrix={"repository": {"owner": "a"}})
+        else:
+            interpolate(text, {}, matrix={"repository": {"owner": "a"}})
+
+
+@pytest.mark.parametrize(
+    "text,value",
+    [
+        ("true", True),
+        ("false", False),
+        ("cancelled()", False),
+        ("!cancelled()", True),
+        ("inputs.a != 'X'", False),
+        ("inputs.a != 'y'", True),
+        ("inputs.a != 'b'", True),
+        ("needs.plan.outputs.releases != '[]'", True),
+        ("vars.a_b.c1", "value"),
+    ],
+)
+def test_job_guard_forms(text, value):
+    assert (
+        evaluate(
+            text,
+            {"a": "x"},
+            needs={"plan": {"outputs": {"releases": '[{"owner":"a"}]'}}},
+            vars={"a_b": {"c1": "value"}},
+        )
+        == value
+    )
+
+
+def test_cancelled_status_context():
+    assert evaluate("cancelled()", {}, cancelled=True) is True
+
+
+@pytest.mark.parametrize("text", ["secrets.a", "inputs.1a", "inputs.a..b", "inputs.a-b"])
+def test_context_segments_refuse_invalid_forms(text):
+    with pytest.raises(ValueError, match="not read here"):
+        evaluate(text, {"a": "x"})
+
+
+def test_unreadable_short_circuited_guard_is_refused():
+    with pytest.raises(ValueError, match="not read here"):
+        evaluate("false && unsupported()", {})
+
+
+def test_expression_patterns_have_no_nested_repetition():
+    source = Path(__file__).with_name("expressions.py").read_text()
+    patterns = [
+        node.args[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compile"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    assert patterns
+    for pattern in patterns[: len(source)]:
+        assert not re.search(r"\([^)]*[+*][^)]*\)[+*]", pattern), pattern

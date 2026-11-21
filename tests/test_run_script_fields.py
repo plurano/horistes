@@ -66,7 +66,9 @@ def test_padded_train_rules_step_is_refused(tmp_path):
     text = source.read_text()
     marker = "cat > \"$RUNNER_TEMP/train_rules.py\" <<'PY'"
     assert text.count(marker) == 1
-    path.write_text(text.replace(marker, "# " + "padding " * 600 + "\n          " + marker))
+    original = dict(workflow_runs(source))["merge-train.yml:train:step-1"]
+    padding = "padding " * (4001 - run_script_fields(original))
+    path.write_text(text.replace(marker, "# " + padding + "\n          " + marker))
     runs = dict(workflow_runs(path))
     with pytest.raises(AssertionError, match=r"run script has \d+ fields; limit 4000"):
         check_run_script(runs["merge-train.yml:train:step-1"])

@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CALLER_TEMPLATES: dict[str, str] = {
     "templates/callers/hook-copy.yml.tmpl": ".github/workflows/hook-copy.yml",
     "templates/callers/licence.yml.tmpl": ".github/workflows/licence-check.yml",
+    "templates/callers/merge-train-release.yml.tmpl": ".github/workflows/merge-train-release.yml",
     "templates/callers/merge-train.yml.tmpl": ".github/workflows/merge-train.yml",
     "templates/callers/release-please.yml.tmpl": ".github/workflows/release-please.yml",
     "templates/callers/scorecard.yml.tmpl": ".github/workflows/scorecard-check.yml",

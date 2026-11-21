@@ -103,9 +103,10 @@ def _read_once(req, method, url, status_only):
                 return resp.status, raw
             return resp.status, json.loads(raw.decode("utf-8")) if raw else {}
     except urllib.error.HTTPError as err:
-        if status_only:
-            return err.code, b""
-        raw = err.read(MAX_BYTES + 1)
+        with err:
+            if status_only:
+                return err.code, b""
+            raw = err.read(MAX_BYTES + 1)
         detail = raw.decode("utf-8", errors="replace")[:200]
         raise CallError(f"{method} {url}: HTTP {err.code}: {detail}", err.code) from err
     except (urllib.error.URLError, TimeoutError) as err:
@@ -479,7 +480,10 @@ def main(argv, env):
     if len(argv) < 2:
         sys.stderr.write("usage: release_labels.py <settings|after>\n")
         return 2
-    commands = {"settings": cmd_settings, "after": cmd_after}
+    commands = {
+        "settings": cmd_settings,
+        "after": cmd_after,
+    }
     if argv[1] not in commands:
         sys.stderr.write(f"unknown command: {argv[1]}\n")
         return 2
@@ -488,7 +492,7 @@ def main(argv, env):
     except URLRefusedError as err:
         sys.stderr.write(f"::error title=Release labels::{argv[1]}: {err}\n")
         return 1
-    except (CallError, KeyError, json.JSONDecodeError) as err:
+    except (CallError, KeyError, OSError, json.JSONDecodeError) as err:
         sys.stdout.write(f"::error title=Release labels::{argv[1]}: {err}\n")
         return 1
 
