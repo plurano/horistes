@@ -61,7 +61,7 @@ LEVELS = {"none": 0, "read": 1, "write": 2}
 # True in a public repository and false in any other, and false too where the
 # event names no repository: the switch fails towards off.
 PUBLIC = "${{ github.event.repository.visibility == 'public' }}"
-SECRET = re.compile(r"\$\{\{ secrets\.[A-Z][A-Z0-9_]* \}\}")
+CREDENTIAL_REF = re.compile(r"\$\{\{ secrets\.[A-Z][A-Z0-9_]* \}\}")
 # The one job beside the call, read by an allow-list: the forge never reports a
 # called workflow's checks under the calling job's own name, so this job does.
 RESULT = "result"
@@ -260,7 +260,7 @@ def _credential_name_problems(job: dict, called: dict, path: str) -> list[str]:
         f"the job passes the secret `{key}` as something other than one secret "
         "of the repository (value not printed)"
         for key, value in sorted(passed.items())
-        if not SECRET.fullmatch(str(value))
+        if not CREDENTIAL_REF.fullmatch(str(value))
     ]
     return problems
 
