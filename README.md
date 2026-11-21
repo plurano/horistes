@@ -166,7 +166,10 @@ while a pre-existing release is verified
 It runs on `release_runner` when set, else `runner`.
 The `release_off` input accepts at most 50 space-separated `owner/name` entries.
 Opt-outs follow repository transfers and renames through forge metadata; the
-summary names each opted-out repository by its current full name. If resolution
+summary names each opted-out repository by its current full name. Once another
+repository takes a moved repository's former name, the forge drops the redirect
+and an entry under that name matches the new repository, so callers rename the
+entry to the current full name before the former name is reused. If resolution
 fails, that installation receives no release runs for this sweep and the summary
 warns with the entry and reason
 ([ADR-0100](docs/adr/0100-release-off-follows-a-moved-repository.md)).

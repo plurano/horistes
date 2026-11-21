@@ -1072,8 +1072,8 @@ class Handler(BaseHTTPRequestHandler):
     def _get_repository(self, path: str) -> None:
         code, body = self.server.forge.repository_read(self.headers["Authorization"], path)
         if code == 301:
-            api = f"http://{self.headers['Host']}"
-            location = str(body).format(api=api, port=self.server.server_address[1])
+            host, port = self.server.server_address[:2]
+            location = str(body).format(api=f"http://{host}:{port}", port=port)
             self.send_response(code)
             self.send_header("Location", location)
             self.end_headers()

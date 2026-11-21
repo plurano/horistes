@@ -59,6 +59,10 @@ engine's workflow scan.
   an unrelated public ID or 404. Neither outcome disables releases there.
 - Discovery errors can postpone releases, preserving the caller's opt-out
   while leaving the merge sweep available.
+- Once another repository takes a moved repository's former name, the forge
+  drops the redirect and an entry under that name matches the new repository,
+  so callers rename the entry to the current full name before the former name
+  is reused ([Renaming a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository)).
 
 ## Alternatives
 

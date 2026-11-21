@@ -2199,9 +2199,10 @@ def release_off_repository_id(api, token, entry):
             raise ValueError("second repository redirect")
     if answer is RELEASE_OFF_NOT_FOUND:
         return None
-    if not isinstance(answer, dict) or type(answer.get("id")) is not int:
+    repo_id = answer.get("id") if isinstance(answer, dict) else None
+    if isinstance(repo_id, bool) or not isinstance(repo_id, int):
         raise ValueError("invalid repository metadata: missing integer id")
-    return answer["id"]
+    return repo_id
 
 
 def release_off_ids(env, conf, installation, token, listed):
