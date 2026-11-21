@@ -100,4 +100,5 @@ record that supersedes it.
 | [0094](0094-the-review-settle-rule-leaves-the-rules-step.md) | 2026-11-17 | The review-settle rule leaves the rules step | Accepted |
 | [0095](0095-pull-requests-check-the-full-sign-off-ident.md) | 2026-11-17 | Pull requests check the full sign-off ident | Accepted |
 | [0096](0096-the-release-labels-module-leaves-the-release-step.md) | 2026-11-19 | The release labels module leaves the release step | Accepted |
+| [0098](0098-the-release-fan-out-runs-in-its-own-workflow-run.md) | 2026-11-20 | The release fan-out runs in its own workflow run | Accepted |
 | [0101](0101-a-failed-read-leaves-the-sweep-green.md) | 2026-11-20 | A failed read leaves the sweep green | Accepted |

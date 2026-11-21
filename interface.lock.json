@@ -48,7 +48,7 @@
     }
   },
   "interface_major": 0,
-  "interface_minor": 2,
+  "interface_minor": 3,
   "workflows": {
     ".github/workflows/draft-release.yml": {
       "inputs": {
@@ -112,6 +112,51 @@
       "secrets": {},
       "write_scopes": []
     },
+    ".github/workflows/merge-train-release.yml": {
+      "inputs": {
+        "app_client_id": {
+          "default": null,
+          "required": true,
+          "type": "string"
+        },
+        "artifact_id": {
+          "default": "",
+          "required": false,
+          "type": "string"
+        },
+        "release_max_parallel": {
+          "default": 3,
+          "required": false,
+          "type": "number"
+        },
+        "runner": {
+          "default": null,
+          "required": true,
+          "type": "string"
+        },
+        "train_run_id": {
+          "default": null,
+          "required": true,
+          "type": "string"
+        },
+        "train_workflow": {
+          "default": "merge-train.yml",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "plan": "Plan release legs",
+        "release": "Release pull request and release"
+      },
+      "outputs": [],
+      "secrets": {
+        "app_private_key": {
+          "required": true
+        }
+      },
+      "write_scopes": []
+    },
     ".github/workflows/merge-train.yml": {
       "inputs": {
         "accept_states": {
@@ -149,18 +194,13 @@
           "required": false,
           "type": "string"
         },
-        "release_max_parallel": {
-          "default": 3,
-          "required": false,
-          "type": "number"
-        },
         "release_off": {
           "default": "",
           "required": false,
           "type": "string"
         },
-        "release_runner": {
-          "default": "",
+        "release_workflow": {
+          "default": "merge-train-release.yml",
           "required": false,
           "type": "string"
         },
@@ -201,7 +241,6 @@
         }
       },
       "jobs": {
-        "release": "Release pull request and release",
         "train": "Merge train"
       },
       "outputs": [],
@@ -210,7 +249,9 @@
           "required": true
         }
       },
-      "write_scopes": []
+      "write_scopes": [
+        "actions"
+      ]
     },
     ".github/workflows/release-please.yml": {
       "inputs": {

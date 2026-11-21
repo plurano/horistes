@@ -32,6 +32,7 @@ from functools import partial
 from typing import NamedTuple
 
 sys.path.insert(0, os.environ["RUNNER_TEMP"])
+from release_workflows import MAX_RELEASES, check_hold_labels
 from review_state import is_bot_dependency, review_evidence, review_incomplete
 from train_rules import (
     RED,
@@ -41,7 +42,6 @@ from train_rules import (
     SESSION_HOLD_LABEL,
     NoSignOffError,
     check_release_off,
-    check_release_parallel,
     check_required_status,
     dependency_hold_target,
     drifted,
@@ -92,7 +92,6 @@ RETRY_CODES = (502, 503, 504)
 SWEEP_SECONDS = 1500
 MAX_PAGES = 20
 JWT_SECONDS = 540
-MAX_RELEASES = 256
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 # NIST SP 800-57 Part 1: 112-bit security is 2048-bit RSA; OpenSSF Best Practices crypto_keylength.
 MIN_KEY_BITS = 2048
@@ -601,8 +600,8 @@ def check_review_bots(value):
     return frozenset(logins)
 
 
-def settings(env):
-    """The inputs of the workflow, each checked against an allow-list."""
+def checked_train_modes(env):
+    """Validate the sweep mode, merge method, states and minimum age."""
     switch = env["TRAIN_SWITCH"]
     method = env["TRAIN_MERGE_METHOD"].upper()
     accept = env["TRAIN_ACCEPT_STATES"].upper().split()
@@ -615,24 +614,30 @@ def settings(env):
         raise InvalidSettingError(f"accept_states holds {accept}, allowed: {', '.join(ACCEPTABLE)}")
     if not age.isdigit() or int(age) > 30:
         raise InvalidSettingError(f"min_age_days is {age!r}, not a whole number from 0 to 30")
+    return switch, method, accept, age
+
+
+def settings(env):
+    """The inputs of the workflow, each checked against an allow-list."""
+    switch, method, accept, age = checked_train_modes(env)
     if not env.get("TRAIN_APP_CLIENT_ID", "").strip():
         raise InvalidSettingError("app_client_id is empty")
     check_app_key(env.get("TRAIN_APP_KEY", ""))
     release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
-    parallel = check_release_parallel(env["TRAIN_RELEASE_MAX_PARALLEL"], InvalidSettingError)
+    hold = check_hold_labels(env["TRAIN_HOLD_LABELS"], InvalidSettingError)
     required_status = check_required_status(
         env.get("TRAIN_REQUIRED_STATUS", ""), InvalidSettingError
     )
+    hours = check_session_hold_hours(env.get("TRAIN_SESSION_HOLD_HOURS", "4"), InvalidSettingError)
     return {
         "switch": switch,
         "method": method,
         "accept": frozenset(("CLEAN", *accept)),
         "min_age": timedelta(days=int(age)),
-        "hold": frozenset(name for name in env["TRAIN_HOLD_LABELS"].split(",") if name),
+        "hold": frozenset(name for name in hold.split(",") if name),
         "dependency": tuple(env["TRAIN_DEPENDENCY_BRANCHES"].split()),
         "person": tuple(env["TRAIN_PERSON_BRANCHES"].split()),
         "release_off": release_off,
-        "release_max_parallel": parallel,
         "security": frozenset(name for name in env["TRAIN_SECURITY_LABELS"].split(",") if name),
         "client_id": env["TRAIN_APP_CLIENT_ID"].strip(),
         "required_status": required_status,
@@ -640,11 +645,7 @@ def settings(env):
         "session_authors": frozenset(
             name.strip() for name in env.get("TRAIN_SESSION_AUTHORS", "").split(",") if name.strip()
         ),
-        "session_hold": timedelta(
-            hours=check_session_hold_hours(
-                env.get("TRAIN_SESSION_HOLD_HOURS", "4"), InvalidSettingError
-            )
-        ),
+        "session_hold": timedelta(hours=hours),
     }
 
 
@@ -2443,6 +2444,20 @@ def review_bots_note(env):
     )
 
 
+def release_summary(releases, off):
+    """Bound the shared list once and report selected and omitted repositories."""
+    lines = []
+    if len(releases) > MAX_RELEASES:
+        late = ", ".join(f"{r['owner']}/{r['name']}" for r in releases[MAX_RELEASES:])
+        lines += ["", f"No release run, the job matrix holds {MAX_RELEASES}: {late}"]
+        del releases[MAX_RELEASES:]
+    if off:
+        lines += ["", f"Release train off: {', '.join(off)}"]
+    named = ", ".join(f"{r['owner']}/{r['name']}" for r in releases) or "none"
+    lines += ["", f"Release pull requests and releases next: {named}"]
+    return lines
+
+
 def summary(env, result):
     """Render the sweep report to standard output and the job step summary."""
     lines = [
@@ -2475,18 +2490,19 @@ def summary(env, result):
         ]
     if result.skipped:
         lines += ["", f"Not reached within {SWEEP_SECONDS} s: {', '.join(result.skipped)}"]
-    if len(result.releases) > MAX_RELEASES:
-        late = ", ".join(f"{r['owner']}/{r['name']}" for r in result.releases[MAX_RELEASES:])
-        lines += ["", f"No release run, the job matrix holds {MAX_RELEASES}: {late}"]
-        del result.releases[MAX_RELEASES:]
-    if result.off:
-        lines += ["", f"Release train off: {', '.join(result.off)}"]
-    named = ", ".join(f"{r['owner']}/{r['name']}" for r in result.releases) or "none"
-    lines += ["", f"Release pull requests and releases next: {named}"]
+    lines += release_summary(result.releases, result.off)
     text = "\n".join([*lines, "", *result.sections]) + "\n"
     sys.stdout.write(text)
     append(env["GITHUB_STEP_SUMMARY"], text)
     append(env["GITHUB_OUTPUT"], f"releases={json.dumps(result.releases, separators=(',', ':'))}\n")
+    if path := env.get("TRAIN_RELEASE_FILE"):
+        payload = {
+            "format": 1,
+            "hold_labels": env["TRAIN_HOLD_LABELS"],
+            "releases": result.releases,
+        }
+        with open(path, "w", encoding="utf-8") as output:
+            json.dump(payload, output, separators=(",", ":"))
 
 
 def main(env):
