@@ -10365,6 +10365,53 @@ def test_planted_incomplete_review_body_hold(tmp_path, monkeypatch):
     assert reason == merge_train.REVIEW_BODY + INCOMPLETE_3507
 
 
+def test_allowance_head_check_review_body_hold(tmp_path, monkeypatch):
+    """Complete detail payload holds without head check and clears with exact-head check."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    p, detail = _incomplete_review_pull()
+    detail["comments"] = {
+        "totalCount": 1,
+        "nodes": [
+            {
+                "author": {"login": "coderabbitai"},
+                "createdAt": "2026-11-15T19:45:04Z",
+                "body": "0 remain after this review",
+            }
+        ],
+    }
+    hold = merge_train.review_body_hold(p, detail)
+    assert hold is not None and "limit reached" in hold
+    run = {
+        "__typename": "CheckRun",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "checkSuite": {
+            "app": {"slug": "coderabbitai"},
+            "commit": {"oid": p["headRefOid"]},
+        },
+    }
+    detail["headCommit"] = {
+        "nodes": [
+            {
+                "commit": {
+                    "oid": p["headRefOid"],
+                    "statusCheckRollup": {
+                        "contexts": {
+                            "totalCount": 1,
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [run],
+                        }
+                    },
+                }
+            }
+        ]
+    }
+    assert merge_train.review_body_hold(p, detail) is None
+    run["checkSuite"]["commit"]["oid"] = p["headRefOid"][:7]
+    short_hold = merge_train.review_body_hold(p, detail)
+    assert short_hold is not None and "limit reached" in short_hold
+
+
 @pytest.mark.parametrize("armed", [False, True], ids=["unarmed", "armed"])
 def test_planted_incomplete_review_train_holds(tmp_path, armed):
     """CLEAN PR 3507 lands nothing; an armed copy is disarmed with the same hold."""
@@ -10527,7 +10574,21 @@ def test_adr92_zero_review(tmp_path, monkeypatch):
     assert "no completed review" in reason
 
 
-def test_adr92_allowance_head_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("statement", "clears"),
+    [
+        pytest.param("\nActionable comments posted: 0", True, id="count-zero-clears"),
+        pytest.param(
+            "\nNo actionable comments were generated in the recent review.",
+            True,
+            id="no-actionable-clears",
+        ),
+        pytest.param("", False, id="no-zero-action-statement-holds"),
+        pytest.param("\nActionable comments posted: 1", False, id="count-one-holds"),
+    ],
+)
+def test_adr92_allowance_head_evidence(tmp_path, monkeypatch, statement, clears):
+    """A same-body allowance summary lifts its notice only with a zero-action statement."""
     mod = adr92_train(tmp_path, monkeypatch)
     p = pull(1, "CLEAN", author={"login": "person"})
     body = (
@@ -10536,12 +10597,19 @@ def test_adr92_allowance_head_evidence(tmp_path, monkeypatch):
         + " and "
         + p["headRefOid"]
         + ".\n0 remain after this review"
+        + statement
     )
     summary = _completed_review_summary("2026-11-16T17:00:00Z") | {"body": body}
     detail = _detail(comments=[summary])
     detail["commits"]["nodes"] = [{"commit": {"committedDate": "2026-11-16T16:10:16Z"}}]
     detail["commits"]["totalCount"] = 1
-    assert adr92_body_hold(mod, p, detail, frozenset({"coderabbitai"})) is None
+    hold = adr92_body_hold(mod, p, detail, frozenset({"coderabbitai"}))
+    if clears:
+        assert hold is None
+    else:
+        assert hold == (
+            "review body: review incomplete: coderabbitai limit reached at 2026-11-16T17:00:00Z"
+        )
 
 
 @pytest.mark.parametrize("kind", ["reviews", "comments", "commits"])
@@ -10786,8 +10854,8 @@ def adr92_mutations():
         (
             "E",
             "review_state",
-            "return allowance or paused or names_head or when >= last_commit",
-            "return allowance or paused or names_head or when > last_commit",
+            "return standing or names_head or when >= last_commit",
+            "return standing or names_head or when > last_commit",
             "E-equal-notice",
         ),
         (
@@ -11063,8 +11131,8 @@ def adr93_mutations():
         (
             "B1",
             "review_state",
-            "allowance or paused or names_head",
-            "allowance or names_head",
+            "allowance or paused",
+            "allowance",
             "test_adr93_paused_notice[stale]",
         ),
     ]
@@ -11086,7 +11154,8 @@ def test_adr93_mutations_reject_defects(tmp_path, section, module_name, old, new
         (root / "tools" / f"{name}.py").write_text((ROOT / "tools" / f"{name}.py").read_text())
     path = workflow if module_name == "rules" else root / "tools" / f"{module_name}.py"
     source = path.read_text()
-    expected_count = 2 if section == "B1" else 1
+    # B1 drops the pause from every standing-notice site: later evidence and both time rules.
+    expected_count = 3 if section == "B1" else 1
     assert source.count(old) == expected_count, (section, old)
     control = adr92_mutation_run(root, selector, tmp_path / "control.log")
     assert control.returncode == 0, control.stdout + control.stderr

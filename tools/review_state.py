@@ -72,6 +72,12 @@ REVIEWED_RANGE_RE = re.compile(
     r"([0-9a-f]{40}) and ([0-9a-f]{40})\.[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
+REVIEWED_RANGE_LINE_RE = re.compile(
+    r"^[ \t]*Reviewing files that changed from the base of the PR and between "
+    r"\S+ and \S+\.[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+FENCE_RE = re.compile(r"^ {0,3}(?:```|~~~)")
 
 
 def _pr_node(pr: dict) -> dict:
@@ -240,6 +246,19 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
     )
 
 
+def _without_fenced_code(body: str) -> str:
+    """Return bounded summary text with fenced Markdown blocks removed."""
+    kept = []
+    in_fence = False
+    for line in body.splitlines()[:MAX_LINES]:
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def _allowance_head_reviewed(body: str, head: str) -> bool:
     """Require exactly one reviewed range ending at the full head in an allowance summary."""
     if (
@@ -248,8 +267,21 @@ def _allowance_head_reviewed(body: str, head: str) -> bool:
         or len(body.splitlines()) > MAX_LINES
     ):
         return False
-    ranges = list(REVIEWED_RANGE_RE.finditer(body))
-    return len(ranges) == 1 and ranges[0].group(2).lower() == head
+    clean = _without_fenced_code(body)
+    declarations = list(REVIEWED_RANGE_LINE_RE.finditer(clean))[:MAX_LINES]
+    ranges = list(REVIEWED_RANGE_RE.finditer(clean))[:MAX_LINES]
+    return len(declarations) == 1 and len(ranges) == 1 and ranges[0].group(2).lower() == head
+
+
+def _zero_action_summary(body: str, head: str) -> bool:
+    """Require no non-allowance notice, one head range, and unfenced zero-action evidence."""
+    if _non_allowance_notice(body) or not _allowance_head_reviewed(body, head):
+        return False
+    clean = _without_fenced_code(body)
+    counts = list(ACTIONABLE_COUNT_RE.finditer(clean))[:MAX_LINES]
+    if any(count.group(1).strip("0") for count in counts[:MAX_LINES]):
+        return False
+    return bool(counts or NO_ACTIONABLE_RE.search(clean))
 
 
 def _completed_summary_reviewers(pr: dict, head: str) -> set[str]:
@@ -260,12 +292,7 @@ def _completed_summary_reviewers(pr: dict, head: str) -> set[str]:
         if login not in REVIEWER_BOTS or not _can_complete(comment):
             continue
         body = str(comment.get("body") or "")
-        if _non_allowance_notice(body) or not _allowance_head_reviewed(body, head):
-            continue
-        counts = list(ACTIONABLE_COUNT_RE.finditer(body))[:MAX_LINES]
-        if any(count.group(1).strip("0") for count in counts[:MAX_LINES]):
-            continue
-        if counts or NO_ACTIONABLE_RE.search(body):
+        if _zero_action_summary(body, head):
             reviewers.add(login)
     return reviewers
 
@@ -399,8 +426,8 @@ def _later_evidence(evidence: list, login: str, notice_at, last_commit, head_onl
 
 
 def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
-    """Only the explicit pause block or allowance range can exempt its own notice."""
-    return _paused_head_reviewed(body, head) or (allowance and _allowance_head_reviewed(body, head))
+    """Only the explicit pause block or zero-action allowance summary exempts its notice."""
+    return _paused_head_reviewed(body, head) or (allowance and _zero_action_summary(body, head))
 
 
 def _notice_read(body: str) -> tuple[str, bool]:
@@ -423,10 +450,6 @@ def _unread_notice_holds(comment: dict, head: str, last_commit) -> bool:
     body = str(comment.get("body") or "")
     if len(body) > MAX_SUMMARY_CHARS:
         return True
-    prefix, _cut = _notice_read(body)
-    if LIMIT_NOTICE_RE.search(prefix):
-        # Preserve the existing fail-closed policy for a notice in a cut prefix.
-        return True
     notices = list(LIMIT_NOTICE_RE.finditer(body))
     if not notices:
         return False
@@ -434,7 +457,7 @@ def _unread_notice_holds(comment: dict, head: str, last_commit) -> bool:
     if when is None or last_commit is None:
         return True
     # A match consumes characters; at most MAX_SUMMARY_CHARS matches can exist.
-    allowance = all(notice.group("allowance") for notice in notices[:MAX_SUMMARY_CHARS])
+    allowance = any(notice.group("allowance") for notice in notices[:MAX_SUMMARY_CHARS])
     paused = any(notice.group("paused") for notice in notices[:MAX_SUMMARY_CHARS])
     names_head = bool(head and head[:7] in body.lower())
     return _notice_time_rule(allowance or paused, names_head, when, last_commit)

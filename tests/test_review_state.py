@@ -391,6 +391,12 @@ def _allowance_cases():
     cases.append(_case("allowance-later-review-without-head-oid-holds", pr, True))
     reviewed["commit"] = {"oid": pr["headRefOid"]}
     cases.append(_case("allowance-later-review-on-head-clears", pr, False))
+    reviewed["author"] = {"login": "copilot"}
+    cases.append(_case("allowance-later-review-other-login-on-head-holds", pr, True))
+    reviewed["author"] = {"login": "coderabbitai"}
+    reviewed["submittedAt"] = "2026-11-14T20:46:00Z"
+    cases.append(_case("allowance-head-review-older-than-notice-holds", pr, True))
+    reviewed["submittedAt"] = "2026-11-14T20:49:00Z"
     reviewed.pop("commit")
     reviewed["commit"] = {"oid": "c" * 40}
     cases.append(_case("allowance-later-review-old-oid-holds", pr, True))
@@ -1370,3 +1376,152 @@ def test_bot_dependency_count_rejects_boolean():
     assert is_bot_dependency(pull, {"dependency": ("renovate/",)}) is False
     authors["totalCount"] = 1
     assert is_bot_dependency(pull, {"dependency": ("renovate/",)}) is True
+
+
+@pytest.mark.parametrize(
+    ("extra_range", "holds"),
+    [
+        pytest.param("", False, id="single-full-range"),
+        pytest.param(
+            "\nReviewing files that changed from the base of the PR and between "
+            + "a" * 40
+            + " and "
+            + ADR92_HEAD[:7]
+            + ".",
+            True,
+            id="second-range-abbreviated-oid",
+        ),
+        pytest.param(
+            "\nReviewing files that changed from the base of the PR and between "
+            + "a" * 40
+            + " and "
+            + "c" * 40
+            + ".",
+            True,
+            id="second-range-full-oid",
+        ),
+    ],
+)
+def test_completed_head_second_range_declarations(extra_range, holds):
+    """Any second reviewed-range declaration line invalidates summary coverage."""
+    body = completed_head_summary() + extra_range
+    assert bool(adr92_reader().review_incomplete(completed_head_pull(summary=body))) is holds
+
+
+@pytest.mark.parametrize(
+    ("statement", "holds"),
+    [
+        pytest.param(
+            "```\nActionable comments posted: 0\n```",
+            True,
+            id="fenced-only-zero",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n```\nActionable comments posted: 1\n```",
+            False,
+            id="standalone-zero-fenced-one",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 0",
+            True,
+            id="unclosed-fence-before-count",
+        ),
+        pytest.param(
+            "~~~\nActionable comments posted: 0\n~~~",
+            True,
+            id="tilde-fence",
+        ),
+    ],
+)
+def test_completed_head_summary_fenced_code(statement, holds):
+    """Fenced code blocks cannot supply or contradict completion counts."""
+    body = completed_head_summary(statement=statement)
+    assert bool(adr92_reader().review_incomplete(completed_head_pull(summary=body))) is holds
+
+
+@pytest.mark.parametrize(
+    ("notice", "when", "expected"),
+    [
+        pytest.param(
+            "Rate limit reached.",
+            "2026-11-16T16:00:00Z",
+            "",
+            id="old-rate-limit-line-one",
+        ),
+        pytest.param(
+            "Rate limit reached.",
+            ADR92_NOTICE,
+            "review incomplete: coderabbitai notice body exceeds the read bound",
+            id="fresh-rate-limit-line-one",
+        ),
+        pytest.param(
+            "0 remain after this review",
+            "2026-11-16T16:00:00Z",
+            "review incomplete: coderabbitai notice body exceeds the read bound",
+            id="old-allowance-line-one",
+        ),
+    ],
+)
+def test_cut_prefix_notice_time_policy(notice, when, expected):
+    """A notice in the read prefix of a cut body still follows the shared notice time rule."""
+    body = notice + "\n" + "Ordinary prose.\n" * MAX_LINES
+    pr = adr92_pull(adr92_comment(body, when))
+    assert adr92_reader().review_incomplete(pr) == expected
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        pytest.param(
+            "0 remain after this review\nRate limit reached.",
+            "review incomplete: coderabbitai notice body exceeds the read bound",
+            id="mixed-old-allowance-and-rate-limit",
+        ),
+        pytest.param(
+            "Rate limit reached.",
+            "",
+            id="old-rate-limit-alone",
+        ),
+    ],
+)
+def test_unread_tail_mixed_notices(tail, expected):
+    """Any allowance notice in a cut body holds even when paired with a stale rate limit."""
+    body = "Prose.\n" * MAX_LINES + tail
+    pr = adr92_pull(adr92_comment(body, "2026-11-16T16:00:00Z"))
+    assert adr92_reader().review_incomplete(pr) == expected
+
+
+@pytest.mark.parametrize(
+    ("statement", "holds"),
+    [
+        pytest.param("Actionable comments posted: 1", True, id="count-one-holds"),
+        pytest.param("Actionable comments posted: 0", False, id="count-zero-clears"),
+        pytest.param(
+            "```\nActionable comments posted: 1\n```\nActionable comments posted: 0",
+            False,
+            id="fenced-one-standalone-zero-clears",
+        ),
+    ],
+)
+def test_same_body_allowance_zero_action(statement, holds):
+    """A summary carrying its own allowance notice requires unfenced zero-action evidence."""
+    body = completed_head_summary(statement=statement) + "\n0 remain after this review"
+    pr = adr92_pull(adr92_comment(body))
+    assert bool(adr92_reader().review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize(
+    ("old_notice", "reviewed_head", "holds"),
+    [
+        pytest.param("0 remain after this review", ADR92_HEAD, True, id="allowance-paused-head"),
+        pytest.param("## Reviews paused", ADR92_HEAD, False, id="pause-paused-head"),
+        pytest.param("## Reviews paused", ADR92_HEAD[:7], True, id="pause-paused-short-head"),
+    ],
+)
+def test_paused_block_does_not_clear_allowance(old_notice, reviewed_head, holds):
+    """A later paused block clears an old pause notice on full head, never an allowance."""
+    pr = adr92_pull(
+        adr92_comment(old_notice, "2026-11-15T19:45:04Z"),
+        adr92_comment("## Reviews paused\nLast reviewed commit: " + reviewed_head, ADR92_NOTICE),
+    )
+    assert bool(adr92_reader().review_incomplete(pr)) is holds
