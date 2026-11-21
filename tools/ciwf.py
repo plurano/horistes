@@ -88,14 +88,31 @@ def complain(line: str) -> None:
     sys.stderr.write(line + "\n")
 
 
+def _single_document(text: str) -> object:
+    """PyYAML's load body with StrictLoader: one document, loader disposed."""
+    loader = StrictLoader(text)
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
+
+
+def loads(text: str, origin: object) -> dict:
+    """Read strict YAML text, naming its origin in every diagnostic."""
+    try:
+        doc = _single_document(text)
+    except yaml.YAMLError as err:
+        raise ReadError(f"{origin}: {err}") from err
+    if not isinstance(doc, dict):
+        raise ReadError(f"{origin}: not a mapping")
+    return doc
+
+
 def load(path: Path) -> dict:
     try:
-        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=StrictLoader)
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as err:
+        return loads(path.read_text(encoding="utf-8"), path)
+    except (OSError, UnicodeDecodeError) as err:
         raise ReadError(f"{path}: {err}") from err
-    if not isinstance(doc, dict):
-        raise ReadError(f"{path}: not a mapping")
-    return doc
 
 
 def files(root: Path) -> list[tuple[str, str, dict]]:

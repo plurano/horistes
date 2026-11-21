@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
-"""Answer whether a pull request review is incomplete (an empty string means complete).
+"""Review settling, bot dependency exemption, and incomplete-review evidence.
 
 Started as an extract of the fleet planning gate reader; now diverges by ADR-0092.
-This file is the canonical reader for the train.
+This file holds the train's review-settle rules and canonical evidence reader.
 Callers pass a GraphQL pullRequest node or its data/repository envelope.
 """
 
@@ -376,9 +376,11 @@ def review_evidence(
         if not _can_complete(comment):
             continue
         body = str(comment.get("body") or "")
-        if _non_allowance_notice(body):
+        paused_head = _paused_head_reviewed(body, head)
+        if _non_allowance_notice(body) and not paused_head:
             continue
-        on_head = _head_evidence(comment, head, formal_only)
+        # A paused block proving the head clears a pause notice (ADR-0093), never an allowance.
+        on_head = (paused_head and not formal_only) or _head_evidence(comment, head, formal_only)
         if comment.get("state") in COMPLETED_STATES or pre_merge_rows(body) or on_head:
             evidence.append((login, _body_at(comment), on_head))
     return evidence
@@ -407,13 +409,13 @@ def _notice_read(body: str) -> tuple[str, bool]:
     return "\n".join(lines[:MAX_LINES]), len(body) > MAX_SUMMARY_CHARS or len(lines) > MAX_LINES
 
 
-def _notice_time_rule(allowance: bool, names_head: bool, when, last_commit) -> bool:
+def _notice_time_rule(standing: bool, names_head: bool, when, last_commit) -> bool:
     """One time rule for a notice, read or beyond the read bound.
 
-    An allowance notice and a notice that names the head hold; any other holds from
-    the head commit's time on.
+    A standing notice (allowance or pause) and a notice that names the head hold; any
+    other holds from the head commit's time on.
     """
-    return allowance or names_head or when >= last_commit
+    return standing or names_head or when >= last_commit
 
 
 def _unread_notice_holds(comment: dict, head: str, last_commit) -> bool:
@@ -433,8 +435,9 @@ def _unread_notice_holds(comment: dict, head: str, last_commit) -> bool:
         return True
     # A match consumes characters; at most MAX_SUMMARY_CHARS matches can exist.
     allowance = all(notice.group("allowance") for notice in notices[:MAX_SUMMARY_CHARS])
+    paused = any(notice.group("paused") for notice in notices[:MAX_SUMMARY_CHARS])
     names_head = bool(head and head[:7] in body.lower())
-    return _notice_time_rule(allowance, names_head, when, last_commit)
+    return _notice_time_rule(allowance or paused, names_head, when, last_commit)
 
 
 def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> bool:
@@ -446,6 +449,7 @@ def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> boo
         return False
     ordinary, formal, completed = evidence
     allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
+    paused = any(notice.group("paused") for notice in notices[:MAX_LINES])
     login = _login(comment).lower().removesuffix("[bot]")
     if allowance and login in REVIEWER_BOTS and login in completed:
         return False
@@ -456,9 +460,9 @@ def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple) -> boo
         return False
     names_head = bool(head and head[:7] in body.lower())
     later = formal if allowance else ordinary
-    if _later_evidence(later, login, when, last_commit, allowance or names_head):
+    if _later_evidence(later, login, when, last_commit, allowance or paused or names_head):
         return False
-    return _notice_time_rule(allowance, names_head, when, last_commit)
+    return _notice_time_rule(allowance or paused, names_head, when, last_commit)
 
 
 def review_incomplete(pr: dict, me: str = "") -> str:
@@ -489,3 +493,179 @@ def review_incomplete(pr: dict, me: str = "") -> str:
             stamp = when.isoformat().replace("+00:00", "Z") if when is not None else "head"
             return f"review incomplete: {login or 'reviewer'} limit reached at {stamp}"
     return ""
+
+
+_REVIEW_HOLD = frozenset({"CHANGES_REQUESTED", "COMMENTED"})
+
+
+def _thread_replies_only(review):
+    """Whether a review has no body and all comments are fetched thread replies."""
+    comments = review.get("comments") or {}
+    nodes = comments.get("nodes") or []
+    return (
+        not (review.get("body") or "").strip()
+        and bool(nodes)
+        and comments.get("totalCount") == len(nodes)
+        and all(node.get("replyTo") for node in nodes)
+    )
+
+
+def _person_reply(review):
+    """Whether a person's review on an app PR answers the reviews before it:
+    an approval, or thread replies only.
+    """
+    if (review.get("author") or {}).get("__typename") != "User":
+        return False
+    if review.get("state") == "APPROVED":
+        return True
+    if review.get("state") != "COMMENTED":
+        return False
+    return _thread_replies_only(review)
+
+
+def _is_bot_author(author):
+    """Whether an author is a bot account: GraphQL type Bot, or a [bot] login."""
+    if not isinstance(author, dict):
+        return False
+    return author.get("__typename") == "Bot" or (author.get("login") or "").endswith("[bot]")
+
+
+BOT_COMMIT_READS = 50
+
+
+def _commit_user(node):
+    """Read the commit user without treating malformed author data as a bot."""
+    for field in ("commit", "author", "user"):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(field)
+    if not isinstance(node, dict) or not isinstance(node.get("login"), str):
+        return None
+    return node
+
+
+def is_bot_dependency(pull, conf):
+    """Exempt only wholly bot-authored dependency updates.
+
+    A person's commit needs review even if a bot opened the PR or pushed last.
+    Missing, malformed, or truncated author reads fail closed to full review.
+    """
+    if not pull["headRefName"].startswith(conf["dependency"]) or not _is_bot_author(
+        pull.get("author")
+    ):
+        return False
+    authors = pull.get("authors")
+    if not isinstance(authors, dict):
+        return False
+    total, nodes = authors.get("totalCount"), authors.get("nodes")
+    if isinstance(total, bool) or not isinstance(total, int) or not 1 <= total <= BOT_COMMIT_READS:
+        return False
+    if not isinstance(nodes, list) or len(nodes) != total:
+        return False
+    return all(_is_bot_author(_commit_user(node)) for node in nodes[:BOT_COMMIT_READS])
+
+
+def _responds(review, pr_author, app_author):
+    """Whether a head review answers: person reply on app PRs, author login otherwise."""
+    if app_author:
+        return _person_reply(review)
+    author = review.get("author") or {}
+    return author.get("login") == pr_author
+
+
+def _standing_change_request(on_head):
+    """The newest person change request on the head that the same person has not
+    approved since, or None.
+    """
+    approvals = {}
+    for review in on_head:
+        author = review.get("author") or {}
+        if author.get("__typename") == "User" and review.get("state") == "APPROVED":
+            login = author.get("login")
+            at = datetime.fromisoformat(review["submittedAt"])
+            approvals[login] = max(approvals.get(login, at), at)
+    standing = []
+    for review in on_head:
+        author = review.get("author") or {}
+        at = datetime.fromisoformat(review["submittedAt"])
+        if (
+            author.get("__typename") == "User"
+            and review.get("state") == "CHANGES_REQUESTED"
+            and approvals.get(author.get("login"), at) <= at
+        ):
+            standing.append(review)
+    return max(standing, key=lambda r: datetime.fromisoformat(r["submittedAt"]), default=None)
+
+
+def _on_head_reviews(pull, connection="reviews"):
+    """Submitted head reviews from the named connection."""
+    head_oid = pull["headRefOid"]
+    reviews = pull.get(connection, {}).get("nodes") or []
+    return [
+        r
+        for r in reviews
+        if (r.get("commit") or {}).get("oid") == head_oid and r.get("submittedAt")
+    ]
+
+
+def _review_timing_hold(on_head, pr_author, app_author, push_at):
+    """Why a holding head review needs a strictly later push or reply, or None."""
+    external = [
+        r
+        for r in on_head
+        if not _responds(r, pr_author, app_author) and r.get("state") in _REVIEW_HOLD
+    ]
+    if not external:
+        return None
+    newest_ext = max(datetime.fromisoformat(r["submittedAt"]) for r in external)
+    responses = (
+        datetime.fromisoformat(r["submittedAt"])
+        for r in on_head
+        if _responds(r, pr_author, app_author)
+    )
+    settle_at = max(push_at, max(responses, default=push_at))
+    if newest_ext >= settle_at:
+        return (
+            f"review settle: review at {newest_ext:%H:%M:%SZ} on head, "
+            f"last response at {settle_at:%H:%M:%SZ}"
+        )
+    return None
+
+
+def review_settle(pull, conf, now):
+    """Why a pull request waits for its reviews to settle, or None.
+
+    A submitted holding review on the current head at or after the author's
+    last push or response holds the PR from landing; a tie holds on every PR.
+    On an app PR, a person thread reply or approval answers earlier reviews;
+    a new person review holds. A person's change request holds until that
+    person approves later. An app's review, including the authoring app's
+    own review, never answers on an app PR (ADR-0081).
+    Opinions read separately; truncated reads hold app PRs.
+    Bot dependency PRs with every commit bot-authored skip this check.
+    Approved, dismissed, and pending reviews do not hold.
+    """
+    if is_bot_dependency(pull, conf):
+        return None
+    author_field = pull.get("author") or {}
+    pr_author = author_field.get("login", "") if isinstance(author_field, dict) else ""
+    app_author = _is_bot_author(author_field)
+    nodes = pull["latest"]["nodes"]
+    if not nodes:
+        return None
+    push_at = datetime.fromisoformat(nodes[-1]["commit"]["committedDate"])
+    on_head = _on_head_reviews(pull)
+    timing_hold = _review_timing_hold(on_head, pr_author, app_author, push_at)
+    if timing_hold:
+        return timing_hold
+    if app_author:
+        opinions = pull["opinions"]
+        total, read = opinions["totalCount"], len(opinions["nodes"])
+        if total > read:
+            return f"review settle: {total} approvals or change requests, {read} read"
+        standing = _standing_change_request(_on_head_reviews(pull, "opinions"))
+        if standing:
+            login = standing["author"]["login"]
+            at = datetime.fromisoformat(standing["submittedAt"])
+            return f"review settle: change request by {login} at {at:%H:%M:%SZ} on head stands"
+    return None

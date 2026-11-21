@@ -13,6 +13,7 @@ UNKNOWN merge state and between read retries are shortened.
 
 from __future__ import annotations
 
+import ast
 import base64
 import email.message
 import errno
@@ -56,6 +57,7 @@ FD_DIR = next((d for d in ("/proc/self/fd", "/dev/fd") if os.path.isdir(d)), Non
 NO_FD_DIR = "counting open descriptors needs /proc/self/fd or /dev/fd"
 
 TRAIN = ROOT / ".github/workflows/merge-train.yml"
+RELEASE = ROOT / ".github/workflows/merge-train-release.yml"
 STEP = "Land or update one pull request in every repository of the app"
 NOW = datetime.now(UTC)
 OLD = (NOW - timedelta(days=10)).isoformat()
@@ -224,9 +226,20 @@ def build_commit_node(number: int, suites: list, **fields) -> dict:
     }
 
 
+def build_commit_authors(commit_node, logins):
+    """Use live commit-user shapes, defaulting to the latest commit's author."""
+    users = (
+        [commit_node["author"].get("user")]
+        if logins is _ABSENT
+        else [{"login": login} if login is not None else None for login in logins[:51]]
+    )
+    return {"totalCount": len(users), "nodes": [{"commit": {"author": {"user": u}}} for u in users]}
+
+
 def pull(number: int, state: str, **fields) -> dict:
     """One open pull request as the query reads it."""
     commits = fields.pop("commits", None)
+    commit_authors = fields.pop("commit_authors", _ABSENT)
     suites = fields.pop("suites", ["SUCCESS"])
     labels = fields.pop("labels", ())
     created_at = fields.get("createdAt", OLD)
@@ -270,6 +283,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "refreshes": {"nodes": []},
         "holds": {"nodes": []},
         "latest": {"nodes": [{"commit": commit_node}]},
+        "authors": build_commit_authors(commit_node, commit_authors),
     }
     if commits is not None:
         node["history"] = {
@@ -1133,7 +1147,6 @@ TRAIN_DEFAULTS = {
     "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
     "TRAIN_PERSON_BRANCHES": "release-please--",
     "TRAIN_RELEASE_OFF": "",
-    "TRAIN_RELEASE_MAX_PARALLEL": "3",
     "TRAIN_SECURITY_LABELS": "security",
     "TRAIN_REQUIRED_STATUS": "",
     "TRAIN_SESSION_AUTHORS": "",
@@ -1159,6 +1172,7 @@ def train(
         path = tmp_path / "train.py"
         path.write_text(source, encoding="utf-8")
         shutil.copyfile(ROOT / "tools/review_state.py", tmp_path / "review_state.py")
+        shutil.copyfile(ROOT / "tools/release_workflows.py", tmp_path / "release_workflows.py")
         command = [sys.executable, "-I", "-B", str(path)]
     summary, output = tmp_path / "summary.md", tmp_path / "output"
     forge.workdir = tmp_path
@@ -1234,7 +1248,10 @@ CHECKOUT = {
     "ref": "${{ job.workflow_sha }}",
     "path": "merge-train-source",
     "persist-credentials": False,
-    "sparse-checkout": "tools/merge_train.py\ntools/review_state.py\n",
+    "sparse-checkout": (
+        "tools/merge_train.py\ntools/review_state.py\ntools/release_workflows.py\n"
+        "tools/release_labels.py\ntools/release_plan.py\n"
+    ),
 }
 
 
@@ -1928,9 +1945,6 @@ def test_switched_off_writes_nothing(tmp_path):
         ("min_age_days", "31"),
         ("min_age_days", "two"),
         ("release_off", "justname"),
-        ("release_max_parallel", "0"),
-        ("release_max_parallel", "4"),
-        ("release_max_parallel", "two"),
         ("required_status", "pipe|inside"),
         ("required_status", "tab\tinside"),
         ("required_status", "-lead"),
@@ -1965,13 +1979,6 @@ def test_entrypoint_exit_status(tmp_path, status, settings):
         assert (forge.minted, forge.writes) == ([], [])
     else:
         assert forge.writes == [landed(1)]
-
-
-@pytest.mark.parametrize("parallel", ["1", "3"])
-def test_release_max_parallel_boundaries_accepted(tmp_path, parallel):
-    forge = Forge(repository(pull(1, "CLEAN")))
-    done, _ = train(tmp_path, forge, release_max_parallel=parallel)
-    assert done.returncode == 0, done.stdout + done.stderr
 
 
 def test_merge_method_merge_is_passed(tmp_path):
@@ -2057,10 +2064,10 @@ def test_app_is_public_so_every_fleet_account_can_install_it():
     assert manifest["public"] is True
 
 
-def test_github_token_gets_no_permission():
+def test_github_token_gets_only_dispatch_permission():
     doc = ciwf.load(TRAIN)
     assert doc["permissions"] == {}
-    assert doc["jobs"]["train"]["permissions"] == {}
+    assert doc["jobs"]["train"]["permissions"] == {"actions": "write"}
 
 
 def sweep_forge() -> Forge:
@@ -2649,11 +2656,33 @@ def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):
     assert event.is_set()
 
 
+def plain_open(node):
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open"
+
+
+def allowed_report_opens(text):
+    """Exact allow-list of the summary append and release artifact writer sites."""
+    tree = ast.parse(text)
+    expected = {
+        "append": ast.dump(ast.parse('open(path, "a", encoding="utf-8")', mode="eval").body),
+        "summary": ast.dump(ast.parse('open(path, "w", encoding="utf-8")', mode="eval").body),
+    }
+    sites = [
+        (function.name, ast.dump(node))
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef)
+        for node in ast.walk(function)
+        if plain_open(node)
+    ]
+    all_opens = sum(plain_open(node) for node in ast.walk(tree))
+    return all_opens == len(expected) and sorted(sites) == sorted(expected.items())
+
+
 def key_on_disk(text: str) -> list[str]:
     """Ways the script could put the key in a file; empty when the key goes through a pipe only."""
     found = [word for word in ("tempfile", "write_text", "write_bytes") if word in text]
-    if len(re.findall(r"(?<![.\w])open\(", text)) != 1:
-        found.append("open() other than the summary file")
+    if not allowed_report_opens(text):
+        found.append("open() outside the summary and release file writers")
     if "pass_fds=(read_end,)" not in text:
         found.append("no pipe to openssl")
     return found
@@ -2670,7 +2699,7 @@ def test_key_written_to_a_file_is_found():
         "    with open('key.pem', 'w') as kept:\n        kept.write(env['TRAIN_APP_KEY'])\n",
     )
     assert mutant != script()
-    assert key_on_disk(mutant) == ["open() other than the summary file"]
+    assert key_on_disk(mutant) == ["open() outside the summary and release file writers"]
 
 
 def test_job_reads_the_key_from_the_environment_merge_train():
@@ -2770,7 +2799,10 @@ def test_no_release_list_without_a_sweep(tmp_path):
 
 
 def test_release_list_is_bounded_by_the_matrix(tmp_path):
-    mutant = script().replace("MAX_RELEASES = 256", "MAX_RELEASES = 1")
+    mutant = script().replace(
+        "from release_workflows import MAX_RELEASES, check_hold_labels",
+        "from release_workflows import check_hold_labels\nMAX_RELEASES = 1",
+    )
     assert mutant != script()
     done, summary = train(tmp_path, release_forge(), mutant)
     assert done.returncode == 0, done.stdout + done.stderr
@@ -2785,23 +2817,14 @@ def frozen_findings(steps: list, pr_step: dict) -> list[str]:
         found.append("pull-request step updates a frozen release pull request")
     reading = [s for s in steps if str(s.get("run", "")).endswith('release_labels.py" settings')]
     if len(reading) != 1 or reading[0].get("env", {}).get("HOLD_LABELS") != (
-        "${{ inputs.hold_labels }}"
+        "${{ needs.plan.outputs.hold_labels }}"
     ):
         found.append("settings step does not read the hold labels")
     return found
 
 
-def release_job_findings(doc: dict) -> list[str]:
-    """What keeps the release job from running release-please with the app's own token."""
+def release_token_findings(mint):
     found = []
-    job = doc["jobs"].get("release", {})
-    steps = job.get("steps", [])
-    minting = [s for s in steps if str(s.get("uses", "")).startswith(APP_TOKEN)]
-    running = [s for s in steps if str(s.get("uses", "")).startswith(RELEASE_PLEASE)]
-    # Release, pull request, and the pull request's second attempt (record 0080).
-    if len(minting) != 1 or len(running) != 3:
-        return [f"{len(minting)} token steps and {len(running)} release-please steps"]
-    mint = minting[0].get("with", {})
     if mint.get("owner") != "${{ matrix.repository.owner }}":
         found.append("token not minted for the repository's owner")
     if mint.get("repositories") != "${{ matrix.repository.name }}":
@@ -2809,23 +2832,33 @@ def release_job_findings(doc: dict) -> list[str]:
     rights = {key: value for key, value in mint.items() if key.startswith("permission-")}
     if rights != TOKEN_RIGHTS:
         found.append(f"token rights {rights}")
-    expected_token = f"${{{{ steps.{minting[0].get('id')}.outputs.token }}}}"
-    expected_repo = "${{ matrix.repository.owner }}/${{ matrix.repository.name }}"
-    create_step, pr_step = running[0], running[1]
-    create_with = create_step.get("with", {})
-    if create_with.get("token") != expected_token:
-        found.append(f"release step token is {create_with.get('token')!r}, not the app's")
-    if create_with.get("repo-url") != expected_repo:
-        found.append("release step runs on another repository")
-    for name, step in (("pull-request step", pr_step), ("second pull-request step", running[2])):
-        pr_with = step.get("with", {})
-        if pr_with.get("token") != expected_token:
-            found.append(f"{name} token is {pr_with.get('token')!r}, not the app's")
-        if pr_with.get("repo-url") != expected_repo:
-            found.append(f"{name} runs on another repository")
-        if pr_with.get("skip-github-release") not in (True, "true"):
+    return found
+
+
+def release_identity_findings(step, name, expected_token):
+    found = []
+    settings = step.get("with", {})
+    if settings.get("token") != expected_token:
+        found.append(f"{name} token is {settings.get('token')!r}, not the app's")
+    if settings.get("repo-url") != "${{ matrix.repository.owner }}/${{ matrix.repository.name }}":
+        found.append(f"{name} runs on another repository")
+    return found
+
+
+def release_action_findings(mint, running):
+    expected_token = f"${{{{ steps.{mint.get('id')}.outputs.token }}}}"
+    found = release_identity_findings(running[0], "release step", expected_token)
+    for name, step in (("pull-request step", running[1]), ("second pull-request step", running[2])):
+        found += release_identity_findings(step, name, expected_token)
+        if step.get("with", {}).get("skip-github-release") not in (True, "true"):
             found.append(f"{name} does not skip releases")
-    if create_with.get("skip-github-pull-request") not in (True, "true"):
+    return found
+
+
+def release_checks_findings(steps, running):
+    found = []
+    create_step, pr_step = running[:2]
+    if create_step.get("with", {}).get("skip-github-pull-request") not in (True, "true"):
         found.append("release step does not skip pull requests")
     if create_step.get("continue-on-error") not in (True, "true"):
         found.append("release step does not continue on error")
@@ -2842,15 +2875,36 @@ def release_job_findings(doc: dict) -> list[str]:
         "${{ steps.settings.outputs.skip }}",
     ):
         found.append("no step judges the release step that continues on error")
+    return found
+
+
+def release_job_scope_findings(job):
+    found = []
     if job.get("permissions") != {} or job.get("environment") != "merge-train":
         found.append("GITHUB_TOKEN has rights, or the key's environment is missing")
-    if "inputs.switch == 'on'" not in job.get("if", ""):
-        found.append("runs while the train is switched off")
+    if "needs.plan.outputs.releases != '[]'" not in job.get("if", ""):
+        found.append("runs without a non-empty release plan")
     if job.get("strategy", {}).get("matrix", {}).get("repository") != (
-        "${{ fromJSON(needs.train.outputs.releases) }}"
+        "${{ fromJSON(needs.plan.outputs.releases) }}"
     ):
         found.append("matrix is not the sweep's list")
     return found
+
+
+def release_job_findings(doc: dict) -> list[str]:
+    """What keeps the release job from running release-please with the app's own token."""
+    job = doc["jobs"].get("release", {})
+    steps = job.get("steps", [])
+    minting = [s for s in steps if str(s.get("uses", "")).startswith(APP_TOKEN)]
+    running = [s for s in steps if str(s.get("uses", "")).startswith(RELEASE_PLEASE)]
+    if len(minting) != 1 or len(running) != 3:
+        return [f"{len(minting)} token steps and {len(running)} release-please steps"]
+    return (
+        release_token_findings(minting[0].get("with", {}))
+        + release_action_findings(minting[0], running)
+        + release_checks_findings(steps, running)
+        + release_job_scope_findings(job)
+    )
 
 
 def release_bound_findings(doc: dict) -> list[str]:
@@ -2871,8 +2925,8 @@ def release_bound_findings(doc: dict) -> list[str]:
 
 
 def test_release_job_runs_release_please_with_the_app_token():
-    assert release_job_findings(ciwf.load(TRAIN)) == []
-    assert release_bound_findings(ciwf.load(TRAIN)) == []
+    assert release_job_findings(ciwf.load(RELEASE)) == []
+    assert release_bound_findings(ciwf.load(RELEASE)) == []
 
 
 @pytest.mark.parametrize(
@@ -2899,7 +2953,7 @@ def test_release_job_runs_release_please_with_the_app_token():
 )
 def test_github_token_for_release_please_is_found(step_index, change, finding):
     """GITHUB_TOKEN opens release pull requests that start no checks (cordanaLLM/imago#58)."""
-    doc = ciwf.load(TRAIN)
+    doc = ciwf.load(RELEASE)
     steps = [
         s for s in doc["jobs"]["release"]["steps"] if s.get("uses", "").startswith(RELEASE_PLEASE)
     ]
@@ -2916,7 +2970,7 @@ def test_github_token_for_release_please_is_found(step_index, change, finding):
     ],
 )
 def test_release_please_repo_url_is_found(step_index, finding):
-    doc = ciwf.load(TRAIN)
+    doc = ciwf.load(RELEASE)
     steps = [
         s for s in doc["jobs"]["release"]["steps"] if s.get("uses", "").startswith(RELEASE_PLEASE)
     ]
@@ -2950,7 +3004,7 @@ def test_release_please_repo_url_is_found(step_index, finding):
     ],
 )
 def test_release_step_pieces_are_found(mutator, finding):
-    doc = ciwf.load(TRAIN)
+    doc = ciwf.load(RELEASE)
     steps = [
         s for s in doc["jobs"]["release"]["steps"] if s.get("uses", "").startswith(RELEASE_PLEASE)
     ]
@@ -2981,14 +3035,14 @@ def test_release_step_pieces_are_found(mutator, finding):
     ],
 )
 def test_release_max_parallel_mutants_are_found(mutator, finding):
-    doc = ciwf.load(TRAIN)
+    doc = ciwf.load(RELEASE)
     mutator(doc)
     assert release_bound_findings(doc) == [finding]
 
 
 def test_release_job_without_the_judge_is_found():
     """continue-on-error would turn every failed release green without the judge step."""
-    doc = ciwf.load(TRAIN)
+    doc = ciwf.load(RELEASE)
     steps = doc["jobs"]["release"]["steps"]
     judge = [s for s in steps if str(s.get("run", "")).endswith('release_labels.py" after')]
     assert len(judge) == 1
@@ -3000,19 +3054,19 @@ def test_release_job_without_the_judge_is_found():
 
 def test_release_job_mutants_are_found():
     """Release job findings flag unconstrained tokens, excess rights, and bypassed switches."""
-    doc = ciwf.load(TRAIN)
+    doc = ciwf.load(RELEASE)
     job = doc["jobs"]["release"]
     mint = [s for s in job["steps"] if s.get("uses", "").startswith(APP_TOKEN)][0]["with"]
     mint.pop("repositories")
     mint["permission-issues"] = "write"
-    job["if"] = job["if"].replace("inputs.switch == 'on'", "true")
+    job["if"] = job["if"].replace("needs.plan.outputs.releases != '[]'", "true")
     assert release_job_findings(doc) == [
         "token not limited to the repository",
         (
             "token rights {'permission-contents': 'write', 'permission-pull-requests': 'write', "
             "'permission-workflows': 'write', 'permission-issues': 'write'}"
         ),
-        "runs while the train is switched off",
+        "runs without a non-empty release plan",
     ]
 
 
@@ -4349,6 +4403,13 @@ def test_switched_off_closes_nothing(tmp_path):
     assert forge.writes == []
 
 
+def load_review_state():
+    """Load the matching reader for live or explicit offline rule sources."""
+    from test_review_state import adr92_reader
+
+    return adr92_reader()
+
+
 def load_rules(tmp_path: Path, text: str | None = None):
     """The train rules module, written from the step text and imported from a file."""
     path = tmp_path / "train_rules_under_test.py"
@@ -4673,7 +4734,7 @@ def test_check_release_off_refuses_invalid_entry(tmp_path, invalid):
     ],
 )
 def test_release_job_without_the_frozen_check_is_refused(mutate):
-    doc = ciwf.load(TRAIN)
+    doc = ciwf.load(RELEASE)
     mutate(doc["jobs"]["release"])
     assert release_job_findings(doc) != []
 
@@ -6623,6 +6684,7 @@ def test_planted_review_settle_skips_bot_pr(tmp_path):
         headRefName="renovate/something",
         author={"login": "renovate[bot]"},
         createdAt=OLD,
+        user="renovate[bot]",
         committedDate=head_time,
         reviews=[
             {
@@ -6941,7 +7003,7 @@ def test_app_pr_person_reply_before_bot_review_holds(tmp_path):
 
 def test_is_bot_author_shapes(tmp_path):
     """Bot detection accepts the GraphQL type and legacy suffix, including missing authors."""
-    rules = load_rules(tmp_path)
+    rules = load_review_state()
     assert rules._is_bot_author(None) is False
     assert rules._is_bot_author({"login": "x"}) is False
     assert rules._is_bot_author({"login": "renovate[bot]"}) is True
@@ -7358,7 +7420,7 @@ def test_app_pr_standalone_review_answered_by_reply_settles(tmp_path):
 
 def test_person_reply_shapes(tmp_path):
     """Only a User approval or a review consisting entirely of thread replies answers."""
-    rules = load_rules(tmp_path)
+    rules = load_review_state()
     assert (
         rules._person_reply(_head_review("alice", "User", "2026-11-13T15:47:00+00:00", "APPROVED"))
         is True
@@ -7426,6 +7488,7 @@ def test_planted_review_settle_skips_live_bot_pr(tmp_path):
         headRefName="renovate/x",
         author={"login": "renovate", "__typename": "Bot"},
         createdAt=OLD,
+        user="renovate[bot]",
         committedDate=head_time,
         reviews=[
             {
@@ -7812,6 +7875,7 @@ def test_bot_dependency_pr_skips_review_bodies_fetch_and_lands(tmp_path):
         headRefName="renovate/pkg-1.x",
         author={"login": "renovate", "__typename": "Bot"},
         createdAt=OLD,
+        user="renovate[bot]",
     )
     forge = Forge(repository(p))
     forge.review_details[1] = _detail(
@@ -9093,12 +9157,12 @@ def test_dependency_pull_held_by_required_status_commits_generated_files(tmp_pat
     assert "### fleet/app: committed generated files to #1" in summary
 
 
-# workflow_call inputs the job reads itself, not the train script.
+# workflow_call inputs the job reads itself, not the train script. release_workflow feeds the
+# "Start the release run" step, pinned by check_dispatch_wiring in tests/test_train_release_run.py.
 JOB_RUNNER_INPUTS = {
     "train": "${{ inputs.runner }}",
-    "release": "${{ inputs.release_runner || inputs.runner }}",
 }
-INPUTS_OFF_TRAIN = frozenset({"runner", "release_runner"})
+INPUTS_OFF_TRAIN = frozenset({"runner", "release_workflow"})
 
 
 def input_wiring_findings(doc: dict, source: str) -> list[str]:
@@ -9153,30 +9217,9 @@ def _train_env(doc: dict) -> dict:
             "input extra does not reach TRAIN_EXTRA",
         ),
         (
-            lambda doc: doc["jobs"]["release"].update({"runs-on": "${{ inputs.runner }}"}),
+            lambda doc: doc["jobs"]["train"].update({"runs-on": "wrong"}),
             None,
-            (
-                "job release runs-on is '${{ inputs.runner }}', "
-                "not '${{ inputs.release_runner || inputs.runner }}'"
-            ),
-        ),
-        (
-            lambda doc: doc["jobs"]["release"].update({"runs-on": "${{ inputs.release_runner }}"}),
-            None,
-            (
-                "job release runs-on is '${{ inputs.release_runner }}', "
-                "not '${{ inputs.release_runner || inputs.runner }}'"
-            ),
-        ),
-        (
-            lambda doc: doc["jobs"]["train"].update(
-                {"runs-on": "${{ inputs.release_runner || inputs.runner }}"}
-            ),
-            None,
-            (
-                "job train runs-on is '${{ inputs.release_runner || inputs.runner }}', "
-                "not '${{ inputs.runner }}'"
-            ),
+            "job train runs-on is 'wrong', not '${{ inputs.runner }}'",
         ),
         (
             lambda doc: None,
@@ -10432,9 +10475,7 @@ def test_incomplete_review_priority_and_connection_guard(tmp_path, monkeypatch):
 
 def adr92_train(tmp_path, monkeypatch):
     """Load either live modules or the explicit offline baseline for regression replay."""
-    from test_review_state import adr92_reader
-
-    reader = adr92_reader()
+    reader = load_review_state()
     monkeypatch.setitem(sys.modules, "review_state", reader)
     root = Path(os.environ.get("HORISTES_READER_SOURCE", ROOT))
     monkeypatch.setattr(sys.modules[__name__], "SCRIPT", root / "tools/merge_train.py")
@@ -10658,7 +10699,12 @@ def adr92_offline_source(monkeypatch):
     """An explicit baseline root redirects only module loading, never repository state."""
     source = os.environ.get("HORISTES_READER_SOURCE")
     if source:
+        monkeypatch.setitem(sys.modules, "review_state", load_review_state())
+        monkeypatch.delitem(sys.modules, "train_rules", raising=False)
         monkeypatch.setattr(sys.modules[__name__], "SCRIPT", Path(source) / "tools/merge_train.py")
+        workflow = Path(source) / ".github/workflows/merge-train.yml"
+        if workflow.is_file():
+            monkeypatch.setattr(sys.modules[__name__], "TRAIN", workflow)
 
 
 def adr92_body_hold(mod, p, detail, review_bots):
@@ -10728,7 +10774,7 @@ def adr92_mutations():
             "review_state",
             'updated = _instant(comment["updatedAt"])',
             "updated = created",
-            "C-edited-notice",
+            "C-edited-ordinary-notice",
         ),
         (
             "D",
@@ -10740,8 +10786,8 @@ def adr92_mutations():
         (
             "E",
             "review_state",
-            "return allowance or names_head or when >= last_commit",
-            "return allowance or names_head or when > last_commit",
+            "return allowance or paused or names_head or when >= last_commit",
+            "return allowance or paused or names_head or when > last_commit",
             "E-equal-notice",
         ),
         (
@@ -10844,7 +10890,7 @@ def adr92_mutation_run(root, selector, log):
 def test_adr92_mutations_reject_defects(tmp_path, section, module_name, old, new, selector):
     root = tmp_path / "mutation"
     (root / "tools").mkdir(parents=True)
-    for name in ("review_state", "merge_train"):
+    for name in ("review_state", "merge_train", "release_workflows"):
         source = (ROOT / "tools" / f"{name}.py").read_text()
         (root / "tools" / f"{name}.py").write_text(source)
     path = root / "tools" / f"{module_name}.py"
@@ -10894,3 +10940,215 @@ def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
     }
     mod.summary(env, {}, [], [], [], [], [], [])
     assert capsys.readouterr().out.count("review bots: none set, zero-review hold off") == 1
+
+
+@pytest.mark.parametrize("all_bot", [False, True], ids=["person-holds", "bots-land"])
+def test_adr93_dependency_paused_train(tmp_path, all_bot):
+    """A bot PR with person commits reaches the reader; a pure bot update stays exempt."""
+    node = json.loads((REVIEW_STATE_FIXTURES / "dependency-person-commits-paused.json").read_text())
+    p = pull(
+        1,
+        "CLEAN",
+        author=node["author"],
+        headRefName=node["headRefName"],
+        headRefOid=node["headRefOid"],
+        authors=node["authors"],
+        committedDate="2026-11-17T02:24:32Z",
+    )
+    if all_bot:
+        p["authors"] = build_commit_authors({}, ["renovate[bot]"] * 5)
+    forge = Forge(repository(p))
+    forge.review_details[1] = {
+        key: node[key] for key in ("headRefOid", "author", "comments", "reviews", "commits")
+    }
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    if all_bot:
+        assert forge.writes == [("merge", "PR_1", p["headRefOid"], "SQUASH")]
+        assert forge.review_body_calls == []
+        assert "### fleet/app: landed #1" in summary
+    else:
+        assert forge.writes == []
+        assert forge.review_body_calls == [1]
+        assert "review incomplete: coderabbitai limit reached" in summary
+
+
+@pytest.mark.parametrize(
+    ("logins", "exempt"),
+    [
+        pytest.param(["renovate[bot]", "plurano-merge-train[bot]"], True, id="all-bot"),
+        pytest.param(["renovate[bot]", "a-person", "renovate[bot]"], False, id="interior-person"),
+        pytest.param(["renovate[bot]", "a-person"], False, id="head-person"),
+        pytest.param([None], False, id="null-user"),
+        pytest.param(["renovate[bot]"] * 50, True, id="fifty"),
+    ],
+)
+def test_adr93_bot_commit_authors(tmp_path, logins, exempt):
+    rules = load_rules(tmp_path)
+    p = pull(
+        1,
+        "CLEAN",
+        headRefName="renovate/x",
+        author={"login": "renovate", "__typename": "Bot"},
+        commit_authors=logins,
+    )
+    assert rules.is_bot_dependency(p, {"dependency": ("renovate/",)}) is exempt
+
+
+@pytest.mark.parametrize(
+    "authors",
+    [
+        pytest.param(_ABSENT, id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param([], id="not-mapping"),
+        pytest.param(
+            {"totalCount": 51, "nodes": build_commit_authors({}, ["renovate[bot]"] * 50)["nodes"]},
+            id="truncated-51",
+        ),
+        pytest.param({"totalCount": 0, "nodes": []}, id="zero"),
+        pytest.param({"totalCount": True, "nodes": [{}]}, id="bool-count"),
+        pytest.param({"totalCount": "1", "nodes": [{}]}, id="string-count"),
+        pytest.param({"totalCount": -1, "nodes": []}, id="negative-count"),
+        pytest.param({"totalCount": 1, "nodes": []}, id="short-nodes"),
+        pytest.param({"totalCount": 1, "nodes": {}}, id="mapping-nodes"),
+        pytest.param({"totalCount": 1, "nodes": [None]}, id="null-node"),
+        pytest.param({"totalCount": 1, "nodes": [{"commit": None}]}, id="null-commit"),
+        pytest.param({"totalCount": 1, "nodes": [{"commit": {"author": []}}]}, id="bad-author"),
+        pytest.param(
+            {"totalCount": 1, "nodes": [{"commit": {"author": {"user": {"login": 3}}}}]},
+            id="bad-login",
+        ),
+    ],
+)
+def test_adr93_unreadable_authors(tmp_path, authors):
+    rules = load_rules(tmp_path)
+    p = pull(
+        1, "CLEAN", headRefName="renovate/x", author={"login": "renovate", "__typename": "Bot"}
+    )
+    if authors is _ABSENT:
+        p.pop("authors")
+    else:
+        p["authors"] = authors
+    assert rules.is_bot_dependency(p, {"dependency": ("renovate/",)}) is False
+
+
+def test_adr93_author_query_bound(tmp_path):
+    rules = load_rules(tmp_path)
+    bound = load_review_state().BOT_COMMIT_READS
+    assert bound == 50
+    expected = (
+        f"authors: commits(last: {bound}) {{\n"
+        "          totalCount nodes { commit { author { user { login } } } } }"
+    )
+    assert expected in rules.QUERY
+    assert expected in rules.STATUS_QUERY
+
+
+def adr93_mutations():
+    return [
+        (
+            "A1",
+            "review_state",
+            "return all(_is_bot_author(_commit_user(node)) for node in nodes[:BOT_COMMIT_READS])",
+            "return True",
+            "test_adr93_dependency_paused_train[person-holds]",
+        ),
+        (
+            "A2",
+            "review_state",
+            "nodes[:BOT_COMMIT_READS]",
+            "nodes[-1:]",
+            "test_adr93_bot_commit_authors[interior-person]",
+        ),
+        (
+            "B1",
+            "review_state",
+            "allowance or paused or names_head",
+            "allowance or names_head",
+            "test_adr93_paused_notice[stale]",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("section", "module_name", "old", "new", "selector"),
+    adr93_mutations(),
+    ids=[row[0] for row in adr93_mutations()[:3]],
+)
+def test_adr93_mutations_reject_defects(tmp_path, section, module_name, old, new, selector):
+    """Restore each defect only in temporary source copies, after an unmutated pass."""
+    root = tmp_path / "mutation"
+    (root / "tools").mkdir(parents=True)
+    workflow = root / ".github/workflows/merge-train.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(TRAIN.read_text())
+    for name in ("review_state", "merge_train", "release_workflows"):
+        (root / "tools" / f"{name}.py").write_text((ROOT / "tools" / f"{name}.py").read_text())
+    path = workflow if module_name == "rules" else root / "tools" / f"{module_name}.py"
+    source = path.read_text()
+    expected_count = 2 if section == "B1" else 1
+    assert source.count(old) == expected_count, (section, old)
+    control = adr92_mutation_run(root, selector, tmp_path / "control.log")
+    assert control.returncode == 0, control.stdout + control.stderr
+    path.write_text(source.replace(old, new))
+    mutated = adr92_mutation_run(root, selector, tmp_path / "mutated.log")
+    assert mutated.returncode == 1, mutated.stdout + mutated.stderr
+    assert "1 failed" in mutated.stdout, mutated.stdout
+
+
+@pytest.mark.parametrize("write_file", [False, True])
+def test_summary_release_file_matches_output(tmp_path, monkeypatch, write_file):
+    mod = load_train(tmp_path, monkeypatch)
+    path = tmp_path / "releases.json"
+    env = {
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        "GITHUB_OUTPUT": str(tmp_path / "output"),
+        "TRAIN_HOLD_LABELS": "hold,exact ",
+    }
+    if write_file:
+        env["TRAIN_RELEASE_FILE"] = str(path)
+    releases = [{"owner": "a", "name": f"r{i}"} for i in range(mod.MAX_RELEASES + 1)]
+    mod.summary(env, {}, [], [], [], releases, [], [])
+    assert path.exists() == write_file
+    if write_file:
+        assert json.loads(path.read_text()) == {
+            "format": 1,
+            "hold_labels": "hold,exact ",
+            "releases": releases_of(tmp_path),
+        }
+        assert len(releases_of(tmp_path)) == mod.MAX_RELEASES
+
+
+@pytest.mark.parametrize("mutation", ["extra-open", "wrong-path", "wrong-mode"])
+def test_report_writer_open_allow_list_refuses_other_files(mutation):
+    source = script()
+    if mutation == "extra-open":
+        source += "\nopen('unexpected.txt', 'w')\n"
+    elif mutation == "wrong-path":
+        source = source.replace(
+            'open(path, "w", encoding="utf-8")', 'open("unexpected.txt", "w", encoding="utf-8")'
+        )
+    else:
+        source = source.replace(
+            'open(path, "a", encoding="utf-8")', 'open(path, "w", encoding="utf-8")'
+        )
+    assert not allowed_report_opens(source)
+    assert key_on_disk(source) == ["open() outside the summary and release file writers"]
+
+
+@pytest.mark.parametrize(
+    "hold", ["x\ny", "x\ry", "x" * 4097], ids=["newline", "return", "oversize"]
+)
+def test_hold_labels_setting_refused_before_requests(tmp_path, hold):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, hold_labels=hold)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "hold_labels" in done.stdout
+    assert (forge.minted, forge.writes) == ([], [])
+
+
+def test_hold_labels_setting_boundary(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    done, _ = train(tmp_path, forge, hold_labels="x" * 4096)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]

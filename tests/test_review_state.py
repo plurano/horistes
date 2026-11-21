@@ -7,7 +7,13 @@ import json
 from pathlib import Path
 
 import pytest
-from review_state import MAX_COMMENTS, MAX_LINES, MAX_SUMMARY_CHARS, review_incomplete
+from review_state import (
+    MAX_COMMENTS,
+    MAX_LINES,
+    MAX_SUMMARY_CHARS,
+    is_bot_dependency,
+    review_incomplete,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures/review-state"
 
@@ -570,6 +576,9 @@ def adr92_reader_cases():
         updatedAt="2026-11-16T17:00:00Z",
     )
     cases.append(("C-edited-notice", adr92_pull(sticky), True))
+    cases.append(
+        ("C-edited-ordinary-notice", adr92_pull({**sticky, "body": "Review limit reached."}), True)
+    )
     table = adr92_comment(ADR92_TABLE, "2026-11-15T19:45:04Z", updatedAt="2026-11-16T17:00:00Z")
     cases.append(("C-edited-evidence", adr92_pull(notice, table), False))
     for name, login in [("author", "person"), ("other-login", "copilot")][:2]:
@@ -1201,10 +1210,11 @@ def test_notice_line_detection_boundary(line):
 )
 @pytest.mark.parametrize("when", [ADR92_NOTICE, "2026-11-16T16:00:00Z", "invalid"])
 def test_unread_notice_time_policy(notice, when):
-    """Old ordinary/pause/rate notices stay stale; fresh or unknown times hold unread."""
+    """Old ordinary/rate notices stay stale; old pauses, fresh or unknown times hold unread."""
     pr = adr92_pull(adr92_comment("Prose.\n" * MAX_LINES + notice, when))
     reason = review_incomplete(pr)
-    if when == "2026-11-16T16:00:00Z":
+    # An old pause waits for its reviewer to prove the head (ADR-0093), read or unread.
+    if when == "2026-11-16T16:00:00Z" and notice != "## Reviews paused":
         assert reason == review_incomplete(adr92_pull(adr92_comment(notice, when))) == ""
     else:
         assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
@@ -1273,3 +1283,90 @@ def test_completed_check_count_integer_only(count, runs, holds):
     contexts = pr["headCommit"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
     contexts["totalCount"] = count
     assert bool(review_incomplete(pr)) is holds
+
+
+def adr93_second_summary_cases(pr, notice):
+    """Only a later same-reviewer pause proving the full head clears the old pause."""
+    summary = copy.deepcopy(notice)
+    summary["updatedAt"] = "2026-11-17T03:00:00Z"
+    summary["body"] = summary["body"].replace("1" * 40, pr["headRefOid"])
+    pr = copy.deepcopy(pr)
+    pr["comments"]["nodes"] = [copy.deepcopy(notice), summary]
+    cases = [_case("second-summary-proves-head", pr, False)]
+    summary["author"]["login"] = "other-reviewer"
+    cases.append(_case("second-summary-other-reviewer", pr, True))
+    summary["author"]["login"] = "coderabbitai"
+    summary["updatedAt"] = "2026-11-17T02:22:00Z"
+    cases.append(_case("second-summary-before-push", pr, True))
+    summary["updatedAt"] = "2026-11-17T03:00:00Z"
+    body = summary["body"]
+    summary["body"] = body.replace(pr["headRefOid"], pr["headRefOid"][:7])
+    cases.append(_case("second-summary-short-head", pr, True))
+    summary["body"] = body + "\n## Rate limit exceeded\n"
+    cases.append(_case("second-summary-mixed-notice", pr, True))
+    summary["body"] = body.replace(
+        "> - Last reviewed commit:", "> ## Rate limit exceeded\n> - Last reviewed commit:"
+    )
+    cases.append(_case("second-summary-inside-mixed-notice", pr, True))
+    summary["body"] = body.replace("> - Last reviewed commit: " + pr["headRefOid"], "")
+    cases.append(_case("second-summary-missing-last-reviewed", pr, True))
+    return cases
+
+
+def adr93_paused_cases():
+    """A persistent pause needs same-reviewer head evidence after a later push."""
+    pr = _fixture("dependency-person-commits-paused.json")
+    cases = [_case("edited-after-push", pr, True)]
+    notice = pr["comments"]["nodes"][0]
+    notice["updatedAt"] = "2026-11-17T02:21:00Z"
+    cases.append(_case("stale", pr, True))
+    formal = {
+        "author": {"login": "coderabbitai"},
+        "state": "COMMENTED",
+        "submittedAt": "2026-11-17T03:00:00Z",
+        "body": "",
+        "commit": {"oid": pr["headRefOid"]},
+    }
+    pr["reviews"] = {"totalCount": 1, "nodes": [formal]}
+    cases.append(_case("head-review", pr, False))
+    formal["commit"]["oid"] = "1" * 40
+    cases.append(_case("old-review", pr, True))
+    formal["commit"]["oid"] = pr["headRefOid"]
+    formal["author"]["login"] = "other-reviewer"
+    cases.append(_case("other-reviewer", pr, True))
+    pr["reviews"] = {"totalCount": 0, "nodes": []}
+    summary = {
+        "author": {"login": "coderabbitai"},
+        "createdAt": "2026-11-17T03:00:00Z",
+        "body": PASSED_TABLE,
+    }
+    pr["comments"]["nodes"].append(summary)
+    cases.append(_case("later-table", pr, True))
+    summary["body"] += (
+        "\nReviewing files that changed from the base of the PR and between "
+        + "1" * 40
+        + " and "
+        + pr["headRefOid"]
+        + "."
+    )
+    cases.append(_case("head-range", pr, False))
+    pr["comments"]["nodes"] = [notice]
+    cases.extend(adr93_second_summary_cases(pr, notice))
+    notice["body"] = notice["body"].replace("1" * 40, pr["headRefOid"])
+    cases.append(_case("pause-names-head", pr, False))
+    return cases
+
+
+@pytest.mark.parametrize(("pr", "me", "expected"), adr93_paused_cases())
+def test_adr93_paused_notice(pr, me, expected):
+    assert bool(adr92_reader().review_incomplete(pr, me)) is expected
+
+
+def test_bot_dependency_count_rejects_boolean():
+    """A valid bot author isolates the count guard from malformed-author refusals."""
+    bot = {"login": "renovate[bot]", "__typename": "Bot"}
+    authors = {"totalCount": True, "nodes": [{"commit": {"author": {"user": bot}}}]}
+    pull = {"headRefName": "renovate/x", "author": bot, "authors": authors}
+    assert is_bot_dependency(pull, {"dependency": ("renovate/",)}) is False
+    authors["totalCount"] = 1
+    assert is_bot_dependency(pull, {"dependency": ("renovate/",)}) is True

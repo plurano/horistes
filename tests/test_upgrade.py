@@ -107,25 +107,38 @@ def test_appended_check_name_on_the_same_major_is_accepted_as_compatible() -> No
         "interface_major": 0,
         "interface_minor": 2,
         "workflows": {
-            ".github/workflows/merge-train.yml": {"jobs": {"train": "Merge train"}, **empty_spec}
+            ".github/workflows/merge-train-release.yml": {
+                "jobs": {"plan": "Plan release legs"},
+                **empty_spec,
+            }
         },
     }
     appended_lock = {
         "interface_major": 0,
         "interface_minor": 2,
         "workflows": {
-            ".github/workflows/merge-train.yml": {
-                "jobs": {"train": "Merge train", "release": "Release pull request and release"},
+            ".github/workflows/merge-train-release.yml": {
+                "jobs": {
+                    "plan": "Plan release legs",
+                    "release": "Release pull request and release",
+                },
                 **empty_spec,
             }
         },
     }
     assert interface.breaks(base_lock, appended_lock) == []
 
-    doc = ciwf.load(ROOT / ".github/workflows/merge-train.yml")
-    assert verdict._job(doc, "Merge train", "merge-train.yml")["name"] == "Merge train"
+    doc = ciwf.load(ROOT / ".github/workflows/merge-train-release.yml")
     assert (
-        verdict._job(doc, "Release pull request and release", "merge-train.yml")["name"]
+        verdict._job(doc, "Plan release legs", "merge-train-release.yml")["name"]
+        == "Plan release legs"
+    )
+    assert (
+        verdict._job(
+            ciwf.load(ROOT / ".github/workflows/merge-train-release.yml"),
+            "Release pull request and release",
+            "merge-train-release.yml",
+        )["name"]
         == "Release pull request and release"
     )
 
@@ -133,12 +146,12 @@ def test_appended_check_name_on_the_same_major_is_accepted_as_compatible() -> No
         "interface_major": 0,
         "interface_minor": 2,
         "workflows": {
-            ".github/workflows/merge-train.yml": {
-                "jobs": {"train": "Train", "release": "Release pull request and release"},
+            ".github/workflows/merge-train-release.yml": {
+                "jobs": {"plan": "Plan", "release": "Release pull request and release"},
                 **empty_spec,
             }
         },
     }
     breaks = interface.breaks(base_lock, mutated)
-    assert any("check name of job train changed 'Merge train' -> 'Train'" in b for b in breaks)
+    assert any("check name of job plan changed 'Plan release legs' -> 'Plan'" in b for b in breaks)
     assert not interface.declared(base_lock, mutated)
