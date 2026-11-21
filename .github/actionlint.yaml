@@ -17,6 +17,9 @@ paths:
   .github/workflows/hook-copy.yml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20 category D: lacks job.workflow_*
+  .github/workflows/merge-train-release.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined' # expires 2027-03-20 category D: lacks job.workflow_*
   .github/workflows/merge-train.yml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20 category D: lacks job.workflow_*

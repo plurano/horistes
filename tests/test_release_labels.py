@@ -34,7 +34,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
 from release_workflows import jobs_sections
 
-TRAIN = ROOT / ".github/workflows/merge-train.yml"
+TRAIN = ROOT / ".github/workflows/merge-train-release.yml"
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
 TAG_OBJECT = "c" * 40
@@ -168,6 +168,17 @@ class Forge:
         self.url = ""
         self.requests: list[str] = []
         self.redirect: str | None = None
+        self.train_run = {
+            "path": ".github/workflows/merge-train.yml",
+            "event": "schedule",
+            "head_branch": "main",
+            "repository": {"full_name": "Fleet/App"},
+            "status": "in_progress",
+            "conclusion": None,
+        }
+        self.dispatch_status = 204
+        self.dispatch_detail = "Workflow does not have workflow_dispatch trigger"
+        self.dispatches: list[tuple[str, dict]] = []
 
     def contents(self, _rest: str) -> tuple[int, object]:
         if self.config is None:
@@ -249,6 +260,8 @@ class Forge:
                 self, "default_branch"
             ) else {}
         rest = path.removeprefix("/repos/fleet/app/")
+        if rest == "actions/runs/123":
+            return 200, self.train_run
         routes = (
             ("contents/release-please-config.json", self.contents),
             ("contents/.github/workflows", self.workflow_contents),
@@ -297,6 +310,11 @@ class Handler(BaseHTTPRequestHandler):
         forge: Forge = self.forge
         path = urlsplit(self.path).path
         length = int(self.headers.get("Content-Length", 0))
+        if "/actions/workflows/" in path:
+            forge.dispatches.append((path, json.loads(self.rfile.read(length))))
+            body = b"" if forge.dispatch_status == 204 else {"message": forge.dispatch_detail}
+            self.answer(forge.dispatch_status, body)
+            return
         if path == "/graphql":
             code, body = forge.graphql(json.loads(self.rfile.read(length)))
             self.answer(code, body, forge.short.pop(0) if forge.short else None)
@@ -2088,3 +2106,342 @@ def test_push_filter_mutations_flip_planted_oracle(
         assert outputs == f"skip={str(not skip).lower()}\npending=[]\nfrozen=false\n"
     else:
         assert outputs == expected
+
+
+# ADR-0098: an untrusted artifact becomes a bounded release plan before token minting.
+def plan_env(tmp_path, forge, payload=None):
+    path = tmp_path / "releases.json"
+    if payload is not None:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "GITHUB_API_URL": forge.url,
+        "TRAIN_RUN_ID": "123",
+        "TRAIN_WORKFLOW": "merge-train.yml",
+        "REPOSITORY": "fleet/app",
+        "MAX_PARALLEL": "3",
+        "FILE": str(path),
+        "GITHUB_OUTPUT": str(tmp_path / "plan-output"),
+    }
+
+
+def plan_payload(releases=None, hold="hold,planted"):
+    return {
+        "format": 1,
+        "hold_labels": hold,
+        "releases": [{"owner": "Fleet", "name": "App"}] if releases is None else releases,
+    }
+
+
+def run_plan(env):
+    import release_plan
+
+    return release_plan.main(["release_plan.py", "plan"], env)
+
+
+def plan_output(env):
+    return dict(line.split("=", 1) for line in Path(env["GITHUB_OUTPUT"]).read_text().splitlines())
+
+
+@pytest.mark.parametrize("releases", [[{"owner": "Fleet", "name": "App"}], []])
+def test_plan_valid_file(tmp_path, forge, releases):
+    env = plan_env(tmp_path, forge, plan_payload(releases))
+    assert run_plan(env) == 0
+    assert plan_output(env) == {
+        "releases": json.dumps(releases, separators=(",", ":")),
+        "hold_labels": "hold,planted",
+    }
+
+
+@pytest.mark.parametrize("conclusion", ["cancelled", "skipped", "timed_out", "neutral", ""])
+def test_plan_ignores_other_conclusions(tmp_path, forge, capsys, conclusion):
+    forge.train_run.update(status="completed", conclusion=conclusion)
+    env = plan_env(tmp_path, forge)
+    assert run_plan(env) == 0
+    assert plan_output(env) == {"releases": "[]", "hold_labels": ""}
+    assert f"::notice::train run conclusion {conclusion!r}" in capsys.readouterr().out
+
+
+def test_plan_absent_file(tmp_path, forge, capsys):
+    env = plan_env(tmp_path, forge)
+    assert run_plan(env) == 0
+    assert plan_output(env) == {"releases": "[]", "hold_labels": ""}
+    assert "train run uploaded no release list" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        pytest.param("path", ".github/workflows/other.yml", id="other-path"),
+        pytest.param("event", "pull_request", id="pull-request"),
+        pytest.param("head_branch", "topic", id="other-branch"),
+        pytest.param("repository", {"full_name": "other/repo"}, id="other-repository"),
+        pytest.param("repository", {"full_name": None}, id="null-repository-name"),
+        pytest.param("repository", None, id="null-repository"),
+        pytest.param("status", "queued", id="queued"),
+    ],
+)
+def test_plan_refuses_untrusted_run(tmp_path, forge, capsys, key, value):
+    forge.train_run[key] = value
+    env = plan_env(tmp_path, forge)
+    # Run validation must refuse even before reading a malformed artifact.
+    Path(env["FILE"]).write_text("{")
+    assert run_plan(env) == 1
+    expected = {
+        "path": "path must match",
+        "event": "event must be schedule or workflow_dispatch",
+        "head_branch": "head branch must be the default branch",
+        "repository": "repository must be the caller repository",
+        "status": "status must be in_progress or completed",
+    }
+    assert expected[key] in capsys.readouterr().out
+    assert not Path(env["GITHUB_OUTPUT"]).exists()
+
+
+@pytest.mark.parametrize(
+    "parallel,rc", [("0", 3), ("1", 0), ("3", 0), ("4", 3), ("1.5", 3), ("two", 3), ("", 3)]
+)
+def test_plan_parallel_boundaries(tmp_path, forge, capsys, parallel, rc):
+    env = plan_env(tmp_path, forge, plan_payload()) | {"MAX_PARALLEL": parallel}
+    assert run_plan(env) == rc
+    if rc:
+        assert "release_max_parallel" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"format": 1, "hold_labels": ""},
+        plan_payload() | {"extra": 1},
+        plan_payload() | {"format": 2},
+        plan_payload() | {"format": True},
+        plan_payload() | {"hold_labels": 2},
+        plan_payload(hold="x\ny"),
+        plan_payload(hold="x\ry"),
+        plan_payload() | {"releases": {}},
+        plan_payload(["fleet/app"]),
+        plan_payload([{"owner": "a"}]),
+        plan_payload([{"owner": "a", "name": "b", "extra": 1}]),
+        plan_payload([{"owner": "-a", "name": "b"}]),
+        plan_payload([{"owner": "a", "name": "bad/name"}]),
+        plan_payload([{"owner": "a", "name": "."}]),
+        plan_payload([{"owner": "a", "name": ".."}]),
+        plan_payload([{"owner": 1, "name": "b"}]),
+        plan_payload([{"owner": "a", "name": None}]),
+        plan_payload([{"owner": "A", "name": "B"}, {"owner": "a", "name": "b"}]),
+    ],
+)
+def test_plan_refuses_invalid_payload(tmp_path, forge, capsys, payload):
+    env = plan_env(tmp_path, forge, payload)
+    assert run_plan(env) == 1
+    assert "::error" in capsys.readouterr().out
+    assert not Path(env["GITHUB_OUTPUT"]).exists()
+
+
+@pytest.mark.parametrize("count,rc", [(256, 0), (257, 1)])
+def test_plan_repository_count_boundary(tmp_path, forge, count, rc):
+    env = plan_env(
+        tmp_path, forge, plan_payload([{"owner": "a", "name": f"r{i}"} for i in range(count)])
+    )
+    assert run_plan(env) == rc
+
+
+@pytest.mark.parametrize("length,rc", [(39, 0), (40, 1)])
+def test_plan_owner_length_boundary(tmp_path, forge, length, rc):
+    env = plan_env(tmp_path, forge, plan_payload([{"owner": "a" * length, "name": "b"}]))
+    assert run_plan(env) == rc
+
+
+@pytest.mark.parametrize("length,rc", [(1, 0), (100, 0), (0, 1), (101, 1)])
+def test_plan_name_length_boundary(tmp_path, forge, length, rc):
+    env = plan_env(tmp_path, forge, plan_payload([{"owner": "a", "name": "b" * length}]))
+    assert run_plan(env) == rc
+
+
+@pytest.mark.parametrize("length,rc", [(4096, 0), (4097, 1)])
+def test_plan_hold_length_boundary(tmp_path, forge, length, rc):
+    assert run_plan(plan_env(tmp_path, forge, plan_payload(hold="a" * length))) == rc
+
+
+@pytest.mark.parametrize("error", [ValueError, RuntimeError])
+@pytest.mark.parametrize(
+    "raw,valid",
+    [
+        pytest.param("x" * 4096, True, id="boundary"),
+        pytest.param("x" * 4097, False, id="oversize"),
+        pytest.param("x\ny", False, id="newline"),
+        pytest.param("x\ry", False, id="return"),
+    ],
+)
+def test_check_hold_labels(raw, valid, error):
+    """Share the inclusive bound and line refusal with the caller's error class."""
+    from release_workflows import check_hold_labels
+
+    if valid:
+        assert check_hold_labels(raw, error) is raw
+    else:
+        with pytest.raises(error, match="hold_labels") as caught:
+            check_hold_labels(raw, error)
+        assert caught.type is error
+
+
+def test_plan_accepts_failed_sweep(tmp_path, forge):
+    forge.train_run.update(status="completed", conclusion="failure", event="workflow_dispatch")
+    env = plan_env(tmp_path, forge, plan_payload())
+    assert run_plan(env) == 0
+    assert json.loads(plan_output(env)["releases"])
+
+
+def test_plan_refuses_malformed_json(tmp_path, forge, capsys):
+    env = plan_env(tmp_path, forge, plan_payload())
+    Path(env["FILE"]).write_text("{")
+    assert run_plan(env) == 1
+    assert "::error" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("damage", ["directory", "encoding", "oversize"])
+def test_plan_read_failures_are_errors(tmp_path, forge, capsys, damage):
+    env = plan_env(tmp_path, forge)
+    path = Path(env["FILE"])
+    if damage == "directory":
+        path.mkdir()
+    elif damage == "encoding":
+        path.write_bytes(b"\xff")
+    else:
+        path.write_text(json.dumps(plan_payload()) + " " * (1024 * 1024))
+    assert run_plan(env) == 1
+    assert "::error" in capsys.readouterr().out
+
+
+def test_plan_empty_list_notice(tmp_path, forge, capsys):
+    env = plan_env(tmp_path, forge, plan_payload([]))
+    assert run_plan(env) == 0
+    assert "::notice::no repository named" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+@pytest.mark.parametrize("status", ["in_progress", "completed"])
+def test_plan_reads_train_run(tmp_path, forge, event, status):
+    forge.default_branch = "trunk"
+    forge.train_run.update(event=event, status=status, conclusion="success", head_branch="trunk")
+    env = plan_env(tmp_path, forge, plan_payload())
+    assert run_plan(env) == 0
+    assert json.loads(plan_output(env)["releases"])
+    assert forge.requests == ["/repos/fleet/app/actions/runs/123", "/repos/fleet/app"]
+
+
+def dispatch_env(forge):
+    return {
+        "GITHUB_API_URL": forge.url,
+        "REPOSITORY": "fleet/app",
+        "TRAIN_RUN_ID": "123",
+        "RELEASE_WORKFLOW": "merge-train-release.yml",
+        "ARTIFACT_ID": "456",
+    }
+
+
+def run_dispatch(env):
+    import release_plan
+
+    return release_plan.main(["release_plan.py", "dispatch"], env)
+
+
+@pytest.mark.parametrize("status", [204, 200])
+def test_dispatch_starts_one_release_run(forge, status):
+    forge.dispatch_status = status
+    forge.default_branch = "trunk"
+    assert run_dispatch(dispatch_env(forge)) == 0
+    assert forge.requests == ["/repos/fleet/app"]
+    assert forge.dispatches == [
+        (
+            "/repos/fleet/app/actions/workflows/merge-train-release.yml/dispatches",
+            {"ref": "trunk", "inputs": {"train_run_id": "123", "artifact_id": "456"}},
+        )
+    ]
+
+
+def test_dispatch_missing_caller_names_template(forge, capsys):
+    forge.dispatch_status = 404
+    assert run_dispatch(dispatch_env(forge)) == 1
+    output = capsys.readouterr().out
+    assert ".github/workflows/merge-train-release.yml" in output
+    assert "default branch" in output
+    assert "templates/callers/merge-train-release.yml.tmpl" in output
+    assert len(forge.dispatches) == 1
+
+
+def test_dispatch_invalid_caller_keeps_forge_detail(forge, capsys):
+    forge.dispatch_status = 422
+    forge.dispatch_detail = "Unexpected inputs provided: train_run_id"
+    assert run_dispatch(dispatch_env(forge)) == 1
+    assert forge.dispatch_detail in capsys.readouterr().out
+    assert len(forge.dispatches) == 1
+
+
+def test_dispatch_server_error_is_never_retried(forge, capsys):
+    forge.dispatch_status = 500
+    assert run_dispatch(dispatch_env(forge)) == 1
+    assert "HTTP 500" in capsys.readouterr().out
+    assert len(forge.dispatches) == 1
+
+
+@pytest.mark.parametrize(
+    "command,key", [("dispatch", "RELEASE_WORKFLOW"), ("plan", "TRAIN_WORKFLOW")]
+)
+@pytest.mark.parametrize("name", ["", "a/b.yml", "../x.yml", ".x.yml", "x.txt", "x.yml\n"])
+def test_release_commands_refuse_workflow_names_before_requests(
+    tmp_path, forge, command, key, name
+):
+    env = dispatch_env(forge) if command == "dispatch" else plan_env(tmp_path, forge)
+    env[key] = name
+    assert (run_dispatch(env) if command == "dispatch" else run_plan(env)) == 1
+    assert forge.requests == [] and forge.dispatches == []
+
+
+@pytest.mark.parametrize("command", ["dispatch", "plan"])
+@pytest.mark.parametrize("run_id", ["", "01", "1a", "-1", "0", "١", "1\n"])
+def test_release_commands_refuse_run_ids_before_requests(tmp_path, forge, command, run_id):
+    env = dispatch_env(forge) if command == "dispatch" else plan_env(tmp_path, forge)
+    env["TRAIN_RUN_ID"] = run_id
+    assert (run_dispatch(env) if command == "dispatch" else run_plan(env)) == 1
+    assert forge.requests == [] and forge.dispatches == []
+
+
+@pytest.mark.parametrize("name", ["a.yml", "A_1-2.yaml", "x..y.yml"])
+def test_dispatch_accepts_workflow_filename_boundaries(forge, name):
+    env = dispatch_env(forge) | {"RELEASE_WORKFLOW": name}
+    assert run_dispatch(env) == 0
+    assert forge.dispatches[0][0].endswith(f"/{name}/dispatches")
+
+
+def test_plan_missing_identified_artifact_is_error(tmp_path, forge, capsys):
+    env = plan_env(tmp_path, forge) | {"ARTIFACT_ID": "456"}
+    assert run_plan(env) == 1
+    output = capsys.readouterr().out
+    assert "::error" in output and "456" in output
+    assert not Path(env["GITHUB_OUTPUT"]).exists()
+
+
+@pytest.mark.parametrize(
+    "command,artifact_id",
+    [
+        ("dispatch", ""),
+        ("dispatch", "01"),
+        ("plan", "01"),
+        ("dispatch", "0"),
+        ("dispatch", "١"),
+        ("plan", "1\n"),
+    ],
+)
+def test_artifact_id_refused_before_requests(tmp_path, forge, command, artifact_id):
+    env = dispatch_env(forge) if command == "dispatch" else plan_env(tmp_path, forge)
+    env["ARTIFACT_ID"] = artifact_id
+    assert (run_dispatch(env) if command == "dispatch" else run_plan(env)) == 1
+    assert forge.requests == [] and forge.dispatches == []
+
+
+def test_plan_identified_empty_list_is_valid(tmp_path, forge):
+    env = plan_env(tmp_path, forge, plan_payload([])) | {"ARTIFACT_ID": "1"}
+    assert run_plan(env) == 0
+    assert plan_output(env)["releases"] == "[]"
