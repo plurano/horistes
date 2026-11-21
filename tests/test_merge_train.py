@@ -2812,6 +2812,25 @@ def test_release_off_follows_a_moved_repository(tmp_path, entry, location):
     assert len(forge.revoked) == len(forge.minted)
 
 
+@pytest.mark.parametrize(
+    ("location", "path"),
+    [
+        ("{api}/repositories/9002", "/repositories/9002"),
+        ("{api}/repos/other/d", "/repos/other/d"),
+    ],
+)
+def test_release_off_follows_an_absolute_same_origin_redirect(tmp_path, location, path):
+    forge = release_forge()
+    forge.repository_moves["/repos/former/d"] = location
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release train off: other/d" in summary
+    assert (9, "/repos/former/d") in forge.repository_calls
+    assert (9, path) in forge.repository_calls
+    assert len(forge.revoked) == len(forge.minted)
+
+
 def test_release_off_exact_match_needs_no_repository_lookup(tmp_path):
     forge = Forge(repository(release=(True, True)))
     done, summary = train(tmp_path, forge, release_off="Fleet/App")
