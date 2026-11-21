@@ -4,6 +4,9 @@
 
 import re
 
+# Shared matrix bound for the sweep writer and the artifact reader (ADR-0098).
+MAX_RELEASES = 256
+
 KNOWN_RELEASE_WORKFLOWS = (
     "jellysin/release-helper/.github/workflows/release-please.yml@",
     "jellysin/release-helper/.github/workflows/release-please.yaml@",
@@ -14,6 +17,13 @@ ALLOWED_TRIGGERS = ("push", "workflow_dispatch", "schedule", "workflow_run")
 LOCAL_WORKFLOW_PREFIX = "./.github/workflows/"
 ACTION_STEP_RE = re.compile(r"^(?:-\s+)?uses:\s*[\"']?googleapis/release-please-action@")
 BLOCK_SCALAR_RE = re.compile(r":\s*[|>][-+0-9]*(?:\s*#.*)?$")
+
+
+def check_hold_labels(raw, error):
+    """Preserve hold labels only when bounded and safe for a single output line."""
+    if len(raw) > 4096 or "\n" in raw or "\r" in raw:
+        raise error("hold_labels must be a single line of at most 4096 characters")
+    return raw
 
 
 def is_literal_false(val):

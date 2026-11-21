@@ -1,0 +1,227 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+name: Merge train releases
+
+on:
+  workflow_call:
+    inputs:
+      train_run_id:
+        description: Train run whose release list is read.
+        type: string
+        required: true
+      artifact_id:
+        description: Set by the train; empty for a request by hand.
+        type: string
+        required: false
+        default: ""
+      train_workflow:
+        description: File name of the train caller under .github/workflows.
+        type: string
+        required: false
+        default: merge-train.yml
+      runner:
+        description: Runner label for planning and release legs; needs python3.
+        type: string
+        required: true
+      app_client_id:
+        description: Client id of the merge-train app.
+        type: string
+        required: true
+      release_max_parallel:
+        description: Release jobs that run at once, a whole number from 1 to 3.
+        type: number
+        required: false
+        default: 3
+    secrets:
+      app_private_key:
+        description: Private key of the merge-train app.
+        required: true
+
+permissions: {}
+
+jobs:
+  plan:
+    name: Plan release legs
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      actions: read # reads the train run and downloads its release list artifact
+    outputs:
+      releases: ${{ steps.plan.outputs.releases }}
+      hold_labels: ${{ steps.plan.outputs.hold_labels }}
+    steps:
+      - name: Check out the release labels module
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: merge-train-source
+          persist-credentials: false
+          sparse-checkout: |
+            tools/release_labels.py
+            tools/release_plan.py
+            tools/release_workflows.py
+          sparse-checkout-cone-mode: false
+
+      - name: Read the identified release list
+        if: ${{ inputs.artifact_id != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/merge-train-plan
+          run-id: ${{ inputs.train_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      # A manual request without an artifact id keeps the absent-list no-op.
+      - name: Read the train run's release list
+        if: ${{ inputs.artifact_id == '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: merge-train-releases
+          merge-multiple: true
+          path: ${{ runner.temp }}/merge-train-plan
+          run-id: ${{ inputs.train_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Validate the release plan
+        id: plan
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRAIN_RUN_ID: ${{ inputs.train_run_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          TRAIN_WORKFLOW: ${{ inputs.train_workflow }}
+          REPOSITORY: ${{ github.repository }}
+          MAX_PARALLEL: ${{ inputs.release_max_parallel }}
+          FILE: ${{ runner.temp }}/merge-train-plan/merge-train-releases.json
+        run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_plan.py" plan
+
+  release:
+    # release-please in every repository the sweep found with
+    # release-please-config.json and .release-please-manifest.json on its
+    # default branch, with a token of the app limited to that repository. Events
+    # the app's token causes start workflow runs, so the release pull request
+    # gets its required checks and a release starts the repository's
+    # `release: published` workflows; with GITHUB_TOKEN neither happens.
+    #
+    # The job splits release creation and release pull request updates into
+    # separate steps (decision records 0031, 0040): repositories that write
+    # their own releases (or run release-please action or reusable workflow
+    # themselves, treated as skip-github-release) skip release creation and
+    # have their labels moved once the tag is on the merge commit, while a
+    # pre-existing release is verified and accepted if already complete.
+    # Settings and label handling live in tools/release_labels.py, checked out
+    # from this workflow's own commit (decision record 0096).
+    name: Release pull request and release
+    needs: plan
+    if: >-
+      ${{ !cancelled() && needs.plan.outputs.releases != ''
+      && needs.plan.outputs.releases != '[]' }}
+    runs-on: ${{ inputs.runner }}
+    environment: merge-train
+    timeout-minutes: 15
+    permissions: {}
+    # One leg per repository across runs. A newer pending leg replaces an older
+    # pending leg (cancelled); release-please reads the default branch afresh,
+    # so the newer leg covers the replaced one.
+    concurrency:
+      group: >-
+        horistes-merge-train-release-${{ inputs.app_client_id }}:${{
+        matrix.repository.owner }}/${{ matrix.repository.name }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.release_max_parallel }}
+      matrix:
+        repository: ${{ fromJSON(needs.plan.outputs.releases) }}
+    steps:
+      - name: Mint a token for this repository alone
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app_client_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ matrix.repository.owner }}
+          repositories: ${{ matrix.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      # Both tools/release_labels.py and tools/release_workflows.py come from this
+      # workflow's own commit; modules leave room below the field cap (ADR-0053, ADR-0096).
+      # The job's token has no permission; the repository is public, so this
+      # sparse checkout needs none.
+      - name: Check out the release labels module
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: merge-train-source
+          persist-credentials: false
+          sparse-checkout: |
+            tools/release_labels.py
+            tools/release_workflows.py
+          sparse-checkout-cone-mode: false
+
+      - name: Read the release settings
+        id: settings
+        shell: bash
+        env:
+          TOKEN: ${{ steps.token.outputs.token }}
+          REPO: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          HOLD_LABELS: ${{ needs.plan.outputs.hold_labels }}
+        run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py" settings
+
+      - name: Create the releases of merged release pull requests
+        id: release
+        if: steps.settings.outputs.skip == 'false'
+        continue-on-error: true
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.token.outputs.token }}
+          repo-url: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      - name: Move the labels, or judge a failed release run
+        shell: bash
+        env:
+          TOKEN: ${{ steps.token.outputs.token }}
+          REPO: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          SKIP: ${{ steps.settings.outputs.skip }}
+          OUTCOME: ${{ steps.release.outcome }}
+          PENDING: ${{ steps.settings.outputs.pending }}
+        run: python3 "$GITHUB_WORKSPACE/merge-train-source/tools/release_labels.py" after
+
+      # A forge Server Error fails the first attempt (record 0080); the second one judges.
+      - name: Open or update the release pull request
+        id: release-pr
+        if: steps.settings.outputs.frozen == 'false'
+        continue-on-error: true
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.token.outputs.token }}
+          repo-url: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      - name: Wait before the second release pull request attempt
+        if: steps.release-pr.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+
+      - name: Open or update the release pull request, second attempt
+        if: steps.release-pr.outcome == 'failure'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.token.outputs.token }}
+          repo-url: ${{ matrix.repository.owner }}/${{ matrix.repository.name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
