@@ -4217,6 +4217,59 @@ def test_unsigned_dependency_update_switch_off_reports_would_ask(tmp_path, state
     assert f"| #1 | {state} | {WOULD_ASK_NOTE} |" in summary
 
 
+LINE_SEP = "\u2028"
+DEP_SUBJECT_CO_AUTHOR_COMMITS = [
+    (
+        (
+            f"chore(deps): update foo to v2{LINE_SEP}"
+            "Co-authored-by: Bot <bot@example.org>\n\n"
+            "Signed-off-by: Dev <dev@example.org>"
+        ),
+        1,
+    ),
+    ("chore(deps): follow up\n\nSigned-off-by: Dev <dev@example.org>", 1),
+]
+CO_AUTHOR_SQUASH_REFUSAL = "fleet/app: #1: squash message holds a Co-authored-by line"
+
+
+@pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
+def test_switch_off_signed_dependency_co_authored_subject_refused(tmp_path, state):
+    forge = Forge(repository(unsigned_dep_pull(1, state)))
+    forge.commits[1] = list(DEP_SUBJECT_CO_AUTHOR_COMMITS)
+    done, summary = train(tmp_path, forge, min_age_days="0", switch="off")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert CO_AUTHOR_SQUASH_REFUSAL in summary
+    assert "Traceback" not in done.stdout + done.stderr
+
+
+def test_signed_dependency_switch_off_without_co_author_subject_reports_no_note(tmp_path):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [(RENOVATE_SIGNOFF, 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0", switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert WOULD_ASK_NOTE not in summary
+    assert CO_AUTHOR_SQUASH_REFUSAL not in summary
+
+
+def test_planted_dependency_unsigned_note_without_value_error_refusal(tmp_path):
+    kept = "        return unsigned_update_note(env, conf, pull, read_head)\n"
+    needle = kept + (
+        "    except ValueError as err:\n"
+        "        raise RefusedError(f\"#{pull['number']}: {err}\") from err\n"
+    )
+    assert script().count(needle) == 1
+    flow = script().replace(needle, kept)
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = list(DEP_SUBJECT_CO_AUTHOR_COMMITS)
+    done, summary = train(tmp_path, forge, flow, min_age_days="0", switch="off")
+    assert CO_AUTHOR_SQUASH_REFUSAL not in summary
+    out = done.stdout + done.stderr
+    assert "Traceback" in out
+    assert "ValueError: squash message holds a Co-authored-by line" in out
+
+
 def test_switch_off_linear_history_behind_unsigned_update_reports_no_ask(tmp_path):
     forge = Forge(
         repository(

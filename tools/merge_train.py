@@ -924,6 +924,8 @@ def dependency_unsigned_note(env, conf, pull):
         squash_message(pull["title"], pull["number"], messages)
     except NoSignOffError:
         return unsigned_update_note(env, conf, pull, read_head)
+    except ValueError as err:
+        raise RefusedError(f"#{pull['number']}: {err}") from err
     return None
 
 
