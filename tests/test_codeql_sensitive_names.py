@@ -7,7 +7,8 @@ Workflow secret names logged through a dict lookup or helper function raised ale
 `semmle/python/dataflow/new/SensitiveDataSources.qll` (`SensitiveSubscript`, `SensitiveGetCall`,
 `SensitiveFunctionCall`, `SensitiveAttributeAccess`, `SensitiveVariableAssignment` and
 `SensitiveParameter`) to keep all seven scanned source kinds (`subscript`, `get`, `function`,
-`call`, `attribute`, `assign` and `parameter`) out of `tools/*.py` before CI.
+`call`, `attribute`, `assign` and `parameter`) out of `tools/*.py` before CI; `assign` mirrors
+`Flow.qll` `assigned_value` plus `with ... as <Name>`, measured against CodeQL.
 """
 
 from __future__ import annotations
@@ -112,10 +113,76 @@ def _attribute_names(node: ast.AST) -> list[tuple[int, str, str]]:
     return []
 
 
+_NAME_TARGET_NODES = (
+    ast.AugAssign,
+    ast.NamedExpr,
+    ast.For,
+    ast.AsyncFor,
+    ast.comprehension,
+)
+
+
+def _paired_assign_names(node: ast.Assign) -> list[tuple[int, str, str]]:
+    """Index-paired Name targets from an `ast.Assign` statement, without recursion."""
+    found: list[tuple[int, str, str]] = []
+    stack: list[tuple[ast.expr, ast.expr]] = [
+        (target, node.value) for target in reversed(node.targets)
+    ]
+    for _ in range(len(list(ast.walk(node)))):
+        if not stack:
+            break
+        target, value = stack.pop()
+        if isinstance(target, ast.Name):
+            found.append((target.lineno, "assign", target.id))
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
+            stack.extend(reversed(list(zip(target.elts, value.elts, strict=False))))
+    return found
+
+
+def _with_assign_names(node: ast.With | ast.AsyncWith) -> list[tuple[int, str, str]]:
+    """Bare-Name `as` bindings in a `with` or `async with` statement."""
+    return [
+        (item.optional_vars.lineno, "assign", item.optional_vars.id)
+        for item in node.items
+        if isinstance(item.optional_vars, ast.Name)
+    ]
+
+
+def _import_assign_names(node: ast.AST) -> list[tuple[int, str, str]]:
+    """Local bindings introduced by `import` and `from ... import ... as ...`."""
+    if isinstance(node, ast.Import):
+        return [
+            (alias.lineno, "assign", alias.asname or alias.name.partition(".")[0])
+            for alias in node.names
+        ]
+    if isinstance(node, ast.ImportFrom):
+        return [
+            (alias.lineno, "assign", alias.asname)
+            for alias in node.names
+            if alias.asname is not None
+        ]
+    return []
+
+
+def _single_assign_target(node: ast.AST) -> ast.Name | None:
+    """Bound `ast.Name` for single-target assignment, walrus or loop constructs."""
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return node.target if isinstance(node.target, ast.Name) else None
+    if isinstance(node, _NAME_TARGET_NODES) and isinstance(node.target, ast.Name):
+        return node.target
+    return None
+
+
 def _assign_names(node: ast.AST) -> list[tuple[int, str, str]]:
-    """SensitiveVariableAssignment: store-context variable name."""
-    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-        return [(node.lineno, "assign", node.id)]
+    """SensitiveVariableAssignment: `assigned_value` bindings plus `with ... as <Name>`."""
+    if isinstance(node, ast.Assign):
+        return _paired_assign_names(node)
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return _with_assign_names(node)
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return _import_assign_names(node)
+    if (target := _single_assign_target(node)) is not None:
+        return [(target.lineno, "assign", target.id)]
     return []
 
 
@@ -147,8 +214,9 @@ def scan_sensitive_names(source: str):
 
     Covers `subscript` (`SensitiveSubscript`), `get` (`SensitiveGetCall`), `function` and `call`
     (`SensitiveFunctionCall`), `attribute` (`SensitiveAttributeAccess`: attribute load,
-    `from ... import` member and literal `getattr`), `assign` (`SensitiveVariableAssignment`)
-    and `parameter` (`SensitiveParameter`).
+    `from ... import` member and literal `getattr`), `assign` (`SensitiveVariableAssignment`:
+    `assigned_value` plus `with ... as <Name>`, measured against CodeQL) and `parameter`
+    (`SensitiveParameter`).
     """
     for node in ast.walk(ast.parse(source)):
         for line, kind, text in _node_candidates(node):
@@ -160,8 +228,9 @@ def test_tools_hold_no_sensitive_lookup_keys_or_function_names() -> None:
     """Every tools/*.py file scans to zero findings across all covered CodeQL source kinds.
 
     Covers SensitiveSubscript, SensitiveGetCall, SensitiveFunctionCall, SensitiveAttributeAccess,
-    SensitiveVariableAssignment and SensitiveParameter (`subscript`, `get`, `function`, `call`,
-    `attribute`, `assign` and `parameter`).
+    SensitiveVariableAssignment (`assigned_value` plus `with ... as <Name>`, measured against
+    CodeQL) and SensitiveParameter (`subscript`, `get`, `function`, `call`, `attribute`, `assign`
+    and `parameter`).
     """
     findings = [
         f"{path.relative_to(ROOT).as_posix()}:{line} {kind} {text}"
@@ -179,17 +248,35 @@ def test_tools_hold_no_sensitive_lookup_keys_or_function_names() -> None:
         ("def _secret_problems(): pass", "function", "_secret_problems"),
         ('d.get("api_key")', "get", "api_key"),
         ('d["client_cert"]', "subscript", "client_cert"),
+        ('os.environ["SECRET"]', "subscript", "SECRET"),
         ("secret_value()", "call", "secret_value"),
         ("x.secrets", "attribute", "secrets"),
+        ("x.get_password()", "attribute", "get_password"),
         ("from m import api_key", "attribute", "api_key"),
+        ("from m import password as pw", "attribute", "password"),
         ('getattr(x, "password")', "attribute", "password"),
         ('getattr(x, "password", None)', "attribute", "password"),
+        ("import secrets", "assign", "secrets"),
+        ("import x as secret", "assign", "secret"),
+        ("from m import x as secret", "assign", "secret"),
+        ("import secret_box.a", "assign", "secret_box"),
+        ("import a as b, secret_box", "assign", "secret_box"),
         ("secret = 1", "assign", "secret"),
         ("secret += 1", "assign", "secret"),
         ("secret: int = 1", "assign", "secret"),
         ("(secret := 1)", "assign", "secret"),
+        ("a = secret = 1", "assign", "secret"),
+        ("[a, secret] = [1, 2]", "assign", "secret"),
+        ("(a, secret) = (1, 2)", "assign", "secret"),
+        ("a, (b, secret) = 1, (2, 3)", "assign", "secret"),
+        ("(secret) = 1", "assign", "secret"),
+        ("secret = lambda: 0", "assign", "secret"),
+        ("secret = None", "assign", "secret"),
         ("for secret in s: pass", "assign", "secret"),
+        ("[1 for secret in s]", "assign", "secret"),
+        ("[(secret := 1) for _ in s]", "assign", "secret"),
         ("with f() as secret: pass", "assign", "secret"),
+        ("with f() as secret, g() as b: pass", "assign", "secret"),
         ("def f(password): pass", "parameter", "password"),
         ("def f(password, /): pass", "parameter", "password"),
         ("def f(*, password): pass", "parameter", "password"),
@@ -203,9 +290,27 @@ def test_scanner_reports_planted_sensitive_sources(source: str, kind: str, text:
 
     Covers `subscript` (SensitiveSubscript), `get` (SensitiveGetCall), `function` and `call`
     (SensitiveFunctionCall), `attribute` (SensitiveAttributeAccess), `assign`
-    (SensitiveVariableAssignment) and `parameter` (SensitiveParameter).
+    (SensitiveVariableAssignment: `assigned_value` plus `with ... as <Name>`, measured against
+    CodeQL) and `parameter` (SensitiveParameter).
     """
     assert list(scan_sensitive_names(source)) == [(1, kind, text)]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("async def g():\n    async for secret in s: pass", [(2, "assign", "secret")]),
+        ("async def g():\n    async with f() as secret: pass", [(2, "assign", "secret")]),
+    ],
+)
+def test_scanner_reports_multiline_sensitive_sources(
+    source: str, expected: list[tuple[int, str, str]]
+) -> None:
+    """Multiline `assign` bindings (`assigned_value` plus `with ... as <Name>`).
+
+    Measured against CodeQL (`codeql/python-all` 7.2.10).
+    """
+    assert list(scan_sensitive_names(source)) == expected
 
 
 @pytest.mark.parametrize(
@@ -224,6 +329,24 @@ def test_scanner_reports_planted_sensitive_sources(source: str, kind: str, text:
         "def f(secret_path): pass",
         "x.is_secret",
         "x.secrets = 1",
+        # CodeQL (codeql/python-all 7.2.10) is the oracle: zero SensitiveDataSource findings here.
+        "with f() as (a, secret): pass",
+        "for secret, b in s: pass",
+        "for (a, secret) in s: pass",
+        "a, secret = f()",
+        "secret: int",
+        "a, *secret = 1, 2, 3",
+        "try:\n    pass\nexcept Exception as secret:\n    pass",
+        "match v:\n    case secret:\n        pass",
+        "match v:\n    case [*secret]:\n        pass",
+        'match v:\n    case {"k": 1, **secret}:\n        pass',
+        "import a.secret_box",
+        "a.secret = 1",
+        "f(password=1)",
+        '{"password": 1}',
+        'd.pop("password")',
+        "print(secret)",
+        "secret_obj.method()",
     ],
 )
 def test_scanner_ignores_excluded_and_non_lookup_names(source: str) -> None:
@@ -231,7 +354,7 @@ def test_scanner_ignores_excluded_and_non_lookup_names(source: str) -> None:
 
     Covers `NOT_SENSITIVE_REGEXP` exclusions plus non-sources of SensitiveSubscript,
     SensitiveGetCall, SensitiveFunctionCall, SensitiveAttributeAccess, SensitiveVariableAssignment
-    and SensitiveParameter.
+    (`assigned_value` plus `with ... as <Name>`, measured against CodeQL) and SensitiveParameter.
     """
     assert list(scan_sensitive_names(source)) == []
 
