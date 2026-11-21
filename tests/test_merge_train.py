@@ -7728,6 +7728,38 @@ def test_planted_sourcery_no_access_with_other_content_holds(tmp_path, body):
 
 
 @pytest.mark.parametrize(
+    "login",
+    ["-", "-person", "a" * 40],
+    ids=["hyphen", "leading-hyphen", "too-long"],
+)
+def test_planted_malformed_greeting_login_holds(tmp_path, login):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(601, "sourcery-ai", sourcery_no_access_notice(login))]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review body: sourcery-ai review 601 has findings" in summary
+
+
+@pytest.mark.parametrize(
+    "login",
+    ["a" * 39, "a" * 39 + "[bot]"],
+    ids=["max-length", "max-length-bot"],
+)
+def test_greeting_login_boundary_lands(tmp_path, login):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(601, "sourcery-ai[bot]", sourcery_no_access_notice(login))]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+@pytest.mark.parametrize(
     ("login", "body"),
     [
         (

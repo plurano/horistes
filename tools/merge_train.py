@@ -326,8 +326,12 @@ _SOURCERY_CLEAN_OPENERS = (
     "### Sourcery assessment",
 )
 _SOURCERY_ACCESS_SENTENCE = "Your private repo does not have access to Sourcery."
+# Forge login grammar: review_bots setting and the Sourcery greeting.
+LOGIN_PATTERN = r"[A-Za-z0-9][A-Za-z0-9-]{0,38}"
 _SOURCERY_NO_ACCESS_LINE = re.compile(
-    r"Hi @[A-Za-z0-9-]+(?:\[bot\])?! 👋|"
+    r"Hi @"
+    + LOGIN_PATTERN
+    + r"(?:\[bot\])?! 👋|"
     + re.escape(_SOURCERY_ACCESS_SENTENCE)
     + r"|Please \[upgrade\]\(https://app\.sourcery\.ai/dashboard/billing\?[^\s)]*\) "
     r"to continue using Sourcery ✨"
@@ -591,7 +595,7 @@ def check_review_bots(value):
         login = name.strip()
         if not login:
             continue
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?", login):
+        if not re.fullmatch(LOGIN_PATTERN + r"(\[bot\])?", login):
             raise InvalidSettingError(f"review_bots has invalid login {login!r}")
         logins.add(login.lower().removesuffix("[bot]"))
     return frozenset(logins)

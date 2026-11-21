@@ -77,10 +77,11 @@ No field or new constant is added to the inline rules module.
 
 After marker and unmet linked-issue checks, `_sourcery_finding()` accepts a
 no-access notice only when every non-blank line fully matches its greeting,
-exact access sentence, or exact upgrade sentence. The greeting accepts user
-logins and an optional `[bot]` suffix. The upgrade URL must start with
-`https://app.sourcery.ai/dashboard/billing?` and contain neither whitespace nor
-`)`. The access sentence must be present. Extra content retains the existing
+exact access sentence, or exact upgrade sentence. The greeting accepts the same
+forge login grammar as `review_bots`: one alphanumeric character then up to 38
+more alphanumerics or hyphens, with an optional `[bot]` suffix. The upgrade URL
+must start with `https://app.sourcery.ai/dashboard/billing?` and contain neither
+whitespace nor `)`. The access sentence must be present. Extra content retains the existing
 classification; review markers and unmet linked issues take precedence.
 
 ## Alternatives
@@ -117,6 +118,10 @@ classification; review markers and unmet linked issues take precedence.
   `test_planted_sourcery_no_access_with_other_content_holds`: both greeting
   forms land, while extra content, missing access text, and malformed URLs or
   logins hold. Existing clean-body and approval-pending cases remain covered.
+- `test_planted_malformed_greeting_login_holds` and
+  `test_greeting_login_boundary_lands`: a greeting login of a lone hyphen, a
+  leading hyphen or 40 characters holds; 39 characters, with and without
+  `[bot]`, land.
 
 The lane report records planted mutants for refusal routing, oversized pages,
 removed no-access recognition, and mutation errors misclassified as unread.
