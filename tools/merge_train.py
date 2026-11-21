@@ -278,6 +278,9 @@ SKIP_UNSIGNED_STILL = (
     "skipped: dependency update still without Signed-off-by after its update bot "
     "recreated it; that bot's config adds none"
 )
+SKIP_UNSIGNED_LABELS_INCOMPLETE = (
+    "skipped: dependency update without Signed-off-by, labels not fully read, no recreate asked"
+)
 SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its producer signs it"
 REGENERATION_REQUESTED_LABEL = "merge-train: regeneration requested"
 REVIEW_BODY = "review body: "
@@ -842,23 +845,45 @@ def is_bot(pull):
 
 def add_pull_labels(pull, *names):
     """Record labels on the in-memory pull request after a successful write."""
-    nodes = pull.setdefault("labels", {"nodes": []})["nodes"]
+    labels = pull.setdefault("labels", {"nodes": []})
+    nodes = labels["nodes"]
     present = {item["name"] for item in nodes}
+    added = 0
     for name in names:
         if name not in present:
             nodes.append({"name": name})
             present.add(name)
+            added += 1
+    total = labels.get("totalCount")
+    if added and isinstance(total, int):
+        labels["totalCount"] = total + added
+
+
+def labels_complete(pull):
+    """Whether the pull request's label connection was read without truncation."""
+    labels = pull.get("labels")
+    if not isinstance(labels, dict):
+        return False
+    total = labels.get("totalCount")
+    nodes = labels.get("nodes")
+    if isinstance(total, bool) or not isinstance(total, int):
+        return False
+    if not isinstance(nodes, list):
+        return False
+    return total == len(nodes)
 
 
 def unsigned_update_note(env, conf, pull):
     """The skip note for an unsigned dependency update; may ask the update bot once."""
     head = pull["headRefName"]
-    if head in conf["onboarding"] or not is_bot(pull) or not conf["regenerate"]:
+    if head in conf["onboarding"] or not is_bot_dependency(pull, conf) or not conf["regenerate"]:
         return SKIP_UNSIGNED
     names = set(label_names(pull))
     guard = REGENERATION_REQUESTED_LABEL
     regen = conf["regenerate"]
     if guard not in names:
+        if not labels_complete(pull):
+            return SKIP_UNSIGNED_LABELS_INCOMPLETE
         if conf["switch"] != "on":
             return SKIP_UNSIGNED_WOULD_ASK
         api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
@@ -887,11 +912,20 @@ def dependency_unsigned_note(env, conf, pull):
     return None
 
 
-def dry_note_unsigned_dependencies(env, conf, rows, notes):
+def dry_note_unsigned_dependencies(env, conf, repo, rows, notes):
     """When `switch` is off, report what the train would ask without forge writes."""
     for pull, reason in rows:
-        if reason not in ("land", "behind"):
+        if reason != "land":
             continue
+        note = dependency_unsigned_note(env, conf, pull)
+        if note:
+            notes[pull["number"]] = note
+    behind = [
+        (pull, reason)
+        for pull, reason in rows
+        if reason == "behind" and pull["headRefName"].startswith(conf["dependency"])
+    ]
+    for pull, _ in updatable(repo, behind, notes, conf):
         note = dependency_unsigned_note(env, conf, pull)
         if note:
             notes[pull["number"]] = note
@@ -2099,7 +2133,7 @@ def run(env, conf, repo, now, notes=None):
     rows = hold_review_bodies(env, conf, verdicts)
     notes.update({pull["number"]: reason for pull, reason in rows})
     if conf["switch"] == "off":
-        dry_note_unsigned_dependencies(env, conf, rows, notes)
+        dry_note_unsigned_dependencies(env, conf, repo, rows, notes)
         return rows, notes, "switched off: nothing landed or updated"
     # Taking auto-merge off a red pull request lands nothing, so it precedes the lease check.
     disarm_red_scanning(env, rows, notes, conf)

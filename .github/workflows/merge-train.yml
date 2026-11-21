@@ -838,7 +838,7 @@ jobs:
                   mergeStateStatus isInMergeQueue reviewDecision
                   author { login __typename }
                   autoMergeRequest { enabledAt commitHeadline mergeMethod }
-                  labels(first: 50) { nodes { name } }
+                  labels(first: 50) { totalCount nodes { name } }
                   opinions: reviews(last: 100, states: [APPROVED, CHANGES_REQUESTED]) {
                     totalCount nodes { submittedAt state author { login __typename } commit { oid } } }
                   reviews(last: 20) {

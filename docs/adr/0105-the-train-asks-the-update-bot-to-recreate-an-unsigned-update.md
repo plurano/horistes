@@ -45,12 +45,16 @@ requests on heads such as `renovate/configure` remain a person's act.
 - **`unsigned_update_note`.** On `NoSignOffError` for a dependency head,
   `signed_message` calls `unsigned_update_note` so every caller (`land`,
   `arm`, `enqueue`, `re_arm_after_review`) shares one path. Onboarding heads,
-  non-bot authors, or an empty `regenerate_label` keep the previous
+  heads that fail the ADR-0093 `is_bot_dependency` rule (including a person's
+  commit on the head), or an empty `regenerate_label` keep the previous
   `SKIP_UNSIGNED` note and write nothing. Otherwise:
-  - Guard absent: one POST of `[regenerate_label, guard]` when `switch` is `on`,
-    then the asked note; when `switch` is `off`, the `would ask` note and no
-    write. The guard is added to the in-memory pull so a second call in the
-    same sweep writes nothing.
+  - Guard absent with a complete label read (`totalCount` matches every
+    returned node): one POST of `[regenerate_label, guard]` when `switch` is
+    `on`, then the asked note; when `switch` is `off`, the `would ask` note and
+    no write. When the guard is absent but the label connection is incomplete,
+    the train records that the labels were not fully read and asks nothing.
+    The guard is added to the in-memory pull so a second call in the same sweep
+    writes nothing.
   - Guard present and `regenerate_label` still on the pull: the waiting note, no
     write.
   - Guard present and `regenerate_label` gone after the bot recreated the head,
@@ -59,6 +63,10 @@ requests on heads such as `renovate/configure` remain a person's act.
     guard remains.
   - A signed head lands as before; the train does not remove the guard label (it
     records the one request).
+  - When `switch` is `off`, `dry_note_unsigned_dependencies` still notes `land`
+    rows as before; for `behind` dependency heads it follows the same
+    `updatable` gate the live `advance` path uses, so a pull the train would not
+    update gets that skip note and no `would ask` note.
 
 - **Tests.** `tests/test_merge_train.py` covers ask, wait, still unsigned, land
   after sign-off, one label write per sweep
@@ -67,7 +75,14 @@ requests on heads such as `renovate/configure` remain a person's act.
   empty label, invalid setting, dry switch, next clean pull
   (`test_after_an_asked_unsigned_dependency_update_the_next_clean_pull_lands`),
   and a planted case without the guard check
-  (`test_planted_unsigned_regenerate_without_guard_check_relabels`). Onboarding
+  (`test_planted_unsigned_regenerate_without_guard_check_relabels`), a person
+  commit on the head (`test_planted_person_commit_on_bot_update_gets_no_recreate_ask`),
+  the bot-commit read bound (`test_bot_commit_count_boundary_for_recreate_ask`),
+  incomplete and complete label reads
+  (`test_planted_guard_beyond_label_page_gets_no_ask`,
+  `test_complete_label_read_of_fifty_asks_once`), and dry reporting behind
+  rows through `updatable`
+  (`test_switch_off_linear_history_behind_unsigned_update_reports_no_ask`). Onboarding
   tests on `renovate/configure` stay unchanged.
 
 ## Consequences

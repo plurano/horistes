@@ -275,7 +275,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "headRefOid": f"{number:040x}",
         "mergeStateStatus": state,
         "autoMergeRequest": None,
-        "labels": {"nodes": [{"name": name} for name in labels]},
+        "labels": {"totalCount": len(labels), "nodes": [{"name": name} for name in labels]},
         "reviews": review_nodes,
         "opinions": opinions,
         "refreshes": {"nodes": []},
@@ -4002,9 +4002,20 @@ WOULD_ASK_NOTE = (
 
 
 def unsigned_dep_pull(number: int, state: str, **fields) -> dict:
-    defaults = {"headRefName": "renovate/foo-2.x", "author": RENOVATE_BOT, "createdAt": OLD}
+    defaults = {
+        "headRefName": "renovate/foo-2.x",
+        "author": RENOVATE_BOT,
+        "createdAt": OLD,
+        "commit_authors": ["renovate[bot]"],
+    }
     defaults.update(fields)
     return pull(number, state, **defaults)
+
+
+LABELS_INCOMPLETE_NOTE = (
+    "skipped: dependency update without Signed-off-by, labels not fully read, no recreate asked"
+)
+SKIP_UNSIGNED_NOTE = "skipped: dependency update without Signed-off-by, a person lands it"
 
 
 @pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
@@ -4070,10 +4081,60 @@ def test_unsigned_dependency_update_by_a_person_still_skips_without_labels(tmp_p
     done, summary = train(tmp_path, forge, min_age_days="0")
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
-    assert (
-        "| #1 | CLEAN | skipped: dependency update without Signed-off-by, a person lands it |"
-        in summary
+    assert f"| #1 | CLEAN | {SKIP_UNSIGNED_NOTE} |" in summary
+
+
+def test_planted_person_commit_on_bot_update_gets_no_recreate_ask(tmp_path):
+    forge = Forge(
+        repository(unsigned_dep_pull(1, "CLEAN", commit_authors=["renovate[bot]", "person-name"]))
     )
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {SKIP_UNSIGNED_NOTE} |" in summary
+
+
+@pytest.mark.parametrize(
+    ("logins", "expect_write"),
+    [
+        pytest.param(["renovate[bot]"] * 50, True, id="fifty"),
+        pytest.param(["renovate[bot]"] * 51, False, id="fifty-one"),
+    ],
+)
+def test_bot_commit_count_boundary_for_recreate_ask(tmp_path, logins, expect_write):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", commit_authors=logins)))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    if expect_write:
+        assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL)]
+        assert f"| #1 | CLEAN | {ASKED_NOTE} |" in summary
+    else:
+        assert forge.writes == []
+        assert f"| #1 | CLEAN | {SKIP_UNSIGNED_NOTE} |" in summary
+
+
+def test_planted_guard_beyond_label_page_gets_no_ask(tmp_path):
+    labels = tuple(f"other-label-{i}" for i in range(50))
+    pull_node = unsigned_dep_pull(1, "CLEAN", labels=labels)
+    pull_node["labels"]["totalCount"] = 51
+    forge = Forge(repository(pull_node))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {LABELS_INCOMPLETE_NOTE} |" in summary
+
+
+def test_complete_label_read_of_fifty_asks_once(tmp_path):
+    labels = tuple(f"other-label-{i}" for i in range(50))
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", labels=labels)))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL)]
+    assert f"| #1 | CLEAN | {ASKED_NOTE} |" in summary
 
 
 def test_unsigned_dependency_update_with_regenerate_label_off_skips_without_labels(tmp_path):
@@ -4088,13 +4149,29 @@ def test_unsigned_dependency_update_with_regenerate_label_off_skips_without_labe
     )
 
 
-def test_unsigned_dependency_update_switch_off_reports_would_ask(tmp_path):
-    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+@pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
+def test_unsigned_dependency_update_switch_off_reports_would_ask(tmp_path, state):
+    forge = Forge(repository(unsigned_dep_pull(1, state)))
     forge.commits[1] = [("chore(deps): update foo to v2", 1)]
     done, summary = train(tmp_path, forge, min_age_days="0", switch="off")
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
-    assert f"| #1 | CLEAN | {WOULD_ASK_NOTE} |" in summary
+    assert f"| #1 | {state} | {WOULD_ASK_NOTE} |" in summary
+
+
+def test_switch_off_linear_history_behind_unsigned_update_reports_no_ask(tmp_path):
+    forge = Forge(
+        repository(
+            unsigned_dep_pull(1, "BEHIND"),
+            rules=("REQUIRED_LINEAR_HISTORY",),
+        )
+    )
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0", switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | BEHIND | behind: linear history, a person rebases |" in summary
+    assert WOULD_ASK_NOTE not in summary
 
 
 def test_after_an_asked_unsigned_dependency_update_the_next_clean_pull_lands(tmp_path):
