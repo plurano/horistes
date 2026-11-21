@@ -676,27 +676,28 @@ def transient(err):
     return isinstance(cause, (ConnectionError, TimeoutError, http.client.HTTPException))
 
 
-def call(url, token=None, method="POST", body=None, raw=False, redirect=True):
+def call(url, token=None, method="POST", body=None, raw=False, redirect=True, shown=None):
     """One request to the forge; a GET is tried again after a gateway error or a dropped
     connection, at most READ_ATTEMPTS times. Any other method runs once (record 0080)."""
     retries = READ_ATTEMPTS - 1 if method == "GET" else 0
     for _ in range(retries):
         try:
-            return request_once(url, token, method, body, raw, redirect)
+            return request_once(url, token, method, body, raw, redirect, shown)
         except RefusedError as err:
             if not transient(err):
                 raise
         time.sleep(READ_BACKOFF_SECONDS)
     try:
-        return request_once(url, token, method, body, raw, redirect)
+        return request_once(url, token, method, body, raw, redirect, shown)
     except RefusedError as err:
         if method == "GET" and transient(err):
             raise UnreadError(str(err)) from err.__cause__
         raise
 
 
-def request_once(url, token, method, body, raw, redirect):
+def request_once(url, token, method, body, raw, redirect, shown=None):
     """One request to the forge; the parsed answer, or RefusedError with what it said."""
+    label = shown or url
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, method=method)
     if token:
@@ -708,13 +709,13 @@ def request_once(url, token, method, body, raw, redirect):
         with opener.open(request, timeout=TIMEOUT) as answer:
             content = answer.read(MAX_ARTIFACT_BYTES + 1)
             if len(content) > MAX_ARTIFACT_BYTES:
-                raise RefusedError(f"{method} {url}: response exceeds {MAX_ARTIFACT_BYTES} bytes")
+                raise RefusedError(f"{method} {label}: response exceeds {MAX_ARTIFACT_BYTES} bytes")
             # read(amt) returns a short body without error if the peer closes early.
             length = answer.headers.get("Content-Length", "")
             if length.isdigit() and len(content) != int(length):
                 # The cause makes a cut body transient: a read is tried again, a write is not.
                 cut = http.client.IncompleteRead(content, int(length) - len(content))
-                message = f"{method} {url}: body cut: {len(content)} of {length} bytes"
+                message = f"{method} {label}: body cut: {len(content)} of {length} bytes"
                 raise RefusedError(message) from cut
             if raw:
                 return content
@@ -724,12 +725,12 @@ def request_once(url, token, method, body, raw, redirect):
             if not redirect and err.code in (301, 302, 303, 307, 308):
                 loc = err.headers.get("Location")
                 return {"location": urllib.parse.urljoin(url, loc) if loc else ""}
-            raise RefusedError(f"{method} {url}: HTTP {err.code} {error_text(err)}") from err
+            raise RefusedError(f"{method} {label}: HTTP {err.code} {error_text(err)}") from err
         finally:
             err.close()
     except (OSError, http.client.HTTPException) as err:
         # URLError, timeouts and dropped connections (RemoteDisconnected) refuse this call only.
-        raise RefusedError(f"{method} {url}: {type(err).__name__}: {err}") from err
+        raise RefusedError(f"{method} {label}: {type(err).__name__}: {err}") from err
     return json.loads(text) if text else {}
 
 
@@ -1132,7 +1133,7 @@ def download_artifact(env, art):
         raise RefusedError(
             f"GET {url}: storage URL scheme {storage_scheme!r} != {expected_scheme!r}"
         )
-    return call(storage_url, None, "GET", raw=True)
+    return call(storage_url, None, "GET", raw=True, shown=f"artifact storage for {url}")
 
 
 def check_zip_members(repo, num, zf):

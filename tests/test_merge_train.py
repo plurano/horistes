@@ -3498,6 +3498,26 @@ def test_negative_artifact_size_above_bound(tmp_path):
     assert "response exceeds" in summary
 
 
+PLANTED_STORAGE_QUERY = "sig=planted-storage-signature&se=2099-01-01"
+
+
+def _read_attempts() -> int:
+    match = re.search(r"^READ_ATTEMPTS = (\d+)", script(), re.M)
+    assert match, "READ_ATTEMPTS missing from merge train script"
+    return int(match.group(1))
+
+
+def planted_storage_forge(*, cut: bool = True, storage: bool = True) -> Forge:
+    """The cut-artifact pull with a signed storage Location; optionally whole or missing bytes."""
+    forge = cut_artifact_forge()
+    if not cut:
+        del forge.storage_cut[101]
+    forge.artifact_redirect_locations[101] = f"/storage/101?{PLANTED_STORAGE_QUERY}"
+    if not storage:
+        del forge.storage[101]
+    return forge
+
+
 def cut_artifact_forge():
     """A dependency pull whose artifact body the storage cuts in half under the full length."""
     head = f"{1:040x}"
@@ -3524,6 +3544,47 @@ def test_cut_artifact_body_fails_by_name(tmp_path):
     assert not any(w[0] == "commit" for w in forge.writes)
     assert "generated files refused:" in summary
     assert "body cut:" in summary
+
+
+def test_exhausted_storage_read_names_artifact_not_signed_url(tmp_path):
+    """Exhausted storage reads name the artifact API URL, not the signed storage query."""
+    forge = planted_storage_forge()
+    attempts = _read_attempts()
+    done, summary = train(tmp_path, forge)
+    secret = "planted-storage-signature"
+    assert secret not in done.stdout
+    assert secret not in done.stderr
+    assert secret not in summary
+    warn = "::warning title=Merge train not read::"
+    assert warn in done.stdout
+    warning = next(line for line in done.stdout.splitlines() if line.startswith(warn))
+    assert "fleet/app" in warning
+    assert "artifact storage for" in warning
+    assert "/actions/artifacts/101/zip" in warning
+    assert forge.storage_reads == [101] * attempts
+
+
+def test_refused_storage_read_names_artifact_not_signed_url(tmp_path):
+    """A non-transient missing storage body names the artifact, not the signed storage query."""
+    forge = planted_storage_forge(cut=False, storage=False)
+    done, summary = train(tmp_path, forge)
+    secret = "planted-storage-signature"
+    assert secret not in done.stdout
+    assert secret not in done.stderr
+    assert secret not in summary
+    assert "generated files refused:" in summary
+    assert "artifact storage for" in summary
+    assert forge.storage_reads == [101]
+
+
+def test_storage_download_still_reaches_signed_url(tmp_path):
+    """The storage GET still follows the signed Location when the body is whole."""
+    forge = planted_storage_forge(cut=False)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert any(w[0] == "commit" for w in forge.writes)
+    assert "planted-storage-signature" not in summary
+    assert forge.storage_reads == [101]
 
 
 def test_without_the_length_check_the_cut_is_not_named(tmp_path):
