@@ -110,8 +110,12 @@ def test_matrix_job_bound(count):
 
 def test_yaml_text_reader_has_one_safe_load_site():
     needle = "yaml" + ".load("
+    reader = "StrictLoader" + "(text)"
     assert needle not in (ROOT / "tests/train_timeline.py").read_text()
-    assert (ROOT / "tools/ciwf.py").read_text().count(needle) == 1
+    assert reader not in (ROOT / "tests/train_timeline.py").read_text()
+    source = (ROOT / "tools/ciwf.py").read_text()
+    assert needle not in source
+    assert source.count(reader) == 1
     assert ciwf.loads("on: true", "fixture") == {"on": True}
     for text in ("[]", "a: 1\na: 2", "!!python/object:bad {}"):
         with pytest.raises(ciwf.ReadError, match="fixture"):
