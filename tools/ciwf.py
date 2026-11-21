@@ -90,10 +90,13 @@ def complain(line: str) -> None:
 
 def loads(text: str, origin: object) -> dict:
     """Read strict YAML text, naming its origin in every diagnostic."""
+    loader = StrictLoader(text)
     try:
-        doc = yaml.load(text, Loader=StrictLoader)
+        doc = loader.get_single_data()
     except yaml.YAMLError as err:
         raise ReadError(f"{origin}: {err}") from err
+    finally:
+        loader.dispose()
     if not isinstance(doc, dict):
         raise ReadError(f"{origin}: not a mapping")
     return doc

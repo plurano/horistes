@@ -2283,7 +2283,7 @@ def test_check_hold_labels(raw, valid, error):
     else:
         with pytest.raises(error, match="hold_labels") as caught:
             check_hold_labels(raw, error)
-        assert type(caught.value) is error
+        assert caught.type is error
 
 
 def test_plan_accepts_failed_sweep(tmp_path, forge):
