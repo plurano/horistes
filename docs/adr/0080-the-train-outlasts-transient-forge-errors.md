@@ -8,6 +8,7 @@ SPDX-License-Identifier: EUPL-1.2
 - **Status**: Accepted
 - **Date**: 2026-11-12
 - **Authors**: Lusoris
+- Amended by [ADR-0101](0101-a-failed-read-leaves-the-sweep-green.md): exhausted transient reads warn.
 
 ## Context
 

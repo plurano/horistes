@@ -8,6 +8,7 @@ SPDX-License-Identifier: EUPL-1.2
 - **Status**: Accepted (amends [ADR-0067](0067-the-train-settles-reviews-before-landing.md))
 - **Date**: 2026-11-09
 - **Authors**: Lusoris
+- Amended by [ADR-0101](0101-a-failed-read-leaves-the-sweep-green.md): Sourcery no-access notices are not findings.
 
 ## Context
 
