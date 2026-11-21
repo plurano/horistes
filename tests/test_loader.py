@@ -27,6 +27,12 @@ def test_python_object_tag_raises_read_error():
         ciwf.loads(text, "origin.yml")
 
 
+def test_unprintable_character_raises_read_error():
+    with pytest.raises(ciwf.ReadError, match="origin.yml") as exc_info:
+        ciwf.loads("key: \x07\n", "origin.yml")
+    assert "unacceptable character" in str(exc_info.value)
+
+
 def test_duplicate_key_is_refused(tree):
     doubled = REUSABLE.replace(
         "permissions:\n  contents: read\n",
