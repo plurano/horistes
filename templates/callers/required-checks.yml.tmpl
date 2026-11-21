@@ -1,0 +1,88 @@
+<%- /*
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+
+Caller of the shared required-checks judge, as a consumer keeps it in
+.github/workflows/required-checks.yml. Required check: "Required checks".
+The forge reports the call as "Required checks / Required checks"; result
+reports "Required checks" and fails unless the call passed (decision record
+0030, decision record 0108).
+
+Set `required` to the JSON list of every check run and commit-status context
+that gates merges in the consumer repository; pass `pull-request-only`,
+`not-owed` and `apps` where the consumer has pull-request-scoped checks,
+event-excluded checks or non-Actions check producers.
+
+The shared repository, commit and version come from .Shared; the runner
+comes from .RunnerTag. The consumer's own licence header comes from .Licence.
+Concurrency belongs to the caller, so separate consumers do not collide;
+push and merge-group runs key by SHA without cancelling in-progress runs.
+*/ -%>
+# SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>
+---
+# Required checks: wait for and verify every owed check and status on the commit.
+# The job is the shared workflow of <% .Shared.Repository %>, named by commit.
+name: Required checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: required-checks-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # On a draft the required-checks call is skipped and spends no runner; the
+  # result job still takes one runner briefly to report the draft; the check
+  # turns red again when a ready pull request is converted to a draft.
+  required-checks:
+    name: Required checks
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.draft == false
+    permissions:
+      contents: read # checks out the required-checks judge at its pinned commit
+      checks: read # lists check runs on the target commit
+      statuses: read # lists commit statuses on the target commit
+      actions: read # lists workflow runs on the target commit to exclude foreign events
+    uses: <% .Shared.Repository %>/.github/workflows/required-checks.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      runner: <% .RunnerTag %>
+      required: '["Licence", "Secret scan", "Sign-off", "Workflow check"]'
+
+  # The forge reports the calling job above only as
+  # "Required checks / Required checks", never as "Required checks", so a rule
+  # set that requires "Required checks" waits forever. This job reports
+  # "Required checks" and fails unless the call passed; it runs under always()
+  # so a failed, cancelled or skipped check still reports here.
+  result:
+    name: Required checks
+    needs: required-checks
+    if: always()
+    runs-on: <% .RunnerTag %>
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Report the draft
+        if: needs.required-checks.result == 'skipped'
+        shell: bash
+        run: >
+          echo "::error title=Gate not run on a draft::The gate did not run
+          because the pull request is a draft.
+          It runs when the pull request is marked ready for review."
+
+          exit 1
+      - name: Fail unless the required checks passed
+        if: needs.required-checks.result != 'success'
+        shell: bash
+        run: |
+          echo "The required checks did not pass or were skipped on a draft."
+          exit 1

@@ -329,8 +329,13 @@ def test_caller_passing_pinned_runner_is_accepted_and_floating_label_is_refused(
             "templates/callers/sign-off.yml.tmpl",
             ".github/workflows/sign-off-check.yml",
         ),
+        (
+            ".github/workflows/required-checks.yml",
+            "templates/callers/required-checks.yml.tmpl",
+            ".github/workflows/required-checks-caller.yml",
+        ),
     ],
-    ids=["licence", "workflow-check", "sign-off"],
+    ids=["licence", "workflow-check", "sign-off", "required-checks"],
 )
 def test_caller_without_runner_input_relies_on_pinned_workflow_default(
     tree, workflow_file: str, template_file: str, caller_file: str
@@ -346,7 +351,12 @@ def test_caller_without_runner_input_relies_on_pinned_workflow_default(
     # A caller omitting the runner input passes while the workflow default is pinned.
     tmpl = (ROOT / template_file).read_text(encoding="utf-8")
     caller = render.render(tmpl, render.SAMPLE, template_file)
-    without_runner = caller.replace(f"    with:\n      runner: {default}\n", "")
+    only_runner = f"    with:\n      runner: {default}\n"
+    without_runner = (
+        caller.replace(f"      runner: {default}\n", "")
+        if f"{only_runner}      " in caller
+        else caller.replace(only_runner, "")
+    )
     assert without_runner != caller
     workflow_text = workflow_path.read_text(encoding="utf-8")
     tree.write(

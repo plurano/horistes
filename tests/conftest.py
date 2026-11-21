@@ -35,6 +35,7 @@ CALLER_TEMPLATES: dict[str, str] = {
     "templates/callers/merge-train-release.yml.tmpl": ".github/workflows/merge-train-release.yml",
     "templates/callers/merge-train.yml.tmpl": ".github/workflows/merge-train.yml",
     "templates/callers/release-please.yml.tmpl": ".github/workflows/release-please.yml",
+    "templates/callers/required-checks.yml.tmpl": ".github/workflows/required-checks.yml",
     "templates/callers/scorecard.yml.tmpl": ".github/workflows/scorecard-check.yml",
     "templates/callers/secret-scan.yml.tmpl": ".github/workflows/secret-scan.yml",
     "templates/callers/sign-off.yml.tmpl": ".github/workflows/sign-off-check.yml",
@@ -137,7 +138,8 @@ forge = ["github.com", "api.github.com", "ghcr.io"]
 
 # A stand-in for the forge's command-line client. It answers GET requests from
 # a file of canned answers, records every call, and serves nothing else. An
-# answer {"hex": ...} is served as those bytes, the way an archive comes.
+# answer {"hex": ...} is served as those bytes, the way an archive comes; `--include`
+# wraps answers with HTTP status and headers and supports stateful `sequence` lists.
 FAKE_CLIENT = """\
 import json
 import os
@@ -145,25 +147,69 @@ import sys
 
 HEAD = ["api", "-H", "Accept: application/vnd.github+json"]
 HEAD += ["-H", "X-GitHub-Api-Version: 2022-11-28"]
+INCLUDE_HEAD = ["api", "--include", *HEAD[1:]]
 args = sys.argv[1:]
 with open(os.environ["FAKE_FORGE_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps(args) + "\\n")
-if args[:5] != HEAD or len(args) != 6:
+if len(args) == 6 and args[:5] == HEAD:
+    include, endpoint = False, args[5]
+elif len(args) == 7 and args[:6] == INCLUDE_HEAD:
+    include, endpoint = True, args[6]
+else:
     sys.stderr.write("fake forge: only GET requests through `api` are served\\n")
     sys.exit(2)
-with open(os.environ["FAKE_FORGE"], encoding="utf-8") as source:
-    answer = json.load(source).get(args[5])
+forge_path = os.environ["FAKE_FORGE"]
+with open(forge_path, encoding="utf-8") as source:
+    answer = json.load(source).get(endpoint)
+if isinstance(answer, dict) and list(answer) == ["sequence"]:
+    state_path = forge_path + ".state"
+    counts = {}
+    if os.path.exists(state_path):
+        with open(state_path, encoding="utf-8") as state_in:
+            counts = json.load(state_in)
+    idx = counts.get(endpoint, 0)
+    counts[endpoint] = idx + 1
+    with open(state_path, "w", encoding="utf-8") as state_out:
+        json.dump(counts, state_out)
+    seq = answer["sequence"]
+    answer = seq[idx] if idx < len(seq) else seq[-1]
+if not include:
+    if answer is None:
+        sys.stderr.write("gh: Not Found (HTTP 404)\\n")
+        sys.exit(1)
+    if isinstance(answer, dict) and list(answer) == ["fail"]:
+        sys.stderr.write(answer["fail"] + "\\n")
+        sys.exit(1)
+    if isinstance(answer, dict) and list(answer) == ["hex"]:
+        sys.stdout.buffer.write(bytes.fromhex(answer["hex"]))
+        sys.exit(0)
+    sys.stdout.write(answer["raw"] if isinstance(answer, dict) and list(answer) == ["raw"]
+                     else json.dumps(answer))
+    sys.exit(0)
 if answer is None:
+    sys.stdout.write('HTTP/2.0 404 Not Found\\r\\n\\r\\n{"message":"Not Found"}')
     sys.stderr.write("gh: Not Found (HTTP 404)\\n")
     sys.exit(1)
+if isinstance(answer, dict) and "raw_include" in answer:
+    sys.stdout.write(answer["raw_include"])
+    if answer.get("stderr"):
+        sys.stderr.write(answer["stderr"] + "\\n")
+    sys.exit(int(answer.get("exit", 0)))
+if isinstance(answer, dict) and "http" in answer:
+    status = int(answer["http"])
+    hdrs = "".join(f"{k}: {v}\\r\\n" for k, v in (answer.get("headers") or {}).items())
+    body = answer["raw_body"] if "raw_body" in answer else json.dumps(answer.get("body", {}))
+    sys.stdout.write(f"HTTP/2.0 {status} Status\\r\\n{hdrs}\\r\\n{body}")
+    if answer.get("stderr"):
+        sys.stderr.write(answer["stderr"] + "\\n")
+    elif status >= 400:
+        sys.stderr.write(f"gh: HTTP {status}\\n")
+    sys.exit(0 if 200 <= status < 300 else 1)
 if isinstance(answer, dict) and list(answer) == ["fail"]:
     sys.stderr.write(answer["fail"] + "\\n")
     sys.exit(1)
-if isinstance(answer, dict) and list(answer) == ["hex"]:
-    sys.stdout.buffer.write(bytes.fromhex(answer["hex"]))
-    sys.exit(0)
-sys.stdout.write(answer["raw"] if isinstance(answer, dict) and list(answer) == ["raw"]
-                 else json.dumps(answer))
+body = answer["raw"] if isinstance(answer, dict) and list(answer) == ["raw"] else json.dumps(answer)
+sys.stdout.write(f"HTTP/2.0 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{body}")
 """
 PAGE = "per_page=100&page=1"
 
@@ -327,6 +373,7 @@ class Tree:
 
     def forge(self, answers: dict[str, object]) -> dict[str, str]:
         """Environment that puts the stand-in client with these answers in the forge's place."""
+        (self.root / "forge.json.state").unlink(missing_ok=True)
         self.write({"fake_gh.py": FAKE_CLIENT, "forge.json": json.dumps(answers)})
         return {
             "GH": shlex.join([sys.executable, "-B", str(self.root / "fake_gh.py")]),
@@ -338,8 +385,11 @@ class Tree:
         """The path of every request the stand-in client received; anything but a GET fails."""
         log = self.root / "forge.log"
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-        assert all(len(call) == 6 and call[0] == "api" for call in calls), calls
-        return [call[5] for call in calls]
+        assert all(
+            call[0] == "api" and (len(call) == 6 or (len(call) == 7 and call[1] == "--include"))
+            for call in calls
+        ), calls
+        return [call[-1] for call in calls]
 
     def git(self, *args: str) -> str:
         """Run git with fixture identity, isolated environment and a timeout."""

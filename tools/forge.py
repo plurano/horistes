@@ -48,11 +48,14 @@ caller must treat a result with errors as unusable.
 from __future__ import annotations
 
 import json
+import math
 import os
 import posixpath
+import re
 import shlex
 import subprocess
 import time
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from urllib.parse import quote
 
@@ -63,12 +66,15 @@ MAX_PAGES = 10
 RETRIES = 4
 WAIT_SECONDS = 20
 DEADLINE_SECONDS = 60
+HEADER_BLOCKS = 10
+MAX_HEADER_LINES = 200
 WORKFLOW_FOLDER = ".github/workflows"
 # The forge's listing of a folder holds at most this many entries (REST reference,
 # "Get repository content"); a listing that long may be cut.
 FOLDER_LIMIT = 1000
 # Events whose run names the commit its workflow files were read from.
 READ_AT_COMMIT = ("push",)
+HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
 HEADERS = (
     "-H",
     "Accept: application/vnd.github+json",
@@ -81,20 +87,44 @@ class ForgeError(Exception):
     """A request the forge did not answer with readable data."""
 
 
+class ResponseError(ForgeError):
+    """An HTTP error from `gh api --include` carrying status, headers and message."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        status: int | None = None,
+        headers: dict[str, str] | None = None,
+        message: str = "",
+    ) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.headers = headers or {}
+        self.message = message
+
+
+def _gh_run(
+    args: list[str], *, token: str | None = None, deadline: float = DEADLINE_SECONDS
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one bounded `gh api` command and return its completed process."""
+    command = [*shlex.split(os.environ.get("GH", "gh")), "api", *args]
+    env = {**os.environ, "GH_TOKEN": token} if token is not None else None
+    return subprocess.run(
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args expires 2027-03-09 category D: the GH variable picks the gh binary so tests run a stand-in  # noqa: E501
+        command,
+        capture_output=True,
+        check=False,
+        timeout=deadline,
+        env=env,
+    )
+
+
 def download(path: str, *, token: str | None = None) -> bytes:
     """The body of one GET as it came; a rate limit is waited out a few times."""
-    command = [*shlex.split(os.environ.get("GH", "gh")), "api", *HEADERS, path]
-    env = {**os.environ, "GH_TOKEN": token} if token is not None else None
     for attempt in range(RETRIES):
         try:
-            done = subprocess.run(
-                # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args expires 2027-03-09 category D: the GH variable picks the gh binary so tests run a stand-in  # noqa: E501
-                command,
-                capture_output=True,
-                check=False,
-                timeout=DEADLINE_SECONDS,
-                env=env,
-            )
+            done = _gh_run([*HEADERS, path], token=token)
         except (OSError, subprocess.TimeoutExpired) as err:
             raise ForgeError(f"GET {path}: {err}") from err
         if done.returncode == 0:
@@ -107,6 +137,143 @@ def download(path: str, *, token: str | None = None) -> bytes:
     raise ForgeError(f"GET {path}: rate limit, {RETRIES} attempts used")
 
 
+def _split_http_block(raw: bytes) -> tuple[bytes, bytes] | None:
+    """Split one HTTP status-and-header block from the bytes that follow it."""
+    crlf = raw.find(b"\r\n\r\n")
+    lf = raw.find(b"\n\n")
+    if crlf >= 0 and (lf < 0 or crlf < lf):
+        return raw[:crlf], raw[crlf + 4 :]
+    if lf >= 0:
+        return raw[:lf], raw[lf + 2 :]
+    return None
+
+
+def _parse_header_block(head_bytes: bytes) -> tuple[int, dict[str, str]] | None:
+    """Parse one HTTP status line and header block into (status, lowercase_headers)."""
+    lines = head_bytes.decode("iso-8859-1").splitlines()
+    parts = lines[0].split() if lines else []
+    if len(parts) < 2 or not parts[1].isdigit():
+        return None
+    headers: dict[str, str] = {}
+    for line in lines[1 : MAX_HEADER_LINES + 1]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+    return int(parts[1]), headers
+
+
+def _parse_included(raw: bytes) -> tuple[int, dict[str, str], bytes] | None:
+    """Parse `gh api --include` stdout into (status, lowercase_headers, body)."""
+    current = raw
+    for _ in range(HEADER_BLOCKS):
+        split = _split_http_block(current) if current.startswith(b"HTTP/") else None
+        parsed = _parse_header_block(split[0]) if split is not None else None
+        if split is None or parsed is None:
+            return None
+        status, headers = parsed
+        body = split[1]
+        if (100 <= status < 200 or 300 <= status < 400) and body.startswith(b"HTTP/"):
+            current = body
+            continue
+        return status, headers, body
+    return None
+
+
+def _json_message(body: bytes) -> str:
+    """Extract a top-level string `message` from JSON bytes, or empty string."""
+    if not body:
+        return ""
+    try:
+        decoded = json.loads(body)
+    except ValueError:
+        return ""
+    msg = decoded.get("message") if isinstance(decoded, dict) else None
+    return msg.strip() if isinstance(msg, str) else ""
+
+
+def _error_message(body: bytes, stderr: str) -> str:
+    """Combine any JSON API `message` field with `gh` stderr."""
+    body_msg = _json_message(body)
+    if body_msg and stderr and body_msg not in stderr:
+        return f"{body_msg} ({stderr})"
+    return body_msg or stderr
+
+
+def request(
+    path: str, *, token: str | None = None, deadline: float = DEADLINE_SECONDS
+) -> tuple[int, dict[str, str], bytes]:
+    """One GET via `gh api --include`, returning (status, lowercase_headers, body)."""
+    try:
+        done = _gh_run(["--include", *HEADERS, path], token=token, deadline=deadline)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise ForgeError(f"GET {path}: {err}") from err
+    stderr = done.stderr.decode("utf-8", "replace").strip()
+    parsed = _parse_included(done.stdout)
+    if parsed is not None:
+        status, headers, body = parsed
+        if done.returncode == 0 and 200 <= status < 300:
+            return status, headers, body
+        message = _error_message(body, stderr)
+        detail = message[:300] or str(done.returncode)
+        raise ResponseError(
+            f"GET {path}: HTTP {status}: {detail}",
+            status=status,
+            headers=headers,
+            message=message,
+        )
+    if done.returncode == 0:
+        raise ForgeError(f"GET {path}: missing HTTP status in --include output")
+    match = HTTP_STATUS.search(stderr)
+    status = int(match.group(1)) if match else None
+    raise ResponseError(
+        f"GET {path}: {stderr[:300] or done.returncode}",
+        status=status,
+        headers={},
+        message=stderr,
+    )
+
+
+def _finite_number(raw: str | None) -> float | None:
+    """Parse a finite float from a header string, or None when absent or invalid."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def is_rate_limit(status: int | None, headers: Mapping[str, str], message: str) -> bool:
+    """Whether an HTTP 403 or 429 answer carries a primary or secondary rate-limit signal."""
+    if status not in (403, 429):
+        return False
+    return (
+        "retry-after" in headers
+        or headers.get("x-ratelimit-remaining") == "0"
+        or "rate limit" in message.lower()
+    )
+
+
+def rate_limit_delay(
+    status: int | None,
+    headers: Mapping[str, str],
+    message: str,
+    repeat: int,
+    now: float,
+) -> int | float | None:
+    """Seconds to wait for a rate-limited response, or None when not a rate limit."""
+    if not is_rate_limit(status, headers, message):
+        return None
+    retry_after = _finite_number(headers.get("retry-after"))
+    if retry_after is not None and retry_after >= 0:
+        return int(retry_after) if retry_after.is_integer() else retry_after
+    reset = _finite_number(headers.get("x-ratelimit-reset"))
+    if headers.get("x-ratelimit-remaining") == "0" and reset is not None:
+        return max(0, int(reset) - math.floor(now)) + 5
+    return min(60 * (2**repeat), 960)
+
+
 def api(path: str, *, token: str | None = None) -> object:
     """The decoded answer of one GET."""
     try:
@@ -115,22 +282,29 @@ def api(path: str, *, token: str | None = None) -> object:
         raise ForgeError(f"GET {path}: answer is not JSON ({err})") from err
 
 
-def paged(path: str, key: str | None) -> list[dict]:
+def paged(
+    path: str,
+    key: str | None,
+    *,
+    max_pages: int = MAX_PAGES,
+    fetch: Callable[[str], object] | None = None,
+) -> list[dict]:
     """Every entry of a listing; `key` names the list inside the answer, None when it is the answer.
 
-    A listing longer than MAX_PAGES pages is an error, never a silent cut.
+    A listing longer than `max_pages` pages is an error, never a silent cut.
     """
+    reader = api if fetch is None else fetch
     entries: list[dict] = []
     joint = "&" if "?" in path else "?"
-    for page in range(1, MAX_PAGES + 1):
-        answer = api(f"{path}{joint}per_page={PER_PAGE}&page={page}")
+    for page in range(1, max_pages + 1):
+        answer = reader(f"{path}{joint}per_page={PER_PAGE}&page={page}")
         batch = answer.get(key) if key and isinstance(answer, dict) else answer
         if not isinstance(batch, list):
             raise ForgeError(f"GET {path}: no list{' ' + key if key else ''} in the answer")
         entries.extend(entry for entry in batch if isinstance(entry, dict))
         if len(batch) < PER_PAGE:
             return entries
-    raise ForgeError(f"GET {path}: more than {MAX_PAGES * PER_PAGE} entries")
+    raise ForgeError(f"GET {path}: more than {max_pages * PER_PAGE} entries")
 
 
 def _time(value: object) -> datetime | None:
