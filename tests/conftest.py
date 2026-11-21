@@ -28,6 +28,19 @@ import ciwf
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Import a tool only after the child has its address-space bound.
+LIMITED_START = """\
+import importlib
+import resource
+import sys
+
+limit = int(sys.argv[1])
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+sys.path.insert(0, sys.argv[2])
+module = importlib.import_module(sys.argv[3])
+sys.exit(module.main(sys.argv[4:]))
+"""
+
 # The consumer path each template's header names.
 CALLER_TEMPLATES: dict[str, str] = {
     "templates/callers/hook-copy.yml.tmpl": ".github/workflows/hook-copy.yml",
@@ -311,7 +324,12 @@ class Tree:
         return self
 
     def tool(
-        self, name: str, *args: str, env: dict[str, str] | None = None
+        self,
+        name: str,
+        *args: str,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        memory_limit: int | None = None,
     ) -> subprocess.CompletedProcess:
         command = [
             sys.executable,
@@ -321,8 +339,26 @@ class Tree:
             "--root",
             str(self.root),
         ]
+        if memory_limit is not None:
+            command = [
+                sys.executable,
+                "-B",
+                "-c",
+                LIMITED_START,
+                str(memory_limit),
+                str(ROOT / "tools"),
+                Path(name).stem,
+                *args,
+                "--root",
+                str(self.root),
+            ]
         return subprocess.run(
-            command, capture_output=True, text=True, check=False, env={**os.environ, **(env or {})}
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, **(env or {})},
+            timeout=timeout,
         )
 
     def forge(self, answers: dict[str, object]) -> dict[str, str]:
