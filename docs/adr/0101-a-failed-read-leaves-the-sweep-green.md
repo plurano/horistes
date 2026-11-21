@@ -56,6 +56,18 @@ A read exhausted inside a hold keeps that hold and also names the repository
 as not read, once per sweep. The repository still counts as served and keeps
 its existing release eligibility.
 
+A maintainer permission read for a review-body answer uses `recorded_right` so
+an exhausted transient refusal is recorded like the four hold reads before the
+hold text names the candidate. `test_exhausted_permission_read_warns_and_holds`,
+`test_nontransient_permission_read_holds_without_warning`, and
+`test_third_permission_read_answer_records_nothing` cover it.
+
+When a repository run is refused after an exhausted hold read,
+`sweep()` lists both the refusal and the collected not-read entry; a terminal
+unread read still warns once for that repository.
+`test_exhausted_hold_read_survives_later_refusal` and
+`test_terminal_unread_after_hold_read_warns_once` cover it.
+
 The inline `QUERY` in `.github/workflows/merge-train.yml` reads 10 open pull
 requests per page; its derived `STATUS_QUERY` inherits that size. Ten pages in
 `pull_pages()` preserve the 100-pull-request cap. `PULL_LIMIT` bounds row loops

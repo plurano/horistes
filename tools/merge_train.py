@@ -340,6 +340,7 @@ class RefusedError(Exception):
     """A forge call that failed or was refused."""
 
     unsigned_bots = ()
+    unread = ()  # exhausted hold reads collected before the refusal
 
 
 class UnreadError(RefusedError):
@@ -1741,6 +1742,15 @@ def record_unread(unread, err):
         unread.append(err)
 
 
+def recorded_right(env, unread, login):
+    """collaborator_right, recording an exhausted read before the review hold catches it."""
+    try:
+        return collaborator_right(env, login)
+    except RefusedError as err:
+        record_unread(unread, err)
+        raise
+
+
 def read_review_hold(env, pull, unread, review_bots=frozenset()):
     """The review-body hold of one pull request, or None; a failed read holds it."""
     try:
@@ -1751,7 +1761,10 @@ def read_review_hold(env, pull, unread, review_bots=frozenset()):
     if not detail:
         return f"{REVIEW_BODY}cannot read: the forge returned no pull request"
     return review_body_hold(
-        pull, detail, right=lambda login: collaborator_right(env, login), review_bots=review_bots
+        pull,
+        detail,
+        right=lambda login: recorded_right(env, unread, login),
+        review_bots=review_bots,
     )
 
 
@@ -2281,6 +2294,7 @@ def one(env, conf, installation, target, now):
             closed = close_issues(local, conf, installation, target, now)
     except RefusedError as err:
         err.unsigned_bots = unsigned_bot_entries(target, notes)
+        err.unread = list(unread)
         raise
     finally:
         revoke(env, token)
@@ -2391,12 +2405,14 @@ def sweep(env, conf, started):
                 )
                 break
             except UnreadError as err:
+                # Terminal read is the one warning per repository; held reads are not listed again.
                 note_unread(unread, target["full_name"], err, unsigned_bots)
                 continue
             except RefusedError as err:
                 tally["refused"] += 1
                 refusals.append(f"{target['full_name']}: {err}")
                 unsigned_bots.extend(err.unsigned_bots)
+                note_held_unread(unread, target["full_name"], err.unread, unsigned_bots)
                 continue
             tally["landed"] += outcome.startswith("landed")
             tally["updated"] += moved

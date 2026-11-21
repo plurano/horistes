@@ -13,6 +13,7 @@ UNKNOWN merge state and between read retries are shortened.
 
 from __future__ import annotations
 
+import ast
 import base64
 import email.message
 import errno
@@ -411,6 +412,7 @@ class Forge:
         self.review_body_calls: list[int] = []
         self.rights: dict[str, str] = {}
         self.right_refusals: dict[str, int] = {}
+        self.right_faults: dict[str, list[int]] = {}
         self.right_calls: list[str] = []
         self.retry_histories: dict[int, dict] = {}
         self.retry_refusals: dict[int, str] = {}
@@ -1036,6 +1038,9 @@ class Handler(BaseHTTPRequestHandler):
         token = self.headers["Authorization"].removeprefix("Bearer ")
         if forge.tokens[token][3].get("metadata") != "read":
             self.answer(403, {"message": "Resource not accessible by integration"})
+        elif login in forge.right_faults and forge.right_faults[login]:
+            status = forge.right_faults[login].pop(0)
+            self.answer(status, {"message": "Permission read refused"})
         elif login in forge.right_refusals:
             self.answer(forge.right_refusals[login], {"message": "Permission read refused"})
         elif login in forge.rights:
@@ -8616,6 +8621,80 @@ def test_maintainer_right_refusal_holds_bot_pull_request(tmp_path):
     assert forge.right_calls == ["maintainer"]
 
 
+def test_exhausted_permission_read_warns_and_holds(tmp_path, monkeypatch, capsys):
+    """An exhausted maintainer permission read names the repository and keeps the hold."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_refusals = {"maintainer": 502}
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert "| #1 | CLEAN | review body: cannot read the right of maintainer:" in summary
+    assert forge.writes == []
+    assert_not_read(done, summary, "fleet/app")
+    assert len(result.unread) == 1
+    assert result.refusals == []
+    assert forge.right_calls == ["maintainer"] * 3
+
+
+def test_nontransient_permission_read_holds_without_warning(tmp_path, monkeypatch, capsys):
+    """A non-transient permission read refusal holds without a not-read warning."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_refusals = {"maintainer": 403}
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert done.returncode == 0, done.stdout
+    assert "| #1 | CLEAN | review body: cannot read the right of maintainer:" in summary
+    assert result.unread == []
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert forge.right_calls == ["maintainer"]
+
+
+def test_third_permission_read_answer_records_nothing(tmp_path, monkeypatch, capsys):
+    """A maintainer permission read that succeeds on the third try lands without a warning."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_faults = {"maintainer": [502, 502]}
+    forge.rights = {"maintainer": "write"}
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert done.returncode == 0, done.stdout
+    assert forge.writes == [landed(1)]
+    assert result.unread == []
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert forge.right_calls == ["maintainer"] * 4
+
+
+def test_exhausted_hold_read_survives_later_refusal(tmp_path, monkeypatch, capsys):
+    """A refused merge after an exhausted hold read lists both refusal and not-read."""
+    forge = hold_read_forge("review", [502] * 3)
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"].append(pull(2, "CLEAN"))
+    forge.mutation_statuses["mergePullRequest"] = [500]
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert len(result.refusals) == 1
+    assert result.refusals[0].startswith("fleet/app: ")
+    assert len(result.unread) == 1
+    assert "HTTP 502" in result.unread[0]
+    assert done.returncode == 1, done.stdout
+    assert "::warning title=Merge train not read::fleet/app: " in done.stdout
+    assert done.stdout.count("::warning title=Merge train not read::") == 1
+    section = summary.split("Not read after 3 tries, the next run reads them again:\n\n", 1)[1]
+    assert section.splitlines()[0].startswith("- fleet/app: ")
+    assert "::error title=Merge train refused::fleet/app:" in done.stdout
+
+
+def test_terminal_unread_after_hold_read_warns_once(tmp_path, monkeypatch, capsys):
+    """The terminal unread read is the sole warning after an exhausted hold-body read."""
+    forge = hold_read_forge("review", [502] * 3)
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"].append(pull(2, "CLEAN"))
+    forge.commits[2] = [("feat: two\n\nSigned-off-by: A <a@example.com>", 1)]
+    forge.merged_pulls["fleet/app"] = [merged_pull(2, (99, "OPEN"))]
+    forge.hold_faults["states: MERGED"] = [504, 504, 504]
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert len(result.unread) == 1
+    assert "HTTP 504" in result.unread[0]
+    assert "HTTP 502" not in result.unread[0]
+    assert done.stdout.count("::warning title=Merge train not read::") == 1
+    assert "::warning title=Merge train not read::fleet/app: " in done.stdout
+    assert assert_not_read(done, summary, "fleet/app") is None
+    assert forge.hold_faults["reviews(first: 100)"] == []
+    assert forge.hold_faults["states: MERGED"] == []
+
+
 def test_maintainer_answer_does_not_release_human_pull_request(tmp_path):
     """Human-authored pull requests still require the author's own review-body answer."""
     forge = _maintainer_forge(comments=[_maintainer_answer()], author={"login": "person"})
@@ -11279,7 +11358,12 @@ class HoldReadForge(Forge):
 
     def graphql_response(self, header, query, variables):
         for marker, statuses in self.hold_faults.items():
-            if marker in query and statuses and "pullRequests(" not in query:
+            if not statuses:
+                continue
+            if marker == "states: MERGED" and "states: MERGED" in query:
+                status = statuses.pop(0)
+                return status, {"message": f"stand-in forge: queued HTTP {status}"}
+            if marker in query and "pullRequests(" not in query:
                 status = statuses.pop(0)
                 return status, {"message": f"stand-in forge: queued HTTP {status}"}
         return super().graphql_response(header, query, variables)
@@ -11430,3 +11514,127 @@ def test_two_exhausted_hold_reads_name_repository_once(tmp_path, monkeypatch, ca
     assert "HTTP 504" not in result.unread[0]
     assert result.refusals == []
     assert not any(forge.hold_faults.values())
+
+
+REFUSED_CATCH_ALLOWED = {
+    "_maintainer_unanswered": "recorded_right records an exhausted read before this conversion",
+    "_unanswered_body_hold": "recorded_right records an exhausted read before this hold",
+    "close_issues": "wraps mint, a POST, which never raises UnreadError",
+    "revoke": "a DELETE, which never raises UnreadError",
+    "sweep": "collects unread and refused repositories",
+    "main": "prints the sweep refusal",
+}
+
+
+def _excepts_refused_or_unread(handler: ast.ExceptHandler) -> bool:
+    kind = handler.type
+    if kind is None:
+        return False
+    if isinstance(kind, ast.Name):
+        return kind.id in ("RefusedError", "UnreadError")
+    if isinstance(kind, ast.Tuple):
+        return any(
+            isinstance(elt, ast.Name) and elt.id in ("RefusedError", "UnreadError")
+            for elt in kind.elts
+        )
+    return False
+
+
+def _handler_records_or_reraises(handler: ast.ExceptHandler) -> bool:
+    for node in ast.walk(ast.Module(body=handler.body, type_ignores=[])):
+        if isinstance(node, ast.Raise) and node.exc is None:
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "record_unread"
+        ):
+            return True
+    return False
+
+
+def refused_catch_offenders(source: str, allowed: dict[str, str]) -> list[str]:
+    """Handlers on RefusedError or UnreadError that neither record nor re-raise."""
+    tree = ast.parse(source)
+    parent: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+    handlers_by_func: dict[str, list[ast.ExceptHandler]] = {}
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler) or not _excepts_refused_or_unread(node):
+            continue
+        func = None
+        current = node
+        for _ in range(200):
+            current = parent.get(current)
+            if current is None:
+                break
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func = current.name
+                break
+        if func is None:
+            continue
+        handlers_by_func.setdefault(func, []).append(node)
+        if func in allowed or _handler_records_or_reraises(node):
+            continue
+        offenders.append(f"{func}:{node.lineno}")
+    stale = [f"stale:{name}" for name in sorted(allowed) if name not in handlers_by_func]
+    return sorted(offenders) + stale
+
+
+def test_every_refused_catch_records_or_reraises():
+    """Every RefusedError or UnreadError handler records, re-raises, or is on the allow list."""
+    source = (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8")
+    assert refused_catch_offenders(source, REFUSED_CATCH_ALLOWED) == []
+
+
+_PLANTED_SWALLOW = (
+    "def hold(env):\n"
+    "    try:\n"
+    "        read(env)\n"
+    "    except RefusedError as err:\n"
+    "        return str(err)\n"
+)
+_PLANTED_TUPLE_SWALLOW = (
+    "def hold(env):\n"
+    "    try:\n"
+    "        read(env)\n"
+    "    except (KeyError, RefusedError) as err:\n"
+    "        return str(err)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "source, allowed, expected",
+    [
+        (_PLANTED_SWALLOW, {}, ["hold:4"]),
+        (_PLANTED_TUPLE_SWALLOW, {}, ["hold:4"]),
+    ],
+)
+def test_planted_swallowing_refused_catch_is_flagged(source, allowed, expected):
+    """Planted handlers that swallow refusals are named with their line number."""
+    assert refused_catch_offenders(source, allowed) == expected
+
+
+def test_planted_removed_review_hold_record_unread_is_flagged():
+    """Dropping record_unread from read_review_hold leaves that handler on the offender list."""
+    source = (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8")
+    pattern = (
+        r"(\n        record_unread\(unread, err\)\n"
+        r"        return f\"\{REVIEW_BODY\}cannot read: \{err\}\")"
+    )
+    replacement = r'\n        return f"{REVIEW_BODY}cannot read: {err}"'
+    stripped = re.sub(pattern, replacement, source, count=1)
+    assert stripped != source
+    offenders = refused_catch_offenders(stripped, REFUSED_CATCH_ALLOWED)
+    assert any(item.startswith("read_review_hold:") for item in offenders)
+
+
+def test_planted_stale_refused_catch_allow_key_is_reported():
+    """An allow-list key with no matching handler is reported as stale."""
+    allowed = {**REFUSED_CATCH_ALLOWED, "gone": "vanished handler"}
+    assert "stale:gone" in refused_catch_offenders(
+        (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8"), allowed
+    )
