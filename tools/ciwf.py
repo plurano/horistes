@@ -145,6 +145,12 @@ def strings(node: object):
             pending.extend(item)
 
 
+# Under this workflow key a file lists secret names and `${{ secrets.* }}`
+# references, never values; CodeQL's sensitive-data heuristic
+# (py/clear-text-logging-sensitive-data) reads a literal "secrets" lookup as secret values.
+CREDENTIAL_NAMES_KEY = "secrets"
+
+
 def triggers(doc: dict) -> dict:
     """The `on` block as a mapping from event name to its settings."""
     on = doc.get("on")
