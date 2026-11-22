@@ -13,6 +13,10 @@ BASE_REF ?= origin/main
 # other gitleaks release than the one the gate workflow pins.
 ACTIONLINT ?= actionlint
 ACTIONLINT_VERSION := 1.7.12
+# Upper bound on pytest-xdist workers for the test recipe (HISS-06 scalar bound);
+# -n auto starts one worker per CPU up to this cap; 8 keeps a 32-core workstation
+# shared with other builders.
+TEST_WORKERS ?= 8
 GITLEAKS ?= gitleaks
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
@@ -161,12 +165,25 @@ check-examples: tools
 # PYTEST_ADDOPTS, whose options can override the warning filters of
 # pyproject.toml.
 # The last step compares the unrounded total with the floor.
+# The coverage run step spreads pytest across workers (-n auto) capped at
+# TEST_WORKERS; 0 is refused because pytest-xdist treats --maxprocesses=0 as no
+# cap and would use every CPU on shared builders.
 test: tools
+	@workers="$(TEST_WORKERS)"; \
+	case "$$workers" in \
+		''|*[!0-9]*) \
+			printf '%s\n' "TEST_WORKERS must be a whole number from 1 to 16, got: $$workers" >&2; \
+			exit 2;; \
+	esac; \
+	if [ "$$workers" -lt 1 ] || [ "$$workers" -gt 16 ]; then \
+		printf '%s\n' "TEST_WORKERS must be a whole number from 1 to 16, got: $$workers" >&2; \
+		exit 2; \
+	fi
 	data=$$(mktemp -d) && \
 	trap 'rm -rf "$$data"' EXIT && \
 	PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
 		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" LEFTHOOK_BIN="$(BIN)/lefthook" \
-		$(BIN)/python -X dev -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest && \
+		$(BIN)/python -X dev -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest -n auto --maxprocesses=$(TEST_WORKERS) && \
 	$(BIN)/python -B -m coverage combine --rcfile=pyproject.toml --data-file="$$data/.coverage" && \
 	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage" && \
 	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage" --precision=10 --format=total
