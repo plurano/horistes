@@ -125,7 +125,7 @@ RESULT = {
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 HOSTED = re.compile(r"^(?:ubuntu|windows|macos)-")
 INPUT = re.compile(r"^\$\{\{\s*inputs\.([\w-]+)\s*\}\}$")
-SECRET = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)")
+CREDENTIAL_REF = re.compile(r"\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)")
 EXPRESSION = re.compile(r"(\$\{\{.*?\}\})")
 PULL_REQUEST_TYPES = ("opened", "synchronize", "reopened")
 
@@ -578,10 +578,10 @@ def _events(doc: dict) -> set[str]:
     return events
 
 
-def _secrets(job: dict) -> set[str]:
-    if job.get("secrets") == "inherit":
+def _credential_names(job: dict) -> set[str]:
+    if job.get(ciwf.CREDENTIAL_NAMES_KEY) == "inherit":
         return {"<inherit>"}
-    return {name for text in ciwf.strings(job) for name in SECRET.findall(text)}
+    return {name for text in ciwf.strings(job) for name in CREDENTIAL_REF.findall(text)}
 
 
 def side_conditions(pair: Pair, root: Path, called_root: Path) -> tuple[list[str], list[str]]:
@@ -604,8 +604,10 @@ def side_conditions(pair: Pair, root: Path, called_root: Path) -> tuple[list[str
 
     for scope in sorted(scopes(new_doc, caller) - scopes(old_doc, old)):
         problems.append(f"{name}: the new job asks to write {scope}, the old one did not")
-    for secret in sorted(_secrets(caller) - _secrets(old)):
-        problems.append(f"{name}: the new job receives the secret {secret}, the old one did not")
+    for credential in sorted(_credential_names(caller) - _credential_names(old)):
+        problems.append(
+            f"{name}: the new job receives the secret {credential}, the old one did not"
+        )
     for event in sorted(_events(old_doc) - _events(new_doc)):
         problems.append(f"{name}: the new workflow does not run on {event}")
     was, now = _kind(old.get("runs-on")), _kind(_label(caller, called, called_doc))
