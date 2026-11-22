@@ -3,10 +3,13 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Check or move best-practices line anchors using pinned source text.
 
-    anchors.py [check|fix] [--root DIR] [--base REV]
+    anchors.py [check|fix] [--root DIR] [--base REV] [--index]
+
+With --index, check reads anchor inputs from the Git index (GIT_INDEX_FILE when
+set, else the default index) instead of the working tree.
 
 Exit codes: 0 pass or nothing left to move, 1 drift or unmappable anchor,
-3 file or git error. Fix maps old ranges against --base (default HEAD).
+2 usage error, 3 file or git error. Fix maps old ranges against --base (default HEAD).
 """
 
 from __future__ import annotations
@@ -259,6 +262,41 @@ def _references(answers: dict[str, str]) -> dict[str, tuple[str, int, int]]:
         for text in answers.values()
         for match in ANCHOR.finditer(text)
     }
+
+
+def _index_env() -> dict[str, str]:
+    """Shared git environment with the caller's GIT_INDEX_FILE when it is set."""
+    env = ciwf.git_env()
+    raw = os.environ.get("GIT_INDEX_FILE")
+    if raw is not None:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        env["GIT_INDEX_FILE"] = str(path.resolve())
+    return env
+
+
+def _checkout_index(root: Path, prefix: Path) -> None:
+    """Materialise the active index under prefix for a bounded read-only check."""
+    destination = prefix.resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    trail = str(destination)
+    if not trail.endswith(os.sep):
+        trail += os.sep
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), "checkout-index", "-a", f"--prefix={trail}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+            env=_index_env(),
+        )
+    except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired) as err:
+        raise OSError(f"git checkout-index in {root} failed: {err}") from err
+    if done.returncode != 0:
+        raise OSError(done.stderr.strip() or f"git checkout-index exited {done.returncode}")
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -533,8 +571,20 @@ def main(argv: list[str] | None = None, *, pins: tuple[Pin, ...] = PINS) -> int:
     parser.add_argument("command", nargs="?", default="check", choices=("check", "fix"))
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--base", default="HEAD")
+    parser.add_argument(
+        "--index",
+        action="store_true",
+        help="check staged index contents instead of the working tree",
+    )
     args = parser.parse_args(argv)
+    if args.index and args.command != "check":
+        parser.error("--index is only valid with check")
     try:
+        if args.index:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = args.root.resolve()
+                _checkout_index(root, Path(temporary))
+                return run("check", Path(temporary), args.base, pins)
         return run(args.command, args.root, args.base, pins)
     except (
         OSError,

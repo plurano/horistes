@@ -13,10 +13,11 @@ from pathlib import Path
 import anchors
 import ciwf
 import pytest
+import yaml
 from conftest import ROOT, Tree, external, measured, rooted
+from test_dev_mode import _child
 
-ANCHORS_RUN = "sh .config/lefthook/python.sh -B tools/anchors.py check"
-ANCHORS_BLOCK = f"    anchors:\n      run: {ANCHORS_RUN}\n"
+ANCHORS_RUN = "make --no-print-directory check-anchors"
 FORBIDDEN_KEYS = ("glob", "files", "skip", "only")
 
 
@@ -41,7 +42,10 @@ def _init_planted_repo(tmp_path: Path) -> Tree:
     tree = Tree(tmp_path / "repo")
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     _copy_file(ROOT / "lefthook.yml", tree.root / "lefthook.yml")
+    _copy_file(ROOT / "Makefile", tree.root / "Makefile")
+    _copy_file(ROOT / "requirements" / "tools.txt", tree.root / "requirements" / "tools.txt")
     _copy_file(ROOT / ".bestpractices.json", tree.root / ".bestpractices.json")
+    (tree.root / ".gitignore").write_text(".venv\n", encoding="utf-8")
     shutil.copytree(
         ROOT / ".config" / "lefthook",
         tree.root / ".config" / "lefthook",
@@ -55,6 +59,7 @@ def _init_planted_repo(tmp_path: Path) -> Tree:
     tree.git("init", "-q", "-b", "main")
     tree.git("add", "-A")
     tree.git("commit", "-q", "-m", "init")
+    (tree.root / ".venv").symlink_to((ROOT / ".venv").resolve())
     tree.write({"staged.txt": "staged\n"})
     tree.git("add", "staged.txt")
     return tree
@@ -90,15 +95,12 @@ def _run_planted_pre_commit(tree: Tree, *commands: str) -> subprocess.CompletedP
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
-    return subprocess.run(
-        cmd,
-        cwd=tree.root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    return _child(cmd, cwd=tree.root, env=env)
+
+
+def _committed_text(tree: Tree, rel: str) -> str:
+    """Return the blob at HEAD for one tracked path."""
+    return tree.git("show", f"HEAD:{rel}")
 
 
 def _insert_drift(tree: Tree) -> None:
@@ -128,14 +130,28 @@ def test_planted_pre_commit_anchors_clean(tmp_path: Path) -> None:
 
 
 @POSIX_SHELL
-def test_planted_pre_commit_anchors_drift_refused(tmp_path: Path) -> None:
-    """Inserting one blank line before an anchored range fails pre-commit with FAIL."""
+def test_planted_pre_commit_anchors_staged_drift_refused(tmp_path: Path) -> None:
+    """Staged drift in a pinned file fails pre-commit with FAIL while the worktree is clean."""
     tree = _init_planted_repo(tmp_path)
+    rel = anchors.PINS[0].path
+    clean = _committed_text(tree, rel)
     _insert_drift(tree)
+    tree.git("add", rel)
+    (tree.root / rel).write_text(clean, encoding="utf-8")
     proc = _run_planted_pre_commit(tree)
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert "FAIL" in output
+
+
+@POSIX_SHELL
+def test_planted_pre_commit_anchors_unstaged_drift_passes(tmp_path: Path) -> None:
+    """Drift only in the working tree, not staged, passes the anchors pre-commit job."""
+    tree = _init_planted_repo(tmp_path)
+    _insert_drift(tree)
+    proc = _run_planted_pre_commit(tree)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
 
 
 @POSIX_SHELL
@@ -147,16 +163,64 @@ def test_planted_pre_commit_without_anchors_allows_drift(tmp_path: Path) -> None
     with `anchors` removed the identical invocation exits 0.
     """
     tree = _init_planted_repo(tmp_path)
+    rel = anchors.PINS[0].path
+    clean = _committed_text(tree, rel)
     _insert_drift(tree)
+    tree.git("add", rel)
+    (tree.root / rel).write_text(clean, encoding="utf-8")
     before = _run_planted_pre_commit(tree, "anchors", "reuse-lint")
     assert before.returncode != 0, before.stdout + before.stderr
     assert "FAIL" in before.stdout + before.stderr
 
     lefthook_path = tree.root / "lefthook.yml"
-    raw = lefthook_path.read_text(encoding="utf-8")
-    assert ANCHORS_BLOCK in raw
-    without_anchors = raw.replace(ANCHORS_BLOCK, "", 1)
-    assert "anchors" not in ciwf.loads(without_anchors, lefthook_path)["pre-commit"]["commands"]
-    lefthook_path.write_text(without_anchors, encoding="utf-8")
+    doc = ciwf.loads(lefthook_path.read_text(encoding="utf-8"), lefthook_path)
+    assert "anchors" in doc["pre-commit"]["commands"]
+    del doc["pre-commit"]["commands"]["anchors"]
+    lefthook_path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    assert (
+        "anchors"
+        not in ciwf.loads(lefthook_path.read_text(encoding="utf-8"), lefthook_path)["pre-commit"][
+            "commands"
+        ]
+    )
     after = _run_planted_pre_commit(tree, "anchors", "reuse-lint")
     assert after.returncode == 0, after.stdout + after.stderr
+
+
+def test_anchors_check_index_alternate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """check --index reads GIT_INDEX_FILE; the default index staying clean still passes."""
+    tree = _init_planted_repo(tmp_path)
+    rel = anchors.PINS[0].path
+    alt = tree.root / "alt.index"
+    shutil.copy2(tree.root / ".git" / "index", alt)
+    env_alt = {**os.environ, "GIT_INDEX_FILE": str(alt)}
+    _insert_drift(tree)
+    _child(
+        ["git", "-C", str(tree.root), "add", rel],
+        cwd=tree.root,
+        env=env_alt,
+    )
+    (tree.root / rel).write_text(_committed_text(tree, rel), encoding="utf-8")
+    monkeypatch.setenv("GIT_INDEX_FILE", str(alt))
+    assert anchors.main(["check", "--index", "--root", str(tree.root)]) == 1
+    monkeypatch.delenv("GIT_INDEX_FILE", raising=False)
+    assert anchors.main(["check", "--index", "--root", str(tree.root)]) == 0
+
+
+def test_anchors_fix_index_usage() -> None:
+    """fix --index is a usage error."""
+    with pytest.raises(SystemExit) as caught:
+        anchors.main(["fix", "--index"])
+    assert caught.value.code == 2
+
+
+@POSIX_SHELL
+def test_planted_pre_commit_anchors_missing_venv(tmp_path: Path) -> None:
+    """Without the tools environment, the anchors job names make tools, not import errors."""
+    tree = _init_planted_repo(tmp_path)
+    (tree.root / ".venv").unlink()
+    proc = _run_planted_pre_commit(tree)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "run make tools" in output
+    assert "ModuleNotFoundError" not in output
