@@ -647,9 +647,9 @@ def _all_statuses(statuses: list[dict]) -> dict[str, dict]:
     return by_context
 
 
-def read_statuses_page(session: ApiSession, config: Config) -> dict[str, dict]:
-    """Statuses on the SHA, including the self context."""
-    path = f"repos/{config.repository}/commits/{config.sha}/statuses"
+def read_statuses(session: ApiSession, repository: str, sha: str) -> dict[str, dict]:
+    """Commit statuses on `sha`, including the self context."""
+    path = f"repos/{repository}/commits/{sha}/statuses"
     statuses = forge.paged(
         path,
         None,
@@ -681,13 +681,7 @@ def read_snapshot(
             fetch=lambda p: session.request_json("workflow-runs", p),
         )
         if statuses is None:
-            statuses_path = f"repos/{config.repository}/commits/{config.sha}/statuses"
-            status_list = forge.paged(
-                statuses_path,
-                None,
-                max_pages=STATUS_MAX_PAGES,
-                fetch=lambda p: session.request_json("statuses", p),
-            )
+            status_list = list(read_statuses(session, config.repository, config.sha).values())
         elif isinstance(statuses, Mapping):
             status_list = list(statuses.values())
         else:
@@ -910,7 +904,7 @@ def evaluate_one(
     """Read, decide and post for one SHA; return 1 only on an evaluation error."""
     if statuses_map is None:
         try:
-            statuses_map = read_statuses_page(session, config)
+            statuses_map = read_statuses(session, config.repository, config.sha)
         except ApiFailureError as exc:
             err.write(f"::error::{exc}\n")
             return 1
@@ -959,17 +953,6 @@ def _open_pull_head_shas(session: ApiSession, repository: str) -> list[str]:
     return heads
 
 
-def _statuses_for_head(session: ApiSession, repository: str, sha: str) -> dict[str, dict]:
-    path = f"repos/{repository}/commits/{sha}/statuses"
-    statuses = forge.paged(
-        path,
-        None,
-        max_pages=STATUS_MAX_PAGES,
-        fetch=lambda p: session.request_json("statuses", p),
-    )
-    return _all_statuses(statuses)
-
-
 def _head_priority(statuses_map: Mapping[str, dict], context: str) -> tuple[bool, float]:
     """Sort key: never-judged heads first, then longest since the last judgment."""
     entry = statuses_map.get(context)
@@ -989,8 +972,8 @@ def _sweep_evaluation_order(
 ) -> list[tuple[str, dict[str, dict]]]:
     """Read each head once, skip settled, return up to `max_targets` unsettled heads."""
     pending: list[tuple[str, dict[str, dict], tuple[bool, float], int]] = []
-    for order, sha in enumerate(heads[:OPEN_PULLS_MAX]):
-        statuses_map = _statuses_for_head(session, repository, sha)
+    for order, sha in enumerate(heads):
+        statuses_map = read_statuses(session, repository, sha)
         newest = statuses_map.get(context)
         if newest and str(newest.get("state") or "") in ("success", "failure"):
             out.write(f"{sha}: {context} already settled\n")
@@ -998,6 +981,51 @@ def _sweep_evaluation_order(
         pending.append((sha, statuses_map, _head_priority(statuses_map, context), order))
     pending.sort(key=lambda row: (row[2], row[3]))
     return [(sha, statuses_map) for sha, statuses_map, _, _ in pending[:max_targets]]
+
+
+def sweep_worst_case_calls_one_page(
+    *,
+    open_pulls_max: int = OPEN_PULLS_MAX,
+    max_targets: int = MAX_TARGETS_DEFAULT,
+) -> int:
+    """Worst-case transport calls when every paged read uses exactly one page."""
+    setup = 1 + open_pulls_max + 2
+    eval_heads = max_targets + 1
+    per_eval = 4
+    return setup + eval_heads * per_eval
+
+
+def sweep_worst_case_calls_page_bound(
+    *,
+    open_pulls_max: int = OPEN_PULLS_MAX,
+    max_targets: int = MAX_TARGETS_DEFAULT,
+) -> int:
+    """Worst-case transport calls when every paged read fills its page budget."""
+    status_reads = (open_pulls_max + 1) * STATUS_MAX_PAGES
+    eval_heads = max_targets + 1
+    per_eval = CHECK_RUN_MAX_PAGES + WORKFLOW_RUN_MAX_PAGES + 2
+    return 3 + status_reads + eval_heads * per_eval
+
+
+def format_sweep_worst_case_calls() -> str:
+    """Two-line report of worst-case sweep transport calls at default limits."""
+    one_page = sweep_worst_case_calls_one_page()
+    page_bound = sweep_worst_case_calls_page_bound()
+    retry_bound = page_bound * MAX_CALL_ATTEMPTS
+    line_one = (
+        f"one page per read: open-pulls(1) + OPEN_PULLS_MAX({OPEN_PULLS_MAX}) + "
+        f"repository(1) + default-commit(1) + "
+        f"(MAX_TARGETS_DEFAULT({MAX_TARGETS_DEFAULT})+1) * "
+        f"(CHECK_RUN(1)+WORKFLOW_RUN(1)+commit(1)+post(1)) = {one_page}"
+    )
+    line_two = (
+        f"page-bound reads: open-pulls(1) + repository(1) + default-commit(1) + "
+        f"(OPEN_PULLS_MAX+1)*STATUS_MAX_PAGES({STATUS_MAX_PAGES}) + "
+        f"(MAX_TARGETS_DEFAULT+1)*(CHECK_RUN_MAX_PAGES({CHECK_RUN_MAX_PAGES})+"
+        f"WORKFLOW_RUN_MAX_PAGES({WORKFLOW_RUN_MAX_PAGES})+commit(1)+post(1)) = "
+        f"{page_bound}; × MAX_CALL_ATTEMPTS({MAX_CALL_ATTEMPTS}) = {retry_bound}"
+    )
+    return f"{line_one}\n{line_two}"
 
 
 def _default_branch_head(session: ApiSession, repository: str) -> str:

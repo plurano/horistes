@@ -31,6 +31,8 @@ from required_checks import (
     MAX_TARGETS_DEFAULT,
     OPEN_PULLS_MAX,
     SESSION_DEADLINE_SECONDS,
+    ApiFailureError,
+    ApiSession,
     InputError,
     below_floor,
     decide,
@@ -1441,6 +1443,208 @@ def test_sweep_caps_status_reads_and_evaluations_at_120_heads() -> None:
     assert _statuses_get_count(paths) <= OPEN_PULLS_MAX + 1
     check_reads = sum(1 for p in paths if "/check-runs" in p)
     assert check_reads <= MAX_TARGETS_DEFAULT + 1
+
+
+def test_api_session_call_deadline_matches_remaining_budget() -> None:
+    start = 1_000_000.0
+    captured: list[float] = []
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: object
+    ) -> tuple[int, dict[str, str], bytes]:
+        deadline = kwargs.get("deadline")
+        if isinstance(deadline, (int, float)):
+            captured.append(float(deadline))
+        return 200, {}, b'{"check_runs": []}'
+
+    session = ApiSession(deadline=start + 20.0, now=lambda: start, transport=transport)
+    session.request_json("check-runs", f"repos/{REPO}/commits/{SHA}/check-runs")
+    assert captured == [20.0]
+
+
+def test_api_session_zero_remaining_skips_transport() -> None:
+    start = 2_000_000.0
+    seen: list[int] = []
+
+    def transport(**_: object) -> tuple[int, dict[str, str], bytes]:
+        seen.append(1)
+        return 200, {}, b"{}"
+
+    session = ApiSession(deadline=start, now=lambda: start, transport=transport)
+    with pytest.raises(ApiFailureError, match=r"Session deadline.*statuses"):
+        session.request_json("statuses", f"repos/{REPO}/commits/{SHA}/statuses")
+    assert seen == []
+
+
+def test_sweep_worst_case_call_bounds_at_defaults() -> None:
+    from required_checks import (  # noqa: PLC0415
+        CHECK_RUN_MAX_PAGES,
+        MAX_CALL_ATTEMPTS,
+        MAX_TARGETS_DEFAULT,
+        OPEN_PULLS_MAX,
+        STATUS_MAX_PAGES,
+        WORKFLOW_RUN_MAX_PAGES,
+        format_sweep_worst_case_calls,
+        sweep_worst_case_calls_one_page,
+        sweep_worst_case_calls_page_bound,
+    )
+
+    assert sweep_worst_case_calls_one_page() == 227
+    bound = sweep_worst_case_calls_page_bound()
+    expected = (
+        3
+        + (OPEN_PULLS_MAX + 1) * STATUS_MAX_PAGES
+        + (MAX_TARGETS_DEFAULT + 1) * (CHECK_RUN_MAX_PAGES + WORKFLOW_RUN_MAX_PAGES + 2)
+    )
+    assert bound == expected
+    text = format_sweep_worst_case_calls()
+    assert "227" in text.splitlines()[0]
+    assert f"MAX_CALL_ATTEMPTS({MAX_CALL_ATTEMPTS})" in text
+    assert str(bound * MAX_CALL_ATTEMPTS) in text.splitlines()[1]
+
+
+def _mixed_sweep_transport(
+    pull_order: list[str],
+    status_by_sha: dict[str, dict],
+    *,
+    record: list[tuple[str, str]],
+) -> Any:
+    def transport(
+        path: str, method: str = "GET", **kwargs: object
+    ) -> tuple[int, dict[str, str], bytes]:
+        record.append((method, path))
+        if "/pulls?" in path:
+            body = [{"head": {"sha": s}} for s in pull_order]
+        elif method == "POST" and "/statuses/" in path:
+            return 201, {}, json.dumps({"id": 1}).encode()
+        elif "/statuses" in path:
+            sha = path.split("/commits/")[1].split("/")[0]
+            body = [status_by_sha[sha]] if sha in status_by_sha else []
+        elif "/check-runs" in path:
+            body = {"check_runs": [check_item(1, "Build", "success")]}
+        elif "/actions/runs" in path:
+            body = {"workflow_runs": [wf_run(1)]}
+        elif path == f"repos/{REPO}":
+            body = {"default_branch": "main"}
+        elif path.endswith("/commits/main"):
+            body = {"sha": "d" * 40}
+        elif "/commits/" in path:
+            body = {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}}
+        else:
+            body = {}
+        return 200, {}, json.dumps(body).encode()
+
+    return transport
+
+
+def test_sweep_settled_heads_skip_eval_slots_and_log_once() -> None:
+    ctx = "required-checks"
+    settled_old = [
+        status_item(1, ctx, "success", updated_at="2026-11-20T10:00:00Z"),
+    ]
+    settled_fail = [
+        status_item(2, ctx, "failure", updated_at="2026-11-20T09:00:00Z"),
+    ]
+    pending_new = [
+        status_item(3, ctx, "pending", updated_at="2026-11-22T12:00:00Z"),
+    ]
+    pending_mid = [
+        status_item(4, ctx, "pending", updated_at="2026-11-22T11:00:00Z"),
+    ]
+    heads = [f"{i:040x}" for i in range(1, 7)]
+    status_by_sha = {
+        heads[0]: settled_old[0],
+        heads[1]: settled_fail[0],
+        heads[2]: pending_new[0],
+        heads[3]: pending_mid[0],
+    }
+    record: list[tuple[str, str]] = []
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=4,
+    )
+    out = io.StringIO()
+    rc = run_sweep(
+        cfg,
+        transport=_mixed_sweep_transport(heads, status_by_sha, record=record),
+        now=lambda: 1.0e9,
+        sleep=lambda _: None,
+        out=out,
+        err=io.StringIO(),
+    )
+    assert rc == 0
+    stdout = out.getvalue()
+    assert stdout.count(f"{heads[0]}: {ctx} already settled") == 1
+    assert stdout.count(f"{heads[1]}: {ctx} already settled") == 1
+    settled_shas = {heads[0], heads[1]}
+    check_shas = {
+        p.split("/commits/")[1].split("/")[0]
+        for m, p in record
+        if m == "GET" and "/check-runs" in p
+    }
+    assert settled_shas.isdisjoint(check_shas)
+    pending_shas = {heads[2], heads[3]}
+    assert pending_shas.issubset(check_shas)
+    assert {heads[4], heads[5]}.issubset(check_shas)
+
+
+def test_sweep_pending_priority_orders_never_judged_before_oldest_judged() -> None:
+    ctx = "required-checks"
+    judged_newer = status_item(1, ctx, "pending", updated_at="2026-11-22T12:00:00Z")
+    judged_older = status_item(2, ctx, "pending", updated_at="2026-11-22T11:00:00Z")
+    judged_tie_a = status_item(3, ctx, "pending", updated_at="2026-11-22T10:00:00Z")
+    judged_tie_b = status_item(4, ctx, "pending", updated_at="2026-11-22T10:00:00Z")
+    heads = [f"{(i + 10):040x}" for i in range(1, 5)]
+    pull_order = [heads[0], heads[1], heads[2], heads[3]]
+    status_by_sha = {heads[0]: judged_newer, heads[1]: judged_older}
+    record: list[tuple[str, str]] = []
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=3,
+    )
+    run_sweep(
+        cfg,
+        transport=_mixed_sweep_transport(pull_order, status_by_sha, record=record),
+        now=lambda: 1.0e9,
+        sleep=lambda _: None,
+        out=io.StringIO(),
+        err=io.StringIO(),
+    )
+    pull_checks = [
+        p.split("/commits/")[1].split("/")[0]
+        for m, p in record
+        if m == "GET" and "/check-runs" in p and p.split("/commits/")[1].split("/")[0] in heads
+    ]
+    assert pull_checks == [heads[2], heads[3], heads[1]]
+    assert heads[0] not in pull_checks
+
+    tie_record: list[tuple[str, str]] = []
+    tie_heads = [f"{(i + 20):040x}" for i in range(1, 3)]
+    tie_status = {tie_heads[0]: judged_tie_a, tie_heads[1]: judged_tie_b}
+    tie_cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=2,
+    )
+    run_sweep(
+        tie_cfg,
+        transport=_mixed_sweep_transport(tie_heads, tie_status, record=tie_record),
+        now=lambda: 1.0e9,
+        sleep=lambda _: None,
+        out=io.StringIO(),
+        err=io.StringIO(),
+    )
+    tie_checks = [
+        p.split("/commits/")[1].split("/")[0]
+        for m, p in tie_record
+        if m == "GET" and "/check-runs" in p and p.split("/commits/")[1].split("/")[0] in tie_heads
+    ]
+    assert tie_checks == tie_heads
 
 
 def test_session_deadline_stops_sweep_and_passes_bounded_deadline() -> None:
