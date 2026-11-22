@@ -1476,31 +1476,154 @@ def test_api_session_zero_remaining_skips_transport() -> None:
     assert seen == []
 
 
-def test_sweep_worst_case_call_bounds_at_defaults() -> None:
-    from required_checks import (  # noqa: PLC0415
-        CHECK_RUN_MAX_PAGES,
-        MAX_CALL_ATTEMPTS,
-        MAX_TARGETS_DEFAULT,
-        OPEN_PULLS_MAX,
-        STATUS_MAX_PAGES,
-        WORKFLOW_RUN_MAX_PAGES,
-        format_sweep_worst_case_calls,
-        sweep_worst_case_calls_one_page,
-        sweep_worst_case_calls_page_bound,
-    )
+def _classify_sweep_call(method: str, path: str) -> str:
+    if method == "POST" and "/statuses/" in path:
+        return "post"
+    if "/pulls?" in path:
+        return "open-pulls"
+    if path == f"repos/{REPO}":
+        return "repository"
+    if path.endswith("/commits/main"):
+        return "default-commit"
+    if "/statuses" in path:
+        return "statuses"
+    if "/check-runs" in path:
+        return "check-runs"
+    if "/actions/runs" in path:
+        return "workflow-runs"
+    if "/commits/" in path:
+        return "commit"
+    return "other"
 
-    assert sweep_worst_case_calls_one_page() == 227
-    bound = sweep_worst_case_calls_page_bound()
-    expected = (
-        3
-        + (OPEN_PULLS_MAX + 1) * STATUS_MAX_PAGES
-        + (MAX_TARGETS_DEFAULT + 1) * (CHECK_RUN_MAX_PAGES + WORKFLOW_RUN_MAX_PAGES + 2)
+
+SWEEP_CALL_KINDS = (
+    "open-pulls",
+    "repository",
+    "default-commit",
+    "statuses",
+    "check-runs",
+    "workflow-runs",
+    "commit",
+    "post",
+    "other",
+)
+SWEEP_FIXED_BODIES: dict[str, object] = {
+    "repository": {"default_branch": "main"},
+    "default-commit": {"sha": "d" * 40},
+    "commit": {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}},
+}
+
+
+def _sweep_page_rows(path: str, page_bound: bool, last: int, rows: list[Any]) -> list[Any] | None:
+    """Full pages below the page budget, an empty page at it; None when one short page is read."""
+    if not page_bound:
+        return None
+    match = re.search(r"[?&]page=(\d+)", path)
+    assert match is not None, path
+    return rows if int(match.group(1)) < last else []
+
+
+def _sweep_body(kind: str, path: str, heads: list[str], page_bound: bool) -> object:
+    if kind == "open-pulls":
+        return [{"head": {"sha": s}} for s in heads]
+    if kind == "statuses":
+        full = [status_item(i, "ext", "pending") for i in range(forge.PER_PAGE)]
+        rows = _sweep_page_rows(path, page_bound, required_checks.STATUS_MAX_PAGES, full)
+        return [] if rows is None else rows
+    if kind == "check-runs":
+        full = [check_item(i, "Build", "success") for i in range(forge.PER_PAGE)]
+        rows = _sweep_page_rows(path, page_bound, required_checks.CHECK_RUN_MAX_PAGES, full)
+        return {"check_runs": [check_item(1, "Build", "success")] if rows is None else rows}
+    if kind == "workflow-runs":
+        full = [wf_run(i, path="other.yml", created_at="") for i in range(1, forge.PER_PAGE + 1)]
+        rows = _sweep_page_rows(path, page_bound, required_checks.WORKFLOW_RUN_MAX_PAGES, full)
+        return {"workflow_runs": [] if rows is None else rows}
+    return SWEEP_FIXED_BODIES.get(kind, {})
+
+
+def _counting_sweep_transport(
+    heads: list[str],
+    *,
+    page_bound: bool,
+) -> tuple[Any, dict[str, int]]:
+    """Stub forge for run_sweep that counts every call per kind, unknown calls under "other"."""
+    counts = dict.fromkeys(SWEEP_CALL_KINDS, 0)
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: object
+    ) -> tuple[int, dict[str, str], bytes]:
+        kind = _classify_sweep_call(method, path)
+        counts[kind] += 1
+        if kind == "post":
+            return 201, {}, json.dumps({"id": 1, "state": "pending"}).encode()
+        return 200, {}, json.dumps(_sweep_body(kind, path, heads, page_bound)).encode()
+
+    return transport, counts
+
+
+@pytest.mark.parametrize(
+    ("page_bound", "expected_total"),
+    [
+        (
+            False,
+            1 + (OPEN_PULLS_MAX + 1) + 2 + (MAX_TARGETS_DEFAULT + 1) * 4,
+        ),
+        (
+            True,
+            3
+            + (OPEN_PULLS_MAX + 1) * required_checks.STATUS_MAX_PAGES
+            + (MAX_TARGETS_DEFAULT + 1)
+            * (required_checks.CHECK_RUN_MAX_PAGES + required_checks.WORKFLOW_RUN_MAX_PAGES + 2),
+        ),
+    ],
+)
+def test_sweep_transport_call_counts_measured_at_defaults(
+    page_bound: bool, expected_total: int
+) -> None:
+    heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
+    transport, counts = _counting_sweep_transport(heads, page_bound=page_bound)
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=MAX_TARGETS_DEFAULT,
     )
-    assert bound == expected
-    text = format_sweep_worst_case_calls()
-    assert "227" in text.splitlines()[0]
-    assert f"MAX_CALL_ATTEMPTS({MAX_CALL_ATTEMPTS})" in text
-    assert str(bound * MAX_CALL_ATTEMPTS) in text.splitlines()[1]
+    err = io.StringIO()
+    rc = run_sweep(
+        cfg,
+        transport=transport,
+        now=lambda: 1.0e9,
+        sleep=lambda _: None,
+        out=io.StringIO(),
+        err=err,
+    )
+    assert rc == 0, err.getvalue()
+    assert "::error::" not in err.getvalue()
+    total = sum(counts.values())
+    assert counts["other"] == 0
+    assert total == expected_total
+    if page_bound:
+        assert counts["open-pulls"] == 1
+        assert counts["repository"] == 1
+        assert counts["default-commit"] == 1
+        assert counts["statuses"] == (OPEN_PULLS_MAX + 1) * required_checks.STATUS_MAX_PAGES
+        check_pages = required_checks.CHECK_RUN_MAX_PAGES
+        assert counts["check-runs"] == (MAX_TARGETS_DEFAULT + 1) * check_pages
+        assert counts["workflow-runs"] == (
+            (MAX_TARGETS_DEFAULT + 1) * required_checks.WORKFLOW_RUN_MAX_PAGES
+        )
+        assert counts["commit"] == MAX_TARGETS_DEFAULT + 1
+        assert counts["post"] == MAX_TARGETS_DEFAULT + 1
+    else:
+        assert counts["open-pulls"] == 1
+        assert counts["statuses"] == OPEN_PULLS_MAX + 1
+        assert counts["repository"] == 1
+        assert counts["default-commit"] == 1
+        eval_heads = MAX_TARGETS_DEFAULT + 1
+        assert counts["check-runs"] == eval_heads
+        assert counts["workflow-runs"] == eval_heads
+        assert counts["commit"] == eval_heads
+        assert counts["post"] == eval_heads
 
 
 def _mixed_sweep_transport(
