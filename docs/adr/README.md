@@ -102,3 +102,4 @@ record that supersedes it.
 | [0096](0096-the-release-labels-module-leaves-the-release-step.md) | 2026-11-19 | The release labels module leaves the release step | Accepted |
 | [0098](0098-the-release-fan-out-runs-in-its-own-workflow-run.md) | 2026-11-20 | The release fan-out runs in its own workflow run | Accepted |
 | [0101](0101-a-failed-read-leaves-the-sweep-green.md) | 2026-11-20 | A failed read leaves the sweep green | Accepted |
+| [0105](0105-the-train-asks-the-update-bot-to-recreate-an-unsigned-update.md) | 2026-11-21 | The train asks the update bot to recreate an unsigned update | Accepted |
