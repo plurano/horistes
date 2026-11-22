@@ -98,6 +98,23 @@ def _prefix_before_starred(elts: list[ast.expr]) -> list[ast.expr]:
     return prefix
 
 
+def _after_starred_pairs(
+    lhs_elts: list[ast.expr], rhs_elts: list[ast.expr]
+) -> list[tuple[ast.expr, ast.expr]]:
+    """Suffix `(target, value)` pairs after one `ast.Starred` target when `rhs_elts` has none."""
+    if any(isinstance(elt, ast.Starred) for elt in rhs_elts):
+        return []
+    starred = [idx for idx, elt in enumerate(lhs_elts) if isinstance(elt, ast.Starred)]
+    if len(starred) != 1:
+        return []
+    split = starred[0]
+    after = lhs_elts[split + 1 :]
+    if len(rhs_elts) < split + len(after):
+        return []
+    offset = len(rhs_elts) - len(after)
+    return [(elt, rhs_elts[offset + j]) for j, elt in enumerate(after)]
+
+
 def _assign_value_bindings(node: ast.Assign, max_steps: int) -> list[tuple[str, ast.expr]]:
     """Index-paired `(name, value)` bindings from an `ast.Assign`, without recursion."""
     pairs: list[tuple[str, ast.expr]] = []
@@ -113,7 +130,9 @@ def _assign_value_bindings(node: ast.Assign, max_steps: int) -> list[tuple[str, 
         elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)):
             lhs = _prefix_before_starred(target.elts)
             rhs = _prefix_before_starred(value.elts)
-            stack.extend(reversed(list(zip(lhs, rhs, strict=False))))
+            seq_pairs = list(zip(lhs, rhs, strict=False))
+            seq_pairs.extend(_after_starred_pairs(target.elts, value.elts))
+            stack.extend(reversed(seq_pairs))
     return pairs
 
 
@@ -461,6 +480,9 @@ def test_tools_hold_no_sensitive_lookup_keys_or_function_names() -> None:
         ('d[(key := "secrets")]', "subscript", "secrets"),
         ('key, other = "secrets", "plain"; d[key]', "subscript", "secrets"),
         ('key, *rest = "secrets", "plain"; d[key]', "subscript", "secrets"),
+        ('*rest, key = "plain", "secrets"; d[key]', "subscript", "secrets"),
+        ('first, *rest, key = "plain", "x", "secrets"; d[key]', "subscript", "secrets"),
+        ('rest, key = ["plain", "secrets"]; d[key]', "subscript", "secrets"),
         ('(key, other), z = ("secrets", "plain"), 1; d[key]', "subscript", "secrets"),
         ('key: str = "secrets"; d[key]', "subscript", "secrets"),
         ('key = c or "secrets"; d[key]', "subscript", "secrets"),
@@ -496,10 +518,15 @@ def test_scanner_reports_planted_sensitive_sources(source: str, kind: str, text:
         ('class C:\n    key = "secrets"\n    val = {}[key]', [(3, "subscript", "secrets")]),
         ('with ctx():\n    key = "secrets"\nd[key]', [(3, "subscript", "secrets")]),
         (
-            'try:\n    key = "plain"\nexcept ValueError:\n    key = "secrets"\nd[key]',
+            'try:\n    key = "secrets"\nexcept ValueError:\n    key = "plain"\nd[key]',
             [(5, "subscript", "secrets")],
         ),
         ('key = "secrets"\nwhile cond:\n    d[key]', [(3, "subscript", "secrets")]),
+        # CodeQL does not report the except-branch alias; flow-insensitive per scope on purpose.
+        (
+            'try:\n    key = "plain"\nexcept ValueError:\n    key = "secrets"\nd[key]',
+            [(5, "subscript", "secrets")],
+        ),
     ],
 )
 def test_scanner_reports_multiline_sensitive_sources(
@@ -566,7 +593,8 @@ def test_scanner_reports_multiline_sensitive_sources(
         'key = "secrets"; d.get(key=key)',
         'key = "is_secret"; d[key]',
         'key = "secrets"\nprint(key)',
-        '*rest, key = "plain", "secrets"; d[key]',
+        '*rest, key = "plain", f(); d[key]',
+        'a, *rest, key = "plain"; d[key]',
     ],
 )
 def test_scanner_ignores_excluded_and_non_lookup_names(source: str) -> None:
