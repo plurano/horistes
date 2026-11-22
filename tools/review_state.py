@@ -326,12 +326,25 @@ def _budget_notice_only(body: str) -> bool:
     return bool(notices) and all(match.group("budget") for match in notices[:MAX_LINES])
 
 
+def _latest_commit_page(conn) -> dict | None:
+    """Read the latest commit page when it returns exactly one commit node."""
+    if not isinstance(conn, dict):
+        return None
+    nodes = conn.get("nodes")
+    if not isinstance(nodes, list) or len(nodes) != 1 or not isinstance(nodes[0], dict):
+        return None
+    count = conn.get("totalCount")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        return None
+    return nodes[0]
+
+
 def _head_checks_commit(head_checks) -> dict | None:
     """The sole commit node under headChecks when it is fully readable."""
-    nodes, ok = _bounded_connection(head_checks, 1)
-    if not ok or len(nodes) != 1:
+    node = _latest_commit_page(head_checks)
+    if node is None:
         return None
-    commit = nodes[0].get("commit")
+    commit = node.get("commit")
     return commit if isinstance(commit, dict) else None
 
 

@@ -11244,6 +11244,16 @@ def adr114_mutations():
             "                or False",
             "H3-run-limit",
         ),
+        (
+            "114-multi-commit",
+            "review_state",
+            "    if isinstance(count, bool) or not isinstance(count, int) or count < 1:",
+            (
+                "    if isinstance(count, bool) or not isinstance(count, int) "
+                "or count < 1 or count != 1:"
+            ),
+            "p3_multi_commit",
+        ),
     ]
 
 

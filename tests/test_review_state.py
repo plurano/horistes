@@ -823,6 +823,7 @@ def adr114_head_checks(
     sourcery_total=None,
     oid=None,
     coderabbit_total=None,
+    commits_total=1,
 ):
     cr_runs = (
         [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)]
@@ -838,7 +839,7 @@ def adr114_head_checks(
     sr_suites = [adr114_head_suite(48477, "sourcery-ai", sr_runs)] if sr_runs else []
     commit_oid = head if oid is None else oid
     return {
-        "totalCount": 1,
+        "totalCount": commits_total,
         "nodes": [
             {
                 "commit": {
@@ -893,6 +894,14 @@ def test_adr114_p2_pass():
         adr114_sourcery_comment(),
         reviews=[adr114_coderabbit_head_review()],
         head_checks=adr114_head_checks(coderabbit_runs=[]),
+    )
+    assert adr92_reader().review_incomplete(pr) == ""
+
+
+def test_adr114_p3_multi_commit_pass():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(commits_total=2),
     )
     assert adr92_reader().review_incomplete(pr) == ""
 
@@ -989,8 +998,29 @@ def test_adr114_h4_budget_on_other_bot_holds(login):
         (adr114_head_checks(oid="c" * 40), ()),
         (None, ()),
         (adr114_head_checks(coderabbit_total=6), ()),
+        (adr114_head_checks(commits_total=0), ()),
+        (adr114_head_checks(commits_total=True), ()),
+        (
+            {
+                **adr114_head_checks(),
+                "nodes": [
+                    adr114_head_checks()["nodes"][0],
+                    adr114_head_checks()["nodes"][0],
+                ],
+            },
+            (),
+        ),
     ],
-    ids=["H5-cr-failure", "H5-cr-summary", "H5-head-mismatch", "H5-missing", "H5-truncated"],
+    ids=[
+        "H5-cr-failure",
+        "H5-cr-summary",
+        "H5-head-mismatch",
+        "H5-missing",
+        "H5-truncated",
+        "H5-commits-zero",
+        "H5-commits-bool",
+        "H5-two-nodes",
+    ],
 )
 def test_adr114_h5_fail_closed_holds(head_checks, reviews):
     pr = adr114_budget_pull(

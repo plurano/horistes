@@ -39,7 +39,10 @@ request node (including `headChecks` read through `review_incomplete`):
 
 - the author login is `sourcery-ai`;
 - every `LIMIT_NOTICE_RE` match in the body is the `budget` alternative;
-- `headChecks` names the pull request head as its single commit `oid`;
+- `headChecks` reads the latest pull request commit (`commits(last: 1)`), which must be
+  exactly one readable node whose `oid` is the head; its `totalCount` counts every pull
+  request commit, so any count of at least 1 is accepted for that page, while suite and
+  run connections must still return every counted node;
 - CodeRabbit finished on that head either through existing `review_evidence` for login
   `coderabbitai` with `on_head`, or through a readable `headChecks.coderabbit` suite
   whose app is id 347564 / slug `coderabbitai` and that holds a `CodeRabbit` run with
