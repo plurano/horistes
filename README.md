@@ -201,6 +201,24 @@ the head, a reviewed range ending at the head, or a later pause summary naming
 the full head as last reviewed commit
 ([ADR-0093](docs/adr/0093-a-person-commit-ends-the-dependency-exemption.md)).
 
+Review settling holds a pull request while a `COMMENTED` or `CHANGES_REQUESTED`
+review on the current head is at or after the author's last push or reply
+([ADR-0067](docs/adr/0067-the-train-settles-reviews-before-landing.md)); on an
+app pull request a person's thread reply or approval is the reply
+([ADR-0081](docs/adr/0081-a-person-review-answers-an-app-pull-request.md)).
+Every such review counts, including a bot follow-up that only replies inside a
+thread the author already resolved and raises nothing new. The train query
+reads no thread state, and the forge's GraphQL API gives no time at which a
+thread was resolved, so the train cannot tell such a follow-up from a new
+finding. The sweep summary then shows `review settle: review at <time> on head,
+last response at <time>`. To clear it, the author posts one closing reply in
+that thread on the same head, with no new claim, question or mention, so the bot
+has nothing to answer. The reply moves the last response past the follow-up; a
+further bot review on the head holds again.
+`test_planted_review_settle_holds_unaddressed_review` and
+`test_planted_review_settle_allows_after_reply` in `tests/test_merge_train.py`
+cover both sides.
+
 Review settling and the dependency exemption live in `tools/review_state.py`;
 the generated rules import them to keep the workflow step below its script cap.
 Every workflow run step has a conservative 4000-field guard
