@@ -178,14 +178,11 @@ check-examples: tools
 test: tools
 	@workers="$(TEST_WORKERS)"; \
 	case "$$workers" in \
-		''|*[!0-9]*) \
+		[1-9]|1[0-6]) ;; \
+		*) \
 			printf '%s\n' "TEST_WORKERS must be a whole number from 1 to 16, got: $$workers" >&2; \
 			exit 2;; \
-	esac; \
-	if [ "$$workers" -lt 1 ] || [ "$$workers" -gt 16 ]; then \
-		printf '%s\n' "TEST_WORKERS must be a whole number from 1 to 16, got: $$workers" >&2; \
-		exit 2; \
-	fi
+	esac
 	data=$$(mktemp -d) && \
 	trap 'rm -rf "$$data"' EXIT && \
 	PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \

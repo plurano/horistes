@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from conftest import ROOT, Tree
 from test_coverage_floor import _recipe_lines
+from test_dev_mode import _child
 
 sys.path.insert(0, str(ROOT / "tools"))
 import suite_minutes
@@ -128,7 +129,7 @@ def test_real_pytest_junit_report(tree: Tree, tmp_path: Path) -> None:
     )
     junit = tmp_path / "r.xml"
     env = {**os.environ, "PYTEST_ADDOPTS": ""}
-    pytest_run = subprocess.run(
+    pytest_run = _child(
         [
             sys.executable,
             "-m",
@@ -141,9 +142,6 @@ def test_real_pytest_junit_report(tree: Tree, tmp_path: Path) -> None:
         ],
         cwd=tree.root,
         env=env,
-        capture_output=True,
-        text=True,
-        check=False,
     )
     assert pytest_run.returncode == 0, pytest_run.stdout + pytest_run.stderr
     done = run_tool(tree, junit, "--budget-seconds", "60")
@@ -159,6 +157,75 @@ def test_over_budget_fails(tree: Tree, tmp_path: Path) -> None:
     assert done.returncode == 1, done.stdout
     assert "FAIL: test stage wall time 50.00s exceeds the 10s budget (500%), 1 tests" in done.stderr
     assert done.stdout.splitlines()[0] == "slowest 1 of 1 tests:"
+
+
+def test_read_report_unreadable_parse_raises_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = tmp_path / "r.xml"
+    _write_junit(report, wall="1", cases=[])
+    err = PermissionError(13, "Permission denied")
+
+    def _deny_parse(_path: Path) -> object:
+        raise err
+
+    monkeypatch.setattr(suite_minutes.DefusedET, "parse", _deny_parse)
+    with pytest.raises(ValueError, match="could not read") as caught:
+        suite_minutes.read_report(report)
+    assert "Permission denied" in str(caught.value)
+
+
+def test_read_report_stat_error_raises_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stat error from Path.is_file (raised on Python 3.12, the CI version) is a read reason."""
+    report = tmp_path / "r.xml"
+    _write_junit(report, wall="1", cases=[])
+
+    def _deny_stat(_self: Path, **_kwargs: object) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(suite_minutes.Path, "is_file", _deny_stat)
+    with pytest.raises(ValueError, match="could not read .*: Permission denied"):
+        suite_minutes.read_report(report)
+
+
+def test_check_unreadable_report_exit_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = tmp_path / "r.xml"
+    _write_junit(report, wall="1", cases=[])
+
+    def _deny_parse(_path: Path) -> object:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(suite_minutes.DefusedET, "parse", _deny_parse)
+    code = suite_minutes.main(["check", str(report), "--budget-seconds", "10"])
+    captured = capsys.readouterr()
+    assert code == 3
+    assert "ERROR: could not measure: could not read" in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores chmod permissions",
+)
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows ignores chmod 000 permissions",
+)
+def test_unreadable_report_file_exit_three(tree: Tree, tmp_path: Path) -> None:
+    report = tmp_path / "r.xml"
+    _write_junit(report, wall="1", cases=[])
+    report.chmod(0o000)
+    try:
+        done = run_tool(tree, report, "--budget-seconds", "10")
+        assert done.returncode == 3
+        assert "could not read" in done.stderr
+        assert done.stdout == ""
+    finally:
+        report.chmod(0o644)
 
 
 @pytest.mark.parametrize(

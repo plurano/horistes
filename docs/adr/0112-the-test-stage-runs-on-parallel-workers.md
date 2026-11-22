@@ -43,7 +43,9 @@ check pinned so the budget cannot silently disappear.
 
 - **`TEST_WORKERS`.** The Makefile defines `TEST_WORKERS ?= 8` (scalar upper
   bound, HISS-06). The `test` target refuses values that are not whole numbers
-  from 1 to 16 before any coverage step. The coverage run step invokes pytest as
+  from 1 to 16 before any coverage step, using one pattern match with no
+  numeric comparison so an overlong digit string cannot slip past a comparison
+  error. The coverage run step invokes pytest as
   `-n auto --maxprocesses=$(TEST_WORKERS)` after `-m pytest`.
 
 - **Pins.** `requirements/tools.in` lists `pytest-xdist`; `requirements/tools.txt`

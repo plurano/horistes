@@ -10,7 +10,8 @@ testsuite ``time`` attribute (session wall clock, including under pytest-xdist),
 not the sum of per-testcase times. The report is read with defusedxml, which
 refuses entity declarations and external references.
 
-Exit codes: 0 pass, 1 over budget, 2 usage error, 3 could not measure.
+Exit codes: 0 pass, 1 over budget, 2 usage error, 3 could not measure (missing,
+invalid, or unreadable report).
 """
 
 from __future__ import annotations
@@ -77,14 +78,24 @@ def _single_testsuite(root: _Node) -> _Node:
     raise ValueError("expected one testsuite, found 0")
 
 
+def _read_failure(path: Path, err: OSError) -> ValueError:
+    reason = err.strerror if err.strerror else str(err)
+    return ValueError(f"could not read {path}: {reason}")
+
+
 def read_report(path: Path, max_tests: int = MAX_TESTS) -> Report:
     """Parse a JUnit report path into wall time and per-test durations."""
-    if not path.is_file():
-        raise ValueError(f"no report at {path}")
+    try:
+        if not path.is_file():
+            raise ValueError(f"no report at {path}")
+    except OSError as err:
+        raise _read_failure(path, err) from None
     try:
         root = DefusedET.parse(path).getroot()
     except (DefusedET.ParseError, DefusedXmlException) as err:
         raise ValueError(f"{path} is not valid XML: {err}") from None
+    except OSError as err:
+        raise _read_failure(path, err) from None
     suite = _single_testsuite(root)
     wall_seconds = _finite_time(suite.get("time"), "testsuite time")
     tests: list[tuple[str, float]] = []

@@ -88,8 +88,26 @@ def test_test_recipe_coverage_run_uses_xdist_cap() -> None:
 
 @pytest.mark.parametrize(
     "workers",
-    ["0", "17", "abc", "", "8 -p no:xdist"],
-    ids=["zero", "over-cap", "non-numeric", "empty", "injection"],
+    [
+        "0",
+        "17",
+        "abc",
+        "",
+        "8 -p no:xdist",
+        "999999999999999999999999",
+        "08",
+        "-1",
+    ],
+    ids=[
+        "zero",
+        "over-cap",
+        "non-numeric",
+        "empty",
+        "injection",
+        "overflow",
+        "leading-zero",
+        "negative",
+    ],
 )
 def test_test_recipe_refuses_invalid_test_workers(tmp_path: Path, workers: str) -> None:
     """Invalid TEST_WORKERS exits 2 before the probe python runs."""
@@ -101,8 +119,13 @@ def test_test_recipe_refuses_invalid_test_workers(tmp_path: Path, workers: str) 
 
 @pytest.mark.parametrize(
     ("workers", "expected"),
-    [("1", "--maxprocesses=1"), ("16", "--maxprocesses=16")],
-    ids=["minimum", "maximum"],
+    [
+        ("1", "--maxprocesses=1"),
+        ("9", "--maxprocesses=9"),
+        ("10", "--maxprocesses=10"),
+        ("16", "--maxprocesses=16"),
+    ],
+    ids=["minimum", "single-digit-max", "two-digit-min", "maximum"],
 )
 def test_test_recipe_passes_worker_cap_to_pytest(
     tmp_path: Path, workers: str, expected: str
