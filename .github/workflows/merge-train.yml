@@ -78,6 +78,8 @@
 # person's act), dependency updates younger than `min_age_days` (3 days,
 # the fleet's minimum age: age counts from the pull request's opening; a
 # rebase or a new version pushed onto an open update does not restart it;
+# an unsigned aged bot update gets labels that ask its update bot to recreate
+# it once, decision record 0105),
 # a security label or "[SECURITY]" in the title, in any letter case, skips
 # the wait), and
 # archived repositories. A repository leaves the train when the app is
@@ -175,6 +177,20 @@ on:
         type: string
         required: false
         default: renovate/ dependabot/
+      regenerate_label:
+        description: >-
+          Label that asks the update bot to recreate an unsigned dependency
+          update; empty turns the request off.
+        type: string
+        required: false
+        default: rebase
+      onboarding_branches:
+        description: >-
+          Exact head names of the update bot onboarding pull requests, separated
+          by spaces; an unsigned head of these is never asked to be recreated.
+        type: string
+        required: false
+        default: renovate/configure
       person_branches:
         description: Head prefixes only a person lands, separated by spaces.
         type: string
@@ -810,7 +826,7 @@ jobs:
                   mergeStateStatus isInMergeQueue reviewDecision
                   author { login __typename }
                   autoMergeRequest { enabledAt commitHeadline mergeMethod }
-                  labels(first: 50) { nodes { name } }
+                  labels(first: 50) { totalCount nodes { name } }
                   opinions: reviews(last: 100, states: [APPROVED, CHANGES_REQUESTED]) {
                     totalCount nodes { submittedAt state author { login __typename } commit { oid } } }
                   reviews(last: 20) {
@@ -916,6 +932,8 @@ jobs:
           TRAIN_MIN_AGE_DAYS: ${{ inputs.min_age_days }}
           TRAIN_HOLD_LABELS: ${{ inputs.hold_labels }}
           TRAIN_DEPENDENCY_BRANCHES: ${{ inputs.dependency_branches }}
+          TRAIN_REGENERATE_LABEL: ${{ inputs.regenerate_label }}
+          TRAIN_ONBOARDING_BRANCHES: ${{ inputs.onboarding_branches }}
           TRAIN_PERSON_BRANCHES: ${{ inputs.person_branches }}
           TRAIN_RELEASE_OFF: ${{ inputs.release_off }}
           TRAIN_RELEASE_FILE: ${{ runner.temp }}/merge-train-releases.json

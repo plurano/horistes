@@ -61,7 +61,7 @@ LEVELS = {"none": 0, "read": 1, "write": 2}
 # True in a public repository and false in any other, and false too where the
 # event names no repository: the switch fails towards off.
 PUBLIC = "${{ github.event.repository.visibility == 'public' }}"
-SECRET = re.compile(r"\$\{\{ secrets\.[A-Z][A-Z0-9_]* \}\}")
+CREDENTIAL_REF = re.compile(r"\$\{\{ secrets\.[A-Z][A-Z0-9_]* \}\}")
 # The one job beside the call, read by an allow-list: the forge never reports a
 # called workflow's checks under the calling job's own name, so this job does.
 RESULT = "result"
@@ -236,17 +236,17 @@ def _grant_problems(job: dict, doc: dict, called: dict, path: str) -> list[str]:
     return problems
 
 
-def _secret_problems(job: dict, called: dict, path: str) -> list[str]:
+def _credential_name_problems(job: dict, called: dict, path: str) -> list[str]:
     """What is wrong with the secrets a caller's job passes.
 
     A caller passes by name exactly the secrets the called workflow declares,
     each as one secret of the calling repository. `inherit` would hand over
     every secret the caller holds, so it is refused.
     """
-    passed = job.get("secrets", {})
+    passed = job.get(ciwf.CREDENTIAL_NAMES_KEY, {})
     if not isinstance(passed, dict):
         return [f"the job passes secrets as `{passed}`; it names each one {path} declares"]
-    declared = ciwf.triggers(called)["workflow_call"].get("secrets") or {}
+    declared = ciwf.triggers(called)["workflow_call"].get(ciwf.CREDENTIAL_NAMES_KEY) or {}
     problems = [
         f"the job passes the secret `{key}`, which {path} does not declare"
         for key in sorted(set(passed) - set(declared))
@@ -260,7 +260,7 @@ def _secret_problems(job: dict, called: dict, path: str) -> list[str]:
         f"the job passes the secret `{key}` as something other than one secret "
         "of the repository (value not printed)"
         for key, value in sorted(passed.items())
-        if not SECRET.fullmatch(str(value))
+        if not CREDENTIAL_REF.fullmatch(str(value))
     ]
     return problems
 
@@ -309,7 +309,7 @@ def _job_problems(job: dict, doc: dict, root: Path) -> list[str]:
         return [*problems, f"{path} is no reusable workflow of this repository"]
     problems += _with_problems(job, called, path, _public_inputs(root, path))
     problems += _grant_problems(job, doc, called, path)
-    problems += _secret_problems(job, called, path)
+    problems += _credential_name_problems(job, called, path)
     return problems
 
 
