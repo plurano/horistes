@@ -6,6 +6,7 @@
 coverage
 lefthook
 pytest
+pytest-xdist
 pyyaml
 reuse
 ruff
