@@ -71,9 +71,9 @@ def describe(root: Path) -> dict:
             scopes.update(ciwf.write_scopes(block))
         workflows[path] = {
             "inputs": _inputs(call.get("inputs")),
-            "secrets": {
+            ciwf.CREDENTIAL_NAMES_KEY: {
                 str(n): {"required": bool((s or {}).get("required", False))}
-                for n, s in (call.get("secrets") or {}).items()
+                for n, s in (call.get(ciwf.CREDENTIAL_NAMES_KEY) or {}).items()
             },
             "outputs": sorted(str(n) for n in (call.get("outputs") or {})),
             "jobs": {
@@ -112,14 +112,14 @@ def breaks(old: dict, new: dict) -> list[str]:
                     found.append(f"{path}: output {name} removed")
             if group == "actions":
                 continue
-            for name, spec in was.get("secrets", {}).items():
-                cur = now["secrets"].get(name)
+            for name, spec in was.get(ciwf.CREDENTIAL_NAMES_KEY, {}).items():
+                cur = now[ciwf.CREDENTIAL_NAMES_KEY].get(name)
                 if cur is None:
                     found.append(f"{path}: secret {name} removed")
                 elif cur["required"] and not spec["required"]:
                     found.append(f"{path}: secret {name} became required")
-            for name, spec in now["secrets"].items():
-                if name not in was.get("secrets", {}) and spec["required"]:
+            for name, spec in now[ciwf.CREDENTIAL_NAMES_KEY].items():
+                if name not in was.get(ciwf.CREDENTIAL_NAMES_KEY, {}) and spec["required"]:
                     found.append(f"{path}: new required secret {name}")
             for job, name in was.get("jobs", {}).items():
                 cur = now["jobs"].get(job)
