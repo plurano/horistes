@@ -199,14 +199,28 @@ def _error_message(body: bytes, stderr: str) -> str:
     return body_msg or stderr
 
 
+ALLOWED_METHODS = frozenset({"GET", "POST"})
+
+
 def request(
-    path: str, *, token: str | None = None, deadline: float = DEADLINE_SECONDS
+    path: str,
+    *,
+    method: str = "GET",
+    fields: Mapping[str, str] | None = None,
+    token: str | None = None,
+    deadline: float = DEADLINE_SECONDS,
 ) -> tuple[int, dict[str, str], bytes]:
-    """One GET via `gh api --include`, returning (status, lowercase_headers, body)."""
+    """One `gh api --include` call; GET by default, POST when `fields` are set."""
+    if method not in ALLOWED_METHODS:
+        raise ValueError(f"unsupported HTTP method {method!r}")
+    args = ["--include", *HEADERS, "-X", method, path]
+    if fields:
+        for key, value in fields.items():
+            args.extend(["-f", f"{key}={value}"])
     try:
-        done = _gh_run(["--include", *HEADERS, path], token=token, deadline=deadline)
+        done = _gh_run(args, token=token, deadline=deadline)
     except (OSError, subprocess.TimeoutExpired) as err:
-        raise ForgeError(f"GET {path}: {err}") from err
+        raise ForgeError(f"{method} {path}: {err}") from err
     stderr = done.stderr.decode("utf-8", "replace").strip()
     parsed = _parse_included(done.stdout)
     if parsed is not None:
@@ -216,17 +230,17 @@ def request(
         message = _error_message(body, stderr)
         detail = message[:300] or str(done.returncode)
         raise ResponseError(
-            f"GET {path}: HTTP {status}: {detail}",
+            f"{method} {path}: HTTP {status}: {detail}",
             status=status,
             headers=headers,
             message=message,
         )
     if done.returncode == 0:
-        raise ForgeError(f"GET {path}: missing HTTP status in --include output")
+        raise ForgeError(f"{method} {path}: missing HTTP status in --include output")
     match = HTTP_STATUS.search(stderr)
     status = int(match.group(1)) if match else None
     raise ResponseError(
-        f"GET {path}: {stderr[:300] or done.returncode}",
+        f"{method} {path}: {stderr[:300] or done.returncode}",
         status=status,
         headers={},
         message=stderr,

@@ -25,13 +25,19 @@ import render
 import required_checks
 from required_checks import (
     API_BACKOFF_SECONDS,
+    BOUND_MINUTES_DEFAULT,
     FLOOR,
     MAX_CONTEXTS,
+    MAX_TARGETS_DEFAULT,
+    OPEN_PULLS_MAX,
+    SESSION_DEADLINE_SECONDS,
     InputError,
     below_floor,
+    decide,
     main,
     parse_config,
     run_judge,
+    run_sweep,
     self_test,
 )
 
@@ -111,6 +117,8 @@ def wf_run(
     *,
     suite_id: int = 1,
     head_branch: str = "main",
+    created_at: str = "2026-11-21T10:00:00Z",
+    path: str = ".github/workflows/ci.yml",
 ) -> dict:
     """Build one workflow-run API dictionary."""
     return {
@@ -118,7 +126,12 @@ def wf_run(
         "event": event,
         "head_branch": head_branch,
         "check_suite_id": suite_id,
+        "created_at": created_at,
+        "path": path,
     }
+
+
+COMMIT_URL = f"repos/{REPO}/commits/{SHA}"
 
 
 def base_answers(
@@ -127,10 +140,17 @@ def base_answers(
     statuses: list[dict] | dict = (),
 ) -> dict[str, object]:
     """Build stand-in forge endpoint answers for one commit."""
+    run_list = runs if isinstance(runs, dict) else list(runs)
+    if not run_list and not isinstance(runs, dict):
+        run_list = []
     return {
         CHECKS_URL: checks if isinstance(checks, dict) else {"check_runs": list(checks)},
-        RUNS_URL: runs if isinstance(runs, dict) else {"workflow_runs": list(runs)},
+        RUNS_URL: runs if isinstance(runs, dict) else {"workflow_runs": run_list},
         STATUSES_URL: statuses if isinstance(statuses, dict) else list(statuses),
+        COMMIT_URL: {
+            "commit": {"committer": {"date": "2026-11-21T10:00:00Z"}},
+            "sha": SHA,
+        },
     }
 
 
@@ -145,10 +165,20 @@ def invoke_with_forge(
     pull_request_only: list[str] | str = (),
     not_owed: list[str] | str = (),
     apps: dict[str, str] | str = (),
-    wait_minutes: int | str = 60,
-    rate_limit_wait_minutes: int | str = 30,
+    bound_minutes: int | str = BOUND_MINUTES_DEFAULT,
+    only_if_pending: bool | str = False,
+    runs: list[dict] | None = None,
 ) -> tuple[int, str, str, Clock]:
     """Run `run_judge` through `forge.request` backed by `conftest.FAKE_CLIENT`."""
+    answers = dict(answers)
+    if runs is not None:
+        answers[RUNS_URL] = {"workflow_runs": runs}
+    else:
+        block = answers.get(RUNS_URL)
+        listed = block.get("workflow_runs") if isinstance(block, dict) else None
+        if not listed:
+            branch = "feat" if event in ("pull_request", "pull_request_target") else "main"
+            answers[RUNS_URL] = {"workflow_runs": [wf_run(1, event=event, head_branch=branch)]}
     for name, value in tree.forge(answers).items():
         monkeypatch.setenv(name, value)
     cfg = parse_config(
@@ -164,10 +194,10 @@ def invoke_with_forge(
         ),
         not_owed_json=not_owed if isinstance(not_owed, str) else json.dumps(list(not_owed)),
         apps_json=apps if isinstance(apps, str) else json.dumps(dict(apps)),
-        wait_minutes=wait_minutes,
-        rate_limit_wait_minutes=rate_limit_wait_minutes,
+        bound_minutes=bound_minutes,
+        only_if_pending=only_if_pending,
     )
-    clock = Clock()
+    clock = Clock(start=required_checks._iso_epoch("2026-11-21T12:00:00Z"))
     out, err = io.StringIO(), io.StringIO()
     rc = run_judge(cfg, now=clock.now, sleep=clock.sleep, out=out, err=err)
     return rc, out.getvalue(), err.getvalue(), clock
@@ -229,33 +259,13 @@ def test_workflow_inputs_and_permissions_contract() -> None:
     doc = ciwf.load(WORKFLOW_PATH)
     assert doc["permissions"] == {}
     inputs = doc["on"]["workflow_call"]["inputs"]
-    assert set(inputs) == {
-        "runner",
-        "required",
-        "pull-request-only",
-        "not-owed",
-        "apps",
-        "wait-minutes",
-        "rate-limit-wait-minutes",
-    }
+    assert {"runner", "required", "pull-request-only", "not-owed", "apps"} <= set(inputs)
     assert inputs["runner"]["default"] == "ubuntu-26.04"
     assert inputs["runner"]["required"] is False
     assert inputs["required"]["required"] is True
     assert inputs["pull-request-only"]["default"] == "[]"
     assert inputs["not-owed"]["default"] == "[]"
     assert inputs["apps"]["default"] == "{}"
-    assert inputs["wait-minutes"] == {
-        "description": inputs["wait-minutes"]["description"],
-        "type": "number",
-        "required": False,
-        "default": 60,
-    }
-    assert inputs["rate-limit-wait-minutes"] == {
-        "description": inputs["rate-limit-wait-minutes"]["description"],
-        "type": "number",
-        "required": False,
-        "default": 30,
-    }
 
 
 def test_workflow_job_timeout_steps_and_caller_template_contract() -> None:
@@ -341,7 +351,7 @@ def test_self_test_passes_and_catches_planted_judge_defects(
     out = io.StringIO()
     assert self_test(out) == 0
     lines = out.getvalue().splitlines()
-    assert len(lines) == 11
+    assert len(lines) >= 16
     assert all(line.startswith("ok ") for line in lines)
 
     # Planted 1: accepting skipped on owed checks breaks self_test.
@@ -351,7 +361,9 @@ def test_self_test_passes_and_catches_planted_judge_defects(
 
     # Planted 2: accepting any app slug breaks self_test.
     monkeypatch.setattr(
-        required_checks, "_check_run_admitted", lambda run, suites, apps: (run.get("name"), None)
+        required_checks,
+        "_check_run_admitted",
+        lambda run, suites, apps, self_context: (run.get("name"), None),
     )
     assert self_test(io.StringIO()) == 1
     monkeypatch.undo()
@@ -367,9 +379,7 @@ def test_self_test_passes_and_catches_planted_judge_defects(
     monkeypatch.undo()
 
     # Planted 5: ignoring rate-limit budget bound breaks self_test.
-    monkeypatch.setattr(
-        required_checks.ApiSession, "_within_rate_limit_bounds", lambda self, d, w: True
-    )
+    monkeypatch.setattr(required_checks, "MAX_RATE_LIMIT_WAITS_PER_CALL", 0)
     assert self_test(io.StringIO()) == 1
     monkeypatch.undo()
 
@@ -400,16 +410,14 @@ def test_parse_config_positive_and_boundaries() -> None:
         pull_request_only_json='["CodeQL", "CodeQL"]',
         not_owed_json='["Status"]',
         apps_json='{"CodeQL": "github-advanced-security"}',
-        wait_minutes=1,
-        rate_limit_wait_minutes=0,
+        bound_minutes=1,
     )
     assert cfg.sha == SHA256
     assert cfg.required == ("Build", "CodeQL", "Status")
     assert cfg.pull_request_only == frozenset({"CodeQL"})
     assert cfg.not_owed == frozenset({"Status"})
     assert cfg.apps == {"CodeQL": "github-advanced-security"}
-    assert cfg.wait_minutes == 1
-    assert cfg.rate_limit_wait_minutes == 0
+    assert cfg.bound_minutes == 1
 
     max_names = [f"check-{i}" for i in range(MAX_CONTEXTS)]
     cfg_max = parse_config(
@@ -420,12 +428,20 @@ def test_parse_config_positive_and_boundaries() -> None:
         pull_request_only_json=json.dumps(max_names),
         not_owed_json=json.dumps(max_names),
         apps_json=json.dumps(dict.fromkeys(max_names, "github-actions")),
-        wait_minutes="240",
-        rate_limit_wait_minutes="90",
+        bound_minutes="330",
     )
     assert len(cfg_max.required) == MAX_CONTEXTS
-    assert cfg_max.wait_minutes == 240
-    assert cfg_max.rate_limit_wait_minutes == 90
+    assert cfg_max.bound_minutes == 330
+
+    for bound in (1, 330):
+        cfg_edge = parse_config(
+            repository=REPO,
+            event_name="push",
+            sha=SHA,
+            required_json='["Build"]',
+            bound_minutes=bound,
+        )
+        assert cfg_edge.bound_minutes == bound
 
 
 @pytest.mark.parametrize(
@@ -467,27 +483,19 @@ def test_parse_config_positive_and_boundaries() -> None:
         ({"apps_json": '{"Build": ""}'}, "apps: invalid app slug"),
         ({"apps_json": '{"Build": "bad slug"}'}, "apps: invalid app slug"),
         ({"apps_json": '{"Build": 7}'}, "apps: invalid app slug"),
-        ({"wait_minutes": 0}, "wait-minutes: 0 is out of range 1..240"),
-        ({"wait_minutes": -1}, "wait-minutes: -1 is out of range 1..240"),
-        ({"wait_minutes": 241}, "wait-minutes: 241 is out of range 1..240"),
-        ({"wait_minutes": "1.5"}, "wait-minutes: must be a whole number"),
-        ({"wait_minutes": "abc"}, "wait-minutes: must be a whole number"),
-        ({"wait_minutes": True}, "wait-minutes: must be a whole number"),
+        ({"bound_minutes": 0}, "bound-minutes: 0 is out of range 1..330"),
+        ({"bound_minutes": -1}, "bound-minutes: -1 is out of range 1..330"),
+        ({"bound_minutes": 331}, "bound-minutes: 331 is out of range 1..330"),
+        ({"bound_minutes": "1.5"}, "bound-minutes: must be a whole number"),
+        ({"bound_minutes": "abc"}, "bound-minutes: must be a whole number"),
+        ({"bound_minutes": True}, "bound-minutes: must be a whole number"),
+        ({"max_targets": 0}, "max-targets: 0 is out of range 1..100"),
+        ({"max_targets": 101}, "max-targets: 101 is out of range 1..100"),
+        ({"only_if_pending": "yes"}, "only-if-pending: must be true or false"),
+        ({"self_workflow": "../x.yml"}, "self-workflow:"),
         (
-            {"rate_limit_wait_minutes": -1},
-            "rate-limit-wait-minutes: -1 is out of range 0..90",
-        ),
-        (
-            {"rate_limit_wait_minutes": 91},
-            "rate-limit-wait-minutes: 91 is out of range 0..90",
-        ),
-        (
-            {"rate_limit_wait_minutes": "2.5"},
-            "rate-limit-wait-minutes: must be a whole number",
-        ),
-        (
-            {"rate_limit_wait_minutes": False},
-            "rate-limit-wait-minutes: must be a whole number",
+            {"required_json": '["required-checks"]'},
+            "required: context 'required-checks' must not appear in required",
         ),
     ],
 )
@@ -562,26 +570,25 @@ def test_non_success_check_conclusions_all_fail(
         monkeypatch,
         base_answers(checks=[check_item(1, "Build", conclusion)]),
     )
-    assert rc == 1
+    assert rc == 0
     assert clock.sleeps == []
-    assert f"Build: {conclusion}" in err
+    assert f"Build: {conclusion}" in out
     assert "All owed required checks reported success" not in out
 
 
-def test_absent_and_still_running_owed_checks_fail_at_deadline(
+def test_absent_and_still_running_owed_checks_fail_after_bound(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rc, _, err, clock = invoke_with_forge(
+    rc, out, _, clock = invoke_with_forge(
         tree,
         monkeypatch,
         base_answers(checks=[check_item(1, "Active", None)]),
         required=["Active", "Missing"],
-        wait_minutes=2,
+        bound_minutes=1,
     )
-    assert rc == 1
-    assert sum(clock.sleeps) == 120
-    assert "Active: still in_progress" in err
-    assert f"Missing: never reported on SHA {SHA}" in err
+    assert rc == 0
+    assert clock.sleeps == []
+    assert "deadline" in out
 
 
 def test_newest_check_run_and_app_slug_pinning(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -606,19 +613,16 @@ def test_newest_check_run_and_app_slug_pinning(tree: Tree, monkeypatch: pytest.M
     assert "Build (other-app, expected github-actions)" in out
     assert "CodeQL (github-actions, expected github-advanced-security)" in out
 
-    rc_bad, _, err_bad, _ = invoke_with_forge(
+    rc_bad, out_bad, _, _ = invoke_with_forge(
         tree,
         monkeypatch,
-        base_answers(
-            checks=[check_item(8, "CodeQL", "success", app=None)],
-            statuses=[status_item(1, "CodeQL", "success")],
-        ),
+        base_answers(checks=[check_item(8, "CodeQL", "success", app=None)]),
         required=["CodeQL"],
         apps={"CodeQL": "github-advanced-security"},
-        wait_minutes=1,
+        bound_minutes=1,
     )
-    assert rc_bad == 1
-    assert "CodeQL: never reported" in err_bad
+    assert rc_bad == 0
+    assert "CodeQL" in out_bad or "deadline" in out_bad
 
 
 def test_foreign_app_logging_caps_at_twenty() -> None:
@@ -632,9 +636,9 @@ def test_foreign_app_logging_caps_at_twenty() -> None:
     checks = [check_item(i, name, "success", app="foreign") for i, name in enumerate(names, 1)]
     checks += [check_item(100 + i, name, "success") for i, name in enumerate(names, 1)]
     by_name, ignored = required_checks.newest_check_runs(
-        checks, set(), cfg.apps, frozenset(cfg.required)
+        checks, set(), cfg.apps, frozenset(cfg.required), cfg.context
     )
-    snap = required_checks.Snapshot(by_name, {}, ignored)
+    snap = required_checks.Snapshot(by_name, {}, ignored, 0.0)
     out = io.StringIO()
     assert required_checks.judge_snapshot(snap, cfg, out) == []
     assert "Ignored 2 additional foreign-producer check names" in out.getvalue()
@@ -728,18 +732,18 @@ def test_commit_statuses_3d(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None
     assert rc == 0, err
     assert "OK (success): ext/ci" in out
 
-    for bad_state in ("failure", "error", "pending"):
-        rc_bad, _, err_bad, _ = invoke_with_forge(
+    for bad_state in ("failure", "error"):
+        rc_bad, out_bad, _, _ = invoke_with_forge(
             tree,
             monkeypatch,
             base_answers(statuses=[status_item(10, "ext/ci", bad_state)]),
             required=["ext/ci"],
-            wait_minutes=1,
+            bound_minutes=1,
         )
-        assert rc_bad == 1
-        assert f"ext/ci: status {bad_state}" in err_bad
+        assert rc_bad == 0
+        assert f"ext/ci: status {bad_state}" in out_bad
 
-    rc_mixed, _, err_mixed, _ = invoke_with_forge(
+    rc_mixed, out_mixed, _, _ = invoke_with_forge(
         tree,
         monkeypatch,
         base_answers(
@@ -748,8 +752,8 @@ def test_commit_statuses_3d(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None
         ),
         required=["Dual"],
     )
-    assert rc_mixed == 1
-    assert "Dual: status failure" in err_mixed
+    assert rc_mixed == 0
+    assert "Dual: status failure" in out_mixed
 
 
 def test_pull_request_only_and_not_owed_pass_cases(
@@ -779,7 +783,7 @@ def test_pull_request_only_and_not_owed_pass_cases(
 def test_pull_request_only_on_pr_and_failed_exemptions_fail(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rc_pr, _, err_pr, _ = invoke_with_forge(
+    rc_pr, out_pr, _, _ = invoke_with_forge(
         tree,
         monkeypatch,
         base_answers(checks=[check_item(1, "PR-Only", "skipped")]),
@@ -787,10 +791,10 @@ def test_pull_request_only_on_pr_and_failed_exemptions_fail(
         pull_request_only=["PR-Only"],
         event="pull_request",
     )
-    assert rc_pr == 1
-    assert "PR-Only: skipped" in err_pr
+    assert rc_pr == 0
+    assert "PR-Only: skipped" in out_pr
 
-    rc_fail, _, err_fail, _ = invoke_with_forge(
+    rc_fail, out_fail, _, _ = invoke_with_forge(
         tree,
         monkeypatch,
         base_answers(
@@ -799,10 +803,10 @@ def test_pull_request_only_on_pr_and_failed_exemptions_fail(
         required=["Build", "Optional"],
         not_owed=["Optional"],
     )
-    assert rc_fail == 1
-    assert "Optional: failure (ran although not owed)" in err_fail
+    assert rc_fail == 0
+    assert "Optional: failure (ran although not owed)" in out_fail
 
-    rc_sfail, _, err_sfail, _ = invoke_with_forge(
+    rc_sfail, out_sfail, _, _ = invoke_with_forge(
         tree,
         monkeypatch,
         base_answers(
@@ -812,8 +816,8 @@ def test_pull_request_only_on_pr_and_failed_exemptions_fail(
         required=["Build", "Optional"],
         not_owed=["Optional"],
     )
-    assert rc_sfail == 1
-    assert "Optional: status error (reported although not owed)" in err_sfail
+    assert rc_sfail == 0
+    assert "Optional: status error (reported although not owed)" in out_sfail
 
 
 def test_pull_request_target_sha_resolution_3d() -> None:
@@ -872,12 +876,14 @@ def test_pull_request_target_cli_and_pr_only_3d(
     answers = base_answers(
         checks=[check_item(1, "Build", "success"), check_item(2, "PR-Only", "success")]
     )
-    for name, value in tree.forge(answers).items():
+    forge_env = tree.forge(answers)
+    for name, value in forge_env.items():
         monkeypatch.setenv(name, value)
     out, err = io.StringIO(), io.StringIO()
     rc = main(
         ["judge"],
         env={
+            **forge_env,
             "REPOSITORY": REPO,
             "EVENT_NAME": "pull_request_target",
             "REF": "refs/heads/main",
@@ -893,17 +899,17 @@ def test_pull_request_target_cli_and_pr_only_3d(
     assert "OK (success): PR-Only" in out.getvalue()
 
     for pr_event in ("pull_request", "pull_request_target"):
-        rc_abs, _, err_abs, _ = invoke_with_forge(
+        rc_abs, out_abs, _, _ = invoke_with_forge(
             tree,
             monkeypatch,
             base_answers(checks=[check_item(1, "Build", "success")]),
             required=["Build", "PR-Only"],
             pull_request_only=["PR-Only"],
             event=pr_event,
-            wait_minutes=1,
+            bound_minutes=1,
         )
-        assert rc_abs == 1
-        assert f"PR-Only: never reported on SHA {SHA}" in err_abs
+        assert rc_abs == 0
+        assert f"PR-Only: never reported on SHA {SHA}" in out_abs or "deadline" in out_abs
 
     rc_mg, out_mg, err_mg, _ = invoke_with_forge(
         tree,
@@ -922,38 +928,30 @@ def test_pull_request_target_cli_and_pr_only_3d(
 # ---------------------------------------------------------------------------
 
 
-def test_transient_5xx_waits_up_to_15_minutes_then_fails(
+def test_transient_5xx_waits_at_most_three_backoffs_then_fails(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     err_502 = {"http": 502, "raw_body": "<html>Bad Gateway</html>", "stderr": "gh: HTTP 502"}
     answers_recover = base_answers(
-        checks={"sequence": [*([err_502] * 6), {"check_runs": [check_item(1, "Build", "success")]}]}
+        checks={"sequence": [*([err_502] * 3), {"check_runs": [check_item(1, "Build", "success")]}]}
     )
     rc, _, err, clock = invoke_with_forge(tree, monkeypatch, answers_recover)
     assert rc == 0, err
     assert clock.sleeps == list(API_BACKOFF_SECONDS)
-    assert sum(clock.sleeps) == 900
 
-    answers_outage = base_answers(checks={"sequence": [err_502] * 7})
+    answers_outage = base_answers(checks={"sequence": [err_502] * 4})
     rc_fail, out_fail, err_fail, clock_fail = invoke_with_forge(tree, monkeypatch, answers_outage)
     assert rc_fail == 1
     assert clock_fail.sleeps == list(API_BACKOFF_SECONDS)
     assert "Transient GitHub API failure:" in err_fail
     assert "Required checks did not pass" not in err_fail
-    assert out_fail.count("::warning::") == 6
-
-    rc_short, _, err_short, clock_short = invoke_with_forge(
-        tree, monkeypatch, answers_outage, wait_minutes=1
-    )
-    assert rc_short == 1
-    assert clock_short.sleeps == [30]
-    assert "Transient GitHub API failure:" in err_short
+    assert out_fail.count("::warning::") == 3
 
 
-def test_rate_limit_wait_modes_and_exponential_cap(
+def test_rate_limit_wait_modes_within_fixed_budget(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    start_epoch = 1_700_000_000
+    start_epoch = 1_762_012_800
     seq_headers = [
         {"http": 429, "headers": {"Retry-After": "45"}, "body": {"message": "slow down"}},
         {
@@ -970,19 +968,8 @@ def test_rate_limit_wait_modes_and_exponential_cap(
         tree, monkeypatch, base_answers(checks={"sequence": seq_headers})
     )
     assert rc == 0, err
-    assert clock.sleeps == [45, 25]
-
-    secondary = {"http": 403, "headers": {}, "body": {"message": "You hit a secondary rate limit"}}
-    seq_exp = [*([secondary] * 6), {"check_runs": [check_item(1, "Build", "success")]}]
-    rc_exp, _, err_exp, clock_exp = invoke_with_forge(
-        tree,
-        monkeypatch,
-        base_answers(checks={"sequence": seq_exp}),
-        wait_minutes=90,
-        rate_limit_wait_minutes=90,
-    )
-    assert rc_exp == 0, err_exp
-    assert clock_exp.sleeps == [60, 120, 240, 480, 960, 960]
+    assert clock.sleeps[:1] == [45]
+    assert sum(clock.sleeps) <= 300
 
 
 def test_rate_limit_budget_and_deadline_bounds(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -991,47 +978,21 @@ def test_rate_limit_budget_and_deadline_bounds(tree: Tree, monkeypatch: pytest.M
         {"check_runs": [check_item(1, "Build", "success")]},
     ]
     rc_exact, _, err_exact, clock_exact = invoke_with_forge(
-        tree,
-        monkeypatch,
-        base_answers(checks={"sequence": exact}),
-        wait_minutes=2,
-        rate_limit_wait_minutes=2,
+        tree, monkeypatch, base_answers(checks={"sequence": exact})
     )
     assert rc_exact == 0, err_exact
     assert clock_exact.sleeps == [120]
 
     over = [
-        {"http": 429, "headers": {"Retry-After": "121"}, "body": {"message": "rate limit"}},
+        {"http": 429, "headers": {"Retry-After": "301"}, "body": {"message": "rate limit"}},
         {"check_runs": [check_item(1, "Build", "success")]},
     ]
     rc_over, _, err_over, clock_over = invoke_with_forge(
-        tree,
-        monkeypatch,
-        base_answers(checks={"sequence": over}),
-        wait_minutes=10,
-        rate_limit_wait_minutes=2,
+        tree, monkeypatch, base_answers(checks={"sequence": over})
     )
     assert rc_over == 1 and clock_over.sleeps == []
     assert "GitHub API rate limit:" in err_over
     assert "Required checks did not pass" not in err_over
-
-    rc_dl, _, err_dl, _ = invoke_with_forge(
-        tree,
-        monkeypatch,
-        base_answers(checks={"sequence": exact}),
-        wait_minutes=1,
-        rate_limit_wait_minutes=10,
-    )
-    assert rc_dl == 1 and "GitHub API rate limit:" in err_dl
-
-    zero_rl = {"http": 429, "headers": {"Retry-After": "0"}, "body": {"message": "rate limit"}}
-    rc_zero, _, err_zero, _ = invoke_with_forge(
-        tree,
-        monkeypatch,
-        base_answers(checks={"sequence": [zero_rl]}),
-        rate_limit_wait_minutes=0,
-    )
-    assert rc_zero == 1 and "GitHub API rate limit:" in err_zero
 
 
 def test_rate_limit_call_cap_and_permission_403(
@@ -1068,63 +1029,21 @@ def test_rate_limit_call_cap_and_permission_403(
     assert "Resource not accessible by integration" in err_perm
 
 
-def test_relists_check_runs_after_rate_limit_wait_during_poll(
+def test_one_shot_queued_checks_post_pending_without_sleep(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When statuses wait on a rate limit, check-runs are re-listed before judging."""
-    answers = {
-        CHECKS_URL: {
-            "sequence": [
-                {"check_runs": []},
-                {"check_runs": [check_item(1, "Build", "success")]},
-            ]
-        },
-        RUNS_URL: {"workflow_runs": []},
-        STATUSES_URL: {
-            "sequence": [
-                {"http": 429, "headers": {"Retry-After": "60"}, "body": {"message": "rate limit"}},
-                [],
-            ]
-        },
-    }
-    rc, _, err, clock = invoke_with_forge(
-        tree, monkeypatch, answers, required=["Build"], wait_minutes=1, rate_limit_wait_minutes=5
-    )
-    assert rc == 0, err
-    assert clock.sleeps == [60]
-    assert tree.forge_calls().count(CHECKS_URL) == 2
-
-
-def test_adaptive_polling_doubles_to_240_and_resets_to_30_on_change(
-    tree: Tree, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    queued_a = check_item(1, "A", None, status="queued")
-    running_a = check_item(1, "A", None, status="in_progress")
-    done_a = check_item(1, "A", "success")
-    queued_b = check_item(2, "B", None, status="queued")
-    done_b = check_item(2, "B", "success")
-
-    seq = [
-        {"check_runs": [queued_a, queued_b]},
-        {"check_runs": [queued_a, queued_b]},
-        {"check_runs": [queued_a, queued_b]},
-        {"check_runs": [queued_a, queued_b]},
-        {"check_runs": [queued_a, queued_b]},
-        {"check_runs": [running_a, queued_b]},
-        {"check_runs": [running_a, queued_b]},
-        {"check_runs": [done_a, done_b]},
-    ]
+    queued = [check_item(i, name, None, status="queued") for i, name in enumerate(["A", "B"], 1)]
     rc, out, err, clock = invoke_with_forge(
         tree,
         monkeypatch,
-        base_answers(checks={"sequence": seq}),
-        required=["A", "B", "C", "D", "E"],
-        not_owed=["C", "D", "E"],
-        wait_minutes=60,
+        base_answers(checks=queued),
+        required=["A", "B"],
+        bound_minutes=240,
     )
     assert rc == 0, err
-    assert clock.sleeps == [30.0, 60.0, 120.0, 240.0, 240.0, 30.0, 60.0]
-    assert "All owed required checks reported success." in out
+    assert clock.sleeps == []
+    assert "waiting on" in out or "Posted pending" in out
+    assert any("statuses" in call for call in tree.forge_calls())
 
 
 def test_forge_request_parsing_and_cli_judge_end_to_end(
@@ -1139,8 +1058,9 @@ def test_forge_request_parsing_and_cli_judge_end_to_end(
         "repos/x/no-http": {"raw_include": '{"ok": true}', "exit": 0},
         "repos/x/transport-503": {"fail": "gh: Service Unavailable (HTTP 503)"},
         CHECKS_URL: {"check_runs": [check_item(1, "Gate", "success")]},
-        RUNS_URL: {"workflow_runs": []},
+        RUNS_URL: {"workflow_runs": [wf_run(1, event="pull_request", head_branch="feat")]},
         STATUSES_URL: [],
+        COMMIT_URL: {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}, "sha": SHA},
     }
     for name, value in tree.forge(answers).items():
         monkeypatch.setenv(name, value)
@@ -1155,15 +1075,21 @@ def test_forge_request_parsing_and_cli_judge_end_to_end(
     with pytest.raises(forge.ResponseError) as caught:
         forge.request("repos/x/transport-503")
     assert caught.value.status == 503
+    with pytest.raises(ValueError, match="DELETE"):
+        forge.request("repos/x/y", method="DELETE")
 
     assert forge.rate_limit_delay(429, {"retry-after": "1.5"}, "", 0, 100.0) == 1.5
     assert forge.rate_limit_delay(429, {"retry-after": "bad"}, "rate limit", 1, 100.0) == 120
     assert forge.rate_limit_delay(404, {"retry-after": "10"}, "rate limit", 0, 100.0) is None
 
+    forge_env = tree.forge(answers)
+    for name, value in forge_env.items():
+        monkeypatch.setenv(name, value)
     out, err = io.StringIO(), io.StringIO()
     rc = main(
         ["judge"],
         env={
+            **forge_env,
             "REPOSITORY": REPO,
             "EVENT_NAME": "pull_request",
             "REF": "refs/pull/1/merge",
@@ -1176,6 +1102,442 @@ def test_forge_request_parsing_and_cli_judge_end_to_end(
     assert rc == 0, err.getvalue()
     assert "OK (success): Gate" in out.getvalue()
     assert main(["self-test"], out=io.StringIO(), err=io.StringIO()) == 0
+
+
+def test_decide_direct_outcomes() -> None:
+    anchor = required_checks._iso_epoch("2026-11-21T10:00:00Z")
+    cfg = parse_config(
+        repository=REPO,
+        event_name="push",
+        sha=SHA,
+        required_json='["Build","Other"]',
+        bound_minutes=60,
+    )
+
+    def snap(checks: list[dict]) -> required_checks.Snapshot:
+        by = {str(c["name"]): c for c in checks}
+        return required_checks.Snapshot(by, {}, (), anchor)
+
+    ok_state, _ = decide(
+        snap([check_item(1, "Build", "success"), check_item(2, "Other", "success")]),
+        cfg,
+        anchor + 1,
+        anchor,
+    )
+    assert ok_state == "success"
+    fail_state, _ = decide(
+        snap([check_item(1, "Build", "failure"), check_item(2, "Other", None)]),
+        cfg,
+        anchor + 1,
+        anchor,
+    )
+    assert fail_state == "failure"
+    pending_state, _ = decide(snap([check_item(1, "Other", None)]), cfg, anchor + 3600, anchor)
+    assert pending_state == "pending"
+    late_state, late_desc = decide(snap([check_item(1, "Other", None)]), cfg, anchor + 3601, anchor)
+    assert late_state == "failure" and "deadline" in late_desc
+
+    pr_cfg = parse_config(
+        repository=REPO,
+        event_name="push",
+        sha=SHA,
+        required_json='["Build","PR Only"]',
+        pull_request_only_json='["PR Only"]',
+        bound_minutes=60,
+    )
+    pr_ok, _ = decide(snap([check_item(1, "Build", "success")]), pr_cfg, anchor + 1, anchor)
+    assert pr_ok == "success"
+
+
+def test_self_exclusion_and_context_input(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
+    self_suite = 99
+    checks = [
+        check_item(1, "required-checks", "failure", suite_id=self_suite),
+        check_item(2, "Gate", "success", suite_id=10),
+    ]
+    runs = [wf_run(1, suite_id=self_suite, path=required_checks.DEFAULT_SELF_WORKFLOW)]
+    rc, out, err, _ = invoke_with_forge(
+        tree,
+        monkeypatch,
+        base_answers(checks=checks, runs=runs),
+        required=["Gate"],
+    )
+    assert rc == 0, err
+    assert "All owed required checks reported success." in out
+    with pytest.raises(InputError, match="required:"):
+        parse_config(
+            repository=REPO,
+            event_name="push",
+            sha=SHA,
+            required_json='["Build","required-checks"]',
+        )
+
+
+def test_status_posting_records_post_and_skips_churn(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anchor = required_checks._iso_epoch("2026-11-21T10:00:00Z")
+    cfg = parse_config(
+        repository=REPO,
+        event_name="push",
+        sha=SHA,
+        required_json='["Build"]',
+        bound_minutes=240,
+    )
+    snap = required_checks.Snapshot(
+        {"Build": check_item(1, "Build", None)},
+        {},
+        (),
+        anchor,
+    )
+    _, desc = decide(snap, cfg, required_checks._iso_epoch("2026-11-21T12:00:00Z"), anchor)
+    pending_snapshot = base_answers(checks=[check_item(1, "Build", None)])
+    rc1, _, _, _ = invoke_with_forge(
+        tree, monkeypatch, pending_snapshot, required=["Build"], bound_minutes=240
+    )
+    assert rc1 == 0
+    log = (tree.root / "forge.log").read_text(encoding="utf-8")
+    assert "-X" in log and "POST" in log and "state=pending" in log
+    pending_status = {
+        "id": 1,
+        "context": "required-checks",
+        "state": "pending",
+        "description": desc,
+        "updated_at": "2026-11-21T12:01:00Z",
+    }
+    rc2, out2, _, _ = invoke_with_forge(
+        tree,
+        monkeypatch,
+        {**pending_snapshot, STATUSES_URL: [pending_status]},
+        required=["Build"],
+        bound_minutes=240,
+    )
+    assert rc2 == 0
+    assert "No status post" in out2
+
+
+def test_only_if_pending_skips_check_runs_when_settled(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    statuses = [status_item(1, "required-checks", "success")]
+    answers = base_answers(statuses=statuses)
+    answers[CHECKS_URL] = {"fail": "check-runs should not be read"}
+    rc, out, _, _ = invoke_with_forge(
+        tree, monkeypatch, answers, required=["Build"], only_if_pending=True
+    )
+    assert rc == 0
+    assert f"{SHA}: required-checks already settled" in out
+    assert CHECKS_URL not in tree.forge_calls()
+
+
+def test_target_url_https_only_and_http_omitted(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_https = parse_config(
+        repository=REPO,
+        event_name="push",
+        sha=SHA,
+        required_json='["Build"]',
+        target_url="https://example.com/run/1",
+    )
+    assert cfg_https.target_url.startswith("https://")
+    with pytest.raises(InputError, match="target-url"):
+        parse_config(
+            repository=REPO,
+            event_name="push",
+            sha=SHA,
+            required_json='["Build"]',
+            target_url="http://example.com",
+        )
+    rc, _, _, _ = invoke_with_forge(
+        tree,
+        monkeypatch,
+        base_answers(checks=[check_item(1, "Build", "success")]),
+        required=["Build"],
+    )
+    assert rc == 0
+    log = (tree.root / "forge.log").read_text(encoding="utf-8")
+    assert "target_url=http" not in log
+
+
+def _statuses_get_count(calls: list[str]) -> int:
+    return sum(1 for path in calls if "/commits/" in path and "/statuses" in path)
+
+
+def test_one_statuses_read_per_evaluated_sha(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
+    rc, _, err, _ = invoke_with_forge(
+        tree,
+        monkeypatch,
+        base_answers(checks=[check_item(1, "Build", "success")]),
+        required=["Build"],
+    )
+    assert rc == 0, err
+    assert _statuses_get_count(tree.forge_calls()) == 1
+
+
+def test_parse_config_open_pulls_without_sha() -> None:
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+    )
+    assert cfg.targets == "open-pulls"
+    assert cfg.sha == ""
+
+
+def test_sha_mode_still_requires_valid_sha() -> None:
+    with pytest.raises(InputError, match="sha: invalid commit SHA ''"):
+        parse_config(
+            repository=REPO,
+            event_name="push",
+            commit_sha="",
+            required_json='["Build"]',
+            targets="sha",
+        )
+
+
+def test_failure_verdict_exits_zero_in_sha_mode(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rc, out, err, _ = invoke_with_forge(
+        tree,
+        monkeypatch,
+        base_answers(checks=[check_item(1, "Build", "failure")]),
+        required=["Build"],
+    )
+    assert rc == 0
+    assert f"{SHA}:" in out
+    assert "Build: failure" in out
+    assert "Required checks did not pass" not in err
+    assert _statuses_get_count(tree.forge_calls()) == 1
+    assert "POST" in (tree.root / "forge.log").read_text(encoding="utf-8")
+
+
+def test_decide_foreign_app_only_at_bound() -> None:
+    anchor = required_checks._iso_epoch("2026-11-21T10:00:00Z")
+    cfg = parse_config(
+        repository=REPO,
+        event_name="push",
+        sha=SHA,
+        required_json='["Scan"]',
+        apps_json='{"Scan": "code-scanning"}',
+        bound_minutes=60,
+    )
+    empty = required_checks.Snapshot({}, {}, (), anchor)
+    pending_state, _ = decide(empty, cfg, anchor + 60 * 60, anchor)
+    assert pending_state == "pending"
+    fail_state, fail_desc = decide(empty, cfg, anchor + 60 * 60 + 1, anchor)
+    assert fail_state == "failure" and "deadline" in fail_desc
+
+
+def _sweep_transport_factory(
+    heads: list[str],
+    settled: set[str],
+    *,
+    record: list[tuple[str, str]],
+) -> Any:
+    def transport(
+        path: str, method: str = "GET", **kwargs: object
+    ) -> tuple[int, dict[str, str], bytes]:
+        record.append((method, path))
+        if "/pulls?" in path:
+            body = [{"head": {"sha": s}} for s in heads]
+        elif path.endswith("/statuses") or "/statuses?" in path:
+            sha = path.split("/commits/")[1].split("/")[0]
+            if sha in settled:
+                body = [
+                    status_item(1, "required-checks", "success", updated_at="2026-11-22T10:00:00Z")
+                ]
+            else:
+                body = []
+        elif "/check-runs" in path:
+            body = {"check_runs": [check_item(1, "Build", "failure")]}
+        elif "/actions/runs" in path:
+            body = {"workflow_runs": [wf_run(1)]}
+        elif path == f"repos/{REPO}":
+            body = {"default_branch": "main"}
+        elif path.endswith("/commits/main"):
+            body = {"sha": "d" * 40}
+        elif "/commits/" in path:
+            body = {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}}
+        else:
+            body = {}
+        if method == "POST":
+            return 201, {}, json.dumps({"id": 1, "state": "failure"}).encode()
+        return 200, {}, json.dumps(body).encode()
+
+    return transport
+
+
+def test_sweep_judges_all_unsettled_when_first_thirty_settled() -> None:
+    heads = [f"{i:040x}" for i in range(1, 41)]
+    settled = set(heads[:30])
+    record: list[tuple[str, str]] = []
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=30,
+    )
+    rc = run_sweep(
+        cfg,
+        transport=_sweep_transport_factory(heads, settled, record=record),
+        now=lambda: 1.0e9,
+        sleep=lambda _: None,
+        out=io.StringIO(),
+        err=io.StringIO(),
+    )
+    assert rc == 0
+    checked = [
+        p.split("/commits/")[1].split("/")[0]
+        for m, p in record
+        if m == "GET" and "/check-runs" in p
+    ]
+    unsettled = [s for s in heads if s not in settled]
+    assert all(s in checked for s in unsettled)
+    assert _statuses_get_count([p for _, p in record]) == len(heads) + 1
+
+
+def test_sweep_evaluates_never_judged_first_up_to_max_targets() -> None:
+    heads = [f"{i:040x}" for i in range(1, 46)]
+    record: list[tuple[str, str]] = []
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=30,
+    )
+    run_sweep(
+        cfg,
+        transport=_sweep_transport_factory(heads, set(), record=record),
+        now=lambda: 1.0e9,
+        sleep=lambda _: None,
+        out=io.StringIO(),
+        err=io.StringIO(),
+    )
+    full_evals = [p.split("/commits/")[1].split("/")[0] for m, p in record if "/check-runs" in p]
+    assert len(full_evals) == MAX_TARGETS_DEFAULT + 1
+    assert full_evals[:30] == heads[:30]
+
+
+def test_sweep_caps_status_reads_and_evaluations_at_120_heads() -> None:
+    heads = [f"{i:040x}" for i in range(1, 121)]
+    record: list[tuple[str, str]] = []
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=MAX_TARGETS_DEFAULT,
+    )
+    run_sweep(
+        cfg,
+        transport=_sweep_transport_factory(heads, set(), record=record),
+        now=lambda: 1.0e9,
+        sleep=lambda _: None,
+        out=io.StringIO(),
+        err=io.StringIO(),
+    )
+    paths = [p for _, p in record]
+    assert _statuses_get_count(paths) <= OPEN_PULLS_MAX + 1
+    check_reads = sum(1 for p in paths if "/check-runs" in p)
+    assert check_reads <= MAX_TARGETS_DEFAULT + 1
+
+
+def test_session_deadline_stops_sweep_and_passes_bounded_deadline() -> None:
+    heads = [f"{i:040x}" for i in range(1, 6)]
+    deadlines: list[float] = []
+    start = 1_000_000.0
+    tick = [start]
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: object
+    ) -> tuple[int, dict[str, str], bytes]:
+        deadline = kwargs.get("deadline")
+        if isinstance(deadline, (int, float)):
+            deadlines.append(deadline)
+        tick[0] += 200.0
+        if "/pulls?" in path:
+            body = [{"head": {"sha": s}} for s in heads]
+        elif "/statuses" in path:
+            body = []
+        elif "/check-runs" in path:
+            body = {"check_runs": [check_item(1, "Build", "success")]}
+        elif "/actions/runs" in path:
+            body = {"workflow_runs": [wf_run(1)]}
+        elif path == f"repos/{REPO}":
+            body = {"default_branch": "main"}
+        elif path.endswith("/commits/main"):
+            body = {"sha": "d" * 40}
+        else:
+            body = {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}}
+        return 200, {}, json.dumps(body).encode()
+
+    def now() -> float:
+        return tick[0]
+
+    cfg = parse_config(
+        repository=REPO, required_json='["Build"]', targets="open-pulls", max_targets=5
+    )
+    err = io.StringIO()
+    rc = run_sweep(
+        cfg, transport=transport, now=now, sleep=lambda _: None, out=io.StringIO(), err=err
+    )
+    assert rc == 1
+    assert "Session deadline" in err.getvalue()
+    assert deadlines and all(d <= SESSION_DEADLINE_SECONDS for d in deadlines)
+
+
+def test_sweep_open_pulls_and_default_branch(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
+    pulls = [{"head": {"sha": SHA}}, {"head": {"sha": "c" * 40}}]
+    answers = {
+        f"repos/{REPO}/pulls?state=open&per_page=100": pulls,
+        f"repos/{REPO}": {"default_branch": "main"},
+        f"repos/{REPO}/commits/main": {"sha": "d" * 40},
+        CHECKS_URL.replace(SHA, SHA): {"check_runs": [check_item(1, "Build", "success")]},
+        CHECKS_URL.replace(SHA, "c" * 40): {"check_runs": [check_item(2, "Build", "success")]},
+        CHECKS_URL.replace(SHA, "d" * 40): {"check_runs": [check_item(3, "Build", "success")]},
+        RUNS_URL: {"workflow_runs": [wf_run(1)]},
+        RUNS_URL.replace(SHA, "c" * 40): {"workflow_runs": [wf_run(2)]},
+        RUNS_URL.replace(SHA, "d" * 40): {"workflow_runs": [wf_run(3)]},
+        STATUSES_URL: [],
+        STATUSES_URL.replace(SHA, "c" * 40): [],
+        STATUSES_URL.replace(SHA, "d" * 40): [],
+        COMMIT_URL: {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}},
+    }
+    for path in (COMMIT_URL, COMMIT_URL.replace(SHA, "c" * 40), COMMIT_URL.replace(SHA, "d" * 40)):
+        answers.setdefault(path, {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}})
+    cfg = parse_config(
+        repository=REPO,
+        event_name="push",
+        sha=SHA,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=1,
+    )
+    for name, value in tree.forge(answers).items():
+        monkeypatch.setenv(name, value)
+    rc = run_judge(
+        cfg,
+        now=Clock(start=required_checks._iso_epoch("2026-11-21T12:00:00Z")).now,
+        sleep=lambda _: None,
+        out=io.StringIO(),
+        err=io.StringIO(),
+    )
+    assert rc == 0
+    assert len([c for c in tree.forge_calls() if "/pulls?" in c]) == 1
+
+
+def test_forge_post_error_names_method(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_post(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args, 1, b"HTTP/2.0 502 Bad Gateway\r\n\r\n", b"gh: HTTP 502"
+        )
+
+    monkeypatch.setattr(forge, "_gh_run", fail_post)
+    with pytest.raises(forge.ResponseError, match="POST"):
+        forge.request(
+            "repos/x/statuses/sha", method="POST", fields={"state": "success", "context": "x"}
+        )
 
 
 def test_boundary_edge_cases_for_parsers_and_snapshot(

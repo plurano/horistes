@@ -151,13 +151,39 @@ INCLUDE_HEAD = ["api", "--include", *HEAD[1:]]
 args = sys.argv[1:]
 with open(os.environ["FAKE_FORGE_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps(args) + "\\n")
-if len(args) == 6 and args[:5] == HEAD:
-    include, endpoint = False, args[5]
-elif len(args) == 7 and args[:6] == INCLUDE_HEAD:
+include = args[0:2] == ["api", "--include"] if len(args) >= 2 else False
+endpoint = None
+post_fields = None
+if args and args[0] == "api" and "-X" in args:
+    idx = args.index("-X")
+    if idx + 1 < len(args) and args[idx + 1] not in ("GET", "POST"):
+        sys.stderr.write("fake forge: only GET/POST requests through `api` are served\\n")
+        sys.exit(2)
+    if idx + 2 < len(args):
+        endpoint = args[idx + 2]
+    fields: dict[str, str] = {}
+    pos = idx + 3
+    while pos + 1 < len(args):
+        if args[pos] == "-f" and "=" in args[pos + 1]:
+            key, val = args[pos + 1].split("=", 1)
+            fields[key] = val
+            pos += 2
+        else:
+            pos += 1
+    if idx + 1 < len(args) and args[idx + 1] == "POST":
+        post_fields = fields
+elif len(args) >= 6 and args[:5] == HEAD:
+    endpoint = args[5]
+    include = False
+elif len(args) >= 7 and args[:6] == INCLUDE_HEAD:
     include, endpoint = True, args[6]
 else:
-    sys.stderr.write("fake forge: only GET requests through `api` are served\\n")
+    sys.stderr.write("fake forge: only GET/POST requests through `api` are served\\n")
     sys.exit(2)
+if post_fields is not None:
+    body = json.dumps({"id": 1, "state": post_fields.get("state", "pending")})
+    sys.stdout.write(f"HTTP/2.0 201 Created\\r\\nContent-Type: application/json\\r\\n\\r\\n{body}")
+    sys.exit(0)
 forge_path = os.environ["FAKE_FORGE"]
 with open(forge_path, encoding="utf-8") as source:
     answer = json.load(source).get(endpoint)
@@ -385,10 +411,7 @@ class Tree:
         """The path of every request the stand-in client received; anything but a GET fails."""
         log = self.root / "forge.log"
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-        assert all(
-            call[0] == "api" and (len(call) == 6 or (len(call) == 7 and call[1] == "--include"))
-            for call in calls
-        ), calls
+        assert all(call[0] == "api" for call in calls), calls
         return [call[-1] for call in calls]
 
     def git(self, *args: str) -> str:
