@@ -11,6 +11,8 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -2137,6 +2139,136 @@ def test_sweep_api_cap_every_call_site(monkeypatch: pytest.MonkeyPatch) -> None:
         assert "Sweep API call cap" in err.getvalue(), err.getvalue()
         assert sum(counts.values()) == cap
         assert counts["post"] == _sweep_posts_at_cap(cap, total, full_posts, setup)
+
+
+@contextmanager
+def _sweep_refresh_clock() -> Iterator[Callable[[], float]]:
+    """Yield a sweep clock that triggers POST_FRESH refresh on every pull evaluation."""
+    base = 1.0e9
+    bump = float(required_checks.POST_FRESH_SECONDS + 1)
+    stale_gate = {"armed": False}
+    read_pass = {"n": 0}
+    real_read = required_checks._read_and_decide
+    real_evaluate = required_checks.evaluate_one
+
+    def now() -> float:
+        if stale_gate["armed"]:
+            stale_gate["armed"] = False
+            return base + bump
+        return base
+
+    def read_and_decide(
+        session: required_checks.ApiSession,
+        config: required_checks.Config,
+        statuses_map: Mapping[str, dict],
+        out: io.TextIO,
+        err: io.TextIO,
+    ) -> tuple[object, str, str, float] | None:
+        read_pass["n"] += 1
+        decided = real_read(session, config, statuses_map, out, err)
+        if decided is not None and read_pass["n"] % 2 == 1:
+            stale_gate["armed"] = True
+        return decided
+
+    def evaluate_one(
+        session: required_checks.ApiSession,
+        config: required_checks.Config,
+        out: io.TextIO,
+        err: io.TextIO,
+        *,
+        statuses_map: Mapping[str, dict] | None = None,
+    ) -> int:
+        read_pass["n"] = 0
+        return real_evaluate(session, config, out, err, statuses_map=statuses_map)
+
+    required_checks._read_and_decide = read_and_decide
+    required_checks.evaluate_one = evaluate_one
+    try:
+        yield now
+    finally:
+        required_checks._read_and_decide = real_read
+        required_checks.evaluate_one = real_evaluate
+
+
+def _sweep_refresh_capless_totals(heads: list[str]) -> tuple[int, int, int, int]:
+    """Totals for an uncapped sweep where every head does a POST_FRESH refresh read."""
+    saved = required_checks.SWEEP_MAX_CALLS
+    required_checks.SWEEP_MAX_CALLS = 10_000
+    transport, counts = _counting_sweep_transport(heads, page_bound=False)
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=MAX_TARGETS_DEFAULT,
+    )
+    err = io.StringIO()
+    try:
+        with _sweep_refresh_clock() as now:
+            rc = run_sweep(
+                cfg,
+                transport=transport,
+                now=now,
+                sleep=lambda _: None,
+                out=io.StringIO(),
+                err=err,
+            )
+        assert rc == 0, err.getvalue()
+        eval_heads = MAX_TARGETS_DEFAULT + 1
+        assert counts["check-runs"] == eval_heads * 2, counts
+        assert counts["workflow-runs"] == eval_heads * 2, counts
+        assert counts["commit"] == eval_heads * 2, counts
+        assert counts["post"] == eval_heads
+        setup = 1 + len(heads) + 2
+        return sum(counts.values()), counts["post"], setup, eval_heads
+    finally:
+        required_checks.SWEEP_MAX_CALLS = saved
+
+
+def _sweep_posts_at_refresh_cap(cap: int, total: int, full_posts: int, setup: int) -> int:
+    """Status posts after a refresh sweep stopped at `cap` (seven API calls per full eval)."""
+    calls_per_eval = 7
+    if cap >= total:
+        return full_posts
+    if cap <= setup:
+        return 0
+    complete = (cap - setup) // calls_per_eval
+    if cap == total - 1 and (cap - setup) % calls_per_eval == 0:
+        return min(full_posts, complete - 1)
+    return min(full_posts, complete)
+
+
+def test_sweep_api_cap_refresh_read_every_call_site(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every API call index of a refresh sweep, refresh read included, stops cleanly at the cap."""
+    heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
+    total, full_posts, setup, eval_heads = _sweep_refresh_capless_totals(heads)
+    assert full_posts == eval_heads
+    first_after_open_pulls = 2
+    caps = list(range(first_after_open_pulls, total))
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=MAX_TARGETS_DEFAULT,
+    )
+    with _sweep_refresh_clock() as now:
+        for cap in caps:
+            monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+            transport, counts = _counting_sweep_transport(heads, page_bound=False)
+            err = io.StringIO()
+            rc = run_sweep(
+                cfg,
+                transport=transport,
+                now=now,
+                sleep=lambda _: None,
+                out=io.StringIO(),
+                err=err,
+            )
+            assert rc == 0, f"cap={cap}: {err.getvalue()}"
+            assert "Sweep API call cap" in err.getvalue(), err.getvalue()
+            assert sum(counts.values()) == cap
+            assert counts["post"] == _sweep_posts_at_refresh_cap(cap, total, full_posts, setup)
 
 
 def test_sweep_call_count_at_fourteen_open_pulls() -> None:
