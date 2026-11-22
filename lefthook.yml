@@ -15,6 +15,9 @@
 # (ADR-0074). Lefthook pastes {1} into the shell line as it is, so the job reads
 # it from a here-document with a quoted delimiter: the shell expands nothing
 # there, and a space, quote or $ stays part of the path.
+# The pre-commit anchors job runs tools/anchors.py check: a commit whose
+# .bestpractices.json anchors no longer match their pins is refused until
+# make fix-anchors moves them.
 ---
 agent-checkpoint-tool:
   commands:
@@ -44,6 +47,8 @@ pre-commit:
       run: sh .config/lefthook/engine.sh compile-context --verify
     hiss-audit:
       run: sh .config/lefthook/engine.sh audit --offline
+    anchors:
+      run: sh .config/lefthook/python.sh -B tools/anchors.py check
 
 commit-msg:
   commands:
