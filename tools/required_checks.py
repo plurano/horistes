@@ -73,7 +73,7 @@ class ApiFailureError(Exception):
     """Unrecoverable API error, transient 5xx timeout, or rate-limit bound exceeded."""
 
 
-class ApiCapReached(Exception):
+class ApiCapReachedError(Exception):
     """Sweep session reached SWEEP_MAX_CALLS before every target was judged."""
 
 
@@ -499,7 +499,7 @@ class ApiSession:
     def request_json(self, label: str, path: str, *, method: str = "GET", **kw: object) -> object:
         """Fetch and decode one JSON endpoint with bounded rate-limit and 5xx retries."""
         if self.max_api_calls is not None and self.api_calls >= self.max_api_calls:
-            raise ApiCapReached(
+            raise ApiCapReachedError(
                 f"Sweep API call cap of {self.max_api_calls} reached during {label}."
             )
         server_attempts = 0
@@ -917,9 +917,8 @@ def _should_post(
     statuses: Mapping[str, dict], config: Config, state: str, description: str
 ) -> bool:
     newest = statuses.get(config.context)
-    if state == "pending":
-        if not newest or str(newest.get("state") or "") != "success":
-            return False
+    if state == "pending" and (not newest or str(newest.get("state") or "") != "success"):
+        return False
     if not newest:
         return True
     return not (
@@ -945,6 +944,11 @@ def post_commit_status(
     fields = _status_fields(config, state, description)
     session.request_json("post-status", path, method="POST", fields=fields)
     session.out.write(f"Posted {state} for {config.context} on {config.sha}\n")
+
+
+def _warn_api_cap(err: TextIO, exc: ApiCapReachedError) -> int:
+    err.write(f"::warning::{exc}\n")
+    return 0
 
 
 def _read_and_decide(
@@ -978,10 +982,9 @@ def evaluate_one(
     if statuses_map is None:
         try:
             statuses_map = read_statuses(session, config.repository, config.sha)
-        except (ApiFailureError, ApiCapReached) as exc:
-            if isinstance(exc, ApiCapReached):
-                err.write(f"::warning::{exc}\n")
-                return 0
+        except (ApiFailureError, ApiCapReachedError) as exc:
+            if isinstance(exc, ApiCapReachedError):
+                return _warn_api_cap(err, exc)
             err.write(f"::error::{exc}\n")
             return 1
     newest = statuses_map.get(config.context)
@@ -990,12 +993,18 @@ def evaluate_one(
         if settled in ("success", "failure"):
             out.write(f"{config.sha}: {config.context} already settled\n")
             return 0
-    decided = _read_and_decide(session, config, statuses_map, out, err)
+    try:
+        decided = _read_and_decide(session, config, statuses_map, out, err)
+    except ApiCapReachedError as exc:
+        return _warn_api_cap(err, exc)
     if decided is None:
         return 1
     _snapshot, state, description, read_end = decided
     if session.now() - read_end > POST_FRESH_SECONDS:
-        decided = _read_and_decide(session, config, statuses_map, out, err)
+        try:
+            decided = _read_and_decide(session, config, statuses_map, out, err)
+        except ApiCapReachedError as exc:
+            return _warn_api_cap(err, exc)
         if decided is None:
             return 1
         _snapshot, state, description, read_end = decided
@@ -1007,9 +1016,8 @@ def evaluate_one(
         return 0
     try:
         post_commit_status(session, config, state, description, statuses_map)
-    except ApiCapReached as exc:
-        err.write(f"::warning::{exc}\n")
-        return 0
+    except ApiCapReachedError as exc:
+        return _warn_api_cap(err, exc)
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
         return 1
@@ -1143,9 +1151,8 @@ def run_sweep(
             out,
         )
         default_sha = _default_branch_head(session, config.repository)
-    except ApiCapReached as exc:
-        err.write(f"::warning::{exc}\n")
-        return 0
+    except ApiCapReachedError as exc:
+        return _warn_api_cap(err, exc)
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
         return 1

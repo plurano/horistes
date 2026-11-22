@@ -85,6 +85,9 @@ DRAFT_ERROR = (
     'echo "::error title=Gate not run on a draft::The gate did not run because '
     'the pull request is a draft. It runs when the pull request is marked ready for review."'
 )
+TAIL_CONCURRENCY_GROUP = (
+    "required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}"
+)
 RENDERED = f"""\
 # SPDX-FileCopyrightText: 2026 Owner <owner@example.org>
 # SPDX-License-Identifier: EUPL-1.2
@@ -162,7 +165,7 @@ jobs:
       || (github.event.pull_request.draft == false
       && github.event.pull_request.head.repo.full_name == github.repository))
     concurrency:
-      group: required-checks-${{{{ github.workflow }}}}-${{{{ github.event.pull_request.head.sha || github.sha }}}}
+      group: {TAIL_CONCURRENCY_GROUP}
       cancel-in-progress: false
     permissions:
       contents: read # checks out the required-checks judge at its pinned commit
@@ -330,17 +333,25 @@ def test_rendered_caller_fails_each_linter_on_its_planted_defect(tree, template,
     """Each linter rejects its planted defect in every rendered caller."""
     text = rendered_real_template(template)
     pin = "@" + render.SAMPLE["Shared"]["Commit"]
-    assert text.count(pin) == 1
+    pin_uses = sum(1 for line in text.splitlines() if "uses:" in line and pin in line)
+    assert pin_uses >= 1
+    assert text.count(pin) == pin_uses
 
-    tree.write({name: text + "bogus-key: 1\n"})
+    tree.write({name: text.rstrip() + "\nbogus-key: 1\n"})
     done = actionlint(tree, name, *ACTIONLINT_CONFIG)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "unexpected key" in done.stdout + done.stderr
 
-    tree.write({name: text.replace(pin, "@main")})
-    done = zizmor(tree)
-    assert done.returncode != 0, done.stdout + done.stderr
-    assert "unpinned-uses" in done.stdout + done.stderr
+    start = 0
+    for _ in range(pin_uses):
+        idx = text.find(pin, start)
+        assert idx != -1
+        planted = text[:idx] + "@main" + text[idx + len(pin) :]
+        tree.write({name: planted})
+        done = zizmor(tree)
+        assert done.returncode != 0, done.stdout + done.stderr
+        assert "unpinned-uses" in done.stdout + done.stderr
+        start = idx + len(pin)
 
 
 def test_good_template_passes(tree):

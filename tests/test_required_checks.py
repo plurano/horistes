@@ -1032,7 +1032,10 @@ def test_one_shot_queued_checks_post_pending_without_sleep(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     queued = [check_item(i, name, None, status="queued") for i, name in enumerate(["A", "B"], 1)]
-    answers = {**base_answers(checks=queued), STATUSES_URL: [status_item(1, "required-checks", "success")]}
+    answers = {
+        **base_answers(checks=queued),
+        STATUSES_URL: [status_item(1, "required-checks", "success")],
+    }
     rc, out, err, clock = invoke_with_forge(
         tree,
         monkeypatch,
@@ -1192,7 +1195,10 @@ def test_status_posting_records_post_and_skips_churn(
     )
     _, desc = decide(snap, cfg, required_checks._iso_epoch("2026-11-21T12:00:00Z"), anchor)
     prior_success = [status_item(0, "required-checks", "success")]
-    pending_snapshot = {**base_answers(checks=[check_item(1, "Build", None)]), STATUSES_URL: prior_success}
+    pending_snapshot = {
+        **base_answers(checks=[check_item(1, "Build", None)]),
+        STATUSES_URL: prior_success,
+    }
     rc1, _, _, _ = invoke_with_forge(
         tree, monkeypatch, pending_snapshot, required=["Build"], bound_minutes=240
     )
@@ -1975,7 +1981,12 @@ def test_fork_tail_makes_no_api_calls(tmp_path: Path, monkeypatch: pytest.Monkey
 
     err = io.StringIO()
     rc = required_checks.run_judge(
-        cfg, transport=transport, now=lambda: 1.0, sleep=lambda _: None, err=err, event_path=str(event)
+        cfg,
+        transport=transport,
+        now=lambda: 1.0,
+        sleep=lambda _: None,
+        err=err,
+        event_path=str(event),
     )
     assert rc == 0
     assert calls == []
@@ -1989,7 +2000,9 @@ def test_tail_sha_counts_own_gate_result_check_run(
     gate_suite = 7
     checks = [check_item(1, "Licence", "success", suite_id=gate_suite)]
     runs = [
-        wf_run(1, event="pull_request", suite_id=gate_suite, path=".github/workflows/licence-check.yml")
+        wf_run(
+            1, event="pull_request", suite_id=gate_suite, path=".github/workflows/licence-check.yml"
+        )
     ]
     answers = {
         **base_answers(checks=checks, runs=runs),
@@ -2009,9 +2022,7 @@ def test_tail_sha_counts_own_gate_result_check_run(
     # targets too → same fixture then omits Licence and posts pending instead.
 
 
-def test_pending_posts_only_over_success(
-    tree: Tree, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_pending_posts_only_over_success(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
     """T4: pending verdict posts only when the existing status is success."""
     queued = [check_item(1, "Build", None, status="queued")]
     over_none = base_answers(checks=queued)
@@ -2057,6 +2068,75 @@ def test_freshness_rereads_then_skips_stale_post(
     rc = run_judge(cfg, now=stepped_now, sleep=lambda _: None, err=err, out=io.StringIO())
     assert rc == 0
     assert "Posting skipped" in err.getvalue()
+
+
+def _sweep_capless_totals(heads: list[str]) -> tuple[int, int, int]:
+    """Return total API calls, status posts, and setup calls for an uncapped sweep."""
+    saved = required_checks.SWEEP_MAX_CALLS
+    required_checks.SWEEP_MAX_CALLS = 10_000
+    transport, counts = _counting_sweep_transport(heads, page_bound=False)
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=MAX_TARGETS_DEFAULT,
+    )
+    try:
+        rc = run_sweep(
+            cfg,
+            transport=transport,
+            now=lambda: 1.0e9,
+            sleep=lambda _: None,
+            out=io.StringIO(),
+            err=io.StringIO(),
+        )
+        assert rc == 0
+        setup = 1 + len(heads) + 2
+        return sum(counts.values()), counts["post"], setup
+    finally:
+        required_checks.SWEEP_MAX_CALLS = saved
+
+
+def _sweep_posts_at_cap(cap: int, total: int, full_posts: int, setup: int) -> int:
+    """Status posts after a sweep stopped at `cap` calls (no post for a cut target)."""
+    if cap >= total:
+        return full_posts
+    if cap <= setup:
+        return 0
+    complete = (cap - setup) // 4
+    if cap == total - 1 and (cap - setup) % 4 == 0:
+        return min(full_posts, complete - 1)
+    return min(full_posts, complete)
+
+
+def test_sweep_api_cap_every_call_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every API call index from after open-pulls through a full sweep stops cleanly at the cap."""
+    heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
+    total, full_posts, setup = _sweep_capless_totals(heads)
+    first_after_open_pulls = 2
+    caps = list(range(first_after_open_pulls, total))
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=MAX_TARGETS_DEFAULT,
+    )
+    for cap in caps:
+        monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+        transport, counts = _counting_sweep_transport(heads, page_bound=False)
+        err = io.StringIO()
+        rc = run_sweep(
+            cfg,
+            transport=transport,
+            now=lambda: 1.0e9,
+            sleep=lambda _: None,
+            out=io.StringIO(),
+            err=err,
+        )
+        assert rc == 0, f"cap={cap}: {err.getvalue()}"
+        assert "Sweep API call cap" in err.getvalue(), err.getvalue()
+        assert sum(counts.values()) == cap
+        assert counts["post"] == _sweep_posts_at_cap(cap, total, full_posts, setup)
 
 
 def test_sweep_call_count_at_fourteen_open_pulls() -> None:

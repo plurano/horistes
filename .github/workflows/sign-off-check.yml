@@ -74,10 +74,10 @@ jobs:
       group: required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}
       cancel-in-progress: false
     permissions:
-      contents: read
-      checks: read
-      actions: read
-      statuses: write
+      contents: read # checks out the required-checks judge at its pinned commit
+      checks: read # lists check runs on the target commit
+      actions: read # lists workflow runs on the target commit
+      statuses: write # posts the required-checks commit status
     uses: ./.github/workflows/required-checks.yml
     with:
       runner: ubuntu-26.04

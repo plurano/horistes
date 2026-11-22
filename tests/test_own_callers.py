@@ -26,7 +26,10 @@ OWN_CONTEXT = {
         "Identifier": "EUPL-1.2",
     },
     "RequiredChecks": {
-        "Required": '["Python 3.12 floor", "Fuzz the result reader", "Verification gate", "CodeQL", "Licence", "Action pins", "Sign-off"]',
+        "Required": (
+            '["Python 3.12 floor", "Fuzz the result reader", "Verification gate", '
+            '"CodeQL", "Licence", "Action pins", "Sign-off"]'
+        ),
         "PullRequestOnly": "[]",
         "NotOwed": "[]",
         "Apps": "{}",
@@ -105,7 +108,11 @@ def comparable(text: str) -> list[str]:
 )
 def test_own_caller_equals_rendered_template(template_path: str, own_path: str) -> None:
     """The repository's own caller matches the rendered template except allow-listed parts."""
-    context = OWN_CONTEXT if own_path.endswith(("licence-check.yml", "sign-off-check.yml")) else render.SAMPLE
+    context = (
+        OWN_CONTEXT
+        if own_path.endswith(("licence-check.yml", "sign-off-check.yml"))
+        else render.SAMPLE
+    )
     template_text = (ROOT / template_path).read_text(encoding="utf-8")
     rendered = render.render(template_text, context, template_path)
     own = (ROOT / own_path).read_text(encoding="utf-8")
@@ -131,7 +138,9 @@ def _ruleset_required_contexts() -> set[str]:
             continue
         params = rule.get("parameters") or {}
         checks = params.get("required_status_checks") or []
-        return {str(item["context"]) for item in checks if isinstance(item, dict) and "context" in item}
+        return {
+            str(item["context"]) for item in checks if isinstance(item, dict) and "context" in item
+        }
     raise AssertionError("ruleset has no required_status_checks rule")
 
 
@@ -167,7 +176,7 @@ def test_comparable_equal_planted_cases() -> None:
     )
     assert comparable(BASE_INLINE) == comparable(variant_uses)
 
-    variant_required = BASE_INLINE.replace('required: \'["A"]\'', 'required: \'["B"]\'')
+    variant_required = BASE_INLINE.replace("required: '[\"A\"]'", "required: '[\"B\"]'")
     assert comparable(BASE_INLINE) == comparable(variant_required)
 
 
