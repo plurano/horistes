@@ -795,6 +795,194 @@ def test_adr93_paused_notice(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
 
 
+# ADR-0114: Sourcery budget skip yields when CodeRabbit completed on the head.
+ADR114_BUDGET = (
+    "Sorry @person, you've used your own review budget of 250,000 diff characters "
+    "for the last 7 days."
+)
+ADR114_CR_SUCCESS = "Result: Success - Review completed\n"
+ADR114_SOURCERY_LOGIN = "sourcery-ai[bot]"
+
+
+def adr114_check_run(name, conclusion, summary, *, status="COMPLETED"):
+    return {"name": name, "status": status, "conclusion": conclusion, "summary": summary}
+
+
+def adr114_head_suite(app_id, slug, runs):
+    return {
+        "app": {"slug": slug, "databaseId": app_id},
+        "checkRuns": {"totalCount": len(runs), "nodes": list(runs)},
+    }
+
+
+def adr114_head_checks(
+    head=ADR92_HEAD,
+    *,
+    coderabbit_runs=None,
+    sourcery_runs=None,
+    sourcery_total=None,
+    oid=None,
+    coderabbit_total=None,
+):
+    cr_runs = (
+        [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)]
+        if coderabbit_runs is None
+        else list(coderabbit_runs)
+    )
+    sr_runs = (
+        [adr114_check_run("Sourcery review", "SKIPPED", ADR114_BUDGET)]
+        if sourcery_runs is None
+        else list(sourcery_runs)
+    )
+    cr_suites = [adr114_head_suite(347564, "coderabbitai", cr_runs)] if cr_runs else []
+    sr_suites = [adr114_head_suite(48477, "sourcery-ai", sr_runs)] if sr_runs else []
+    commit_oid = head if oid is None else oid
+    return {
+        "totalCount": 1,
+        "nodes": [
+            {
+                "commit": {
+                    "oid": commit_oid,
+                    "coderabbit": {
+                        "totalCount": (
+                            len(cr_suites) if coderabbit_total is None else coderabbit_total
+                        ),
+                        "nodes": cr_suites,
+                    },
+                    "sourcery": {
+                        "totalCount": len(sr_suites) if sourcery_total is None else sourcery_total,
+                        "nodes": sr_suites,
+                    },
+                }
+            }
+        ],
+    }
+
+
+def adr114_budget_pull(*comments, reviews=(), head_checks=None, **fields):
+    pull = adr92_pull(*comments, reviews=reviews, **fields)
+    if head_checks is not None:
+        pull["headChecks"] = head_checks
+    return pull
+
+
+def adr114_sourcery_comment(body=None, login=ADR114_SOURCERY_LOGIN, **fields):
+    return adr92_comment(body or ADR114_BUDGET, login=login, **fields)
+
+
+def adr114_coderabbit_head_review(when="2026-11-16T17:00:00Z"):
+    return {
+        "author": {"login": "coderabbitai[bot]"},
+        "state": "COMMENTED",
+        "body": "Review completed.",
+        "submittedAt": when,
+        "commit": {"oid": ADR92_HEAD},
+    }
+
+
+def test_adr114_p1_pass():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(),
+    )
+    assert adr92_reader().review_incomplete(pr) == ""
+
+
+def test_adr114_p2_pass():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        reviews=[adr114_coderabbit_head_review()],
+        head_checks=adr114_head_checks(coderabbit_runs=[]),
+    )
+    assert adr92_reader().review_incomplete(pr) == ""
+
+
+def test_adr114_h1_sourcery_failure_holds():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(
+            sourcery_runs=[adr114_check_run("Sourcery review", "FAILURE", ADR114_BUDGET)]
+        ),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+def test_adr114_h1_success_beside_skipped_holds():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(
+            sourcery_runs=[
+                adr114_check_run("Sourcery review", "SKIPPED", ADR114_BUDGET),
+                adr114_check_run("Sourcery review", "SUCCESS", "Done."),
+            ]
+        ),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Review limit reached.",
+        ADR114_BUDGET + "\nReview limit reached.",
+    ],
+    ids=["H3-skip-text", "H3-mixed"],
+)
+def test_adr114_h3_other_skip_text_holds(body):
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(body),
+        head_checks=adr114_head_checks(),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+@pytest.mark.parametrize(
+    "login",
+    ["coderabbitai[bot]", "copilot[bot]"],
+    ids=["H4-coderabbit", "H4-copilot"],
+)
+def test_adr114_h4_budget_on_other_bot_holds(login):
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(login=login),
+        head_checks=adr114_head_checks(),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+@pytest.mark.parametrize(
+    "head_checks, reviews",
+    [
+        (
+            adr114_head_checks(
+                coderabbit_runs=[
+                    adr114_check_run("CodeRabbit", "FAILURE", ADR114_CR_SUCCESS),
+                ]
+            ),
+            (),
+        ),
+        (
+            adr114_head_checks(
+                coderabbit_runs=[
+                    adr114_check_run("CodeRabbit", "SUCCESS", "Result: Failed - review"),
+                ]
+            ),
+            (),
+        ),
+        (adr114_head_checks(oid="c" * 40), ()),
+        (None, ()),
+        (adr114_head_checks(coderabbit_total=6), ()),
+    ],
+    ids=["H5-cr-failure", "H5-cr-summary", "H5-head-mismatch", "H5-missing", "H5-truncated"],
+)
+def test_adr114_h5_fail_closed_holds(head_checks, reviews):
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        reviews=list(reviews),
+        head_checks=head_checks,
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
 def test_bot_dependency_count_rejects_boolean():
     """A valid bot author isolates the count guard from malformed-author refusals."""
     bot = {"login": "renovate[bot]", "__typename": "Bot"}
