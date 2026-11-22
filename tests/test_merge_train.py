@@ -11230,6 +11230,20 @@ def adr114_mutations():
             "all(False for match in notices[:MAX_LINES])",
             "test_adr114_p1_pass",
         ),
+        (
+            "114-any-text",
+            "review_state",
+            'all(match.group("budget") for match in notices[:MAX_LINES])',
+            "all(True for match in notices[:MAX_LINES])",
+            "H3-skip-text",
+        ),
+        (
+            "114-run-summary",
+            "review_state",
+            '                or not match.group("budget")',
+            "                or False",
+            "H3-run-limit",
+        ),
     ]
 
 

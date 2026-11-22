@@ -937,6 +937,24 @@ def test_adr114_h3_other_skip_text_holds(body):
 
 
 @pytest.mark.parametrize(
+    "summary",
+    [
+        "Review limit reached.\n",
+        "",
+    ],
+    ids=["H3-run-limit", "H3-run-empty"],
+)
+def test_adr114_h3_run_summary_holds(summary):
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(
+            sourcery_runs=[adr114_check_run("Sourcery review", "SKIPPED", summary)]
+        ),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+@pytest.mark.parametrize(
     "login",
     ["coderabbitai[bot]", "copilot[bot]"],
     ids=["H4-coderabbit", "H4-copilot"],
