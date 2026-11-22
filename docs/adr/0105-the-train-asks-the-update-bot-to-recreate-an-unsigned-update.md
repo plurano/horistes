@@ -124,10 +124,11 @@ while a signed head lands on the normal path (`person_branches` in
   <https://docs.renovatebot.com/configuration-options/#rebaselabel>; Renovate
   source `lib/workers/repository/update/branch/handle-existing.ts` line 62 at
   commit `8172379176b12fb88b42de178fc1d97b87550ab6`); a commit a person pushes
-  after the train's head check in `unsigned_update_note` in
-  `tools/merge_train.py` and before the bot acts on the label can be lost. The
-  head check narrows the window to that span; the train accepts the rest because
-  the forge offers no head precondition on a label request.
+  after `pull_commits` in `tools/merge_train.py` read the head commit, and
+  before the bot acts on the label, can be lost; the comparison of that read
+  with the sweep snapshot in `unsigned_update_note` narrows the window to that
+  span; the train accepts the rest because the forge offers no head
+  precondition on a label request.
 
 ## Revisit trigger
 
