@@ -36,6 +36,9 @@ can fail the gate.
 pytest-xdist 3.8.0 treats `--maxprocesses=0` as no cap on `-n auto`, so an
 unbounded worker count is refused at the Makefile.
 
+Issue 221 also asks for per-test timing on every test-stage run and a timing
+check pinned so the budget cannot silently disappear.
+
 ## Decision
 
 - **`TEST_WORKERS`.** The Makefile defines `TEST_WORKERS ?= 8` (scalar upper
@@ -54,6 +57,15 @@ unbounded worker count is refused at the Makefile.
   `pytest_sessionfinish` hookwrapper yields (`xdist/remote.py`), so this hook
   runs before the controller tears the worker down.
 
+- **Timing budget.** `TEST_BUDGET_SECONDS := 900` fixes the test-stage wall-time
+  budget (scalar, not overridable by the environment). The coverage run step
+  passes `--junitxml="$$data/junit.xml"`; the next recipe step runs
+  `tools/suite_minutes.py` on that report, prints the slowest tests, and fails
+  when the testsuite wall time exceeds the budget. The tool reads the report
+  with defusedxml (pinned in `requirements/tools.txt`), which refuses entity
+  declarations and external references. `tests/test_suite_minutes.py` pins the
+  budget, the two recipe steps and the tool's exit codes.
+
 ## Consequences
 
 - Tests must stay independent of run order and of each other; shared mutable
@@ -68,6 +80,9 @@ unbounded worker count is refused at the Makefile.
 - `tests/test_dev_mode.py` and `tests/test_coverage_floor.py` continue to probe
   the recipe; parallel flags are part of the pinned gate shape.
 
+- A test stage above 900 seconds fails with the slowest tests named instead of
+  relying only on the 20-minute pre-push stop.
+
 ## Alternatives considered
 
 - **Raise the 20-minute pre-push bound.** Refused by issue 221.
@@ -80,3 +95,13 @@ unbounded worker count is refused at the Makefile.
 - **pytest-cov.** Would move the recipe from `coverage run` to a plugin and
   change every pinned coverage step. The one conftest hook keeps the four
   coverage steps as they are.
+
+- **Print durations only.** Would record slow tests but enforce no budget.
+
+- **conftest timing file.** Would hand-write what the JUnit report already
+  records from pytest.
+
+- **The standard library XML parser.** Bandit, which Codacy runs on this
+  repository, flags `xml.etree.ElementTree` imports and `parse` calls (B405,
+  B314). A dated `nosec` exception would need renewing; defusedxml removes the
+  finding.

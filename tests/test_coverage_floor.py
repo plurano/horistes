@@ -39,6 +39,7 @@ GATE_COVERAGE = [
         "-n",
         "auto",
         "--maxprocesses=$(TEST_WORKERS)",
+        '--junitxml="$$data/junit.xml"',
     ],
     [*COVERAGE, "combine", RCFILE, DATA_FILE],
     [*COVERAGE, "report", RCFILE, DATA_FILE],
