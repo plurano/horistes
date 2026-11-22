@@ -6,56 +6,69 @@ SPDX-License-Identifier: EUPL-1.2
 # ADR-0108: A reusable workflow judges the required checks
 
 - **Status**: Accepted
-- **Date**: 2026-11-21
+- **Date**: 2026-11-21 (amended 2026-11-22, decision **b**)
 - **Authors**: Lusoris
 
 ## Context
 
-Branch protection and repository rulesets across an organisation otherwise list every required check context directly or maintain a separate aggregator workflow in each repository. Direct ruleset lists deadlock whenever a path-filtered workflow does not run or when pull-request-only gates do not exist on default-branch pushes and merge-group commits. Per-repository copies drift as bug fixes land in one repository and not in others.
+Organisation rulesets list many required check contexts. Per-repository aggregators drift, and a single long-polling caller competes with gate workflows for `GITHUB_TOKEN` budget (1,000 requests/hour/repository). Earlier aggregators established verdict rules: owed contexts must report `success`; foreign event/branch suites are excluded; unexpected app slugs are ignored; transient forge errors and rate limits stay bounded.
 
-An earlier single-repository aggregator established six hard invariants from production incidents: every owed context must report `success` rather than passing when absent, `skipped`, `neutral` or `cancelled`; each check run is admitted only from its expected GitHub App slug (`github-actions` by default) so another app cannot satisfy or mask the same name; check suites created by workflow runs from another event or another branch on the same commit SHA (such as a scheduled run or a cancelled pull-request run after a fast-forward push) are excluded; commit statuses on the SHA count alongside check runs by their newest state per context; transient HTTP 5xx forge outages are waited out for up to 15 minutes before failing as `Transient GitHub API failure:`; and primary or secondary HTTP 403/429 rate limits are waited out using `retry-after`, `x-ratelimit-reset` plus 5 seconds, or exponential backoff while polling adapts from 30 seconds up to 240 seconds.
+Horistes ships reusable workflows as thin YAML over standard-library Python at `job.workflow_sha` ([ADR-0074](0074-the-commit-message-judge-runs-on-the-host-python.md)).
 
-`plurano/horistes` keeps reusable workflows as small YAML shells over standard-library Python modules checked out from the workflow's own commit and self-tested before judging the caller ([ADR-0074](0074-the-commit-message-judge-runs-on-the-host-python.md), [ADR-0095](0095-pull-requests-check-the-full-sign-off-ident.md)). Its forge transport already lives in [forge.py](../../tools/forge.py), where rate-limit detection previously inspected `gh api` error text without HTTP headers.
+## Decision (b)
 
-## Decision
+Two reusable workflows share [required_checks.py](../../tools/required_checks.py):
 
-[required-checks.yml](../../.github/workflows/required-checks.yml) provides a single reusable `workflow_call` job named `Required checks` (reported by the forge as `<calling job> / Required checks`), paired with the consumer caller template [required-checks.yml.tmpl](../../templates/callers/required-checks.yml.tmpl) whose `result` job reports `Required checks` ([ADR-0030](0030-a-result-job-reports-the-calling-jobs-name.md)). Top-level permissions are `{}`; the job asks for `contents: read`, `checks: read`, `statuses: read` and `actions: read` and nothing else. On a draft pull request the job stops before checkout. Otherwise it sparse-checks out [required_checks.py](../../tools/required_checks.py), [forge.py](../../tools/forge.py) and [results.py](../../tools/results.py) from `job.workflow_repository` at `job.workflow_sha` without persisted credentials, runs `python3 -I -B required-checks-source/tools/required_checks.py self-test`, and then runs `judge` ([test_required_checks.py](../../tests/test_required_checks.py)).
+| Workflow | Trigger | Target | Draft stop |
+| :--- | :--- | :--- | :--- |
+| [required-checks.yml](../../.github/workflows/required-checks.yml) | gating caller tail after `result` | `sha` (head commit), one-shot | yes (second barrier behind caller skip) |
+| [required-checks-sweep.yml](../../.github/workflows/required-checks-sweep.yml) | [required-checks-caller.yml](../../.github/workflows/required-checks-caller.yml) `schedule` `17,47 * * * *` + `workflow_dispatch` | `open-pulls` + default branch head | no |
 
-The workflow declares seven inputs: `runner` (string, default `ubuntu-26.04`), `required` (required string, non-empty JSON list of unique context names), `pull-request-only` (string, default `"[]"`), `not-owed` (string, default `"[]"`), `apps` (string, default `"{}"`, mapping context name to expected GitHub App slug), `wait-minutes` (number, default `60`, whole minutes `1`–`240`), and `rate-limit-wait-minutes` (number, default `30`, whole minutes `0`–`90`). Because GitHub Actions expressions provide no arithmetic `+` operator, `timeout-minutes` maps `inputs.wait-minutes` (`1`–`240`) to `wait-minutes + 10` (`11`–`250`) through a `fromJSON` lookup table with fallback `10` for out-of-range inputs, which `parse_config` then refuses before polling. Malformed JSON, `NaN` or `Infinity` constants, an empty or duplicate `required` list, any name in `pull-request-only`, `not-owed` or `apps` absent from `required`, an invalid app slug, or an out-of-range minute value exits with code 2 and a named error before any API call ([required_checks.py](../../tools/required_checks.py), [test_required_checks.py](../../tests/test_required_checks.py)).
+Gating callers ([licence](../../templates/callers/licence.yml.tmpl), [secret-scan](../../templates/callers/secret-scan.yml.tmpl), [sign-off](../../templates/callers/sign-off.yml.tmpl), [workflow-check](../../templates/callers/workflow-check.yml.tmpl)) add job `required-checks` after `result` with `needs: result`, `if: always()` plus same-repository and draft guards, concurrency `required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}` with `cancel-in-progress: false`, and call the tail workflow. Fork heads skip the tail (`::notice::`); the sweep posts for them.
 
-[forge.py](../../tools/forge.py) gains `ResponseError`, `request` (invoking `gh api --include` with the existing 60-second deadline and parsing HTTP status lines and lowercase response headers), `is_rate_limit`, `rate_limit_delay`, and optional `max_pages` and `fetch` parameters on `paged` while keeping `download`, `api`, `paged` defaults and `collect` unchanged for existing callers ([test_forge.py](../../tests/test_forge.py), [test_required_checks.py](../../tests/test_required_checks.py)). One `gh api` runner and one pagination loop serve both readers.
+### Permission grants
 
-[required_checks.py](../../tools/required_checks.py) enforces the base aggregator semantics with injectable clock, sleep and transport functions:
+| Caller piece | Scopes | Serves endpoint |
+| :--- | :--- | :--- |
+| Gate reusable job | as declared by each gate workflow | gate's own reads |
+| Tail job | `contents: read`, `checks: read`, `actions: read`, `statuses: write` | checkout judge; list check runs; list workflow runs; read/post commit statuses |
+| Sweep caller job | same reads + `pull-requests: read` | open pulls list |
 
-- Every owed context (in `required`, not in `not-owed`, and not in `pull-request-only` outside `pull_request` and `pull_request_target` events) must settle with `success`: a completed check run from its expected app with conclusion `success`, or—for contexts not pinned in `apps`—a newest commit status in state `success` (and when both exist, neither failing nor pending). Absent, `skipped`, `neutral`, `cancelled`, `timed_out`, `action_required`, `failure`, `stale`, `startup_failure`, active check runs at the deadline, and `pending`, `failure` or `error` statuses all fail. Exempt contexts (`not-owed`, or `pull-request-only` outside `pull_request` and `pull_request_target`) pass when absent, `skipped`, pending or `success`, and still fail if a completed check run or settled commit status reported a failure.
-- Check runs are filtered to the caller's expected app slug (`apps[name]`, defaulting to `github-actions`); runs from any other app or missing `app.slug` do not count and are logged. Check runs whose `check_suite.id` belongs to a workflow run on the same SHA from a foreign event (such as `schedule`, `pull_request` during a `push` or `merge_group` run, or `push` on another branch) are excluded via `/repos/{owner}/{repo}/actions/runs?head_sha={sha}`. Within the remaining runs, the newest check run per name wins by timestamp and numeric id; commit statuses select the newest status per context by timestamp and numeric id.
-- API HTTP 5xx responses retry with delays `30, 60, 120, 240, 240, 210` seconds (15 minutes total) and then fail with `Transient GitHub API failure:` without judging checks. HTTP 403 or 429 responses carrying `retry-after`, `x-ratelimit-remaining: 0`, or a `rate limit` message wait `retry-after` seconds, `max(0, reset - floor(now)) + 5` seconds, or `60` seconds doubling up to `960` seconds; at most 6 waits per call are permitted, cumulative waits stay within `rate-limit-wait-minutes`, and no wait may cross the `wait-minutes` deadline (`<=` allowed, `>` refused). Exceeding any bound fails with `GitHub API rate limit:` without judging checks. HTTP 403 without a rate-limit signal fails immediately. When a poll pass waits on a rate limit after its initial check-run read, check runs are listed once more before judging so checks registered during the wait are included.
-- Polling starts at 30 seconds, doubles up to 240 seconds while the judged set's statuses and conclusions are unchanged, resets to 30 seconds on any change, and clamps sleeps to the remaining deadline. Every loop carries a scalar upper bound.
+Only `statuses` is write scope in tail and sweep jobs.
 
-## Alternatives
+### Judge rules ([tools/required_checks.py](../../tools/required_checks.py))
 
-- Embedding JavaScript inside `actions/github-script` as in the earlier single-repository aggregator: rejected because large inline scripts hit GitHub Actions expression and field limits, duplicate transport logic outside [forge.py](../../tools/forge.py), and cannot be unit-tested and coverage-gated alongside the Python tools in `tools/`.
-- Adding a preliminary setup job to compute `wait-minutes + 10` as a job output: rejected because it consumes a second runner queue slot on every invocation and adds a second check-run name to the reusable workflow's recorded interface in [interface.lock.json](../../interface.lock.json), whereas `fromJSON` array indexing computes `wait-minutes + 10` directly in `timeout-minutes`.
-- Enforcing a fixed two-minute registration cutoff on absent owed checks: rejected because every Horistes consumer caller reports its required context from a `result` job with `needs:` on the reusable call ([ADR-0030](0030-a-result-job-reports-the-calling-jobs-name.md)), which GitHub registers only after the needed job finishes. Polling up to `wait-minutes` until all owed contexts register and complete handles `needs:` chains without per-consumer dependency tables.
+- **Self exclusion** by workflow path: `open-pulls` only (`GITHUB_WORKFLOW_REF`); `sha` tail counts the gate's own `result` check run.
+- **Fork tail stop** on `pull_request` when head repo ≠ `GITHUB_REPOSITORY` (zero API calls).
+- **Pending post** only when the current `required-checks` status is `success` (rerun).
+- **Freshness**: post within `POST_FRESH_SECONDS` (10) of snapshot read end; one re-read; otherwise `::warning::` and exit 0.
+- **Sweep cap**: `SWEEP_MAX_CALLS` (250) per session.
 
-## Consequences and migration
+Render context `[RequiredChecks]` (Required, PullRequestOnly, NotOwed, Apps) is the single source for tail and sweep template inputs ([tools/render.py](../../tools/render.py)).
 
-Consumers render [required-checks.yml.tmpl](../../templates/callers/required-checks.yml.tmpl) into `.github/workflows/required-checks.yml`, list every merge-gating context in `required`, configure `pull-request-only`, `not-owed` and `apps` as needed, and switch their ruleset to `Required checks` only after a side-by-side verdict trial ([ADR-0004](0004-same-verdict-before-a-switch.md)). Adding this new workflow and template is backwards-compatible and leaves `interface_major` and `interface_minor` at `0.3` in [interface.lock.json](../../interface.lock.json).
+## Budget (measured in tests, one page per read)
 
-Five concerns from the earlier single-repository aggregator remain outside this workflow as caller duties or later work:
+| Scenario | API calls |
+| :--- | ---: |
+| Tail one sha | 3 reads + 0–1 POST ≈ 4 |
+| Sweep 14 open heads + default | 78 |
+| Sweep `OPEN_PULLS_MAX` (100) + default | 228 |
+| Page-bound sweep (uncapped theory) | 3015 |
+| Page-bound sweep (cap enforced) | 250 |
 
-- **Tier computation**: callers that vary owed checks by event or pull-request tier compute that decision in the caller and pass excluded names in `not-owed`.
-- **Hardware lane switches**: callers with optional self-hosted hardware lanes evaluate their repository variables or runner probes in the caller and pass disabled lanes in `not-owed`.
-- **Edited pull-request window anchoring**: this workflow does not inspect timeline `ready_for_review` timestamps or edit-stamped `display_title` prefixes; callers that re-run partial gates on `edited` pull-request events scope those triggers in the caller or leave edit-stamp correlation to later work.
-- **Delayed registration dependencies**: no `needs:` dependency map is passed; polling waits up to `wait-minutes` for absent owed contexts to register, so a broken workflow that never creates an owed context fails at `wait-minutes` rather than after a short grace window unless dependency declarations are added later.
-- **External upload jobs**: no SARIF upload-job propagation map is declared; where an external code-scanning app already posted an older check run on an unchanged SHA before a new upload finishes, coordinating propagation remains a caller duty or later work.
+Calls per hour at a 30-minute schedule: \(2 \times 228 = 456\) at 100 open pulls (under 1,000/h).
 
-## References
+## Alternatives rejected
 
-- Credit: semantics adapted from an earlier single-repository aggregator (owed contexts must succeed, producer app pinning, foreign-event suite exclusion, 15-minute 5xx outage wait, bounded primary/secondary rate-limit wait, check-run re-read after a wait, and adaptive 30–240 s polling).
-- [ADR-0004: A consumer switches only after the same verdict is shown](0004-same-verdict-before-a-switch.md)
-- [ADR-0030: A result job reports the calling job's name](0030-a-result-job-reports-the-calling-jobs-name.md)
-- [ADR-0074: The commit-message judge runs on the host Python](0074-the-commit-message-judge-runs-on-the-host-python.md)
-- [ADR-0095: Pull requests check the full sign-off ident](0095-pull-requests-check-the-full-sign-off-ident.md)
-- [ADR-0098: The release fan-out runs in its own workflow run](0098-the-release-fan-out-runs-in-its-own-workflow-run.md)
-- GitHub Docs, "REST API endpoints for check runs", "REST API endpoints for commit statuses", "REST API endpoints for workflow runs", and "Rate limits for the REST API" (`X-GitHub-Api-Version: 2022-11-28`).
+- **a — `workflow_run` caller**: needs a dated dangerous-triggers exception against the ADR-0098 rendered-caller zizmor contract.
+- **c — sweep only**: ≈1,368 calls/hour at 10-minute interval with 100 open pulls (exceeds 1,000 budget).
+
+## Revisit when
+
+- Pinned actionlint accepts `concurrency.queue`.
+- Measured evidence that a shared concurrency group leaves a PR `CLEAN` with a lone cancelled tail check run.
+- Measured token use near the repository budget cap.
+
+## Consequences
+
+Consumers render tails from gating templates and the sweep from [required-checks.yml.tmpl](../../templates/callers/required-checks.yml.tmpl) into `.github/workflows/required-checks-caller.yml`. Interface stays at `interface_minor` **0.3** in [interface.lock.json](../../interface.lock.json).

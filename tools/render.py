@@ -25,9 +25,11 @@ and no fewer. An input that switches on a host hosts.toml marks `public_only` is
 passed as the repository's visibility (PUBLIC below) or as false. A caller that
 runs on pull requests also holds the job `result`, in exactly the shape that
 reports the calling job's own name and fails unless the call passed; the forge
-reports a called workflow's checks only as "<calling job> / <called job>". While
-exceptions.yaml holds an entry on the required check's name, the note of every
-template must name that entry's issue.
+reports a called workflow's checks only as "<calling job> / <called job>". Such a
+caller may add one job `required-checks` after `result` that calls
+`.github/workflows/required-checks.yml` with the tail grant and inputs from
+`.RequiredChecks`. While exceptions.yaml holds an entry on the required check's
+name, the note of every template must name that entry's issue.
 
 Exit codes: 0 pass, 1 a template fails the check, 3 input error.
 """
@@ -65,7 +67,27 @@ SECRET = re.compile(r"\$\{\{ secrets\.[A-Z][A-Z0-9_]* \}\}")
 # The one job beside the call, read by an allow-list: the forge never reports a
 # called workflow's checks under the calling job's own name, so this job does.
 RESULT = "result"
+TAIL = "required-checks"
 RESULT_KEYS = ("if", "name", "needs", "permissions", "runs-on", "steps", "timeout-minutes")
+TAIL_KEYS = ("concurrency", "if", "name", "needs", "permissions", "uses", "with")
+TAIL_NAME = "Required checks"
+TAIL_IF = (
+    "always() && (github.event_name != 'pull_request' || "
+    "(github.event.pull_request.draft == false && "
+    "github.event.pull_request.head.repo.full_name == github.repository))"
+)
+TAIL_GROUP = (
+    "required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}"
+)
+TAIL_WORKFLOW = ".github/workflows/required-checks.yml"
+TAIL_WITH = (
+    "runner",
+    "required",
+    "pull-request-only",
+    "not-owed",
+    "apps",
+)
+WS_FOLD = re.compile(r"\s+")
 STEP_KEYS = ("if", "name", "run", "shell")
 ECHO = re.compile(r'echo "[^"$`\\]*"')
 DRAFT_ECHO = re.compile(r'echo "::error title=[^"$`\\]+?::[^"$`\\]+"')
@@ -82,6 +104,12 @@ SAMPLE = {
     "Licence": {
         "CopyrightText": "2026 Owner <owner@example.org>",
         "Identifier": "EUPL-1.2",
+    },
+    "RequiredChecks": {
+        "Required": '["Licence", "Secret scan", "Sign-off", "Workflow check"]',
+        "PullRequestOnly": "[]",
+        "NotOwed": "[]",
+        "Apps": "{}",
     },
 }
 HEADER = (
@@ -399,6 +427,67 @@ def _result_problems(jobs: dict, key: str, doc: dict) -> list[str]:
     return problems + _step_problems(steps[0], key)
 
 
+def _fold_ws(text: str) -> str:
+    """Collapse YAML folded condition text for comparison."""
+    return WS_FOLD.sub(" ", str(text).strip())
+
+
+def _tail_problems(tail: dict, doc: dict, root: Path) -> list[str]:
+    """What keeps the required-checks tail job from matching the contract."""
+    if sorted(tail) != sorted(TAIL_KEYS):
+        return [f"job `{TAIL}` has keys other than {', '.join(TAIL_KEYS)}"]
+    problems: list[str] = []
+    if tail.get("name") != TAIL_NAME:
+        problems.append(f"job `{TAIL}` has `name: {tail.get('name')}`, not `{TAIL_NAME}`")
+    if tail.get("needs") != RESULT:
+        problems.append(f"job `{TAIL}` has `needs: {tail.get('needs')}`, not `{RESULT}`")
+    folded = _fold_ws(str(tail.get("if", "")))
+    if folded != _fold_ws(TAIL_IF):
+        problems.append(f"job `{TAIL}` has an `if` that does not match the tail contract")
+    concurrency = tail.get("concurrency")
+    if not isinstance(concurrency, dict):
+        problems.append(f"job `{TAIL}` has no concurrency block")
+    else:
+        if concurrency.get("group") != TAIL_GROUP:
+            problems.append(f"job `{TAIL}` concurrency group must key caller and head commit")
+        if concurrency.get("cancel-in-progress") is not False:
+            problems.append(f"job `{TAIL}` must set `cancel-in-progress: false`")
+    call = CALL.fullmatch(str(tail.get("uses", "")))
+    if call is None:
+        problems.append(f"job `{TAIL}` does not call a workflow by path and reference")
+    elif call["path"] != TAIL_WORKFLOW:
+        problems.append(f"job `{TAIL}` must call {TAIL_WORKFLOW}")
+    elif call["repository"] != SAMPLE["Shared"]["Repository"]:
+        problems.append(f"job `{TAIL}` calls {call['repository']}, not the shared repository")
+    elif call["ref"] != SAMPLE["Shared"]["Commit"]:
+        problems.append("job `required-checks` is not named by the commit field alone")
+    called = _called(root, TAIL_WORKFLOW) if call else None
+    if called is None:
+        problems.append(f"{TAIL_WORKFLOW} is no reusable workflow of this repository")
+    else:
+        problems += _grant_problems(tail, doc, called, TAIL_WORKFLOW)
+        problems += _with_problems(tail, called, TAIL_WORKFLOW, _public_inputs(root, TAIL_WORKFLOW))
+    passed = tail.get("with") or {}
+    for key in TAIL_WITH:
+        if key not in passed:
+            problems.append(f"job `{TAIL}` does not pass `{key}`")
+    extra = sorted(set(passed) - set(TAIL_WITH))
+    problems += [f"job `{TAIL}` passes `{key}`, which the tail does not declare" for key in extra]
+    return problems
+
+
+def _caller_tail_problems(tail: dict | None, jobs: dict, doc: dict, root: Path) -> list[str]:
+    """Problems of the required-checks tail job, when the caller holds one."""
+    if tail is None:
+        return []
+    triggers = ciwf.triggers(doc)
+    if "pull_request" not in triggers and "pull_request_target" not in triggers:
+        return ["a required-checks tail on a caller without pull_request"]
+    if RESULT not in jobs:
+        return [f"job `{TAIL}` needs `{RESULT}`, which is missing"]
+    return _tail_problems(tail, doc, root)
+
+
 def caller_problems(text: str, root: Path) -> list[str]:
     """What keeps a rendered text from being a thin caller of a workflow kept in `root`."""
     try:
@@ -406,13 +495,44 @@ def caller_problems(text: str, root: Path) -> list[str]:
     except yaml.YAMLError as err:
         return [f"the result is no YAML: {err}"]
     jobs = doc.get("jobs") if isinstance(doc, dict) else None
-    calls = [key for key in jobs if key != RESULT] if isinstance(jobs, dict) else []
-    if len(calls) != 1:
+    if not isinstance(jobs, dict):
+        return ["the result names no jobs"]
+    for key, job in jobs.items():
+        if key == RESULT:
+            continue
+        if isinstance(job, dict) and "steps" in job and "uses" not in job:
+            return ["the job has steps of its own; a caller only calls"]
+    raw_tail = jobs.get(TAIL)
+    tail = (
+        raw_tail
+        if isinstance(raw_tail, dict) and raw_tail.get("needs") == RESULT and "uses" in raw_tail
+        else None
+    )
+    extra_tails = [
+        key
+        for key, job in jobs.items()
+        if key != TAIL and isinstance(job, dict) and job.get("needs") == RESULT and "uses" in job
+    ]
+    gate_keys = [
+        key
+        for key, job in jobs.items()
+        if isinstance(job, dict)
+        and "uses" in job
+        and "steps" not in job
+        and not (key == TAIL and tail is not None)
+    ]
+    if len(gate_keys) != 1:
         return [f"the result is no workflow with exactly one job besides `{RESULT}`"]
-    job = jobs[calls[0]]
-    if not isinstance(job, dict) or "steps" in job:
+    if extra_tails:
+        return ["the caller holds more than one required-checks tail"]
+    if isinstance(raw_tail, dict) and raw_tail.get("needs") == RESULT and tail is None:
+        return [f"job `{TAIL}` is not a reusable workflow call"]
+    job = jobs[gate_keys[0]]
+    if "steps" in job:
         return ["the job has steps of its own; a caller only calls"]
-    problems = _job_problems(job, doc, root) + _result_problems(jobs, calls[0], doc)
+    problems = _job_problems(job, doc, root)
+    problems += _caller_tail_problems(tail, jobs, doc, root)
+    problems += _result_problems(jobs, gate_keys[0], doc)
     if not text.startswith(HEADER):
         problems.append("the rendered caller does not start with the two SPDX header lines")
     if f"@{SAMPLE['Shared']['Commit']} # {SAMPLE['Shared']['Version']}\n" not in text:

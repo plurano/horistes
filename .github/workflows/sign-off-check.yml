@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 # SPDX-License-Identifier: EUPL-1.2
 ---
-# This repository's own sign-off check: a thin caller of the reusable workflow
-# beside it, the same shape a consumer's caller has, and one job that reports
-# its result under the name the rule set requires.
+# Sign-off: judge each pull-request commit's author name and email.
+# The job is the shared workflow of plurano/horistes, named by commit.
 name: Sign-off check
 
 on:
@@ -62,3 +61,27 @@ jobs:
         run: |
           echo "The sign-off check did not pass or was skipped on a draft."
           exit 1
+
+  required-checks:
+    name: Required checks
+    needs: result
+    if: >-
+      always()
+      && (github.event_name != 'pull_request'
+      || (github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository))
+    concurrency:
+      group: required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+      statuses: write
+    uses: ./.github/workflows/required-checks.yml
+    with:
+      runner: ubuntu-26.04
+      required: '["Python 3.12 floor", "Fuzz the result reader", "Verification gate", "CodeQL", "Licence", "Action pins", "Sign-off"]'
+      pull-request-only: '[]'
+      not-owed: '[]'
+      apps: '{}'

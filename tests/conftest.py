@@ -35,7 +35,7 @@ CALLER_TEMPLATES: dict[str, str] = {
     "templates/callers/merge-train-release.yml.tmpl": ".github/workflows/merge-train-release.yml",
     "templates/callers/merge-train.yml.tmpl": ".github/workflows/merge-train.yml",
     "templates/callers/release-please.yml.tmpl": ".github/workflows/release-please.yml",
-    "templates/callers/required-checks.yml.tmpl": ".github/workflows/required-checks.yml",
+    "templates/callers/required-checks.yml.tmpl": ".github/workflows/required-checks-caller.yml",
     "templates/callers/scorecard.yml.tmpl": ".github/workflows/scorecard-check.yml",
     "templates/callers/secret-scan.yml.tmpl": ".github/workflows/secret-scan.yml",
     "templates/callers/sign-off.yml.tmpl": ".github/workflows/sign-off-check.yml",

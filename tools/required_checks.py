@@ -33,6 +33,8 @@ MAX_TARGETS_MIN = 1
 MAX_TARGETS_MAX = 100
 MAX_TARGETS_DEFAULT = 30
 SESSION_DEADLINE_SECONDS = 8 * 60
+POST_FRESH_SECONDS = 10
+SWEEP_MAX_CALLS = 250
 MAX_RATE_LIMIT_SECONDS = 300
 API_BACKOFF_SECONDS = (30, 60, 120)
 MAX_RATE_LIMIT_WAITS_PER_CALL = 6
@@ -69,6 +71,10 @@ class InputError(Exception):
 
 class ApiFailureError(Exception):
     """Unrecoverable API error, transient 5xx timeout, or rate-limit bound exceeded."""
+
+
+class ApiCapReached(Exception):
+    """Sweep session reached SWEEP_MAX_CALLS before every target was judged."""
 
 
 @dataclass(frozen=True)
@@ -173,6 +179,42 @@ def _parse_self_workflow(raw: str) -> str:
             f"self-workflow: {path!r} must match .github/workflows/<name>.yml or .yaml"
         )
     return path
+
+
+def _path_from_workflow_ref(raw: str) -> str:
+    """Workflow path from GITHUB_WORKFLOW_REF, or empty when unset."""
+    text = raw.strip()
+    if not text:
+        return ""
+    path_part = text.rsplit("@", 1)[0]
+    parts = path_part.split("/", 2)
+    if len(parts) < 3:
+        raise InputError(f"github-workflow-ref: {raw!r} has no workflow path")
+    return _parse_self_workflow(parts[2])
+
+
+def _fork_head_repository(event_path: str) -> str:
+    """Head repository full name from the forge event payload, or empty."""
+    path = Path(event_path)
+    if not path.is_file():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    pull = payload.get("pull_request")
+    if not isinstance(pull, dict):
+        return ""
+    head = pull.get("head")
+    if not isinstance(head, dict):
+        return ""
+    repo = head.get("repo")
+    if not isinstance(repo, dict):
+        return ""
+    name = repo.get("full_name")
+    return name.strip() if isinstance(name, str) else ""
 
 
 def _parse_required(raw: str) -> tuple[str, ...]:
@@ -395,12 +437,15 @@ class ApiSession:
         sleep: Callable[[float], None] = time.sleep,
         transport: Callable[..., tuple[int, dict[str, str], bytes]] = forge.request,
         out: TextIO = sys.stdout,
+        max_api_calls: int | None = None,
     ) -> None:
         self.deadline = deadline
         self.now = now
         self.sleep = sleep
         self.transport = transport
         self.out = out
+        self.max_api_calls = max_api_calls
+        self.api_calls = 0
         self.rate_limit_waited_seconds = 0.0
         self.rate_limit_wait_count = 0
 
@@ -453,6 +498,10 @@ class ApiSession:
 
     def request_json(self, label: str, path: str, *, method: str = "GET", **kw: object) -> object:
         """Fetch and decode one JSON endpoint with bounded rate-limit and 5xx retries."""
+        if self.max_api_calls is not None and self.api_calls >= self.max_api_calls:
+            raise ApiCapReached(
+                f"Sweep API call cap of {self.max_api_calls} reached during {label}."
+            )
         server_attempts = 0
         rate_limit_waits = 0
         for _ in range(MAX_CALL_ATTEMPTS):
@@ -464,6 +513,7 @@ class ApiSession:
             try:
                 call_deadline = self._call_deadline()
                 _, _, body = self.transport(path, method=method, deadline=call_deadline, **kw)
+                self.api_calls += 1
                 return json.loads(body)
             except forge.ResponseError as err:
                 delay = forge.rate_limit_delay(
@@ -689,7 +739,8 @@ def read_snapshot(
     except forge.ForgeError as err:
         raise ApiFailureError(f"GitHub API error: {err}") from err
     excluded = foreign_suites(workflow_runs, config.event_name, config.ref)
-    excluded |= self_workflow_suites(workflow_runs, config.self_workflow)
+    if config.targets == TARGETS_OPEN_PULLS:
+        excluded |= self_workflow_suites(workflow_runs, config.self_workflow)
     by_name, ignored = newest_check_runs(
         check_runs,
         excluded,
@@ -866,6 +917,9 @@ def _should_post(
     statuses: Mapping[str, dict], config: Config, state: str, description: str
 ) -> bool:
     newest = statuses.get(config.context)
+    if state == "pending":
+        if not newest or str(newest.get("state") or "") != "success":
+            return False
     if not newest:
         return True
     return not (
@@ -893,6 +947,25 @@ def post_commit_status(
     session.out.write(f"Posted {state} for {config.context} on {config.sha}\n")
 
 
+def _read_and_decide(
+    session: ApiSession,
+    config: Config,
+    statuses_map: Mapping[str, dict],
+    out: TextIO,
+    err: TextIO,
+) -> tuple[Snapshot, str, str, float] | None:
+    """Return snapshot, verdict, and wall time when the snapshot read finished."""
+    try:
+        snapshot = read_snapshot(session, config, statuses_map)
+    except ApiFailureError as exc:
+        err.write(f"::error::{exc}\n")
+        return None
+    read_end = session.now()
+    judge_snapshot(snapshot, config, out)
+    state, description = decide(snapshot, config, session.now(), snapshot.anchor)
+    return snapshot, state, description, read_end
+
+
 def evaluate_one(
     session: ApiSession,
     config: Config,
@@ -905,7 +978,10 @@ def evaluate_one(
     if statuses_map is None:
         try:
             statuses_map = read_statuses(session, config.repository, config.sha)
-        except ApiFailureError as exc:
+        except (ApiFailureError, ApiCapReached) as exc:
+            if isinstance(exc, ApiCapReached):
+                err.write(f"::warning::{exc}\n")
+                return 0
             err.write(f"::error::{exc}\n")
             return 1
     newest = statuses_map.get(config.context)
@@ -914,15 +990,26 @@ def evaluate_one(
         if settled in ("success", "failure"):
             out.write(f"{config.sha}: {config.context} already settled\n")
             return 0
-    try:
-        snapshot = read_snapshot(session, config, statuses_map)
-    except ApiFailureError as exc:
-        err.write(f"::error::{exc}\n")
+    decided = _read_and_decide(session, config, statuses_map, out, err)
+    if decided is None:
         return 1
-    judge_snapshot(snapshot, config, out)
-    state, description = decide(snapshot, config, session.now(), snapshot.anchor)
+    _snapshot, state, description, read_end = decided
+    if session.now() - read_end > POST_FRESH_SECONDS:
+        decided = _read_and_decide(session, config, statuses_map, out, err)
+        if decided is None:
+            return 1
+        _snapshot, state, description, read_end = decided
+    if session.now() - read_end > POST_FRESH_SECONDS:
+        err.write(
+            f"::warning::Posting skipped for {config.sha}: snapshot read ended "
+            f"{session.now() - read_end:.0f} s ago (limit {POST_FRESH_SECONDS} s).\n"
+        )
+        return 0
     try:
         post_commit_status(session, config, state, description, statuses_map)
+    except ApiCapReached as exc:
+        err.write(f"::warning::{exc}\n")
+        return 0
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
         return 1
@@ -1000,6 +1087,29 @@ def _default_branch_head(session: ApiSession, repository: str) -> str:
     return sha
 
 
+def _sweep_deadline_passed(session: ApiSession, err: TextIO, what: str) -> bool:
+    """Refuse the next sweep target once the session deadline has passed."""
+    if session.now() < session.deadline:
+        return False
+    err.write(
+        f"::error::Session deadline of {SESSION_DEADLINE_SECONDS} s reached before "
+        f"judging {what}. No check result was judged; rerun this job.\n"
+    )
+    return True
+
+
+def _sweep_default_branch(
+    session: ApiSession, sweep_cfg: Config, default_sha: str, out: TextIO, err: TextIO
+) -> int:
+    """Judge the default branch head last, with the sweep's shared session."""
+    if _sweep_deadline_passed(session, err, "the default branch"):
+        return 1
+    default_cfg = Config(
+        **{**sweep_cfg.__dict__, "sha": default_sha, "event_name": "push", "ref": ""}
+    )
+    return 1 if evaluate_one(session, default_cfg, out, err) != 0 else 0
+
+
 def run_sweep(
     config: Config,
     *,
@@ -1016,6 +1126,7 @@ def run_sweep(
         sleep=sleep,
         transport=transport,
         out=out,
+        max_api_calls=SWEEP_MAX_CALLS,
     )
     sweep_cfg = Config(
         **{**config.__dict__, "only_if_pending": True, "targets": TARGETS_OPEN_PULLS}
@@ -1032,33 +1143,31 @@ def run_sweep(
             out,
         )
         default_sha = _default_branch_head(session, config.repository)
+    except ApiCapReached as exc:
+        err.write(f"::warning::{exc}\n")
+        return 0
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
         return 1
+    pending = len(to_eval) + 1
     for sha, statuses_map in to_eval:
-        if session.now() >= session.deadline:
-            err.write(
-                f"::error::Session deadline of {SESSION_DEADLINE_SECONDS} s reached before "
-                f"judging {sha}. No check result was judged; rerun this job.\n"
-            )
+        pending -= 1
+        if _sweep_deadline_passed(session, err, sha):
             return 1
         one = Config(**{**sweep_cfg.__dict__, "sha": sha, "event_name": "pull_request"})
-        if evaluate_one(session, one, out, err, statuses_map=statuses_map) != 0:
+        result = evaluate_one(session, one, out, err, statuses_map=statuses_map)
+        if result != 0:
             any_error = True
             break
-    if not any_error:
-        if session.now() >= session.deadline:
+        if session.api_calls >= SWEEP_MAX_CALLS:
             err.write(
-                f"::error::Session deadline of {SESSION_DEADLINE_SECONDS} s reached before "
-                "judging the default branch. No check result was judged; rerun this job.\n"
+                f"::warning::Sweep API call cap of {SWEEP_MAX_CALLS} reached; "
+                f"{pending} target(s) not judged.\n"
             )
-            return 1
-        default_cfg = Config(
-            **{**sweep_cfg.__dict__, "sha": default_sha, "event_name": "push", "ref": ""}
-        )
-        if evaluate_one(session, default_cfg, out, err) != 0:
-            any_error = True
-    return 1 if any_error else 0
+            return 0
+    if any_error or session.api_calls >= SWEEP_MAX_CALLS:
+        return 1 if any_error else 0
+    return _sweep_default_branch(session, sweep_cfg, default_sha, out, err)
 
 
 def run_judge(
@@ -1069,10 +1178,19 @@ def run_judge(
     sleep: Callable[[float], None] = time.sleep,
     out: TextIO = sys.stdout,
     err: TextIO = sys.stderr,
+    event_path: str = "",
 ) -> int:
     """Execute one-shot judgment for a validated Config."""
     if config.targets == TARGETS_OPEN_PULLS:
         return run_sweep(config, transport=transport, now=now, sleep=sleep, out=out, err=err)
+    if config.event_name in PR_EVENTS:
+        head_repo = _fork_head_repository(event_path)
+        if head_repo and head_repo != config.repository:
+            err.write(
+                "::notice::Fork pull request head; the required-checks tail does not post "
+                "here. The scheduled sweep judges this commit.\n"
+            )
+            return 0
     session = ApiSession(
         deadline=now() + SESSION_DEADLINE_SECONDS,
         now=now,
@@ -1591,6 +1709,17 @@ def _env_or(arg: str | None, env: Mapping[str, str], key: str, default: str) -> 
     return env.get(key, default)
 
 
+def _apply_workflow_ref(config: Config, environ: Mapping[str, str]) -> Config:
+    """Take the judge's own workflow path from GITHUB_WORKFLOW_REF when the runner sets it."""
+    workflow_ref = environ.get("GITHUB_WORKFLOW_REF", "").strip()
+    if not workflow_ref:
+        return config
+    parsed = _path_from_workflow_ref(workflow_ref)
+    if not parsed:
+        return config
+    return Config(**{**config.__dict__, "self_workflow": parsed})
+
+
 def main(
     argv: list[str] | None = None,
     env: Mapping[str, str] | None = None,
@@ -1640,10 +1769,11 @@ def main(
             ),
             target_url=_env_or(args.target_url, environ, f"{prefix}TARGET_URL", ""),
         )
+        config = _apply_workflow_ref(config, environ)
     except InputError as exc:
         err.write(f"::error title=Invalid required-checks input::{exc}\n")
         return 2
-    return run_judge(config, out=out, err=err)
+    return run_judge(config, out=out, err=err, event_path=environ.get("GITHUB_EVENT_PATH", ""))
 
 
 if __name__ == "__main__":

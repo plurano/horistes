@@ -28,6 +28,7 @@ CONTEXT = {
     "Count": 7,
     "Shared": render.SAMPLE["Shared"],
     "Licence": render.SAMPLE["Licence"],
+    "RequiredChecks": render.SAMPLE["RequiredChecks"],
 }
 COMMIT = render.SAMPLE["Shared"]["Commit"]
 REAL = "templates/callers/licence.yml.tmpl"
@@ -148,6 +149,33 @@ jobs:
         run: |
           echo "The licence check did not pass or was skipped on a draft."
           exit 1
+
+  # One-shot tail after the gate result: same-repository pull requests only;
+  # fork heads are judged by the scheduled sweep. Group keys caller and head
+  # SHA so concurrent callers do not cancel one another (ADR-0108).
+  required-checks:
+    name: Required checks
+    needs: result
+    if: >-
+      always()
+      && (github.event_name != 'pull_request'
+      || (github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository))
+    concurrency:
+      group: required-checks-${{{{ github.workflow }}}}-${{{{ github.event.pull_request.head.sha || github.sha }}}}
+      cancel-in-progress: false
+    permissions:
+      contents: read # checks out the required-checks judge at its pinned commit
+      checks: read # lists check runs on the target commit
+      actions: read # lists workflow runs on the target commit
+      statuses: write # posts the required-checks commit status
+    uses: owner/shared/.github/workflows/required-checks.yml@{COMMIT} # v1.2.3
+    with:
+      runner: ubuntu-26.04
+      required: '["Licence", "Secret scan", "Sign-off", "Workflow check"]'
+      pull-request-only: '[]'
+      not-owed: '[]'
+      apps: '{{}}'
 """
 
 
@@ -908,6 +936,12 @@ Version = "v1.2.3"
 [Licence]
 CopyrightText = "2026 Owner <owner@example.org>"
 Identifier = "EUPL-1.2"
+
+[RequiredChecks]
+Required = '["Licence", "Secret scan", "Sign-off", "Workflow check"]'
+PullRequestOnly = "[]"
+NotOwed = "[]"
+Apps = "{{}}"
 """
 
 

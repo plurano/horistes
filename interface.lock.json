@@ -287,6 +287,43 @@
       },
       "write_scopes": []
     },
+    ".github/workflows/required-checks-sweep.yml": {
+      "inputs": {
+        "apps": {
+          "default": "{}",
+          "required": false,
+          "type": "string"
+        },
+        "not-owed": {
+          "default": "[]",
+          "required": false,
+          "type": "string"
+        },
+        "pull-request-only": {
+          "default": "[]",
+          "required": false,
+          "type": "string"
+        },
+        "required": {
+          "default": null,
+          "required": true,
+          "type": "string"
+        },
+        "runner": {
+          "default": "ubuntu-26.04",
+          "required": false,
+          "type": "string"
+        }
+      },
+      "jobs": {
+        "required-checks": "Required checks"
+      },
+      "outputs": [],
+      "secrets": {},
+      "write_scopes": [
+        "statuses"
+      ]
+    },
     ".github/workflows/required-checks.yml": {
       "inputs": {
         "apps": {
@@ -304,11 +341,6 @@
           "required": false,
           "type": "string"
         },
-        "rate-limit-wait-minutes": {
-          "default": 30,
-          "required": false,
-          "type": "number"
-        },
         "required": {
           "default": null,
           "required": true,
@@ -318,11 +350,6 @@
           "default": "ubuntu-26.04",
           "required": false,
           "type": "string"
-        },
-        "wait-minutes": {
-          "default": 60,
-          "required": false,
-          "type": "number"
         }
       },
       "jobs": {
@@ -330,7 +357,9 @@
       },
       "outputs": [],
       "secrets": {},
-      "write_scopes": []
+      "write_scopes": [
+        "statuses"
+      ]
     },
     ".github/workflows/scorecard.yml": {
       "inputs": {

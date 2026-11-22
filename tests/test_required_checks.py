@@ -268,6 +268,8 @@ def test_workflow_inputs_and_permissions_contract() -> None:
     assert inputs["pull-request-only"]["default"] == "[]"
     assert inputs["not-owed"]["default"] == "[]"
     assert inputs["apps"]["default"] == "{}"
+    assert "wait-minutes" not in inputs
+    assert "rate-limit-wait-minutes" not in inputs
 
 
 def test_workflow_job_timeout_steps_and_caller_template_contract() -> None:
@@ -275,18 +277,13 @@ def test_workflow_job_timeout_steps_and_caller_template_contract() -> None:
     job = doc["jobs"]["required-checks"]
     assert job["name"] == "Required checks"
     assert job["runs-on"] == "${{ inputs.runner }}"
+    assert job["timeout-minutes"] == 10
     assert job["permissions"] == {
         "contents": "read",
         "checks": "read",
-        "statuses": "read",
         "actions": "read",
+        "statuses": "write",
     }
-    pattern = r"fromJSON\('(\[[^\']*?\])'\)\[inputs\.wait-minutes\]\s*\|\|\s*(\d+)"
-    match = re.search(pattern, str(job["timeout-minutes"]))
-    assert match is not None
-    table = json.loads(match.group(1))
-    assert int(match.group(2)) == 10
-    assert table == [0, *(minute + 10 for minute in range(1, 241))]
 
     steps = job["steps"]
     assert steps[0]["if"] == "github.event.pull_request.draft == true"
@@ -1035,10 +1032,11 @@ def test_one_shot_queued_checks_post_pending_without_sleep(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     queued = [check_item(i, name, None, status="queued") for i, name in enumerate(["A", "B"], 1)]
+    answers = {**base_answers(checks=queued), STATUSES_URL: [status_item(1, "required-checks", "success")]}
     rc, out, err, clock = invoke_with_forge(
         tree,
         monkeypatch,
-        base_answers(checks=queued),
+        answers,
         required=["A", "B"],
         bound_minutes=240,
     )
@@ -1193,7 +1191,8 @@ def test_status_posting_records_post_and_skips_churn(
         anchor,
     )
     _, desc = decide(snap, cfg, required_checks._iso_epoch("2026-11-21T12:00:00Z"), anchor)
-    pending_snapshot = base_answers(checks=[check_item(1, "Build", None)])
+    prior_success = [status_item(0, "required-checks", "success")]
+    pending_snapshot = {**base_answers(checks=[check_item(1, "Build", None)]), STATUSES_URL: prior_success}
     rc1, _, _, _ = invoke_with_forge(
         tree, monkeypatch, pending_snapshot, required=["Build"], bound_minutes=240
     )
@@ -1570,10 +1569,7 @@ def _counting_sweep_transport(
         ),
         (
             True,
-            3
-            + (OPEN_PULLS_MAX + 1) * required_checks.STATUS_MAX_PAGES
-            + (MAX_TARGETS_DEFAULT + 1)
-            * (required_checks.CHECK_RUN_MAX_PAGES + required_checks.WORKFLOW_RUN_MAX_PAGES + 2),
+            required_checks.SWEEP_MAX_CALLS,
         ),
     ],
 )
@@ -1604,16 +1600,8 @@ def test_sweep_transport_call_counts_measured_at_defaults(
     assert total == expected_total
     if page_bound:
         assert counts["open-pulls"] == 1
-        assert counts["repository"] == 1
-        assert counts["default-commit"] == 1
-        assert counts["statuses"] == (OPEN_PULLS_MAX + 1) * required_checks.STATUS_MAX_PAGES
-        check_pages = required_checks.CHECK_RUN_MAX_PAGES
-        assert counts["check-runs"] == (MAX_TARGETS_DEFAULT + 1) * check_pages
-        assert counts["workflow-runs"] == (
-            (MAX_TARGETS_DEFAULT + 1) * required_checks.WORKFLOW_RUN_MAX_PAGES
-        )
-        assert counts["commit"] == MAX_TARGETS_DEFAULT + 1
-        assert counts["post"] == MAX_TARGETS_DEFAULT + 1
+        assert "Sweep API call cap" in err.getvalue()
+        assert total == required_checks.SWEEP_MAX_CALLS
     else:
         assert counts["open-pulls"] == 1
         assert counts["statuses"] == OPEN_PULLS_MAX + 1
@@ -1922,3 +1910,176 @@ def test_boundary_edge_cases_for_parsers_and_snapshot(
         tree, monkeypatch, base_answers(checks={"unexpected": 1})
     )
     assert rc_shape == 1 and "no list check_runs" in err_shape
+
+
+GATES = ("Licence", "Secret scan", "Sign-off", "Workflow check")
+
+
+def test_last_tail_posts_success_after_four_gates(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T1: tails 1-3 post nothing while waiting; tail 4 posts success once."""
+    posts: list[str] = []
+    answers = base_answers(
+        checks=[check_item(i, name, "success") for i, name in enumerate(GATES, 1)]
+    )
+    answers[STATUSES_URL] = []
+
+    for idx, finished in enumerate((1, 2, 3, 4)):
+        subset = list(GATES[:finished])
+        checks = [check_item(i, name, "success") for i, name in enumerate(subset, 1)]
+        snap = base_answers(checks=checks, statuses=[])
+        rc, out, err, _ = invoke_with_forge(
+            tree,
+            monkeypatch,
+            snap,
+            required=list(GATES),
+            event="pull_request",
+            ref="refs/pull/1/head",
+        )
+        assert rc == 0, err
+        log = (tree.root / "forge.log").read_text(encoding="utf-8")
+        post_lines = [line for line in log.splitlines() if "state=success" in line]
+        posts.append(post_lines[-1] if post_lines else "")
+        if idx < 3:
+            assert "POST" not in log or "state=success" not in log
+        else:
+            assert "state=success" in log
+            assert "All owed required checks reported success." in out
+
+
+def test_fork_tail_makes_no_api_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """T2: fork pull_request on sha target prints notice and uses no transport."""
+    event = tmp_path / "event.json"
+    event.write_text(
+        json.dumps(
+            {
+                "pull_request": {
+                    "head": {"repo": {"full_name": "fork/other"}, "sha": SHA},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = parse_config(
+        repository=REPO,
+        event_name="pull_request",
+        sha=SHA,
+        required_json=json.dumps(["Build"]),
+    )
+    calls: list[str] = []
+
+    def transport(path: str, **_: object) -> tuple[int, dict[str, str], bytes]:
+        calls.append(path)
+        return 200, {}, b"{}"
+
+    err = io.StringIO()
+    rc = required_checks.run_judge(
+        cfg, transport=transport, now=lambda: 1.0, sleep=lambda _: None, err=err, event_path=str(event)
+    )
+    assert rc == 0
+    assert calls == []
+    assert "Fork pull request" in err.getvalue()
+
+
+def test_tail_sha_counts_own_gate_result_check_run(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T3: sha target still counts the gate caller result when GITHUB_WORKFLOW_REF is set."""
+    gate_suite = 7
+    checks = [check_item(1, "Licence", "success", suite_id=gate_suite)]
+    runs = [
+        wf_run(1, event="pull_request", suite_id=gate_suite, path=".github/workflows/licence-check.yml")
+    ]
+    answers = {
+        **base_answers(checks=checks, runs=runs),
+        STATUSES_URL: [status_item(1, "required-checks", "success")],
+    }
+    rc, out, err, _ = invoke_with_forge(
+        tree,
+        monkeypatch,
+        answers,
+        required=["Licence"],
+        event="pull_request",
+        ref="refs/pull/1/head",
+    )
+    assert rc == 0, err
+    assert "OK (success): Licence" in out
+    # Planted mutant (manual): in read_snapshot, apply self_workflow_suites on sha
+    # targets too → same fixture then omits Licence and posts pending instead.
+
+
+def test_pending_posts_only_over_success(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T4: pending verdict posts only when the existing status is success."""
+    queued = [check_item(1, "Build", None, status="queued")]
+    over_none = base_answers(checks=queued)
+    rc0, _, err0, _ = invoke_with_forge(tree, monkeypatch, over_none, required=["Build"])
+    assert rc0 == 0
+    assert "POST" not in (tree.root / "forge.log").read_text(encoding="utf-8")
+
+    over_success = {
+        **over_none,
+        STATUSES_URL: [status_item(1, "required-checks", "success")],
+    }
+    rc1, _, _, _ = invoke_with_forge(tree, monkeypatch, over_success, required=["Build"])
+    assert rc1 == 0
+    assert "state=pending" in (tree.root / "forge.log").read_text(encoding="utf-8")
+
+    over_failure = {**over_none, STATUSES_URL: [status_item(2, "required-checks", "failure")]}
+    rc2, out2, _, _ = invoke_with_forge(tree, monkeypatch, over_failure, required=["Build"])
+    assert rc2 == 0
+    assert "Posted pending" not in out2
+
+
+def test_freshness_rereads_then_skips_stale_post(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T5: stale snapshot read skips POST after one re-read."""
+    ticks = {"n": 0}
+    anchor = required_checks._iso_epoch("2026-11-21T12:00:00Z")
+
+    def stepped_now() -> float:
+        ticks["n"] += 1
+        return anchor + (ticks["n"] - 1) * (required_checks.POST_FRESH_SECONDS + 5)
+
+    answers = base_answers(checks=[check_item(1, "Gate", "success")])
+    for name, value in tree.forge(answers).items():
+        monkeypatch.setenv(name, value)
+    cfg = parse_config(
+        repository=REPO,
+        event_name="push",
+        sha=SHA,
+        required_json='["Gate"]',
+    )
+    err = io.StringIO()
+    rc = run_judge(cfg, now=stepped_now, sleep=lambda _: None, err=err, out=io.StringIO())
+    assert rc == 0
+    assert "Posting skipped" in err.getvalue()
+
+
+def test_sweep_call_count_at_fourteen_open_pulls() -> None:
+    """D9: measured sweep at 14 open pull heads, one page per read."""
+    heads = [f"{i:040x}" for i in range(1, 15)]
+    transport, counts = _counting_sweep_transport(heads, page_bound=False)
+    cfg = parse_config(
+        repository=REPO,
+        required_json='["Build"]',
+        targets="open-pulls",
+        max_targets=MAX_TARGETS_DEFAULT,
+    )
+    assert (
+        run_sweep(
+            cfg,
+            transport=transport,
+            now=lambda: 1.0e9,
+            sleep=lambda _: None,
+            out=io.StringIO(),
+            err=io.StringIO(),
+        )
+        == 0
+    )
+    eval_heads = min(14, MAX_TARGETS_DEFAULT) + 1
+    expected = 1 + (14 + 1) + 2 + eval_heads * 4
+    assert sum(counts.values()) == expected
