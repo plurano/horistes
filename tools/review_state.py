@@ -30,7 +30,7 @@ LIMIT_NOTICE_RE = re.compile(
     r"(?:(?:rate[- ]limit|review[- ]limit)[ \t]+(?:was[ \t]+)?(?:reached|exceeded|hit)"
     r"(?:[ \t]+for[ \t]+(?:this[ \t]+(?:repository|organization)"
     r"|commit[ \t]+[0-9a-f]{7,40}))?"
-    r"|Sorry @[^\s,]+, you've used your own review budget[^\r\n]*"
+    r"|Sorry @(?P<budget>[^\s,]+, you've used your own review budget[^\r\n]*)"
     r"|(?P<paused>reviews[ \t]+paused)"
     r"|(?P<allowance>(?:Included review availability:[^\r\n]*;[ \t]*)?"
     r"0[ \t]+remain[ \t]+after[ \t]+this[ \t]+review)"
@@ -56,6 +56,15 @@ REVIEWED_RANGE_RE = re.compile(
     r"([0-9a-f]{40}) and ([0-9a-f]{40})\.[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
+MAX_HEAD_CHECK_SUITES = 5
+MAX_HEAD_CHECK_RUNS = 5
+CODERABBIT_APP_ID = 347564
+CODERABBIT_SLUG = "coderabbitai"
+CODERABBIT_RUN = "CodeRabbit"
+CODERABBIT_SUCCESS_LINE = "Result: Success - Review completed"
+SOURCERY_APP_ID = 48477
+SOURCERY_SLUG = "sourcery-ai"
+SOURCERY_RUN = "Sourcery review"
 
 
 def _pr_node(pr: dict) -> dict:
@@ -197,20 +206,39 @@ def _paused_block(lines: list[str], notice_idx: int) -> list[str]:
     return lines[notice_idx + 1 : end][:MAX_LINES]
 
 
-def _paused_head_reviewed(body: str, head: str) -> bool:
-    """Exempt only pause notices with unambiguous, block-local evidence for the full head."""
-    if not re.fullmatch(r"[0-9a-f]{40}", head):
-        return False
+def _pause_allowance_notices(body: str) -> tuple[list, bool, bool]:
+    """Limit notices in body and whether the body is mixed pause plus allowance only."""
     lines = body.splitlines()
     if len(lines) > MAX_LINES:
-        return False
+        return [], False, False
     notices = [
         (idx, match)
         for idx, line in enumerate(lines[:MAX_LINES])
         if (match := LIMIT_NOTICE_RE.search(line))
     ]
-    if not notices or any(not match.group("paused") for _idx, match in notices[:MAX_LINES]):
+    if not notices:
+        return notices, False, False
+    foreign = any(
+        not match.group("paused") and not match.group("allowance")
+        for _idx, match in notices[:MAX_LINES]
+    )
+    has_paused = any(match.group("paused") for _idx, match in notices[:MAX_LINES])
+    has_allowance = any(match.group("allowance") for _idx, match in notices[:MAX_LINES])
+    mixed = has_paused and has_allowance and not foreign
+    return notices, mixed, foreign
+
+
+def _paused_head_reviewed(body: str, head: str) -> bool:
+    """Exempt only pause notices with unambiguous, block-local evidence for the full head."""
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
         return False
+    notices, mixed, foreign = _pause_allowance_notices(body)
+    if not notices or foreign:
+        return False
+    pause_notices = [(idx, match) for idx, match in notices[:MAX_LINES] if match.group("paused")]
+    if not pause_notices:
+        return False
+    lines = body.splitlines()
     reviewed = {
         match.group(1).lower()
         for line in lines[:MAX_LINES]
@@ -218,10 +246,13 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
     }
     if reviewed != {head}:
         return False
-    return all(
+    pause_ok = all(
         any(LAST_REVIEWED_RE.fullmatch(line) for line in _paused_block(lines, idx)[:MAX_LINES])
-        for idx, _match in notices[:MAX_LINES]
+        for idx, _match in pause_notices[:MAX_LINES]
     )
+    if mixed:
+        return pause_ok and _allowance_head_reviewed(body, head)
+    return pause_ok
 
 
 def _allowance_head_reviewed(body: str, head: str) -> bool:
@@ -296,7 +327,148 @@ def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
     return _paused_head_reviewed(body, head) or (allowance and _allowance_head_reviewed(body, head))
 
 
-def _notice_holds(comment: dict, head: str, last_commit, evidence: list) -> bool:
+def _bounded_connection(conn, bound: int) -> tuple[list[dict], bool]:
+    """Read a bounded GraphQL connection when totalCount matches every returned node."""
+    if not isinstance(conn, dict) or not isinstance(conn.get("nodes"), list):
+        return [], False
+    count = conn.get("totalCount")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return [], False
+    nodes = conn["nodes"]
+    if len(nodes) > bound or count > bound or count != len(nodes):
+        return [], False
+    if any(not isinstance(node, dict) for node in nodes[:bound]):
+        return [], False
+    return nodes[:bound], True
+
+
+def _budget_notice_only(body: str) -> bool:
+    """Every limit notice in the body is the Sourcery budget line."""
+    notices = list(LIMIT_NOTICE_RE.finditer(body))[:MAX_LINES]
+    return bool(notices) and all(match.group("budget") for match in notices[:MAX_LINES])
+
+
+def _latest_commit_page(conn) -> dict | None:
+    """Read the latest commit page when it returns exactly one commit node."""
+    if not isinstance(conn, dict):
+        return None
+    nodes = conn.get("nodes")
+    if not isinstance(nodes, list) or len(nodes) != 1 or not isinstance(nodes[0], dict):
+        return None
+    count = conn.get("totalCount")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        return None
+    return nodes[0]
+
+
+def _head_checks_commit(head_checks) -> dict | None:
+    """The sole commit node under headChecks when it is fully readable."""
+    node = _latest_commit_page(head_checks)
+    if node is None:
+        return None
+    commit = node.get("commit")
+    return commit if isinstance(commit, dict) else None
+
+
+def _suite_app_matches(suite: dict, database_id: int, slug: str) -> bool:
+    """Whether a check suite names the expected forge app."""
+    app = suite.get("app") if isinstance(suite, dict) else None
+    return (
+        isinstance(app, dict) and app.get("databaseId") == database_id and app.get("slug") == slug
+    )
+
+
+def _run_summary_first_line(summary) -> str:
+    """First line of a check-run summary; an empty summary has no first line."""
+    if not isinstance(summary, str):
+        return ""
+    lines = summary.splitlines()
+    return lines[0] if lines else ""
+
+
+def _coderabbit_evidence_on_head(evidence: list) -> bool:
+    """Whether review evidence records a timed CodeRabbit completion on the head."""
+    for login, when, on_head in evidence[: MAX_COMMENTS + MAX_REVIEWS]:
+        if login == CODERABBIT_SLUG and when is not None and on_head:
+            return True
+    return False
+
+
+def _coderabbit_check_on_head(head_checks) -> bool:
+    """Whether headChecks records a successful CodeRabbit check run on the head commit."""
+    commit = _head_checks_commit(head_checks)
+    if commit is None:
+        return False
+    suites, ok = _bounded_connection(commit.get("coderabbit"), MAX_HEAD_CHECK_SUITES)
+    if not ok:
+        return False
+    for suite in suites[:MAX_HEAD_CHECK_SUITES]:
+        if not _suite_app_matches(suite, CODERABBIT_APP_ID, CODERABBIT_SLUG):
+            continue
+        runs, runs_ok = _bounded_connection(suite.get("checkRuns"), MAX_HEAD_CHECK_RUNS)
+        if not runs_ok:
+            return False
+        for run in runs[:MAX_HEAD_CHECK_RUNS]:
+            if (
+                run.get("name") == CODERABBIT_RUN
+                and run.get("status") == "COMPLETED"
+                and run.get("conclusion") == "SUCCESS"
+                and _run_summary_first_line(run.get("summary")) == CODERABBIT_SUCCESS_LINE
+            ):
+                return True
+    return False
+
+
+def _sourcery_budget_skip_on_head(head_checks) -> bool:
+    """Whether every Sourcery review run on the head is a skipped budget summary."""
+    commit = _head_checks_commit(head_checks)
+    if commit is None:
+        return False
+    suites, ok = _bounded_connection(commit.get("sourcery"), MAX_HEAD_CHECK_SUITES)
+    if not ok:
+        return False
+    found = False
+    for suite in suites[:MAX_HEAD_CHECK_SUITES]:
+        if not _suite_app_matches(suite, SOURCERY_APP_ID, SOURCERY_SLUG):
+            continue
+        runs, runs_ok = _bounded_connection(suite.get("checkRuns"), MAX_HEAD_CHECK_RUNS)
+        if not runs_ok:
+            return False
+        for run in runs[:MAX_HEAD_CHECK_RUNS]:
+            if run.get("name") != SOURCERY_RUN:
+                continue
+            found = True
+            first = _run_summary_first_line(run.get("summary"))
+            match = LIMIT_NOTICE_RE.search(first)
+            if (
+                run.get("status") != "COMPLETED"
+                or run.get("conclusion") != "SKIPPED"
+                or not match
+                or not match.group("budget")
+            ):
+                return False
+    return found
+
+
+def _sourcery_budget_exempt(comment: dict, head: str, evidence: list, node: dict) -> bool:
+    """Drop a Sourcery budget notice when CodeRabbit finished and Sourcery skipped on the head."""
+    login = _login(comment).lower().removesuffix("[bot]")
+    if login != SOURCERY_SLUG:
+        return False
+    body = str(comment.get("body") or "")
+    if not _budget_notice_only(body) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return False
+    head_checks = node.get("headChecks") if isinstance(node, dict) else None
+    commit = _head_checks_commit(head_checks)
+    if commit is None or str(commit.get("oid") or "").strip().lower() != head:
+        return False
+    coderabbit = _coderabbit_evidence_on_head(evidence) or _coderabbit_check_on_head(head_checks)
+    return bool(coderabbit and _sourcery_budget_skip_on_head(head_checks))
+
+
+def _notice_holds(
+    comment: dict, head: str, last_commit, evidence: list, node: dict | None = None
+) -> bool:
     """Apply head coverage, reviewer scope, and instant ordering to one notice body."""
     body = str(comment.get("body") or "")
     notices = list(LIMIT_NOTICE_RE.finditer(body))[:MAX_LINES]
@@ -307,13 +479,20 @@ def _notice_holds(comment: dict, head: str, last_commit, evidence: list) -> bool
         return True
     allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
     paused = any(notice.group("paused") for notice in notices[:MAX_LINES])
-    if _can_complete(comment) and _notice_covers_head(body, head, allowance):
+    _notices, mixed, _foreign = _pause_allowance_notices(body)
+    covers = _notice_covers_head(body, head, allowance)
+    stale_push = mixed and last_commit > when
+    if _can_complete(comment) and covers and not stale_push:
         return False
     names_head = bool(head and head[:7] in body.lower())
     login = _login(comment).lower().removesuffix("[bot]")
     if _later_evidence(evidence, login, when, last_commit, allowance or paused or names_head):
         return False
-    return allowance or paused or names_head or when >= last_commit
+    holds = allowance or paused or names_head or when >= last_commit
+    pr = node if isinstance(node, dict) else {}
+    if holds and _sourcery_budget_exempt(comment, head, evidence, pr):
+        return False
+    return holds
 
 
 def review_incomplete(pr: dict, me: str = "") -> str:
@@ -331,7 +510,7 @@ def review_incomplete(pr: dict, me: str = "") -> str:
     for comment in comments[: MAX_COMMENTS + MAX_REVIEWS]:
         if _login(comment).lower().removesuffix("[bot]") in answerers:
             continue
-        if _notice_holds(comment, head, last_commit, evidence):
+        if _notice_holds(comment, head, last_commit, evidence, node):
             when = _body_at(comment)
             stamp = when.isoformat().replace("+00:00", "Z") if when is not None else "head"
             return f"review incomplete: {_login(comment) or 'reviewer'} limit reached at {stamp}"

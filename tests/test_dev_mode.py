@@ -136,6 +136,7 @@ from pathlib import Path
 line = json.dumps(
     {
         "optimize": sys.flags.optimize,
+        "dont_write_bytecode": sys.flags.dont_write_bytecode,
         "addopts": os.environ.get("PYTEST_ADDOPTS"),
         "argv": sys.argv[1:],
     }
@@ -147,6 +148,7 @@ with (Path(__file__).resolve().parent / "probe.jsonl").open("a", encoding="utf-8
 # (tests/test_message_hook.py), so the anchor takes the next assignment too.
 CLEARED = "PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="
 UNCLEARED = "ACTIONLINT="
+BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE=1 "
 
 
 def _setup_probe_tree(tmp_path: Path) -> None:
@@ -165,19 +167,31 @@ def _setup_probe_tree(tmp_path: Path) -> None:
     python.chmod(0o755)
 
 
-def _probe_coverage_run(tmp_path: Path, cleared: bool, inherited: dict[str, str]) -> dict:
+def _probe_coverage_run(
+    tmp_path: Path,
+    cleared: bool,
+    inherited: dict[str, str],
+    *,
+    recipe_bytecode: bool = True,
+) -> dict:
     """Run `make test` with the probe as python and return what the coverage run step saw.
 
     With cleared False the recipe runs from a copy of the Makefile without the
     two empty assignments, so the probe shows what the step would inherit.
+    With recipe_bytecode False the copy omits PYTHONDONTWRITEBYTECODE=1 on the run step.
     """
     _setup_probe_tree(tmp_path)
+    text = (ROOT / "Makefile").read_text(encoding="utf-8")
     makefile = ROOT / "Makefile"
     if not cleared:
-        text = makefile.read_text(encoding="utf-8")
         assert text.count(CLEARED) == 1
-        makefile = tmp_path / "Makefile.uncleared"
-        makefile.write_text(text.replace(CLEARED, UNCLEARED), encoding="utf-8")
+        text = text.replace(CLEARED, UNCLEARED)
+    if not recipe_bytecode:
+        assert text.count(BYTECODE_ENV) == 1, text
+        text = text.replace(BYTECODE_ENV, "", 1)
+    if not cleared or not recipe_bytecode:
+        makefile = tmp_path / "Makefile.probe"
+        makefile.write_text(text, encoding="utf-8")
     env = {name: os.environ[name] for name in KEEP if name in os.environ} | inherited
     command = [
         "make",
@@ -193,8 +207,10 @@ def _probe_coverage_run(tmp_path: Path, cleared: bool, inherited: dict[str, str]
     assert done.returncode == 0, done.stdout + done.stderr
     log = (tmp_path / "probe.jsonl").read_text(encoding="utf-8").splitlines()
     calls = [json.loads(line) for line in log]
-    assert len(calls) == 4, calls
-    steps = [call["argv"][call["argv"].index("coverage") + 1] for call in calls]
+    assert len(calls) == 5, calls
+    coverage_calls = [call for call in calls if "coverage" in call["argv"]]
+    assert len(coverage_calls) == 4, coverage_calls
+    steps = [call["argv"][call["argv"].index("coverage") + 1] for call in coverage_calls]
     assert steps == ["run", "combine", "report", "report"], calls
     assert calls[0]["argv"][:2] == ["-X", "dev"], calls
     return calls[0]
@@ -220,3 +236,27 @@ def test_test_recipe_clears_the_inherited_settings(
     """
     run = _probe_coverage_run(tmp_path, cleared, inherited)
     assert (run["optimize"], run["addopts"]) == (optimize, addopts), run
+
+
+@pytest.mark.parametrize(
+    ("recipe_bytecode", "inherited", "dont_write_bytecode"),
+    [
+        (True, {}, 1),
+        (False, {}, 0),
+        (True, {"PYTHONDONTWRITEBYTECODE": ""}, 1),
+        (True, {"PYTHONDONTWRITEBYTECODE": "0"}, 1),
+    ],
+    ids=["positive-set", "negative-unset", "boundary-caller-empty", "boundary-caller-zero"],
+)
+def test_test_recipe_sets_dont_write_bytecode_for_workers(
+    tmp_path: Path,
+    recipe_bytecode: bool,
+    inherited: dict[str, str],
+    dont_write_bytecode: int,
+) -> None:
+    """The coverage run step sets PYTHONDONTWRITEBYTECODE so xdist workers inherit it.
+
+    -B on the controller alone does not propagate; workers read the environment.
+    """
+    run = _probe_coverage_run(tmp_path, True, inherited, recipe_bytecode=recipe_bytecode)
+    assert run["dont_write_bytecode"] == dont_write_bytecode, run

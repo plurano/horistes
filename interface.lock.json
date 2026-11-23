@@ -189,8 +189,18 @@
           "required": false,
           "type": "string"
         },
+        "onboarding_branches": {
+          "default": "renovate/configure",
+          "required": false,
+          "type": "string"
+        },
         "person_branches": {
           "default": "release-please--",
+          "required": false,
+          "type": "string"
+        },
+        "regenerate_label": {
+          "default": "rebase",
           "required": false,
           "type": "string"
         },

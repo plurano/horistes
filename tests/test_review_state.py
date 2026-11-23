@@ -4,10 +4,17 @@
 
 import copy
 import json
+import re
 from pathlib import Path
 
 import pytest
-from review_state import MAX_COMMENTS, MAX_LINES, is_bot_dependency, review_incomplete
+from review_state import (
+    MAX_COMMENTS,
+    MAX_LINES,
+    is_bot_dependency,
+    review_evidence,
+    review_incomplete,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures/review-state"
 
@@ -475,6 +482,113 @@ def _allowance_range_cases():
     return cases
 
 
+_MIXED_PAUSE_ALLOWANCE_FIXTURE = FIXTURES / "cr234-summary-paused-allowance-7056094813.md"
+_MIXED_PAUSE_ALLOWANCE_HEAD = "5f70ad27b885ee534c38453f6107ecf8070e897d"
+_MIXED_PAUSE_ALLOWANCE_OTHER = "f" * 40
+
+
+def _mixed_pause_allowance_body_parts():
+    body = _MIXED_PAUSE_ALLOWANCE_FIXTURE.read_text(encoding="utf-8")
+    head = _MIXED_PAUSE_ALLOWANCE_HEAD
+    last_reviewed = f"> - Last reviewed commit: {head}"
+    range_line = next(
+        line
+        for line in body.splitlines()[:MAX_LINES]
+        if line.startswith("Reviewing files that changed")
+    )
+    return body, head, last_reviewed, range_line
+
+
+def _mixed_pause_allowance_pr(summary, current_head, committed="2026-11-22T15:59:00Z"):
+    head = _MIXED_PAUSE_ALLOWANCE_HEAD
+    oid = current_head if re.fullmatch(r"[0-9a-f]{40}", current_head) else head
+    return {
+        "headRefOid": current_head,
+        "author": {"login": "lusoris"},
+        "commits": {"nodes": [{"commit": {"oid": oid, "committedDate": committed}}]},
+        "comments": {
+            "nodes": [
+                {
+                    "author": {"login": "coderabbitai"},
+                    "body": summary,
+                    "createdAt": "2026-11-21T03:00:00Z",
+                    "updatedAt": "2026-11-22T17:03:26Z",
+                }
+            ]
+        },
+    }
+
+
+def _mixed_pause_allowance_variants(body, head, last_reviewed, range_line):
+    other = _MIXED_PAUSE_ALLOWANCE_OTHER
+    return [
+        ("fixture-head", body, head, False),
+        (
+            "wrong-pause-sha",
+            body.replace(last_reviewed, f"> - Last reviewed commit: {other}"),
+            head,
+            True,
+        ),
+        (
+            "wrong-range-end",
+            body.replace(range_line, range_line.replace(head, other)),
+            head,
+            True,
+        ),
+        ("missing-range", body.replace(range_line, ""), head, True),
+        ("rate-limit-appended", body + "\nRate limit exceeded.", head, True),
+        ("missing-pause-sha", body.replace(last_reviewed, ""), head, True),
+        (
+            "short-pause-sha",
+            body.replace(last_reviewed, f"> - Last reviewed commit: {head[:7]}"),
+            head,
+            True,
+        ),
+        (
+            "second-range",
+            body + "\n" + range_line.replace(head, other),
+            head,
+            True,
+        ),
+        ("short-pr-head", body, head[:7], True),
+        ("push-after-summary", body, head, True),
+    ]
+
+
+def _mixed_pause_allowance_cases():
+    """Pause and allowance notices together clear only with both evidence paths."""
+    body, head, last_reviewed, range_line = _mixed_pause_allowance_body_parts()
+    cases = []
+    for name, summary, current_head, expected in _mixed_pause_allowance_variants(
+        body, head, last_reviewed, range_line
+    )[:MAX_LINES]:
+        after_push = name == "push-after-summary"
+        committed = "2026-11-22T18:00:00Z" if after_push else "2026-11-22T15:59:00Z"
+        pr = _mixed_pause_allowance_pr(summary, current_head, committed=committed)
+        cases.append(_case(f"mixed-pause-allowance-{name}", pr, expected))
+    return cases
+
+
+def _mixed_pause_allowance_evidence_cases():
+    body, head, last_reviewed, range_line = _mixed_pause_allowance_body_parts()
+    negative = {
+        "wrong-range-end",
+        "missing-range",
+        "second-range",
+        "wrong-pause-sha",
+    }
+    cases = []
+    for name, summary, current_head, _expected in _mixed_pause_allowance_variants(
+        body, head, last_reviewed, range_line
+    )[:MAX_LINES]:
+        if name not in {"fixture-head", *negative}:
+            continue
+        pr = _mixed_pause_allowance_pr(summary, current_head)
+        on_head = name == "fixture-head"
+        cases.append(pytest.param(copy.deepcopy(pr), on_head, id=f"mixed-evidence-{name}"))
+    return cases
+
+
 def _thread_and_limit_cases():
     """Keep only the limit half of the gate's thread-and-limit cases."""
     pr = _fixture_golusoris_1266()
@@ -499,10 +613,33 @@ def _thread_and_limit_cases():
     + _promo_cases()
     + _allowance_cases()
     + _allowance_range_cases()
+    + _mixed_pause_allowance_cases()
     + _thread_and_limit_cases(),
 )
 def test_review_incomplete_gate_cases(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
+
+
+@pytest.mark.parametrize(("pr", "on_head"), _mixed_pause_allowance_evidence_cases())
+def test_review_evidence_mixed_pause_allowance(pr, on_head):
+    evidence = review_evidence(pr)
+    if on_head:
+        assert len(evidence) == 1
+        assert evidence[0][2] is True
+        return
+    assert not any(entry[2] for entry in evidence)
+
+
+def test_review_evidence_paused_notice_matches_main():
+    """Pure pause bodies keep the head-evidence shape origin/main already had."""
+    _name, block, head, _expected = bodies[0]
+    pr = _fixture_golusoris_1266()
+    pr["headRefOid"] = head
+    pr["comments"]["nodes"] = [
+        {"author": {"login": "coderabbitai"}, "createdAt": "2026-11-14T04:25:24Z", "body": block}
+    ]
+    evidence = review_evidence(pr)
+    assert len(evidence) == 1 and evidence[0][2] is True
 
 
 @pytest.mark.parametrize("envelope", [False, True], ids=["node", "data-repository-envelope"])
@@ -793,6 +930,242 @@ def adr93_paused_cases():
 @pytest.mark.parametrize(("pr", "me", "expected"), adr93_paused_cases())
 def test_adr93_paused_notice(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
+
+
+# ADR-0114: Sourcery budget skip yields when CodeRabbit completed on the head.
+ADR114_BUDGET = (
+    "Sorry @person, you've used your own review budget of 250,000 diff characters "
+    "for the last 7 days."
+)
+ADR114_CR_SUCCESS = "Result: Success - Review completed\n"
+ADR114_SOURCERY_LOGIN = "sourcery-ai[bot]"
+
+
+def adr114_check_run(name, conclusion, summary, *, status="COMPLETED"):
+    return {"name": name, "status": status, "conclusion": conclusion, "summary": summary}
+
+
+def adr114_head_suite(app_id, slug, runs):
+    return {
+        "app": {"slug": slug, "databaseId": app_id},
+        "checkRuns": {"totalCount": len(runs), "nodes": list(runs)},
+    }
+
+
+def adr114_head_checks(
+    head=ADR92_HEAD,
+    *,
+    coderabbit_runs=None,
+    sourcery_runs=None,
+    sourcery_total=None,
+    oid=None,
+    coderabbit_total=None,
+    commits_total=1,
+):
+    cr_runs = (
+        [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)]
+        if coderabbit_runs is None
+        else list(coderabbit_runs)
+    )
+    sr_runs = (
+        [adr114_check_run("Sourcery review", "SKIPPED", ADR114_BUDGET)]
+        if sourcery_runs is None
+        else list(sourcery_runs)
+    )
+    cr_suites = [adr114_head_suite(347564, "coderabbitai", cr_runs)] if cr_runs else []
+    sr_suites = [adr114_head_suite(48477, "sourcery-ai", sr_runs)] if sr_runs else []
+    commit_oid = head if oid is None else oid
+    return {
+        "totalCount": commits_total,
+        "nodes": [
+            {
+                "commit": {
+                    "oid": commit_oid,
+                    "coderabbit": {
+                        "totalCount": (
+                            len(cr_suites) if coderabbit_total is None else coderabbit_total
+                        ),
+                        "nodes": cr_suites,
+                    },
+                    "sourcery": {
+                        "totalCount": len(sr_suites) if sourcery_total is None else sourcery_total,
+                        "nodes": sr_suites,
+                    },
+                }
+            }
+        ],
+    }
+
+
+def adr114_budget_pull(*comments, reviews=(), head_checks=None, **fields):
+    pull = adr92_pull(*comments, reviews=reviews, **fields)
+    if head_checks is not None:
+        pull["headChecks"] = head_checks
+    return pull
+
+
+def adr114_sourcery_comment(body=None, login=ADR114_SOURCERY_LOGIN, **fields):
+    return adr92_comment(body or ADR114_BUDGET, login=login, **fields)
+
+
+def adr114_coderabbit_head_review(when="2026-11-16T17:00:00Z"):
+    return {
+        "author": {"login": "coderabbitai[bot]"},
+        "state": "COMMENTED",
+        "body": "Review completed.",
+        "submittedAt": when,
+        "commit": {"oid": ADR92_HEAD},
+    }
+
+
+def test_adr114_p1_pass():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(),
+    )
+    assert adr92_reader().review_incomplete(pr) == ""
+
+
+def test_adr114_p2_pass():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        reviews=[adr114_coderabbit_head_review()],
+        head_checks=adr114_head_checks(coderabbit_runs=[]),
+    )
+    assert adr92_reader().review_incomplete(pr) == ""
+
+
+def test_adr114_p3_multi_commit_pass():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(commits_total=2),
+    )
+    assert adr92_reader().review_incomplete(pr) == ""
+
+
+def test_adr114_h1_sourcery_failure_holds():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(
+            sourcery_runs=[adr114_check_run("Sourcery review", "FAILURE", ADR114_BUDGET)]
+        ),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+def test_adr114_h1_success_beside_skipped_holds():
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(
+            sourcery_runs=[
+                adr114_check_run("Sourcery review", "SKIPPED", ADR114_BUDGET),
+                adr114_check_run("Sourcery review", "SUCCESS", "Done."),
+            ]
+        ),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Review limit reached.",
+        ADR114_BUDGET + "\nReview limit reached.",
+    ],
+    ids=["H3-skip-text", "H3-mixed"],
+)
+def test_adr114_h3_other_skip_text_holds(body):
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(body),
+        head_checks=adr114_head_checks(),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "Review limit reached.\n",
+        "",
+    ],
+    ids=["H3-run-limit", "H3-run-empty"],
+)
+def test_adr114_h3_run_summary_holds(summary):
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        head_checks=adr114_head_checks(
+            sourcery_runs=[adr114_check_run("Sourcery review", "SKIPPED", summary)]
+        ),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+@pytest.mark.parametrize(
+    "login",
+    ["coderabbitai[bot]", "copilot[bot]"],
+    ids=["H4-coderabbit", "H4-copilot"],
+)
+def test_adr114_h4_budget_on_other_bot_holds(login):
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(login=login),
+        head_checks=adr114_head_checks(),
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
+
+
+@pytest.mark.parametrize(
+    "head_checks, reviews",
+    [
+        (
+            adr114_head_checks(
+                coderabbit_runs=[
+                    adr114_check_run("CodeRabbit", "FAILURE", ADR114_CR_SUCCESS),
+                ]
+            ),
+            (),
+        ),
+        (
+            adr114_head_checks(
+                coderabbit_runs=[
+                    adr114_check_run("CodeRabbit", "SUCCESS", "Result: Failed - review"),
+                ]
+            ),
+            (),
+        ),
+        (adr114_head_checks(oid="c" * 40), ()),
+        (None, ()),
+        (adr114_head_checks(coderabbit_total=6), ()),
+        (adr114_head_checks(commits_total=0), ()),
+        (adr114_head_checks(commits_total=True), ()),
+        (
+            {
+                **adr114_head_checks(),
+                "nodes": [
+                    adr114_head_checks()["nodes"][0],
+                    adr114_head_checks()["nodes"][0],
+                ],
+            },
+            (),
+        ),
+    ],
+    ids=[
+        "H5-cr-failure",
+        "H5-cr-summary",
+        "H5-head-mismatch",
+        "H5-missing",
+        "H5-truncated",
+        "H5-commits-zero",
+        "H5-commits-bool",
+        "H5-two-nodes",
+    ],
+)
+def test_adr114_h5_fail_closed_holds(head_checks, reviews):
+    pr = adr114_budget_pull(
+        adr114_sourcery_comment(),
+        reviews=list(reviews),
+        head_checks=head_checks,
+    )
+    assert adr92_reader().review_incomplete(pr) != ""
 
 
 def test_bot_dependency_count_rejects_boolean():

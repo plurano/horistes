@@ -13,10 +13,19 @@ BASE_REF ?= origin/main
 # other gitleaks release than the one the gate workflow pins.
 ACTIONLINT ?= actionlint
 ACTIONLINT_VERSION := 1.7.12
+# Upper bound on pytest-xdist workers for the test recipe (HISS-06 scalar bound);
+# -n auto starts one worker per CPU up to this cap; 8 keeps a 32-core workstation
+# shared with other builders.
+TEST_WORKERS ?= 8
+# Wall-time budget of the test stage in seconds (issue 221: the pre-push gate
+# stops the repository gate at 20 minutes and the target is 18; 900 s leaves
+# 3 minutes for the other stages; tools/suite_minutes.py fails the stage above
+# it). := so an environment variable cannot raise it.
+TEST_BUDGET_SECONDS := 900
 GITLEAKS ?= gitleaks
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
-.PHONY: verify verify-all tools check-tools-stamp check-message requirements requirements-fuzz lint-yaml lint-python lint-workflows \
+.PHONY: verify verify-all tools check-tools-stamp check-anchors check-message requirements requirements-fuzz lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
 	interface-snapshot list-pins check-pins pin check-runners check-links fix-anchors check-examples
 
@@ -58,6 +67,12 @@ check-tools-stamp:
 		printf '%s\n' '$(VENV)/.stamp does not match requirements/tools.txt; run make tools' >&2; \
 		exit 1; \
 	fi
+
+# The pre-commit anchors job checks the staged anchors with the tools
+# environment, which holds PyYAML; a missing or stale `.venv` stops at the
+# stamp check, which names `make tools`.
+check-anchors: check-tools-stamp
+	@$(BIN)/python -B tools/anchors.py check --index
 
 # The commit-msg hook judges one message with tools/commit_message.py
 # (ADR-0074): lefthook names the message file in MESSAGE_FILE. Without it the
@@ -161,12 +176,25 @@ check-examples: tools
 # PYTEST_ADDOPTS, whose options can override the warning filters of
 # pyproject.toml.
 # The last step compares the unrounded total with the floor.
+# The coverage run step spreads pytest across workers (-n auto) capped at
+# TEST_WORKERS; 0 is refused because pytest-xdist treats --maxprocesses=0 as no
+# cap and would use every CPU on shared builders. The run step writes a JUnit
+# report into $$data; the next step prints the slowest tests and fails above
+# TEST_BUDGET_SECONDS.
 test: tools
+	@workers="$(TEST_WORKERS)"; \
+	case "$$workers" in \
+		[1-9]|1[0-6]) ;; \
+		*) \
+			printf '%s\n' "TEST_WORKERS must be a whole number from 1 to 16, got: $$workers" >&2; \
+			exit 2;; \
+	esac
 	data=$$(mktemp -d) && \
 	trap 'rm -rf "$$data"' EXIT && \
-	PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
+	PYTHONDONTWRITEBYTECODE=1 PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
 		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" LEFTHOOK_BIN="$(BIN)/lefthook" \
-		$(BIN)/python -X dev -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest && \
+		$(BIN)/python -X dev -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest -n auto --maxprocesses=$(TEST_WORKERS) --junitxml="$$data/junit.xml" && \
+	$(BIN)/python -B tools/suite_minutes.py check "$$data/junit.xml" --budget-seconds $(TEST_BUDGET_SECONDS) && \
 	$(BIN)/python -B -m coverage combine --rcfile=pyproject.toml --data-file="$$data/.coverage" && \
 	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage" && \
 	$(BIN)/python -B -m coverage report --rcfile=pyproject.toml --data-file="$$data/.coverage" --precision=10 --format=total

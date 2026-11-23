@@ -277,7 +277,7 @@ def pull(number: int, state: str, **fields) -> dict:
         "headRefOid": f"{number:040x}",
         "mergeStateStatus": state,
         "autoMergeRequest": None,
-        "labels": {"nodes": [{"name": name} for name in labels]},
+        "labels": {"totalCount": len(labels), "nodes": [{"name": name} for name in labels]},
         "reviews": review_nodes,
         "opinions": opinions,
         "refreshes": {"nodes": []},
@@ -400,10 +400,15 @@ class Forge:
         self.rest_faults: dict[str, list[int | str]] = {}
         self.label_missing = False
         self.unlabel_status: int | None = None
+        self.repository_moves: dict[str, str] = {}
+        self.repository_statuses: dict[tuple[int, str], int] = {}
+        self.repository_bodies: dict[str, object] = {}
+        self.repository_calls: list[tuple[int, str]] = []
         self.install(7, "fleet", app=list(reads))
 
     def _init_pull_reads(self) -> None:
         self.commits: dict[int, list[tuple[str, int]]] = {}
+        self.commit_heads: dict[int, str] = {}
         self.merge_states: dict[int, str] = {}
         self.commit_counts: dict[int, int] = {}
         # One detail per number, or a list read in turn (the last repeats); None reads as
@@ -690,13 +695,24 @@ class Forge:
         default = [(f"change {number}\n\nbody {number}\n\nSigned-off-by: Dev <dev@example.org>", 1)]
         items = self.commits.get(number, default)
         total = self.commit_counts.get(number, len(items))
+        if number in self.commit_heads:
+            head = self.commit_heads[number]
+        else:
+            read_nodes = self.active_reads.get(full, {}).get("pullRequests", {}).get("nodes", [])
+            matches = [p["headRefOid"] for p in read_nodes if p["number"] == number]
+            head = matches[0] if matches else f"{number:040x}"
         nodes = [
             {"commit": {"message": message, "parents": {"totalCount": parents}}}
             for message, parents in items
         ]
         return {
             "data": {
-                "repository": {"pullRequest": {"commits": {"totalCount": total, "nodes": nodes}}}
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": head,
+                        "commits": {"totalCount": total, "nodes": nodes},
+                    }
+                }
             }
         }
 
@@ -882,14 +898,35 @@ class Forge:
         (inst,) = [i for i in self.installations if i["id"] == kind[1]]
         repos = [
             {
+                "id": inst["id"] * 1000 + index,
                 "name": name,
                 "full_name": f"{inst['account']}/{name}",
                 "archived": f"{inst['account']}/{name}" in self.archived,
                 "disabled": False,
             }
-            for name in inst["repos"]
+            for index, name in enumerate(inst["repos"])
         ]
         return {"total_count": len(repos), "repositories": repos}
+
+    def repository_read(self, header: str, path: str) -> tuple[int, object]:
+        """Metadata lookups use the live list token, including a moved repository's new path."""
+        token = header.removeprefix("Bearer ")
+        kind = self.tokens[token]
+        assert kind[0] == "list" and token not in self.revoked
+        self.repository_calls.append((kind[1], path))
+        if status := self.repository_statuses.get((kind[1], path)):
+            return status, {"message": "planted response body must stay private"}
+        if path in self.repository_moves:
+            return 301, self.repository_moves[path]
+        if path in self.repository_bodies:
+            return 200, self.repository_bodies[path]
+        for inst in self.installations:
+            for index, name in enumerate(inst["repos"]):
+                full = f"{inst['account']}/{name}"
+                repo_id = inst["id"] * 1000 + index
+                if path.casefold() in (f"/repos/{full}".casefold(), f"/repositories/{repo_id}"):
+                    return 200, {"id": repo_id, "full_name": full}
+        return 404, {"message": "Not Found"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1023,6 +1060,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/installation/repositories":
             self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
             return True
+        if re.fullmatch(r"/(repos/[^/]+/[^/]+|repositories/\d+)", path):
+            self._get_repository(path)
+            return True
         return False
 
     def _get_collaborator(self, path: str) -> None:
@@ -1042,6 +1082,22 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(200, {"permission": permission, "role_name": permission})
         else:
             self.answer(404, {"message": "Not Found"})
+
+    def _get_repository(self, path: str) -> None:
+        code, body = self.server.forge.repository_read(self.headers["Authorization"], path)
+        if code == 301:
+            host, port = self.server.server_address[:2]
+            location = str(body).format(api=f"http://{host}:{port}", port=port)
+            self.send_response(code)
+            self.send_header("Location", location)
+            self.end_headers()
+        elif isinstance(body, bytes):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.answer(code, body)
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
@@ -1145,6 +1201,8 @@ TRAIN_DEFAULTS = {
     "TRAIN_MIN_AGE_DAYS": "3",
     "TRAIN_HOLD_LABELS": "hold,do-not-merge,planted",
     "TRAIN_DEPENDENCY_BRANCHES": "renovate/ dependabot/",
+    "TRAIN_REGENERATE_LABEL": "rebase",
+    "TRAIN_ONBOARDING_BRANCHES": "renovate/configure",
     "TRAIN_PERSON_BRANCHES": "release-please--",
     "TRAIN_RELEASE_OFF": "",
     "TRAIN_SECURITY_LABELS": "security",
@@ -1949,6 +2007,7 @@ def test_switched_off_writes_nothing(tmp_path):
         ("required_status", "tab\tinside"),
         ("required_status", "-lead"),
         ("required_status", "x" * 101),
+        ("regenerate_label", "a,b"),
     ],
 )
 def test_invalid_setting_stops_before_any_call(tmp_path, key, value):
@@ -2764,11 +2823,298 @@ def test_release_off_is_case_insensitive(tmp_path):
 
 
 def test_without_the_release_off_check_a_listed_repository_is_named(tmp_path):
-    mutant = script().replace('target["full_name"].lower() in conf["release_off"]', "False")
+    mutant = script().replace('target["full_name"].casefold() in conf["release_off"]', "False")
     assert mutant != script()
     done, _ = train(tmp_path, release_forge(), mutant, release_off="other/d")
     assert done.returncode == 0, done.stdout + done.stderr
     assert {"owner": "other", "name": "d"} in releases_of(tmp_path)
+
+
+@pytest.mark.parametrize("entry", ["former/d", "other/old-name"])
+@pytest.mark.parametrize("location", ["/repositories/9002", "/repos/other/d"])
+def test_release_off_follows_a_moved_repository(tmp_path, entry, location):
+    forge = release_forge()
+    forge.repository_moves[f"/repos/{entry}"] = location
+    done, summary = train(tmp_path, forge, release_off=entry)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release train off: other/d" in summary
+    assert (9, f"/repos/{entry}") in forge.repository_calls
+    assert (9, location) in forge.repository_calls
+    assert len(forge.revoked) == len(forge.minted)
+
+
+@pytest.mark.parametrize(
+    ("location", "path"),
+    [
+        ("{api}/repositories/9002", "/repositories/9002"),
+        ("{api}/repos/other/d", "/repos/other/d"),
+    ],
+)
+def test_release_off_follows_an_absolute_same_origin_redirect(tmp_path, location, path):
+    forge = release_forge()
+    forge.repository_moves["/repos/former/d"] = location
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release train off: other/d" in summary
+    assert (9, "/repos/former/d") in forge.repository_calls
+    assert (9, path) in forge.repository_calls
+    assert len(forge.revoked) == len(forge.minted)
+
+
+def test_release_off_exact_match_needs_no_repository_lookup(tmp_path):
+    forge = Forge(repository(release=(True, True)))
+    done, summary = train(tmp_path, forge, release_off="Fleet/App")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == []
+    assert "Release train off: fleet/app" in summary
+    assert forge.repository_calls == []
+
+
+@pytest.mark.parametrize("redirect", [False, True])
+def test_release_off_missing_repository_matches_nothing(tmp_path, redirect):
+    forge = release_forge()
+    if redirect:
+        forge.repository_moves["/repos/former/d"] = "/repositories/99999"
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [
+        {"owner": "fleet", "name": "app"},
+        {"owner": "other", "name": "d"},
+    ]
+    assert "Release train off:" not in summary
+    assert "::warning" not in summary
+
+
+@pytest.mark.parametrize("status", [403, 500, 502, 503, 504])
+@pytest.mark.parametrize("path", ["/repos/former/d", "/repositories/9002"])
+def test_release_off_lookup_failure_closes_only_its_installation(tmp_path, status, path):
+    forge = release_forge()
+    forge.repository_moves["/repos/former/d"] = "/repositories/9002"
+    forge.repository_statuses[(9, path)] = status
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release train off: other/d" in summary
+    assert "::warning" in summary
+    assert f"release_off entry former/d: HTTP {status}" in summary
+    assert "installation 9" in summary
+    assert "planted response body must stay private" not in done.stdout + done.stderr + summary
+    assert forge.repository_calls.count((9, path)) == (3 if status in (502, 503, 504) else 1)
+    assert len(forge.revoked) == len(forge.minted)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://localhost:{port}/repositories/9002",
+        "{api}/user",
+        "{api}/repositories/9002?extra=1",
+        "{api}/repos/other/d#fragment",
+        "{api}/repos/other/d/extra",
+        "{api}/repositories/not-a-number",
+    ],
+    ids=["other-host", "user", "query", "fragment", "extra-path", "non-numeric-id"],
+)
+def test_release_off_refuses_unsafe_repository_redirect(tmp_path, location):
+    forge = release_forge()
+    forge.repository_moves["/repos/former/d"] = location
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == []
+    assert "Release train off: fleet/app, other/d" in summary
+    assert "release_off entry former/d: unsafe repository redirect" in summary
+    assert forge.repository_calls == [(7, "/repos/former/d"), (9, "/repos/former/d")]
+
+
+def test_release_off_refuses_a_second_repository_redirect(tmp_path):
+    forge = release_forge()
+    forge.repository_moves["/repos/former/d"] = "/repos/other/old-name"
+    forge.repository_moves["/repos/other/old-name"] = "/repositories/9002"
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == []
+    assert "release_off entry former/d: second repository redirect" in summary
+    assert forge.repository_calls == [
+        (7, "/repos/former/d"),
+        (7, "/repos/other/old-name"),
+        (9, "/repos/former/d"),
+        (9, "/repos/other/old-name"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"id": "9002"},
+        {"id": True},
+        [],
+        b"{bad JSON",
+        pytest.param(None, id="empty"),
+        pytest.param(b"null", id="null"),
+        pytest.param(b"\xff", id="invalid-utf8"),
+    ],
+)
+@pytest.mark.parametrize("redirect", [False, True])
+def test_release_off_refuses_invalid_repository_metadata(tmp_path, body, redirect):
+    forge = release_forge()
+    path = "/repositories/9002" if redirect else "/repos/former/d"
+    if redirect:
+        forge.repository_moves["/repos/former/d"] = path
+    forge.repository_bodies[path] = body
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == []
+    assert "release_off entry former/d:" in summary
+    assert "invalid repository metadata" in summary
+    assert "bad JSON" not in done.stdout + done.stderr + summary
+
+
+def test_release_off_repository_id_does_not_match_another_owner(tmp_path):
+    forge = release_forge()
+    forge.install(11, "former", d=[repository(release=(True, True))])
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [
+        {"owner": "fleet", "name": "app"},
+        {"owner": "other", "name": "d"},
+    ]
+    assert "Release train off: former/d" in summary
+
+
+def test_release_off_public_repository_outside_installations_matches_nothing(tmp_path):
+    forge = release_forge()
+    forge.repository_bodies["/repos/former/d"] = {"id": 99999, "full_name": "other/d"}
+    done, summary = train(tmp_path, forge, release_off="former/d")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [
+        {"owner": "fleet", "name": "app"},
+        {"owner": "other", "name": "d"},
+    ]
+    assert "Release train off:" not in summary
+
+
+def test_release_off_resolves_repository_metadata_without_a_redirect(tmp_path):
+    forge = release_forge()
+    forge.repository_bodies["/repos/former/d"] = {
+        "id": 9002,
+        "full_name": "other/d",
+        "temp_clone_token": "planted response body must stay private",
+    }
+    done, summary = train(tmp_path, forge, release_off="Former/D")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert "Release train off: other/d" in summary
+    assert "planted response body must stay private" not in done.stdout + done.stderr + summary
+    assert forge.repository_calls == [(7, "/repos/former/d"), (9, "/repos/former/d")]
+
+
+def test_release_off_bounds_repository_lookups_per_installation(tmp_path):
+    forge = Forge(repository(release=(True, True)))
+    entries = [f"former/repo-{number}" for number in range(50)]
+    done, summary = train(tmp_path, forge, release_off=" ".join(entries))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert releases_of(tmp_path) == [{"owner": "fleet", "name": "app"}]
+    assert forge.repository_calls == [(7, f"/repos/{entry}") for entry in sorted(entries)]
+    assert "::warning" not in summary
+
+
+def test_release_off_ids_resolves_unmatched_entries_within_budget(tmp_path, monkeypatch):
+    """When started is in budget, release_off_ids resolves each unmatched entry without warning."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+    ids = {"former/a": 101, "former/b": 102, "former/c": 103}
+
+    def fake_lookup(api, token, entry):
+        calls.append((api, token, entry))
+        return ids[entry]
+
+    monkeypatch.setattr(train_mod, "release_off_repository_id", fake_lookup)
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: 100.0)
+    env = {"GITHUB_API_URL": "https://api.example.test"}
+    conf = {"release_off": frozenset(ids)}
+    listed = [{"id": 1, "full_name": "fleet/app"}, {"id": 2, "full_name": "other/d"}]
+    resolved, warnings = train_mod.release_off_ids(env, conf, {"id": 9}, "list-token", listed, 0.0)
+    assert [entry for _, _, entry in calls] == ["former/a", "former/b", "former/c"]
+    assert resolved == frozenset({101, 102, 103})
+    assert warnings == []
+
+
+def test_release_off_ids_closes_installation_when_budget_spent_before_first_lookup(
+    tmp_path, monkeypatch
+):
+    """A spent sweep budget before the first lookup runs 0 lookups and opts out all listed IDs."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        train_mod, "release_off_repository_id", lambda api, token, entry: calls.append(entry)
+    )
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: float(train_mod.SWEEP_SECONDS + 1))
+    env = {"GITHUB_API_URL": "https://api.example.test"}
+    conf = {"release_off": frozenset({"former/a", "former/b", "former/c"})}
+    listed = [{"id": 9001, "full_name": "fleet/app"}, {"id": 9002, "full_name": "other/d"}]
+    resolved, warnings = train_mod.release_off_ids(env, conf, {"id": 9}, "list-token", listed, 0.0)
+    assert calls == []
+    assert resolved == frozenset({9001, 9002})
+    assert warnings == [
+        (
+            f"::warning title=Merge train::release_off entry former/a: "
+            f"sweep budget of {train_mod.SWEEP_SECONDS} s spent; "
+            f"release train off for installation 9"
+        )
+    ]
+
+
+def test_release_off_ids_stops_after_first_lookup_when_budget_becomes_spent(tmp_path, monkeypatch):
+    """When the sweep budget is spent after the first lookup, the second entry triggers fallback."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_lookup(api, token, entry):
+        calls.append(entry)
+        return 101
+
+    ticks = itertools.chain(
+        [float(train_mod.SWEEP_SECONDS - 1)],
+        itertools.repeat(float(train_mod.SWEEP_SECONDS + 1)),
+    )
+    monkeypatch.setattr(train_mod, "release_off_repository_id", fake_lookup)
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: next(ticks))
+    env = {"GITHUB_API_URL": "https://api.example.test"}
+    conf = {"release_off": frozenset({"former/a", "former/b", "former/c"})}
+    listed = [{"id": 9001, "full_name": "fleet/app"}, {"id": 9002, "full_name": "other/d"}]
+    resolved, warnings = train_mod.release_off_ids(env, conf, {"id": 9}, "list-token", listed, 0.0)
+    assert calls == ["former/a"]
+    assert resolved == frozenset({9001, 9002})
+    assert warnings == [
+        (
+            f"::warning title=Merge train::release_off entry former/b: "
+            f"sweep budget of {train_mod.SWEEP_SECONDS} s spent; "
+            f"release train off for installation 9"
+        )
+    ]
+
+
+def test_release_off_ids_allows_lookups_at_exact_sweep_budget_boundary(tmp_path, monkeypatch):
+    """Elapsed time equal to SWEEP_SECONDS is still within budget (> is strict)."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_lookup(api, token, entry):
+        calls.append(entry)
+        return 9002
+
+    monkeypatch.setattr(train_mod, "release_off_repository_id", fake_lookup)
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: float(train_mod.SWEEP_SECONDS))
+    env = {"GITHUB_API_URL": "https://api.example.test"}
+    conf = {"release_off": frozenset({"former/a", "former/b"})}
+    listed = [{"id": 9001, "full_name": "fleet/app"}, {"id": 9002, "full_name": "other/d"}]
+    resolved, warnings = train_mod.release_off_ids(env, conf, {"id": 9}, "list-token", listed, 0.0)
+    assert calls == ["former/a", "former/b"]
+    assert resolved == frozenset({9002})
+    assert warnings == []
 
 
 def test_without_the_manifest_check_a_config_alone_is_named(tmp_path):
@@ -4021,6 +4367,359 @@ def test_after_an_unsigned_dependency_update_the_next_clean_pull_lands(tmp_path)
     assert forge.writes == [landed(2)]
 
 
+RENOVATE_BOT = {"login": "renovate", "__typename": "Bot"}
+REGENERATION_LABEL = "merge-train: regeneration requested"
+RENOVATE_SIGNOFF = (
+    "chore(deps): update foo to v2\n\n"
+    "Signed-off-by: renovate[bot] <29139614+renovate[bot]@users.noreply.github.com>"
+)
+ASKED_NOTE = "skipped: dependency update without Signed-off-by, asked its update bot to recreate it"
+WAITING_NOTE = (
+    "skipped: dependency update without Signed-off-by, waiting for its update bot to recreate it"
+)
+STILL_UNSIGNED_NOTE = (
+    "skipped: dependency update still without Signed-off-by after its update bot "
+    "recreated it; that bot's config adds none"
+)
+WOULD_ASK_NOTE = (
+    "would ask: dependency update without Signed-off-by, would ask its update bot to recreate it"
+)
+
+
+def unsigned_dep_pull(number: int, state: str, **fields) -> dict:
+    defaults = {
+        "headRefName": "renovate/foo-2.x",
+        "author": RENOVATE_BOT,
+        "createdAt": OLD,
+        "commit_authors": ["renovate[bot]"],
+    }
+    defaults.update(fields)
+    return pull(number, state, **defaults)
+
+
+LABELS_INCOMPLETE_NOTE = (
+    "skipped: dependency update without Signed-off-by, labels not fully read, no recreate asked"
+)
+HEAD_MOVED_NOTE = (
+    "skipped: dependency update without Signed-off-by, head moved since the sweep read, "
+    "no recreate asked"
+)
+SKIP_UNSIGNED_NOTE = "skipped: dependency update without Signed-off-by, a person lands it"
+
+
+@pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
+def test_unsigned_dependency_update_asks_the_update_bot_to_recreate(tmp_path, state):
+    forge = Forge(repository(unsigned_dep_pull(1, state)))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL)]
+    assert f"| #1 | {state} | {ASKED_NOTE} |" in summary
+
+
+def test_unsigned_dependency_update_waiting_for_recreate_writes_nothing(tmp_path):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", labels=("rebase", REGENERATION_LABEL))))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {WAITING_NOTE} |" in summary
+
+
+def test_unsigned_dependency_update_after_recreate_still_unsigned(tmp_path):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", labels=(REGENERATION_LABEL,))))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {STILL_UNSIGNED_NOTE} |" in summary
+
+
+def test_unsigned_dependency_update_lands_after_the_update_bot_recreated_and_signed(tmp_path):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", labels=(REGENERATION_LABEL,))))
+    forge.commits[1] = [(RENOVATE_SIGNOFF, 1)]
+    done, _ = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+
+
+def test_unsigned_dependency_regenerate_labels_once_when_signed_message_runs_twice(tmp_path):
+    needle = (
+        "            note = unsigned_update_note(env, conf, pull, read_head)\n"
+        "            raise UnsignedBotError(f\"#{pull['number']}: {err}\", note) from err"
+    )
+    flow = script().replace(
+        needle,
+        "            note = unsigned_update_note(env, conf, pull, read_head)\n"
+        "            unsigned_update_note(env, conf, pull, read_head)\n"
+        "            raise UnsignedBotError(f\"#{pull['number']}: {err}\", note) from err",
+        1,
+    )
+    assert flow != script()
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, _ = train(tmp_path, forge, flow, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL)]
+
+
+def test_unsigned_dependency_update_by_a_person_still_skips_without_labels(tmp_path):
+    user = {"login": "someone", "__typename": "User"}
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", author=user)))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {SKIP_UNSIGNED_NOTE} |" in summary
+
+
+def test_planted_person_commit_on_bot_update_gets_no_recreate_ask(tmp_path):
+    forge = Forge(
+        repository(unsigned_dep_pull(1, "CLEAN", commit_authors=["renovate[bot]", "person-name"]))
+    )
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {SKIP_UNSIGNED_NOTE} |" in summary
+
+
+@pytest.mark.parametrize(
+    ("logins", "expect_write"),
+    [
+        pytest.param(["renovate[bot]"] * 50, True, id="fifty"),
+        pytest.param(["renovate[bot]"] * 51, False, id="fifty-one"),
+    ],
+)
+def test_bot_commit_count_boundary_for_recreate_ask(tmp_path, logins, expect_write):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", commit_authors=logins)))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    if expect_write:
+        assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL)]
+        assert f"| #1 | CLEAN | {ASKED_NOTE} |" in summary
+    else:
+        assert forge.writes == []
+        assert f"| #1 | CLEAN | {SKIP_UNSIGNED_NOTE} |" in summary
+
+
+def test_planted_guard_beyond_label_page_gets_no_ask(tmp_path):
+    labels = tuple(f"other-label-{i}" for i in range(50))
+    pull_node = unsigned_dep_pull(1, "CLEAN", labels=labels)
+    pull_node["labels"]["totalCount"] = 51
+    forge = Forge(repository(pull_node))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {LABELS_INCOMPLETE_NOTE} |" in summary
+
+
+def test_complete_label_read_of_fifty_asks_once(tmp_path):
+    labels = tuple(f"other-label-{i}" for i in range(50))
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", labels=labels)))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL)]
+    assert f"| #1 | CLEAN | {ASKED_NOTE} |" in summary
+
+
+def test_unsigned_dependency_update_with_regenerate_label_off_skips_without_labels(tmp_path):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0", regenerate_label="")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert (
+        "| #1 | CLEAN | skipped: dependency update without Signed-off-by, a person lands it |"
+        in summary
+    )
+
+
+@pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
+def test_unsigned_dependency_update_switch_off_reports_would_ask(tmp_path, state):
+    forge = Forge(repository(unsigned_dep_pull(1, state)))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0", switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | {state} | {WOULD_ASK_NOTE} |" in summary
+
+
+LINE_SEP = "\u2028"
+DEP_SUBJECT_CO_AUTHOR_COMMITS = [
+    (
+        (
+            f"chore(deps): update foo to v2{LINE_SEP}"
+            "Co-authored-by: Bot <bot@example.org>\n\n"
+            "Signed-off-by: Dev <dev@example.org>"
+        ),
+        1,
+    ),
+    ("chore(deps): follow up\n\nSigned-off-by: Dev <dev@example.org>", 1),
+]
+CO_AUTHOR_SQUASH_REFUSAL = "fleet/app: #1: squash message holds a Co-authored-by line"
+
+
+@pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
+def test_switch_off_signed_dependency_co_authored_subject_refused(tmp_path, state):
+    forge = Forge(repository(unsigned_dep_pull(1, state)))
+    forge.commits[1] = list(DEP_SUBJECT_CO_AUTHOR_COMMITS)
+    done, summary = train(tmp_path, forge, min_age_days="0", switch="off")
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.writes == []
+    assert CO_AUTHOR_SQUASH_REFUSAL in summary
+    assert "Traceback" not in done.stdout + done.stderr
+
+
+def test_signed_dependency_switch_off_without_co_author_subject_reports_no_note(tmp_path):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [(RENOVATE_SIGNOFF, 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0", switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert WOULD_ASK_NOTE not in summary
+    assert CO_AUTHOR_SQUASH_REFUSAL not in summary
+
+
+def test_planted_dependency_unsigned_note_without_value_error_refusal(tmp_path):
+    kept = "        return unsigned_update_note(env, conf, pull, read_head)\n"
+    needle = kept + (
+        "    except ValueError as err:\n"
+        "        raise RefusedError(f\"#{pull['number']}: {err}\") from err\n"
+    )
+    assert script().count(needle) == 1
+    flow = script().replace(needle, kept)
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = list(DEP_SUBJECT_CO_AUTHOR_COMMITS)
+    done, summary = train(tmp_path, forge, flow, min_age_days="0", switch="off")
+    assert CO_AUTHOR_SQUASH_REFUSAL not in summary
+    out = done.stdout + done.stderr
+    assert "Traceback" in out
+    assert "ValueError: squash message holds a Co-authored-by line" in out
+
+
+def test_switch_off_linear_history_behind_unsigned_update_reports_no_ask(tmp_path):
+    forge = Forge(
+        repository(
+            unsigned_dep_pull(1, "BEHIND"),
+            rules=("REQUIRED_LINEAR_HISTORY",),
+        )
+    )
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, min_age_days="0", switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "| #1 | BEHIND | behind: linear history, a person rebases |" in summary
+    assert WOULD_ASK_NOTE not in summary
+
+
+def test_after_an_asked_unsigned_dependency_update_the_next_clean_pull_lands(tmp_path):
+    forge = Forge(
+        repository(
+            unsigned_dep_pull(1, "CLEAN"),
+            pull(2, "CLEAN"),
+        )
+    )
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, _ = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL), landed(2)]
+
+
+def test_planted_unsigned_regenerate_without_guard_check_relabels(tmp_path):
+    target = "    if guard not in names:"
+    assert script().count(target) == 1
+    flow = script().replace(target, "    if True:")
+    assert flow != script()
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN", labels=(REGENERATION_LABEL,))))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, _ = train(tmp_path, forge, flow, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert ("label", 1, "rebase", REGENERATION_LABEL) in forge.writes
+
+
+@pytest.mark.parametrize("switch", ["on", "off"])
+def test_unsigned_dependency_update_head_moved_skips_recreate_ask(tmp_path, switch):
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    forge.commit_heads[1] = "b" * 40
+    done, summary = train(tmp_path, forge, min_age_days="0", switch=switch)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {HEAD_MOVED_NOTE} |" in summary
+    assert ASKED_NOTE not in summary
+    assert WOULD_ASK_NOTE not in summary
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["same-head", "moved-head"])
+def test_unsigned_dependency_update_incomplete_labels_precede_head_moved(tmp_path, moved):
+    labels = tuple(f"other-label-{i}" for i in range(50))
+    pull_node = unsigned_dep_pull(1, "CLEAN", labels=labels)
+    pull_node["labels"]["totalCount"] = 51
+    forge = Forge(repository(pull_node))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    if moved:
+        forge.commit_heads[1] = "b" * 40
+    done, summary = train(tmp_path, forge, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | CLEAN | {LABELS_INCOMPLETE_NOTE} |" in summary
+    assert HEAD_MOVED_NOTE not in summary
+
+
+def test_behind_unsigned_dependency_non_arming_reports_no_would_ask_and_writes_no_label(tmp_path):
+    dry_dir = tmp_path / "dry"
+    dry_dir.mkdir()
+    armed_pull = unsigned_dep_pull(1, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    dry_forge = Forge(repository(armed_pull))
+    dry_forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    dry_done, dry_summary = train(dry_dir, dry_forge, min_age_days="0", switch="off")
+    assert dry_done.returncode == 0, dry_done.stdout + dry_done.stderr
+    assert dry_forge.writes == []
+    assert "| #1 | BEHIND | behind |" in dry_summary
+    assert WOULD_ASK_NOTE not in dry_summary
+
+    live_dir = tmp_path / "live"
+    live_dir.mkdir()
+    live_forge = Forge(repository(armed_pull))
+    live_forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    live_done, live_summary = train(live_dir, live_forge, min_age_days="0", switch="on")
+    assert live_done.returncode == 0, live_done.stdout + live_done.stderr
+    assert live_forge.writes == [updated(1)]
+    assert "| #1 | BEHIND | updated from the default branch |" in live_summary
+    assert ASKED_NOTE not in live_summary
+
+
+def test_planted_unsigned_head_moved_without_head_check_labels(tmp_path):
+    target = '        if read_head != pull["headRefOid"]:'
+    assert script().count(target) == 1
+    flow = script().replace(target, "        if False:")
+    assert flow != script()
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    forge.commit_heads[1] = "b" * 40
+    done, _ = train(tmp_path, forge, flow, min_age_days="0")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [("label", 1, "rebase", REGENERATION_LABEL)]
+
+
+def test_planted_dry_unsigned_behind_without_arming_skip_reports_would_ask(tmp_path):
+    target = "        if not arming:\n            continue\n"
+    assert script().count(target) == 1
+    flow = script().replace(target, "")
+    assert flow != script()
+    armed_pull = unsigned_dep_pull(1, "BEHIND", autoMergeRequest={"enabledAt": OLD})
+    forge = Forge(repository(armed_pull))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    done, summary = train(tmp_path, forge, flow, min_age_days="0", switch="off")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert f"| #1 | BEHIND | {WOULD_ASK_NOTE} |" in summary
+
+
 @pytest.mark.parametrize("state", ["CLEAN", "BEHIND"])
 def test_unsigned_bot_pull_request_is_skipped_and_listed(tmp_path, state):
     """An unsigned bot PR is skipped on non-dependency branches and listed in summary."""
@@ -4723,6 +5422,41 @@ def test_check_release_off_refuses_invalid_entry(tmp_path, invalid):
     rules = load_rules(tmp_path)
     with pytest.raises(ValueError, match="not owner/name"):
         rules.check_release_off(invalid)
+
+
+def test_release_off_setting_accepts_50_entries(tmp_path, monkeypatch):
+    """Fifty entries, the bound, parse to the casefolded set."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    entries = [f"fleet/repo-{number}" for number in range(50)]
+    assert train_mod.MAX_RELEASE_OFF == 50
+    assert train_mod.release_off_setting(" ".join(entries)) == frozenset(entries)
+
+
+def test_release_off_setting_refuses_51_entries(tmp_path, monkeypatch):
+    """Fifty-one entries are refused with the setting error."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    raw = " ".join(f"fleet/repo-{number}" for number in range(51))
+    with pytest.raises(train_mod.InvalidSettingError, match="release_off.*50"):
+        train_mod.release_off_setting(raw)
+
+
+def test_release_off_setting_counts_repeated_entries(tmp_path, monkeypatch):
+    """The bound counts entries before deduplication, so 51 copies of one name are refused."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    raw = " ".join(["fleet/app"] * 51)
+    with pytest.raises(train_mod.InvalidSettingError, match="release_off.*50"):
+        train_mod.release_off_setting(raw)
+
+
+def test_release_off_over_the_bound_stops_before_any_forge_call(tmp_path):
+    """A release_off over the bound is a setting error: exit 3, no token minted, no call."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    raw = " ".join(f"fleet/repo-{number}" for number in range(51))
+    done, _ = train(tmp_path, forge, release_off=raw)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert done.stdout.startswith("::error title=Merge train setting::")
+    assert "release_off accepts at most 50 entries" in done.stdout
+    assert (forge.minted, forge.where) == ([], [])
 
 
 @pytest.mark.parametrize(
@@ -7953,7 +8687,9 @@ def test_review_bodies_query_fields(tmp_path, monkeypatch):
         "commit { message committedDate }",
     ):
         assert token in q
-    assert q.count("totalCount") == 3
+    assert "headChecks: commits(last: 1)" in q
+    assert "filterBy: {appId: 347564}" in q
+    assert q.count("totalCount") == 8
 
 
 def test_planted_code_scanning_failure_holds_clean_pull(tmp_path):
@@ -10732,6 +11468,37 @@ def test_adr92_notice_boundary_without_evidence(tmp_path, monkeypatch, when, hol
     assert bool(mod.review_body_hold(p, detail)) is holds
 
 
+def test_adr114_h2_open_findings_hold(tmp_path, monkeypatch):
+    """Budget exemption clears incomplete only; unanswered Sourcery findings still hold."""
+    from test_review_state import ADR92_COMMIT, ADR92_HEAD, ADR114_BUDGET, adr114_head_checks
+
+    mod = load_train(tmp_path, monkeypatch)
+    p = pull(1, "CLEAN", author={"login": "person"}, headRefOid=ADR92_HEAD)
+    detail = _detail(
+        reviews=[
+            _bot_review(9101, "sourcery-ai[bot]", "## Overall Comments\nPlease address this."),
+        ],
+        comments=[
+            {
+                "author": {"login": "sourcery-ai[bot]"},
+                "createdAt": "2026-11-16T16:40:51Z",
+                "body": ADR114_BUDGET,
+            }
+        ],
+        commits=["c"],
+    )
+    detail["headRefOid"] = ADR92_HEAD
+    detail["commits"] = {
+        "totalCount": 1,
+        "nodes": [{"commit": {"message": "c", "committedDate": ADR92_COMMIT}}],
+    }
+    detail["headChecks"] = adr114_head_checks()
+    reason = mod.review_body_hold(p, detail)
+    assert reason is not None
+    assert "review incomplete" not in reason
+    assert "sourcery" in reason.lower() and "findings" in reason.lower()
+
+
 def test_adr92_arming_read_budget(tmp_path, monkeypatch):
     mod = adr92_train(tmp_path, monkeypatch)
     p, detail = _incomplete_review_pull()
@@ -10784,8 +11551,8 @@ def adr92_mutations():
         (
             "E",
             "review_state",
-            "return allowance or paused or names_head or when >= last_commit",
-            "return allowance or paused or names_head or when > last_commit",
+            "holds = allowance or paused or names_head or when >= last_commit",
+            "holds = allowance or paused or names_head or when > last_commit",
             "E-equal-notice",
         ),
         (
@@ -10817,6 +11584,43 @@ def adr92_mutations():
             "test_adr92_arming_rereads[I-hold]",
         ),
     ] + adr92_followup_mutations()
+
+
+# ADR-0114 rows: each removes one leg of the Sourcery budget exemption.
+def adr114_mutations():
+    return [
+        (
+            "114",
+            "review_state",
+            'all(match.group("budget") for match in notices[:MAX_LINES])',
+            "all(False for match in notices[:MAX_LINES])",
+            "test_adr114_p1_pass",
+        ),
+        (
+            "114-any-text",
+            "review_state",
+            'all(match.group("budget") for match in notices[:MAX_LINES])',
+            "all(True for match in notices[:MAX_LINES])",
+            "H3-skip-text",
+        ),
+        (
+            "114-run-summary",
+            "review_state",
+            '                or not match.group("budget")',
+            "                or False",
+            "H3-run-limit",
+        ),
+        (
+            "114-multi-commit",
+            "review_state",
+            "    if isinstance(count, bool) or not isinstance(count, int) or count < 1:",
+            (
+                "    if isinstance(count, bool) or not isinstance(count, int) "
+                "or count < 1 or count != 1:"
+            ),
+            "p3_multi_commit",
+        ),
+    ]
 
 
 def adr92_followup_mutations():
@@ -10856,7 +11660,7 @@ def adr92_followup_mutations():
             'counter = "review_reads"',
             "test_adr92_arming_allowance_beside_admission",
         ),
-    ]
+    ] + adr114_mutations()
 
 
 def adr92_mutation_run(root, selector, log):

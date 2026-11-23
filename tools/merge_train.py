@@ -90,6 +90,8 @@ RETRY_CODES = (502, 503, 504)
 SWEEP_SECONDS = 1500
 MAX_PAGES = 20
 JWT_SECONDS = 540
+RELEASE_OFF_NOT_FOUND = object()
+MAX_RELEASE_OFF = 50
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 # NIST SP 800-57 Part 1: 112-bit security is 2048-bit RSA; OpenSSF Best Practices crypto_keylength.
 MIN_KEY_BITS = 2048
@@ -159,6 +161,7 @@ COMMITS = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
+      headRefOid
       commits(first: 100) {
         totalCount
         nodes { commit { message parents { totalCount } } }
@@ -264,7 +267,28 @@ MERGE_IN_PROGRESS = "Merge already in progress"
 NOT_MERGEABLE = "pull request is not mergeable"
 UNGRANTED = "The permissions requested are not granted"
 SKIP_UNSIGNED = "skipped: dependency update without Signed-off-by, a person lands it"
+SKIP_UNSIGNED_ASKED = (
+    "skipped: dependency update without Signed-off-by, asked its update bot to recreate it"
+)
+SKIP_UNSIGNED_WOULD_ASK = (
+    "would ask: dependency update without Signed-off-by, would ask its update bot to recreate it"
+)
+SKIP_UNSIGNED_WAITING = (
+    "skipped: dependency update without Signed-off-by, waiting for its update bot to recreate it"
+)
+SKIP_UNSIGNED_STILL = (
+    "skipped: dependency update still without Signed-off-by after its update bot "
+    "recreated it; that bot's config adds none"
+)
+SKIP_UNSIGNED_LABELS_INCOMPLETE = (
+    "skipped: dependency update without Signed-off-by, labels not fully read, no recreate asked"
+)
+SKIP_UNSIGNED_HEAD_MOVED = (
+    "skipped: dependency update without Signed-off-by, head moved since the sweep read, "
+    "no recreate asked"
+)
 SKIP_UNSIGNED_BOT = "skipped: bot pull request without Signed-off-by, its producer signs it"
+REGENERATION_REQUESTED_LABEL = "merge-train: regeneration requested"
 REVIEW_BODY = "review body: "
 # Pull requests whose review bodies one run reads in one repository (ADR-0070).
 REVIEW_READS = 10
@@ -302,6 +326,34 @@ query($owner: String!, $name: String!, $number: Int!) {
       commits(first: 100) {
         totalCount
         nodes { commit { message committedDate } }
+      }
+      headChecks: commits(last: 1) {
+        totalCount
+        nodes {
+          commit {
+            oid
+            coderabbit: checkSuites(first: 5, filterBy: {appId: 347564}) {
+              totalCount
+              nodes {
+                app { slug databaseId }
+                checkRuns(first: 5, filterBy: {checkName: "CodeRabbit"}) {
+                  totalCount
+                  nodes { name status conclusion summary }
+                }
+              }
+            }
+            sourcery: checkSuites(first: 5, filterBy: {appId: 48477}) {
+              totalCount
+              nodes {
+                app { slug databaseId }
+                checkRuns(first: 5, filterBy: {checkName: "Sourcery review"}) {
+                  totalCount
+                  nodes { name status conclusion summary }
+                }
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -566,6 +618,20 @@ def check_app_key(key):
         )
 
 
+def check_regenerate_label(raw, error_cls=InvalidSettingError):
+    """The label that asks the update bot to recreate an unsigned dependency update."""
+    if "," in raw or "\n" in raw:
+        raise error_cls(f"regenerate_label is {raw!r}, must not contain a comma or newline")
+    if len(raw) > 50:
+        raise error_cls(f"regenerate_label is {len(raw)} characters, at most 50 are allowed")
+    return raw
+
+
+def check_onboarding_branches(raw):
+    """Exact head names of update-bot onboarding pull requests."""
+    return tuple(name for name in raw.split() if name)
+
+
 def check_review_bots(value):
     """Allow only comma-separated forge logins, normalizing optional bot suffixes."""
     names = value.split(",")
@@ -580,6 +646,13 @@ def check_review_bots(value):
             raise InvalidSettingError(f"review_bots has invalid login {login!r}")
         logins.add(login.lower().removesuffix("[bot]"))
     return frozenset(logins)
+
+
+def release_off_setting(raw):
+    """At most MAX_RELEASE_OFF entries, repeats counted, then the owner/name parse."""
+    if len(raw.split()) > MAX_RELEASE_OFF:
+        raise InvalidSettingError(f"release_off accepts at most {MAX_RELEASE_OFF} entries")
+    return check_release_off(raw, InvalidSettingError)
 
 
 def checked_train_modes(env):
@@ -605,7 +678,7 @@ def settings(env):
     if not env.get("TRAIN_APP_CLIENT_ID", "").strip():
         raise InvalidSettingError("app_client_id is empty")
     check_app_key(env.get("TRAIN_APP_KEY", ""))
-    release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
+    release_off = release_off_setting(env["TRAIN_RELEASE_OFF"])
     hold = check_hold_labels(env["TRAIN_HOLD_LABELS"], InvalidSettingError)
     required_status = check_required_status(
         env.get("TRAIN_REQUIRED_STATUS", ""), InvalidSettingError
@@ -628,6 +701,12 @@ def settings(env):
             name.strip() for name in env.get("TRAIN_SESSION_AUTHORS", "").split(",") if name.strip()
         ),
         "session_hold": timedelta(hours=hours),
+        "regenerate": check_regenerate_label(
+            env.get("TRAIN_REGENERATE_LABEL", "rebase"), InvalidSettingError
+        ),
+        "onboarding": check_onboarding_branches(
+            env.get("TRAIN_ONBOARDING_BRANCHES", "renovate/configure")
+        ),
     }
 
 
@@ -780,17 +859,19 @@ def fetch(env, conf):
 
 
 def pull_commits(env, number):
-    """The non-merge commit messages of one pull request, oldest first."""
+    """The head commit oid and non-merge commit messages of one pull request, oldest first."""
     owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
     data = read_graphql(env, COMMITS, {"owner": owner, "name": name, "number": number})
-    commits = data["repository"]["pullRequest"]["commits"]
+    pull = data["repository"]["pullRequest"]
+    commits = pull["commits"]
     if commits["totalCount"] > 100:
         raise RefusedError(f"#{number}: more than 100 commits, cannot read every sign-off")
-    return [
+    messages = [
         node["commit"]["message"]
         for node in commits["nodes"]
         if node["commit"]["parents"]["totalCount"] == 1
     ]
+    return pull["headRefOid"], messages
 
 
 def pull_merge_state(env, number):
@@ -807,14 +888,114 @@ def is_bot(pull):
     return isinstance(author, dict) and author.get("__typename") == "Bot"
 
 
+def add_pull_labels(pull, *names):
+    """Record labels on the in-memory pull request after a successful write."""
+    labels = pull.setdefault("labels", {"nodes": []})
+    nodes = labels["nodes"]
+    present = {item["name"] for item in nodes}
+    added = 0
+    for name in names:
+        if name not in present:
+            nodes.append({"name": name})
+            present.add(name)
+            added += 1
+    total = labels.get("totalCount")
+    if added and isinstance(total, int):
+        labels["totalCount"] = total + added
+
+
+def labels_complete(pull):
+    """Whether the pull request's label connection was read without truncation."""
+    labels = pull.get("labels")
+    if not isinstance(labels, dict):
+        return False
+    total = labels.get("totalCount")
+    nodes = labels.get("nodes")
+    if isinstance(total, bool) or not isinstance(total, int):
+        return False
+    if not isinstance(nodes, list):
+        return False
+    return total == len(nodes)
+
+
+def _ask_update_bot_recreate(env, pull, regen, guard):
+    """Post the recreate and guard labels once and record them on the in-memory pull."""
+    api = f"{env['GITHUB_API_URL']}/repos/{env['GITHUB_REPOSITORY']}"
+    url = f"{api}/issues/{pull['number']}/labels"
+    try:
+        call(url, env["TRAIN_TOKEN"], "POST", {"labels": [regen, guard]})
+    except RefusedError as err:
+        msg = f"#{pull['number']}: could not ask the update bot to recreate it"
+        raise RefusedError(msg) from err
+    add_pull_labels(pull, regen, guard)
+
+
+def unsigned_update_note(env, conf, pull, read_head):
+    """The skip note for an unsigned dependency update; may ask the update bot once."""
+    head = pull["headRefName"]
+    if head in conf["onboarding"] or not is_bot_dependency(pull, conf) or not conf["regenerate"]:
+        return SKIP_UNSIGNED
+    names = set(label_names(pull))
+    guard = REGENERATION_REQUESTED_LABEL
+    regen = conf["regenerate"]
+    if guard not in names:
+        if not labels_complete(pull):
+            return SKIP_UNSIGNED_LABELS_INCOMPLETE
+        if read_head != pull["headRefOid"]:
+            return SKIP_UNSIGNED_HEAD_MOVED
+        if conf["switch"] != "on":
+            return SKIP_UNSIGNED_WOULD_ASK
+        _ask_update_bot_recreate(env, pull, regen, guard)
+        return SKIP_UNSIGNED_ASKED
+    if regen in names:
+        return SKIP_UNSIGNED_WAITING
+    return SKIP_UNSIGNED_STILL
+
+
+def dependency_unsigned_note(env, conf, pull):
+    """The skip note for an unsigned dependency head, or None when signed or not a dependency."""
+    if not pull["headRefName"].startswith(conf["dependency"]):
+        return None
+    read_head, messages = pull_commits(env, pull["number"])
+    try:
+        squash_message(pull["title"], pull["number"], messages)
+    except NoSignOffError:
+        return unsigned_update_note(env, conf, pull, read_head)
+    except ValueError as err:
+        raise RefusedError(f"#{pull['number']}: {err}") from err
+    return None
+
+
+def dry_note_unsigned_dependencies(env, conf, repo, rows, notes):
+    """When `switch` is off, report what the train would ask without forge writes."""
+    for pull, reason in rows:
+        if reason != "land":
+            continue
+        note = dependency_unsigned_note(env, conf, pull)
+        if note:
+            notes[pull["number"]] = note
+    behind = [
+        (pull, reason)
+        for pull, reason in rows
+        if reason == "behind" and pull["headRefName"].startswith(conf["dependency"])
+    ]
+    for pull, arming in updatable(repo, behind, notes, conf)[: PULL_PAGES * 100]:
+        if not arming:
+            continue
+        note = dependency_unsigned_note(env, conf, pull)
+        if note:
+            notes[pull["number"]] = note
+
+
 def signed_message(env, conf, pull):
     """The headline and body for a signed pull request; raises when unsigned or invalid."""
-    messages = pull_commits(env, pull["number"])
+    read_head, messages = pull_commits(env, pull["number"])
     try:
         return squash_message(pull["title"], pull["number"], messages)
     except NoSignOffError as err:
         if pull["headRefName"].startswith(conf["dependency"]):
-            raise UnsignedBotError(f"#{pull['number']}: {err}", SKIP_UNSIGNED) from err
+            note = unsigned_update_note(env, conf, pull, read_head)
+            raise UnsignedBotError(f"#{pull['number']}: {err}", note) from err
         if is_bot(pull):
             raise UnsignedBotError(f"#{pull['number']}: {err}", SKIP_UNSIGNED_BOT) from err
         raise RefusedError(f"#{pull['number']}: {err}") from err
@@ -2008,6 +2189,7 @@ def run(env, conf, repo, now, notes=None):
     rows = hold_review_bodies(env, conf, verdicts)
     notes.update({pull["number"]: reason for pull, reason in rows})
     if conf["switch"] == "off":
+        dry_note_unsigned_dependencies(env, conf, repo, rows, notes)
         return rows, notes, "switched off: nothing landed or updated"
     # Taking auto-merge off a red pull request lands nothing, so it precedes the lease check.
     disarm_red_scanning(env, rows, notes, conf)
@@ -2163,8 +2345,73 @@ def revoke(env, token):
         )
 
 
-def repositories(env, conf, installation, identity):
-    """The installation's repositories the train serves, read with a read-only token.
+def release_off_get(url, token):
+    """Read metadata without automatic redirects or exposing response bodies in failures."""
+    try:
+        return call(url, token, "GET", redirect=False)
+    except RefusedError as err:
+        cause = err.__cause__
+        if isinstance(cause, urllib.error.HTTPError):
+            if cause.code == 404:
+                return RELEASE_OFF_NOT_FOUND
+            raise ValueError(f"HTTP {cause.code}") from None
+        raise ValueError("repository metadata request failed") from None
+    except (ValueError, UnicodeError):
+        raise ValueError("invalid repository metadata") from None
+
+
+def release_off_repository_id(api, token, entry):
+    """Resolve an entry's ID, following at most one allow-listed redirect on the API origin."""
+    answer = release_off_get(f"{api}/repos/{urllib.parse.quote(entry, safe='/')}", token)
+    if isinstance(answer, dict) and "location" in answer:
+        location = answer["location"]
+        allowed = rf"{re.escape(api)}/(?:repositories/[0-9]+|repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+        if not isinstance(location, str) or not re.fullmatch(allowed, location):
+            raise ValueError("unsafe repository redirect")
+        answer = release_off_get(location, token)
+        if isinstance(answer, dict) and "location" in answer:
+            raise ValueError("second repository redirect")
+    if answer is RELEASE_OFF_NOT_FOUND:
+        return None
+    repo_id = answer.get("id") if isinstance(answer, dict) else None
+    if isinstance(repo_id, bool) or not isinstance(repo_id, int):
+        raise ValueError("invalid repository metadata: missing integer id")
+    return repo_id
+
+
+def over_budget(started):
+    """Whether the sweep has run past SWEEP_SECONDS."""
+    return time.monotonic() - started > SWEEP_SECONDS
+
+
+def release_off_fallback(installation, listed, entry, reason):
+    """All listed repository IDs and the summary warning when release_off resolution stops."""
+    warning = (
+        f"::warning title=Merge train::release_off entry {entry}: {reason}; "
+        f"release train off for installation {installation['id']}"
+    )
+    return frozenset(target["id"] for target in listed), [warning]
+
+
+def release_off_ids(env, conf, installation, token, listed, started):
+    """Resolve at most MAX_RELEASE_OFF unmatched entries; any failure opts out all listed IDs."""
+    exact = {target["full_name"].casefold() for target in listed}
+    resolved = set()
+    for entry in sorted(conf["release_off"] - exact):
+        if over_budget(started):
+            reason = f"sweep budget of {SWEEP_SECONDS} s spent"
+            return release_off_fallback(installation, listed, entry, reason)
+        try:
+            repo_id = release_off_repository_id(env["GITHUB_API_URL"], token, entry)
+        except ValueError as err:
+            return release_off_fallback(installation, listed, entry, err)
+        if repo_id is not None:
+            resolved.add(repo_id)
+    return frozenset(resolved), []
+
+
+def repositories(env, conf, installation, identity, started):
+    """Served repositories, resolved release-off IDs and warnings, read with a read-only token.
 
     The first call fills identity with the bot login and id, using that token.
     """
@@ -2173,9 +2420,11 @@ def repositories(env, conf, installation, identity):
         if not identity:
             identity["bot_login"], identity["bot_id"] = bot_identity(env, conf, token)
         listed = pages(env, token, "/installation/repositories", "repositories")
+        resolved, warnings = release_off_ids(env, conf, installation, token, listed, started)
     finally:
         revoke(env, token)
-    return [r for r in listed if not r.get("archived") and not r.get("disabled")]
+    targets = [r for r in listed if not r.get("archived") and not r.get("disabled")]
+    return targets, resolved, warnings
 
 
 def close_issues(env, conf, installation, target, now):
@@ -2266,6 +2515,11 @@ def one(env, conf, installation, target, now):
     )
 
 
+def release_is_off(target, conf, resolved):
+    """Match the casefolded current name or a resolved repository ID; the reported name stays."""
+    return target["full_name"].casefold() in conf["release_off"] or target["id"] in resolved
+
+
 def sweep(env, conf, started):
     """Run the train in every repository; the per-account tally, the sections, the refusals."""
     accounts, sections, refusals, skipped, releases, off, identity = {}, [], [], [], [], [], {}
@@ -2276,15 +2530,16 @@ def sweep(env, conf, started):
             accounts[account] = "suspended"
             continue
         try:
-            targets = repositories(env, conf, installation, identity)
+            targets, resolved, warnings = repositories(env, conf, installation, identity, started)
         except RefusedError as err:
             refusals.append(f"{account}: {err}")
             accounts[account] = "refused"
             continue
+        sections.extend(warnings)
         tally = {"repositories": 0, "landed": 0, "updated": 0, "refused": 0}
         accounts[account] = tally
         for index, target in enumerate(targets):
-            if time.monotonic() - started > SWEEP_SECONDS:
+            if over_budget(started):
                 skipped.append(target["full_name"])
                 continue
             tally["repositories"] += 1
@@ -2312,7 +2567,7 @@ def sweep(env, conf, started):
             sections.append(section)
             unsigned_bots.extend(unsigned)
             if release:
-                if target["full_name"].lower() in conf["release_off"]:
+                if release_is_off(target, conf, resolved):
                     off.append(target["full_name"])
                 else:
                     releases.append({"owner": account, "name": target["name"]})
