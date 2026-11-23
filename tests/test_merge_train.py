@@ -8321,7 +8321,9 @@ def test_review_bodies_query_fields(tmp_path, monkeypatch):
         "commit { message committedDate }",
     ):
         assert token in q
-    assert q.count("totalCount") == 3
+    assert "headChecks: commits(last: 1)" in q
+    assert "filterBy: {appId: 347564}" in q
+    assert q.count("totalCount") == 8
 
 
 def test_planted_code_scanning_failure_holds_clean_pull(tmp_path):
@@ -11100,6 +11102,37 @@ def test_adr92_notice_boundary_without_evidence(tmp_path, monkeypatch, when, hol
     assert bool(mod.review_body_hold(p, detail)) is holds
 
 
+def test_adr114_h2_open_findings_hold(tmp_path, monkeypatch):
+    """Budget exemption clears incomplete only; unanswered Sourcery findings still hold."""
+    from test_review_state import ADR92_COMMIT, ADR92_HEAD, ADR114_BUDGET, adr114_head_checks
+
+    mod = load_train(tmp_path, monkeypatch)
+    p = pull(1, "CLEAN", author={"login": "person"}, headRefOid=ADR92_HEAD)
+    detail = _detail(
+        reviews=[
+            _bot_review(9101, "sourcery-ai[bot]", "## Overall Comments\nPlease address this."),
+        ],
+        comments=[
+            {
+                "author": {"login": "sourcery-ai[bot]"},
+                "createdAt": "2026-11-16T16:40:51Z",
+                "body": ADR114_BUDGET,
+            }
+        ],
+        commits=["c"],
+    )
+    detail["headRefOid"] = ADR92_HEAD
+    detail["commits"] = {
+        "totalCount": 1,
+        "nodes": [{"commit": {"message": "c", "committedDate": ADR92_COMMIT}}],
+    }
+    detail["headChecks"] = adr114_head_checks()
+    reason = mod.review_body_hold(p, detail)
+    assert reason is not None
+    assert "review incomplete" not in reason
+    assert "sourcery" in reason.lower() and "findings" in reason.lower()
+
+
 def test_adr92_arming_read_budget(tmp_path, monkeypatch):
     mod = adr92_train(tmp_path, monkeypatch)
     p, detail = _incomplete_review_pull()
@@ -11152,8 +11185,8 @@ def adr92_mutations():
         (
             "E",
             "review_state",
-            "return allowance or paused or names_head or when >= last_commit",
-            "return allowance or paused or names_head or when > last_commit",
+            "holds = allowance or paused or names_head or when >= last_commit",
+            "holds = allowance or paused or names_head or when > last_commit",
             "E-equal-notice",
         ),
         (
@@ -11185,6 +11218,43 @@ def adr92_mutations():
             "test_adr92_arming_rereads[I-hold]",
         ),
     ] + adr92_followup_mutations()
+
+
+# ADR-0114 rows: each removes one leg of the Sourcery budget exemption.
+def adr114_mutations():
+    return [
+        (
+            "114",
+            "review_state",
+            'all(match.group("budget") for match in notices[:MAX_LINES])',
+            "all(False for match in notices[:MAX_LINES])",
+            "test_adr114_p1_pass",
+        ),
+        (
+            "114-any-text",
+            "review_state",
+            'all(match.group("budget") for match in notices[:MAX_LINES])',
+            "all(True for match in notices[:MAX_LINES])",
+            "H3-skip-text",
+        ),
+        (
+            "114-run-summary",
+            "review_state",
+            '                or not match.group("budget")',
+            "                or False",
+            "H3-run-limit",
+        ),
+        (
+            "114-multi-commit",
+            "review_state",
+            "    if isinstance(count, bool) or not isinstance(count, int) or count < 1:",
+            (
+                "    if isinstance(count, bool) or not isinstance(count, int) "
+                "or count < 1 or count != 1:"
+            ),
+            "p3_multi_commit",
+        ),
+    ]
 
 
 def adr92_followup_mutations():
@@ -11224,7 +11294,7 @@ def adr92_followup_mutations():
             'counter = "review_reads"',
             "test_adr92_arming_allowance_beside_admission",
         ),
-    ]
+    ] + adr114_mutations()
 
 
 def adr92_mutation_run(root, selector, log):
