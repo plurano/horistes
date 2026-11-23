@@ -116,8 +116,11 @@ timestamp
 **Unverified** in source at 44.257.9: that Renovate still writes the original
 image name in the update, and that the Docker Hub copy carries the same tags and
 digests as the image in the file. A repository may use this per image only after
-a Renovate dry run shows the release timestamp and an unchanged image name; the
-preset does not.
+all three proofs hold: a Renovate dry run shows the release timestamp, the same
+dry run shows an unchanged image name in the file, and a comparison of both
+registries shows that the twin lists the same tags as the source image, each tag
+resolving to the same manifest digest. When any of those proofs is missing, that
+image stays on the dashboard path in **Status quo (works)**; the preset does not.
 
 ### `registryAliases`
 
@@ -138,9 +141,10 @@ The wait-keeping path for undated outside images is section **Status quo
 (works)** above: no branch and no pull request until a person checks release age
 outside Renovate and requests the update on the Dependency Dashboard.
 
-Per-image **overridePackageName** toward a Docker Hub twin is allowed under the
-proof stated in **Dated twin per image**; **Time-based pull request creation**
-and host-qualified **`registryUrls`** do not keep a wait.
+Per-image **overridePackageName** toward a Docker Hub twin is allowed only when
+all three proofs in **Dated twin per image** hold; when any is missing, the
+dashboard path in **Status quo (works)** applies. **Time-based pull request
+creation** and host-qualified **`registryUrls`** do not keep a wait.
 
 Revisit when upstream work on registry timestamps (renovatebot/renovate issues
 38656, 39064, 38572, 38659; names only) lands in a Renovate release that the
