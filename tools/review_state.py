@@ -206,20 +206,39 @@ def _paused_block(lines: list[str], notice_idx: int) -> list[str]:
     return lines[notice_idx + 1 : end][:MAX_LINES]
 
 
-def _paused_head_reviewed(body: str, head: str) -> bool:
-    """Exempt only pause notices with unambiguous, block-local evidence for the full head."""
-    if not re.fullmatch(r"[0-9a-f]{40}", head):
-        return False
+def _pause_allowance_notices(body: str) -> tuple[list, bool, bool]:
+    """Limit notices in body and whether the body is mixed pause plus allowance only."""
     lines = body.splitlines()
     if len(lines) > MAX_LINES:
-        return False
+        return [], False, False
     notices = [
         (idx, match)
         for idx, line in enumerate(lines[:MAX_LINES])
         if (match := LIMIT_NOTICE_RE.search(line))
     ]
-    if not notices or any(not match.group("paused") for _idx, match in notices[:MAX_LINES]):
+    if not notices:
+        return notices, False, False
+    foreign = any(
+        not match.group("paused") and not match.group("allowance")
+        for _idx, match in notices[:MAX_LINES]
+    )
+    has_paused = any(match.group("paused") for _idx, match in notices[:MAX_LINES])
+    has_allowance = any(match.group("allowance") for _idx, match in notices[:MAX_LINES])
+    mixed = has_paused and has_allowance and not foreign
+    return notices, mixed, foreign
+
+
+def _paused_head_reviewed(body: str, head: str) -> bool:
+    """Exempt only pause notices with unambiguous, block-local evidence for the full head."""
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
         return False
+    notices, mixed, foreign = _pause_allowance_notices(body)
+    if not notices or foreign:
+        return False
+    pause_notices = [(idx, match) for idx, match in notices[:MAX_LINES] if match.group("paused")]
+    if not pause_notices:
+        return False
+    lines = body.splitlines()
     reviewed = {
         match.group(1).lower()
         for line in lines[:MAX_LINES]
@@ -227,10 +246,13 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
     }
     if reviewed != {head}:
         return False
-    return all(
+    pause_ok = all(
         any(LAST_REVIEWED_RE.fullmatch(line) for line in _paused_block(lines, idx)[:MAX_LINES])
-        for idx, _match in notices[:MAX_LINES]
+        for idx, _match in pause_notices[:MAX_LINES]
     )
+    if mixed:
+        return pause_ok and _allowance_head_reviewed(body, head)
+    return pause_ok
 
 
 def _allowance_head_reviewed(body: str, head: str) -> bool:
@@ -457,7 +479,10 @@ def _notice_holds(
         return True
     allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
     paused = any(notice.group("paused") for notice in notices[:MAX_LINES])
-    if _can_complete(comment) and _notice_covers_head(body, head, allowance):
+    _notices, mixed, _foreign = _pause_allowance_notices(body)
+    covers = _notice_covers_head(body, head, allowance)
+    stale_push = mixed and last_commit > when
+    if _can_complete(comment) and covers and not stale_push:
         return False
     names_head = bool(head and head[:7] in body.lower())
     login = _login(comment).lower().removesuffix("[bot]")

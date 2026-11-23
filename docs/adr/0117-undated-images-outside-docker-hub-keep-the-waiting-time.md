@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 SPDX-License-Identifier: EUPL-1.2
 -->
 
-# ADR-0116: Undated images outside Docker Hub keep the waiting time
+# ADR-0117: Undated images outside Docker Hub keep the waiting time
 
 - **Status**: Accepted
 - **Date**: 2026-11-23

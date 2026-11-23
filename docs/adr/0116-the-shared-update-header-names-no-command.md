@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
 SPDX-License-Identifier: EUPL-1.2
 -->
 
-# ADR-0115: The shared update header names no command
+# ADR-0116: The shared update header names no command
 
 - **Status**: Accepted
 - **Date**: 2026-11-23
