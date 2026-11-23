@@ -59,6 +59,13 @@ check pinned so the budget cannot silently disappear.
   `pytest_sessionfinish` hookwrapper yields (`xdist/remote.py`), so this hook
   runs before the controller tears the worker down.
 
+- **Workers write no bytecode.** The `-B` flag sets `sys.flags.dont_write_bytecode`
+  only in the interpreter that receives it; pytest-xdist worker processes inherit
+  the environment, not the controller's argv. The coverage run step of the `test`
+  recipe exports `PYTHONDONTWRITEBYTECODE=1` before `PYTHONOPTIMIZE=` so workers
+  inherit it. `tests/test_dev_mode.py::test_test_recipe_sets_dont_write_bytecode_for_workers`
+  probes that assignment.
+
 - **Timing budget.** `TEST_BUDGET_SECONDS := 900` fixes the test-stage wall-time
   budget (scalar, not overridable by the environment). The coverage run step
   passes `--junitxml="$$data/junit.xml"`; the next recipe step runs
@@ -84,6 +91,10 @@ check pinned so the budget cannot silently disappear.
 
 - A test stage above 900 seconds fails with the slowest tests named instead of
   relying only on the 20-minute pre-push stop.
+
+- The push gate's check that verification must not write into `.venv` no longer
+  trips on the first test stage after a fresh tool install from xdist worker
+  assertion-rewrite caches.
 
 ## Alternatives considered
 

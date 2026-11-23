@@ -86,6 +86,13 @@ def test_test_recipe_coverage_run_uses_xdist_cap() -> None:
     assert "--maxprocesses=$(TEST_WORKERS)" in run_step
 
 
+def test_test_recipe_coverage_run_sets_pythondontwritebytecode() -> None:
+    """The coverage run step exports PYTHONDONTWRITEBYTECODE=1 before pytest workers start."""
+    steps = _recipe_lines(_makefile_text(), "test")
+    run_step = next(step for step in steps if "coverage run" in step)
+    assert "PYTHONDONTWRITEBYTECODE=1" in run_step
+
+
 @pytest.mark.parametrize(
     "workers",
     [
