@@ -104,3 +104,4 @@ record that supersedes it.
 | [0105](0105-the-train-asks-the-update-bot-to-recreate-an-unsigned-update.md) | 2026-11-21 | The train asks the update bot to recreate an unsigned update | Accepted |
 | [0112](0112-the-test-stage-runs-on-parallel-workers.md) | 2026-11-22 | The test stage runs on parallel workers | Accepted |
 | [0114](0114-a-sourcery-budget-skip-yields-to-a-coderabbit-review-on-the-head.md) | 2026-11-22 | A Sourcery budget skip yields to a CodeRabbit review on the head | Accepted |
+| [0115](0115-scorecard-callers-publish-by-visibility.md) | 2026-11-23 | Scorecard callers publish results for public repositories | Accepted |
