@@ -25,7 +25,7 @@ TEST_BUDGET_SECONDS := 900
 GITLEAKS ?= gitleaks
 PRAETORCTL ?= $(shell command -v praetorctl 2>/dev/null || command -v standardsctl 2>/dev/null || echo praetorctl)
 
-.PHONY: verify verify-all tools check-tools-stamp check-message requirements requirements-fuzz lint-yaml lint-python lint-workflows \
+.PHONY: verify verify-all tools check-tools-stamp check-anchors check-message requirements requirements-fuzz lint-yaml lint-python lint-workflows \
 	check-interface check-hosts check-exceptions check-templates check-scorecard test verify-reuse \
 	interface-snapshot list-pins check-pins pin check-runners check-links fix-anchors check-examples
 
@@ -67,6 +67,12 @@ check-tools-stamp:
 		printf '%s\n' '$(VENV)/.stamp does not match requirements/tools.txt; run make tools' >&2; \
 		exit 1; \
 	fi
+
+# The pre-commit anchors job checks the staged anchors with the tools
+# environment, which holds PyYAML; a missing or stale `.venv` stops at the
+# stamp check, which names `make tools`.
+check-anchors: check-tools-stamp
+	@$(BIN)/python -B tools/anchors.py check --index
 
 # The commit-msg hook judges one message with tools/commit_message.py
 # (ADR-0074): lefthook names the message file in MESSAGE_FILE. Without it the
