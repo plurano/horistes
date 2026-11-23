@@ -1368,6 +1368,28 @@ def test_decide_foreign_app_only_at_bound() -> None:
     assert fail_state == "failure" and "deadline" in fail_desc
 
 
+def _sweep_response_body(path: str, heads: list[str], settled: set[str]) -> object:
+    if "/pulls?" in path:
+        return [{"head": {"sha": sha}} for sha in heads]
+    if path.endswith("/statuses") or "/statuses?" in path:
+        sha = path.split("/commits/")[1].split("/")[0]
+        if sha in settled:
+            return [status_item(1, "required-checks", "success", updated_at="2026-11-22T10:00:00Z")]
+        return []
+    if "/check-runs" in path:
+        return {"check_runs": [check_item(1, "Build", "failure")]}
+    if "/actions/runs" in path:
+        event = "push" if f"head_sha={'d' * 40}&" in path else "pull_request"
+        return {"workflow_runs": [wf_run(1, event=event)]}
+    if path == f"repos/{REPO}":
+        return {"default_branch": "main"}
+    if path.endswith("/commits/main"):
+        return {"sha": "d" * 40}
+    if "/commits/" in path:
+        return {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}}
+    return {}
+
+
 def _sweep_transport_factory(
     heads: list[str],
     settled: set[str],
@@ -1378,29 +1400,7 @@ def _sweep_transport_factory(
         path: str, method: str = "GET", **kwargs: object
     ) -> tuple[int, dict[str, str], bytes]:
         record.append((method, path))
-        if "/pulls?" in path:
-            body = [{"head": {"sha": s}} for s in heads]
-        elif path.endswith("/statuses") or "/statuses?" in path:
-            sha = path.split("/commits/")[1].split("/")[0]
-            if sha in settled:
-                body = [
-                    status_item(1, "required-checks", "success", updated_at="2026-11-22T10:00:00Z")
-                ]
-            else:
-                body = []
-        elif "/check-runs" in path:
-            body = {"check_runs": [check_item(1, "Build", "failure")]}
-        elif "/actions/runs" in path:
-            event = "push" if f"head_sha={'d' * 40}&" in path else "pull_request"
-            body = {"workflow_runs": [wf_run(1, event=event)]}
-        elif path == f"repos/{REPO}":
-            body = {"default_branch": "main"}
-        elif path.endswith("/commits/main"):
-            body = {"sha": "d" * 40}
-        elif "/commits/" in path:
-            body = {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}}
-        else:
-            body = {}
+        body = _sweep_response_body(path, heads, settled)
         if method == "POST":
             return 201, {}, json.dumps({"id": 1, "state": "failure"}).encode()
         return 200, {}, json.dumps(body).encode()

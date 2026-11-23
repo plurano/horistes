@@ -466,26 +466,21 @@ def _fold_ws(text: str) -> str:
     return WS_FOLD.sub(" ", str(text).strip())
 
 
-def _tail_problems(tail: dict, doc: dict, root: Path) -> list[str]:
-    """What keeps the required-checks tail job from matching the contract."""
-    if sorted(tail) != sorted(TAIL_KEYS):
-        return [f"job `{TAIL}` has keys other than {', '.join(TAIL_KEYS)}"]
-    problems: list[str] = []
-    if tail.get("name") != TAIL_NAME:
-        problems.append(f"job `{TAIL}` has `name: {tail.get('name')}`, not `{TAIL_NAME}`")
-    if tail.get("needs") != RESULT:
-        problems.append(f"job `{TAIL}` has `needs: {tail.get('needs')}`, not `{RESULT}`")
-    folded = _fold_ws(str(tail.get("if", "")))
-    if folded != _fold_ws(TAIL_IF):
-        problems.append(f"job `{TAIL}` has an `if` that does not match the tail contract")
-    concurrency = tail.get("concurrency")
+def _tail_concurrency_problems(concurrency: object) -> list[str]:
+    """Check that the tail queues by caller and head without cancelling a run."""
     if not isinstance(concurrency, dict):
-        problems.append(f"job `{TAIL}` has no concurrency block")
-    else:
-        if concurrency.get("group") != TAIL_GROUP:
-            problems.append(f"job `{TAIL}` concurrency group must key caller and head commit")
-        if concurrency.get("cancel-in-progress") is not False:
-            problems.append(f"job `{TAIL}` must set `cancel-in-progress: false`")
+        return [f"job `{TAIL}` has no concurrency block"]
+    problems: list[str] = []
+    if concurrency.get("group") != TAIL_GROUP:
+        problems.append(f"job `{TAIL}` concurrency group must key caller and head commit")
+    if concurrency.get("cancel-in-progress") is not False:
+        problems.append(f"job `{TAIL}` must set `cancel-in-progress: false`")
+    return problems
+
+
+def _tail_workflow_problems(tail: dict, doc: dict, root: Path) -> list[str]:
+    """Check the tail's reusable workflow reference, grants and input values."""
+    problems: list[str] = []
     call = CALL.fullmatch(str(tail.get("uses", "")))
     if call is None:
         problems.append(f"job `{TAIL}` does not call a workflow by path and reference")
@@ -501,6 +496,23 @@ def _tail_problems(tail: dict, doc: dict, root: Path) -> list[str]:
     else:
         problems += _grant_problems(tail, doc, called, TAIL_WORKFLOW)
         problems += _with_problems(tail, called, TAIL_WORKFLOW, _public_inputs(root, TAIL_WORKFLOW))
+    return problems
+
+
+def _tail_problems(tail: dict, doc: dict, root: Path) -> list[str]:
+    """What keeps the required-checks tail job from matching the contract."""
+    if sorted(tail) != sorted(TAIL_KEYS):
+        return [f"job `{TAIL}` has keys other than {', '.join(TAIL_KEYS)}"]
+    problems: list[str] = []
+    if tail.get("name") != TAIL_NAME:
+        problems.append(f"job `{TAIL}` has `name: {tail.get('name')}`, not `{TAIL_NAME}`")
+    if tail.get("needs") != RESULT:
+        problems.append(f"job `{TAIL}` has `needs: {tail.get('needs')}`, not `{RESULT}`")
+    folded = _fold_ws(str(tail.get("if", "")))
+    if folded != _fold_ws(TAIL_IF):
+        problems.append(f"job `{TAIL}` has an `if` that does not match the tail contract")
+    problems += _tail_concurrency_problems(tail.get("concurrency"))
+    problems += _tail_workflow_problems(tail, doc, root)
     passed = tail.get("with") or {}
     for key in TAIL_WITH:
         if key not in passed:
@@ -522,20 +534,11 @@ def _caller_tail_problems(tail: dict | None, jobs: dict, doc: dict, root: Path) 
     return _tail_problems(tail, doc, root)
 
 
-def caller_problems(text: str, root: Path) -> list[str]:
-    """What keeps a rendered text from being a thin caller of a workflow kept in `root`."""
-    try:
-        doc = yaml.load(text, Loader=ciwf.StrictLoader)
-    except yaml.YAMLError as err:
-        return [f"the result is no YAML: {err}"]
-    jobs = doc.get("jobs") if isinstance(doc, dict) else None
-    if not isinstance(jobs, dict):
-        return ["the result names no jobs"]
+def _classify_caller_jobs(jobs: dict) -> tuple[str, dict | None] | str:
+    """Find the gate key and optional tail, or return the first job shape problem."""
     for key, job in jobs.items():
-        if key == RESULT:
-            continue
-        if isinstance(job, dict) and "steps" in job and "uses" not in job:
-            return [f"job `{key}` has steps of its own; a caller only calls"]
+        if key != RESULT and isinstance(job, dict) and "steps" in job and "uses" not in job:
+            return f"job `{key}` has steps of its own; a caller only calls"
     raw_tail = jobs.get(TAIL)
     tail = (
         raw_tail
@@ -556,12 +559,27 @@ def caller_problems(text: str, root: Path) -> list[str]:
         and not (key == TAIL and tail is not None)
     ]
     if len(gate_keys) != 1:
-        return [f"the result is no workflow with exactly one job besides `{RESULT}`"]
+        return f"the result is no workflow with exactly one job besides `{RESULT}`"
     if extra_tails:
-        return ["the caller holds more than one required-checks tail"]
+        return "the caller holds more than one required-checks tail"
     if isinstance(raw_tail, dict) and raw_tail.get("needs") == RESULT and tail is None:
-        return [f"job `{TAIL}` is not a reusable workflow call"]
-    gate_key = gate_keys[0]
+        return f"job `{TAIL}` is not a reusable workflow call"
+    return gate_keys[0], tail
+
+
+def caller_problems(text: str, root: Path) -> list[str]:
+    """What keeps a rendered text from being a thin caller of a workflow kept in `root`."""
+    try:
+        doc = yaml.load(text, Loader=ciwf.StrictLoader)
+    except yaml.YAMLError as err:
+        return [f"the result is no YAML: {err}"]
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, dict):
+        return ["the result names no jobs"]
+    classification = _classify_caller_jobs(jobs)
+    if isinstance(classification, str):
+        return [classification]
+    gate_key, tail = classification
     classified = {gate_key, RESULT} if tail is None else {gate_key, RESULT, TAIL}
     problems = [f"job `{key}` is not classified" for key in jobs if key not in classified]
     problems += _job_problems(jobs[gate_key], doc, root)
