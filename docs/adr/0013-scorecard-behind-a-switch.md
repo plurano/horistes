@@ -5,7 +5,7 @@ SPDX-License-Identifier: EUPL-1.2
 
 # ADR-0013: The scorecard run sits behind a switch that a caller sets by the repository's visibility
 
-- **Status**: Accepted
+- **Status**: Accepted. Superseded in part by [ADR-0115](0115-scorecard-callers-publish-by-visibility.md) for the caller's `publish` input.
 - **Date**: 2026-10-11
 - **Authors**: Lusoris
 
