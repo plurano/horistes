@@ -32,12 +32,28 @@ updates in `default.json`, before the own-release rules:
 
 ```json
 {
-  "description": "Non-major updates wait for one weekly batch per manager; a major update stays its own proposal.",
+  "description": "Non-major updates wait for one weekly batch per manager; a major update stays its own proposal; pin updates share their manager's batch branch and an open batch branch changes only inside the window or on a requested rebase.",
   "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
   "groupName": "{{manager}} non-major",
-  "schedule": ["* 0-3 * * 1"]
+  "groupSlug": "{{manager}}-non-major",
+  "schedule": ["* 0-3 * * 1"],
+  "updateNotScheduled": false
 }
 ```
+
+Pin and pinDigest updates inherit `groupSlug: "pin-dependencies"` from
+Renovate's update-type defaults
+(`lib/config/options/index.ts`, merged in
+`lib/workers/repository/updates/flatten.ts` before packageRules run again,
+Renovate 44.257.9). Without an explicit `groupSlug` on this rule, the compiled
+slug stays `pin-dependencies` for every manager
+(`lib/workers/repository/updates/branch-name.ts`, `generateBranchName`), so pin
+updates would not share each manager's batch branch topic.
+
+`updateNotScheduled` defaults to `true`
+(`lib/config/options/index.ts`). With `updateNotScheduled: false`, Renovate
+skips changing an existing batch branch outside the cron window unless a rebase
+was requested (`lib/workers/repository/update/branch/index.ts`).
 
 The template uses Renovate's allowed `manager` field, so each manager has one
 group. The cron window is Monday 00:00-03:59 UTC. Majors do not match this rule
@@ -80,3 +96,8 @@ tests continue to pin the vulnerability block and release-age exceptions.
 - Major updates, vulnerability fixes, and own releases remain separate
   proposals. Own releases and vulnerability fixes have no weekly waiting
   window; forks still wait for the three-day release age.
+- When an open batch branch falls behind the default branch between Monday
+  windows, the merge train brings it up to date through the forge update-branch
+  merge (`update()` in [tools/merge_train.py](../../tools/merge_train.py));
+  Renovate itself changes that branch only inside the window or after a
+  requested rebase.

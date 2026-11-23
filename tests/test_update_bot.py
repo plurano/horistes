@@ -73,7 +73,9 @@ RULE = {
     "prBodyNotes",
     # Shared batching and the later own-release exceptions belong in the preset.
     "groupName",
+    "groupSlug",
     "schedule",
+    "updateNotScheduled",
 }
 # The fleet organisations whose own releases wait for no release age.
 ORGS = (
@@ -407,6 +409,95 @@ def batch_problems(preset: dict) -> list[str]:
     """Named dependencies whose batching differs from the fixed probe table."""
     return [
         name for name, dependency, expected in BATCH_CASES if batch(preset, *dependency) != expected
+    ]
+
+
+_PIN_TYPE_DEFAULTS = {"groupName": "Pin Dependencies", "groupSlug": "pin-dependencies"}
+
+
+def _branch_topic(manager: str, group_name: str | None, group_slug: str | None) -> str | None:
+    """Lower-case branch topic from Renovate groupName / groupSlug template fields."""
+    if group_name is None:
+        return None
+    if group_slug is not None:
+        raw = group_slug.replace("{{manager}}", manager)
+    else:
+        raw = group_name.replace("{{manager}}", manager)
+    return raw.lower().replace(" ", "-")
+
+
+def batch_branch(
+    preset: dict, manager: str, datasource: str, package: str, update_type: str
+) -> tuple[str | None, bool]:
+    """Emulate update-type defaults, then later rules, for branch topic and updateNotScheduled."""
+    rules = preset.get("packageRules", [])
+    if len(rules) > MAX_RULES:
+        raise ValueError(f"preset has {len(rules)} packageRules, at most {MAX_RULES} supported")
+    current: dict = {"updateNotScheduled": True}
+    if update_type in ("pin", "pinDigest"):
+        current.update(_PIN_TYPE_DEFAULTS)
+    for rule in rules[:MAX_RULES]:
+        if "enabled" in rule:
+            continue
+        if not _batch_rule_matches(rule, manager, datasource, package, update_type):
+            continue
+        for key in ("groupName", "groupSlug", "updateNotScheduled"):
+            if key in rule:
+                current[key] = rule[key]
+    topic = _branch_topic(manager, current.get("groupName"), current.get("groupSlug"))
+    return topic, bool(current["updateNotScheduled"])
+
+
+BATCH_BRANCH_POSITIVE = (
+    ("pin-npm", ("npm", "npm", "@types/node", "pin"), ("npm-non-major", False)),
+    (
+        "pin-github-actions",
+        ("github-actions", "github-tags", "actions/checkout", "pin"),
+        ("github-actions-non-major", False),
+    ),
+    (
+        "pindigest-github-actions",
+        ("github-actions", "github-tags", "actions/checkout", "pinDigest"),
+        ("github-actions-non-major", False),
+    ),
+    (
+        "patch-pip-compile",
+        ("pip-compile", "pypi", "ruff", "patch"),
+        ("pip-compile-non-major", False),
+    ),
+)
+
+BATCH_BRANCH_OUTSIDE_FLAG = tuple(
+    (
+        f"outside-flag:{manager}:{kind}",
+        (manager, source, package, kind),
+        (f"{manager}-non-major", False),
+    )
+    for manager, source, package, kind in BATCH_OUTSIDE
+)
+
+BATCH_BRANCH_BOUNDARY = (
+    (
+        "major-github-actions",
+        ("github-actions", "github-tags", "actions/checkout", "major"),
+        (None, True),
+    ),
+    ("own-pin-npm", ("npm", "npm", "@jellysin/pkg", "pin"), (None, False)),
+)
+
+BATCH_BRANCH_CASES = (
+    *BATCH_BRANCH_POSITIVE,
+    *BATCH_BRANCH_OUTSIDE_FLAG,
+    *BATCH_BRANCH_BOUNDARY,
+)
+
+
+def batch_branch_problems(preset: dict) -> list[str]:
+    """Named probes whose branch topic or updateNotScheduled differ from the fixed table."""
+    return [
+        name
+        for name, dependency, expected in BATCH_BRANCH_CASES
+        if batch_branch(preset, *dependency) != expected
     ]
 
 
@@ -1200,6 +1291,65 @@ def test_planted_makefile_tool_pin_is_not_read(old, new):
 
 def test_preset_batches_non_major_updates_per_manager():
     assert batch_problems(PRESET) == []
+    assert batch_branch_problems(PRESET) == []
+
+
+def test_pin_managers_have_distinct_batch_branch_topics():
+    npm_topic = batch_branch(PRESET, "npm", "npm", "@types/node", "pin")
+    gh_topic = batch_branch(PRESET, "github-actions", "github-tags", "actions/checkout", "pin")
+    assert npm_topic[0] == "npm-non-major"
+    assert gh_topic[0] == "github-actions-non-major"
+    assert npm_topic[0] != gh_topic[0]
+
+
+@pytest.mark.parametrize(
+    ("name", "dependency", "expected"),
+    BATCH_BRANCH_CASES,
+    ids=[case[0] for case in BATCH_BRANCH_CASES],
+)
+def test_batch_branch_positive_negative_and_boundary_cases(name, dependency, expected):
+    assert batch_branch(PRESET, *dependency) == expected, name
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    list(BATCH_OWN),
+    ids=[f"own:{manager}:{kind}" for manager, _, _, kind in BATCH_OWN],
+)
+def test_batch_branch_own_release_schedule_empty(dependency):
+    assert batch(PRESET, *dependency)[1] == []
+
+
+@pytest.mark.parametrize(
+    ("case", "field", "problems"),
+    [
+        (
+            "no-group-slug",
+            "groupSlug",
+            [
+                "pin-npm",
+                "pin-github-actions",
+                "pindigest-github-actions",
+                "outside-flag:npm:pin",
+                "outside-flag:github-actions:pinDigest",
+            ],
+        ),
+        (
+            "no-update-not-scheduled",
+            "updateNotScheduled",
+            [
+                *[row[0] for row in BATCH_BRANCH_POSITIVE],
+                *[row[0] for row in BATCH_BRANCH_OUTSIDE_FLAG],
+                "own-pin-npm",
+            ],
+        ),
+    ],
+    ids=["no-group-slug", "no-update-not-scheduled"],
+)
+def test_planted_batch_branch_defect_is_refused(case, field, problems):
+    planted = copy.deepcopy(PRESET)
+    planted["packageRules"][1].pop(field)
+    assert batch_branch_problems(planted) == problems
 
 
 @pytest.mark.parametrize(
