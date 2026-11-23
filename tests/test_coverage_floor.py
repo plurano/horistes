@@ -29,7 +29,18 @@ STRICT = ["--precision=10", "--format=total"]
 # total with the floor at ten decimals.
 # Environment assignments may come first.
 GATE_COVERAGE = [
-    [*DEV_COVERAGE, "run", RCFILE, DATA_FILE, "-m", "pytest"],
+    [
+        *DEV_COVERAGE,
+        "run",
+        RCFILE,
+        DATA_FILE,
+        "-m",
+        "pytest",
+        "-n",
+        "auto",
+        "--maxprocesses=$(TEST_WORKERS)",
+        '--junitxml="$$data/junit.xml"',
+    ],
     [*COVERAGE, "combine", RCFILE, DATA_FILE],
     [*COVERAGE, "report", RCFILE, DATA_FILE],
     [*COVERAGE, "report", RCFILE, DATA_FILE, *STRICT],
