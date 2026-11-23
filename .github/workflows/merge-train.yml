@@ -789,13 +789,13 @@ jobs:
 
 
           def check_release_off(raw, error_cls=ValueError):
-              """Repositories opted out of release runs, lowercased frozenset of 'owner/name'."""
+              """Repositories opted out of release runs, casefolded frozenset of 'owner/name'."""
               repos = set()
               for item in raw.split():
                   parts = item.split("/")
                   if len(parts) != 2 or not parts[0] or not parts[1]:
                       raise error_cls(f"release_off entry {item!r} is not owner/name")
-                  repos.add(item.lower())
+                  repos.add(item.casefold())
               return frozenset(repos)
 
 

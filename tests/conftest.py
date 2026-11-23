@@ -450,3 +450,21 @@ def measured(env: dict[str, str]) -> dict[str, str]:
     if "COVERAGE_PROCESS_CONFIG" in os.environ:
         return {**env, "COVERAGE_PROCESS_CONFIG": os.environ["COVERAGE_PROCESS_CONFIG"]}
     return dict(env)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    """Save coverage in each pytest-xdist worker once session teardown has finished.
+
+    Under pytest-xdist one worker's exit-time coverage save was lost; saving here
+    keeps the parallel measured total equal to the serial run.
+    """
+    if not hasattr(session.config, "workerinput"):
+        return
+    module = sys.modules.get("coverage")
+    if module is None:
+        return
+    cov = module.Coverage.current()
+    if cov is None:
+        return
+    cov.save()
