@@ -4,10 +4,17 @@
 
 import copy
 import json
+import re
 from pathlib import Path
 
 import pytest
-from review_state import MAX_COMMENTS, MAX_LINES, is_bot_dependency, review_incomplete
+from review_state import (
+    MAX_COMMENTS,
+    MAX_LINES,
+    is_bot_dependency,
+    review_evidence,
+    review_incomplete,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures/review-state"
 
@@ -475,6 +482,113 @@ def _allowance_range_cases():
     return cases
 
 
+_MIXED_PAUSE_ALLOWANCE_FIXTURE = FIXTURES / "cr234-summary-paused-allowance-7056094813.md"
+_MIXED_PAUSE_ALLOWANCE_HEAD = "5f70ad27b885ee534c38453f6107ecf8070e897d"
+_MIXED_PAUSE_ALLOWANCE_OTHER = "f" * 40
+
+
+def _mixed_pause_allowance_body_parts():
+    body = _MIXED_PAUSE_ALLOWANCE_FIXTURE.read_text(encoding="utf-8")
+    head = _MIXED_PAUSE_ALLOWANCE_HEAD
+    last_reviewed = f"> - Last reviewed commit: {head}"
+    range_line = next(
+        line
+        for line in body.splitlines()[:MAX_LINES]
+        if line.startswith("Reviewing files that changed")
+    )
+    return body, head, last_reviewed, range_line
+
+
+def _mixed_pause_allowance_pr(summary, current_head, committed="2026-11-22T15:59:00Z"):
+    head = _MIXED_PAUSE_ALLOWANCE_HEAD
+    oid = current_head if re.fullmatch(r"[0-9a-f]{40}", current_head) else head
+    return {
+        "headRefOid": current_head,
+        "author": {"login": "lusoris"},
+        "commits": {"nodes": [{"commit": {"oid": oid, "committedDate": committed}}]},
+        "comments": {
+            "nodes": [
+                {
+                    "author": {"login": "coderabbitai"},
+                    "body": summary,
+                    "createdAt": "2026-11-21T03:00:00Z",
+                    "updatedAt": "2026-11-22T17:03:26Z",
+                }
+            ]
+        },
+    }
+
+
+def _mixed_pause_allowance_variants(body, head, last_reviewed, range_line):
+    other = _MIXED_PAUSE_ALLOWANCE_OTHER
+    return [
+        ("fixture-head", body, head, False),
+        (
+            "wrong-pause-sha",
+            body.replace(last_reviewed, f"> - Last reviewed commit: {other}"),
+            head,
+            True,
+        ),
+        (
+            "wrong-range-end",
+            body.replace(range_line, range_line.replace(head, other)),
+            head,
+            True,
+        ),
+        ("missing-range", body.replace(range_line, ""), head, True),
+        ("rate-limit-appended", body + "\nRate limit exceeded.", head, True),
+        ("missing-pause-sha", body.replace(last_reviewed, ""), head, True),
+        (
+            "short-pause-sha",
+            body.replace(last_reviewed, f"> - Last reviewed commit: {head[:7]}"),
+            head,
+            True,
+        ),
+        (
+            "second-range",
+            body + "\n" + range_line.replace(head, other),
+            head,
+            True,
+        ),
+        ("short-pr-head", body, head[:7], True),
+        ("push-after-summary", body, head, True),
+    ]
+
+
+def _mixed_pause_allowance_cases():
+    """Pause and allowance notices together clear only with both evidence paths."""
+    body, head, last_reviewed, range_line = _mixed_pause_allowance_body_parts()
+    cases = []
+    for name, summary, current_head, expected in _mixed_pause_allowance_variants(
+        body, head, last_reviewed, range_line
+    )[:MAX_LINES]:
+        after_push = name == "push-after-summary"
+        committed = "2026-11-22T18:00:00Z" if after_push else "2026-11-22T15:59:00Z"
+        pr = _mixed_pause_allowance_pr(summary, current_head, committed=committed)
+        cases.append(_case(f"mixed-pause-allowance-{name}", pr, expected))
+    return cases
+
+
+def _mixed_pause_allowance_evidence_cases():
+    body, head, last_reviewed, range_line = _mixed_pause_allowance_body_parts()
+    negative = {
+        "wrong-range-end",
+        "missing-range",
+        "second-range",
+        "wrong-pause-sha",
+    }
+    cases = []
+    for name, summary, current_head, _expected in _mixed_pause_allowance_variants(
+        body, head, last_reviewed, range_line
+    )[:MAX_LINES]:
+        if name not in {"fixture-head", *negative}:
+            continue
+        pr = _mixed_pause_allowance_pr(summary, current_head)
+        on_head = name == "fixture-head"
+        cases.append(pytest.param(copy.deepcopy(pr), on_head, id=f"mixed-evidence-{name}"))
+    return cases
+
+
 def _thread_and_limit_cases():
     """Keep only the limit half of the gate's thread-and-limit cases."""
     pr = _fixture_golusoris_1266()
@@ -499,10 +613,33 @@ def _thread_and_limit_cases():
     + _promo_cases()
     + _allowance_cases()
     + _allowance_range_cases()
+    + _mixed_pause_allowance_cases()
     + _thread_and_limit_cases(),
 )
 def test_review_incomplete_gate_cases(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
+
+
+@pytest.mark.parametrize(("pr", "on_head"), _mixed_pause_allowance_evidence_cases())
+def test_review_evidence_mixed_pause_allowance(pr, on_head):
+    evidence = review_evidence(pr)
+    if on_head:
+        assert len(evidence) == 1
+        assert evidence[0][2] is True
+        return
+    assert not any(entry[2] for entry in evidence)
+
+
+def test_review_evidence_paused_notice_matches_main():
+    """Pure pause bodies keep the head-evidence shape origin/main already had."""
+    _name, block, head, _expected = bodies[0]
+    pr = _fixture_golusoris_1266()
+    pr["headRefOid"] = head
+    pr["comments"]["nodes"] = [
+        {"author": {"login": "coderabbitai"}, "createdAt": "2026-11-14T04:25:24Z", "body": block}
+    ]
+    evidence = review_evidence(pr)
+    assert len(evidence) == 1 and evidence[0][2] is True
 
 
 @pytest.mark.parametrize("envelope", [False, True], ids=["node", "data-repository-envelope"])
