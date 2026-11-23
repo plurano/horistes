@@ -29,3 +29,4 @@ jobs:
     uses: ./.github/workflows/scorecard.yml
     with:
       outside_hosts: ${{ github.event.repository.visibility == 'public' }}
+      publish: ${{ github.event.repository.visibility == 'public' }}
