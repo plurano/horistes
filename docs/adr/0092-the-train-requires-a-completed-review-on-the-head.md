@@ -76,6 +76,8 @@ head evidence. The check-run completion form is CodeRabbit's successful check
 run on the head, read through the headChecks reader of ADR-0114.
 A body that mixes an allowance notice with another notice holds while either
 part holds under its own rule, checked by `test_read_body_mixed_notices`.
+A mixed pause and allowance body proves the head only when its unfenced text
+carries zero-action evidence.
 `E-*` cases in `test_adr92_reader_planted` cover these rules.
 
 F. Unreadable or truncated connections hold before either review reader runs.

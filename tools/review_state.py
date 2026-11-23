@@ -272,7 +272,11 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
         for idx, _match in pause_notices[:MAX_LINES]
     )
     if mixed:
-        return pause_ok and _allowance_head_reviewed(body, head)
+        return (
+            pause_ok
+            and _allowance_head_reviewed(body, head)
+            and _unfenced_zero_action_evidence(body)
+        )
     return pause_ok
 
 
@@ -303,15 +307,20 @@ def _allowance_head_reviewed(body: str, head: str) -> bool:
     return len(declarations) == 1 and len(ranges) == 1 and ranges[0].group(2).lower() == head
 
 
-def _zero_action_summary(body: str, head: str) -> bool:
-    """Require no non-allowance notice, one head range, and unfenced zero-action evidence."""
-    if _non_allowance_notice(body) or not _allowance_head_reviewed(body, head):
-        return False
+def _unfenced_zero_action_evidence(body: str) -> bool:
+    """Unfenced text carries only zero actionable counts or an explicit no-action line."""
     clean = _without_fenced_code(body)
     counts = list(ACTIONABLE_COUNT_RE.finditer(clean))[:MAX_LINES]
     if any(count.group(1).strip("0") for count in counts[:MAX_LINES]):
         return False
     return bool(counts or NO_ACTIONABLE_RE.search(clean))
+
+
+def _zero_action_summary(body: str, head: str) -> bool:
+    """Require no non-allowance notice, one head range, and unfenced zero-action evidence."""
+    if _non_allowance_notice(body) or not _allowance_head_reviewed(body, head):
+        return False
+    return _unfenced_zero_action_evidence(body)
 
 
 def _completed_summary_reviewers(pr: dict, head: str) -> set[str]:

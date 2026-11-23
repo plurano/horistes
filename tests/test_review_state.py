@@ -596,6 +596,39 @@ def _mixed_pause_allowance_evidence_cases():
     return cases
 
 
+_MIXED_NO_ACTIONABLE = "No actionable comments were generated in the recent review."
+
+
+def _mixed_pause_allowance_zero_action_params():
+    """Mixed pause plus allowance bodies need unfenced zero-action evidence for the head."""
+    body, head, _, _ = _mixed_pause_allowance_body_parts()
+    actionable = body.replace(_MIXED_NO_ACTIONABLE, "Actionable comments posted: 1")
+    fenced_only = body.replace(
+        _MIXED_NO_ACTIONABLE,
+        "```\nActionable comments posted: 1\n```",
+    )
+    return [
+        pytest.param(body, False, True, id="fixture-zero-action-clears"),
+        pytest.param(actionable, True, False, id="unfenced-actionable-count-holds"),
+        pytest.param(fenced_only, True, False, id="fenced-actionable-only-holds"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("summary", "holds", "on_head"),
+    _mixed_pause_allowance_zero_action_params(),
+)
+def test_mixed_pause_allowance_zero_action(summary, holds, on_head):
+    head = _MIXED_PAUSE_ALLOWANCE_HEAD
+    pr = _mixed_pause_allowance_pr(summary, head)
+    assert bool(adr92_reader().review_incomplete(pr)) is holds
+    evidence = review_evidence(pr)
+    if on_head:
+        assert len(evidence) == 1 and evidence[0][2] is True
+    else:
+        assert not any(entry[2] for entry in evidence)
+
+
 def _thread_and_limit_cases():
     """Keep only the limit half of the gate's thread-and-limit cases."""
     pr = _fixture_golusoris_1266()
