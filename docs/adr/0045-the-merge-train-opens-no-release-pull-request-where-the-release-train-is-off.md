@@ -8,6 +8,7 @@ SPDX-License-Identifier: EUPL-1.2
 - **Status**: Accepted
 - **Date**: 2026-10-19
 - **Authors**: Lusoris
+- Amended by [ADR-0100](0100-release-off-follows-a-moved-repository.md).
 
 ## Context
 

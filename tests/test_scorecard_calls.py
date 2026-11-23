@@ -22,6 +22,7 @@ from conftest import ROOT
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
+import render
 from expressions import evaluate
 
 SCORECARD = ROOT / ".github/workflows/scorecard.yml"
@@ -138,9 +139,9 @@ def test_repositorys_own_scorecard_caller_runs_green_in_a_public_repository(tmp_
     assert "workflow_dispatch" in events
     with_clause = job.get("with") or {}
     assert with_clause.get("outside_hosts") == PUBLIC
-    assert "publish" not in with_clause
+    assert with_clause.get("publish") == PUBLIC
 
-    inputs = {"outside_hosts": True, "publish": False}
+    inputs = {"outside_hosts": True, "publish": True}
     checks = play(ciwf.load(SCORECARD), inputs, "public", tmp_path)
     assert checks.get("Analysis", ("", ""))[0] == "success"
     assert not any(result == "failure" for result, _ in checks.values())
@@ -153,3 +154,11 @@ def test_repositorys_own_scorecard_caller_runs_green_in_a_public_repository(tmp_
         ciwf.load(SCORECARD), {"outside_hosts": False, "publish": False}, "public", tmp_path
     )
     assert off_checks["Analysis"][0] == "failure"
+
+
+def test_render_refuses_unconditional_scorecard_publication():
+    template = ROOT / "templates/callers/scorecard.yml.tmpl"
+    caller = render.render(template.read_text(encoding="utf-8"), render.SAMPLE, str(template))
+    planted = caller.replace(f"publish: {PUBLIC}", "publish: true")
+    problems = render.caller_problems(planted, ROOT)
+    assert any("the job passes `publish` as `true`; it switches on a host" in p for p in problems)
