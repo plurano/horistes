@@ -37,7 +37,7 @@
       "enabled": false
     },
     {
-      "description": "Non-major updates wait for one weekly batch per manager; a major update stays its own proposal; pin updates share their manager's batch branch and an open batch branch changes only inside the window or on a requested rebase.",
+      "description": "Non-major updates wait for one weekly batch per manager; a major update stays its own proposal; pin updates share their manager's batch branch; a repository rule that names its own group keeps its own branch; an open batch branch changes only inside the window or on a requested rebase.",
       "matchUpdateTypes": [
         "minor",
         "patch",
@@ -46,7 +46,7 @@
         "pinDigest"
       ],
       "groupName": "{{manager}} non-major",
-      "groupSlug": "{{manager}}-non-major",
+      "groupSlug": "{{{groupName}}}",
       "schedule": [
         "* 0-3 * * 1"
       ],

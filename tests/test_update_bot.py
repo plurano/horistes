@@ -419,10 +419,11 @@ def _branch_topic(manager: str, group_name: str | None, group_slug: str | None) 
     """Lower-case branch topic from Renovate groupName / groupSlug template fields."""
     if group_name is None:
         return None
+    resolved_name = group_name.replace("{{manager}}", manager)
     if group_slug is not None:
-        raw = group_slug.replace("{{manager}}", manager)
+        raw = group_slug.replace("{{{groupName}}}", resolved_name).replace("{{manager}}", manager)
     else:
-        raw = group_name.replace("{{manager}}", manager)
+        raw = resolved_name
     return raw.lower().replace(" ", "-")
 
 
@@ -498,6 +499,78 @@ def batch_branch_problems(preset: dict) -> list[str]:
         name
         for name, dependency, expected in BATCH_BRANCH_CASES
         if batch_branch(preset, *dependency) != expected
+    ]
+
+
+def layered(preset: dict, repository_rules: list[dict]) -> dict:
+    """Deep copy of the preset with repository package rules appended after the preset's."""
+    merged = copy.deepcopy(preset)
+    merged["packageRules"] = [*merged.get("packageRules", []), *repository_rules]
+    return merged
+
+
+_OWN_GROUP_RULE = [{"matchPackageNames": ["left-pad"], "groupName": "npm tooling"}]
+_OWN_GROUP_SLUG_RULE = [
+    {"matchPackageNames": ["left-pad"], "groupName": "npm tooling", "groupSlug": "tooling"}
+]
+_OWN_GROUP_NULL_RULE = [{"matchPackageNames": ["left-pad"], "groupName": None}]
+
+CONSUMER_GROUP_CASES = (
+    ("own-group-minor", _OWN_GROUP_RULE, ("npm", "npm", "left-pad", "minor"), "npm-tooling"),
+    ("own-group-pin", _OWN_GROUP_RULE, ("npm", "npm", "left-pad", "pin"), "npm-tooling"),
+    (
+        "other-package-keeps-batch",
+        _OWN_GROUP_RULE,
+        ("npm", "npm", "@types/node", "minor"),
+        "npm-non-major",
+    ),
+    (
+        "own-group-with-own-slug",
+        _OWN_GROUP_SLUG_RULE,
+        ("npm", "npm", "left-pad", "minor"),
+        "tooling",
+    ),
+    ("own-group-null", _OWN_GROUP_NULL_RULE, ("npm", "npm", "left-pad", "minor"), None),
+)
+
+BRANCH_TOPIC_CASES = (
+    ("preset-minor", "{{manager}}-non-major", "{{manager}} non-major", "npm", "npm-non-major"),
+    ("preset-pin", "{{manager}}-non-major", "{{manager}} non-major", "npm", "npm-non-major"),
+    (
+        "manager-slug-consumer-group",
+        "{{manager}}-non-major",
+        "npm tooling",
+        "npm",
+        "npm-non-major",
+    ),
+    ("compiled-slug-minor", "{{{groupName}}}", "{{manager}} non-major", "npm", "npm-non-major"),
+    ("compiled-slug-pin", "{{{groupName}}}", "{{manager}} non-major", "npm", "npm-non-major"),
+    (
+        "compiled-slug-pindigest-gh",
+        "{{{groupName}}}",
+        "{{manager}} non-major",
+        "github-actions",
+        "github-actions-non-major",
+    ),
+    ("consumer-group-minor", "{{{groupName}}}", "npm tooling", "npm", "npm-tooling"),
+    ("consumer-group-pin", "{{{groupName}}}", "npm tooling", "npm", "npm-tooling"),
+    ("pin-type-default-slug", "pin-dependencies", "Pin Dependencies", "npm", "pin-dependencies"),
+    (
+        "consumer-pin-keeps-type-slug",
+        "pin-dependencies",
+        "npm tooling",
+        "npm",
+        "pin-dependencies",
+    ),
+)
+
+
+def consumer_group_problems(preset: dict) -> list[str]:
+    """Layered consumer rules whose batch branch topic differs from the fixed table."""
+    return [
+        name
+        for name, rules, dependency, expected in CONSUMER_GROUP_CASES
+        if batch_branch(layered(preset, rules), *dependency)[0] != expected
     ]
 
 
@@ -1292,6 +1365,33 @@ def test_planted_makefile_tool_pin_is_not_read(old, new):
 def test_preset_batches_non_major_updates_per_manager():
     assert batch_problems(PRESET) == []
     assert batch_branch_problems(PRESET) == []
+    assert consumer_group_problems(PRESET) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "rules", "dependency", "expected_topic"),
+    CONSUMER_GROUP_CASES,
+    ids=[case[0] for case in CONSUMER_GROUP_CASES],
+)
+def test_consumer_group_positive_negative_and_boundary(name, rules, dependency, expected_topic):
+    assert batch_branch(layered(PRESET, rules), *dependency)[0] == expected_topic, name
+
+
+@pytest.mark.parametrize(
+    ("label", "slug", "group_name", "manager", "expected"),
+    BRANCH_TOPIC_CASES,
+    ids=[case[0] for case in BRANCH_TOPIC_CASES],
+)
+def test_branch_topic_matches_renovate_generate_branch_name(
+    label, slug, group_name, manager, expected
+):
+    assert _branch_topic(manager, group_name, slug) == expected, label
+
+
+def test_planted_manager_non_major_group_slug_defect_is_refused():
+    planted = copy.deepcopy(PRESET)
+    planted["packageRules"][1]["groupSlug"] = "{{manager}}-non-major"
+    assert consumer_group_problems(planted) == ["own-group-minor", "own-group-pin"]
 
 
 def test_pin_managers_have_distinct_batch_branch_topics():
