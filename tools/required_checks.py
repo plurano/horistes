@@ -16,7 +16,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO
@@ -54,13 +54,14 @@ DEFAULT_APP = "github-actions"
 DEFAULT_CONTEXT = "required-checks"
 DEFAULT_SELF_WORKFLOW = ".github/workflows/required-checks.yml"
 PR_EVENTS = frozenset({"pull_request", "pull_request_target"})
+PROPOSAL_EVENTS = PR_EVENTS | {"merge_group"}
 TARGETS_SHA = "sha"
 TARGETS_OPEN_PULLS = "open-pulls"
 ALLOWED_TARGETS = frozenset({TARGETS_SHA, TARGETS_OPEN_PULLS})
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,38}/[A-Za-z0-9._-]{1,100}$")
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
-INT_RE = re.compile(r"^-?[0-9]+$")
+INT_RE = re.compile(r"^-?[0-9]{1,6}$")
 SELF_WORKFLOW_RE = re.compile(r"^\.github/workflows/[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml$")
 HTTPS_URL_RE = re.compile(r"^https://", re.IGNORECASE)
 
@@ -75,6 +76,37 @@ class ApiFailureError(Exception):
 
 class ApiCapReachedError(Exception):
     """Sweep session reached SWEEP_MAX_CALLS before every target was judged."""
+
+
+class PostFailureError(ApiFailureError):
+    """A status write failed with an HTTP response."""
+
+    def __init__(self, label: str, response: forge.ResponseError) -> None:
+        super().__init__(f"GitHub API error ({label}): {response}")
+        self.response = response
+
+
+@dataclass(frozen=True, kw_only=True)
+class RawInputs:
+    """Caller inputs before normalization and validation."""
+
+    repository: str
+    event_name: str = ""
+    ref: str = ""
+    sha: str = ""
+    commit_sha: str = ""
+    pr_head_sha: str = ""
+    required_json: str
+    pull_request_only_json: str = "[]"
+    not_owed_json: str = "[]"
+    apps_json: str = "{}"
+    bound_minutes: str | int = BOUND_MINUTES_DEFAULT
+    context: str = DEFAULT_CONTEXT
+    self_workflow: str = DEFAULT_SELF_WORKFLOW
+    targets: str = TARGETS_SHA
+    max_targets: str | int = MAX_TARGETS_DEFAULT
+    only_if_pending: str | bool = False
+    target_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -106,6 +138,18 @@ class Snapshot:
     statuses_by_context: dict[str, dict]
     ignored_foreign_apps: tuple[str, ...]
     anchor: float
+    self_status: dict | None = None
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    """A verdict and the timestamps bracketing its evidence read."""
+
+    snapshot: Snapshot
+    state: str
+    description: str
+    read_started: float
+    read_end: float
 
 
 def below_floor(version: tuple[int, ...]) -> str | None:
@@ -135,6 +179,8 @@ def _parse_int_range(label: str, raw: str | int, low: int, high: int) -> int:
     if isinstance(raw, bool):
         raise InputError(f"{label}: must be a whole number from {low} to {high}, got {raw!r}")
     if isinstance(raw, int):
+        if not -999_999 <= raw <= 999_999:
+            raise InputError(f"{label}: integer exceeds six digits")
         value = raw
     elif isinstance(raw, str) and INT_RE.fullmatch(raw.strip()):
         value = int(raw.strip())
@@ -151,10 +197,10 @@ def _parse_bool(label: str, raw: str | bool) -> bool:
         return raw
     if not isinstance(raw, str):
         raise InputError(f"{label}: must be true or false, got {raw!r}")
-    token = raw.strip().lower()
-    if token == "true":
+    word = raw.strip().lower()
+    if word == "true":
         return True
-    if token == "false":
+    if word == "false":
         return False
     raise InputError(f"{label}: must be true or false, got {raw!r}")
 
@@ -299,131 +345,59 @@ def _resolve_sha(event_name: str, explicit_sha: str, commit_sha: str, pr_head_sh
     return chosen
 
 
-def _parse_config_fields(
-    *,
-    required_json: str,
-    pull_request_only_json: str,
-    not_owed_json: str,
-    apps_json: str,
-    bound_minutes: str | int,
-    context: str,
-    self_workflow: str,
-    max_targets: str | int,
-    only_if_pending: str | bool,
-    target_url: str,
-) -> tuple[
-    tuple[str, ...],
-    frozenset[str],
-    frozenset[str],
-    dict[str, str],
-    int,
-    str,
-    str,
-    int,
-    bool,
-    str,
-]:
-    """Parse list, bound, and posting fields shared by every targets mode."""
-    required = _parse_required(required_json)
+def _parse_config_fields(raw: RawInputs) -> Config:
+    """Validate check policy and build the normalized configuration."""
+    required = _parse_required(raw.required_json)
     allowed = frozenset(required)
-    pr_only = _parse_subset("pull-request-only", pull_request_only_json, allowed)
-    not_owed = _parse_subset("not-owed", not_owed_json, allowed)
-    apps = _parse_apps(apps_json, allowed)
-    bound = _parse_int_range("bound-minutes", bound_minutes, BOUND_MINUTES_MIN, BOUND_MINUTES_MAX)
-    ctx = _parse_context(context)
-    self_wf = _parse_self_workflow(self_workflow)
+    pr_only = _parse_subset("pull-request-only", raw.pull_request_only_json, allowed)
+    not_owed = _parse_subset("not-owed", raw.not_owed_json, allowed)
+    apps = _parse_apps(raw.apps_json, allowed)
+    bound = _parse_int_range(
+        "bound-minutes", raw.bound_minutes, BOUND_MINUTES_MIN, BOUND_MINUTES_MAX
+    )
+    ctx = _parse_context(raw.context)
+    self_workflow = _parse_self_workflow(raw.self_workflow)
     _reject_self_context(ctx, allowed, "required")
     _reject_self_context(ctx, pr_only, "pull-request-only")
     _reject_self_context(ctx, not_owed, "not-owed")
-    max_t = _parse_int_range("max-targets", max_targets, MAX_TARGETS_MIN, MAX_TARGETS_MAX)
-    pending_only = _parse_bool("only-if-pending", only_if_pending)
-    url = _parse_target_url(target_url)
-    return required, pr_only, not_owed, apps, bound, ctx, self_wf, max_t, pending_only, url
-
-
-def _config_from_parsed(
-    repo: str,
-    event: str,
-    ref: str,
-    resolved_sha: str,
-    mode: str,
-    parsed: tuple[
-        tuple[str, ...],
-        frozenset[str],
-        frozenset[str],
-        dict[str, str],
-        int,
-        str,
-        str,
-        int,
-        bool,
-        str,
-    ],
-) -> Config:
-    required, pr_only, not_owed, apps, bound, ctx, self_wf, max_t, pending_only, url = parsed
     return Config(
-        repository=repo,
-        sha=resolved_sha,
-        event_name=event,
-        ref=ref,
+        repository=raw.repository,
+        sha=raw.sha,
+        event_name=raw.event_name,
+        ref=raw.ref,
         required=required,
         pull_request_only=pr_only,
         not_owed=not_owed,
         apps=apps,
         bound_minutes=bound,
         context=ctx,
-        self_workflow=self_wf,
-        targets=mode,
-        max_targets=max_t,
-        only_if_pending=pending_only,
-        target_url=url,
+        self_workflow=self_workflow,
+        targets=raw.targets,
+        max_targets=_parse_int_range(
+            "max-targets", raw.max_targets, MAX_TARGETS_MIN, MAX_TARGETS_MAX
+        ),
+        only_if_pending=_parse_bool("only-if-pending", raw.only_if_pending),
+        target_url=_parse_target_url(raw.target_url),
     )
 
 
-def parse_config(
-    *,
-    repository: str,
-    event_name: str = "",
-    ref: str = "",
-    sha: str = "",
-    commit_sha: str = "",
-    pr_head_sha: str = "",
-    required_json: str,
-    pull_request_only_json: str = "[]",
-    not_owed_json: str = "[]",
-    apps_json: str = "{}",
-    bound_minutes: str | int = BOUND_MINUTES_DEFAULT,
-    context: str = DEFAULT_CONTEXT,
-    self_workflow: str = DEFAULT_SELF_WORKFLOW,
-    targets: str = TARGETS_SHA,
-    max_targets: str | int = MAX_TARGETS_DEFAULT,
-    only_if_pending: str | bool = False,
-    target_url: str = "",
-) -> Config:
+def parse_config(raw: RawInputs) -> Config:
     """Validate every caller input before any forge API request is made."""
-    repo = repository.strip()
+    repo = raw.repository.strip()
     if not REPO_RE.fullmatch(repo) or repo.split("/", 1)[1] in (".", ".."):
-        raise InputError(f"repository: invalid owner/name {repository!r}")
-    event = event_name.strip()
-    mode = targets.strip().lower()
+        raise InputError(f"repository: invalid owner/name {raw.repository!r}")
+    event = raw.event_name.strip()
+    mode = raw.targets.strip().lower()
     if mode not in ALLOWED_TARGETS:
-        raise InputError(f"targets: {targets!r} must be sha or open-pulls")
+        raise InputError(f"targets: {raw.targets!r} must be sha or open-pulls")
     if mode == TARGETS_SHA and not event:
         raise InputError("event: event name must not be empty")
-    resolved_sha = _resolve_sha(event, sha, commit_sha, pr_head_sha) if mode == TARGETS_SHA else ""
-    parsed = _parse_config_fields(
-        required_json=required_json,
-        pull_request_only_json=pull_request_only_json,
-        not_owed_json=not_owed_json,
-        apps_json=apps_json,
-        bound_minutes=bound_minutes,
-        context=context,
-        self_workflow=self_workflow,
-        max_targets=max_targets,
-        only_if_pending=only_if_pending,
-        target_url=target_url,
+    sha = (
+        _resolve_sha(event, raw.sha, raw.commit_sha, raw.pr_head_sha) if mode == TARGETS_SHA else ""
     )
-    return _config_from_parsed(repo, event, ref.strip(), resolved_sha, mode, parsed)
+    return _parse_config_fields(
+        replace(raw, repository=repo, event_name=event, ref=raw.ref.strip(), sha=sha, targets=mode)
+    )
 
 
 class ApiSession:
@@ -464,6 +438,7 @@ class ApiSession:
                 f"GitHub API rate limit: {label} still answers HTTP {err.status}. "
                 "No check result was judged; rerun this job."
             ) from err
+        self._check_api_cap(label)
         self.out.write(f"::warning::{label}: GitHub API HTTP {err.status}, retrying in {delay} s\n")
         self.rate_limit_wait_count += 1
         self.rate_limit_waited_seconds += delay
@@ -481,40 +456,64 @@ class ApiSession:
                 f"Transient GitHub API failure: {label} still answers HTTP {err.status} "
                 "at the session deadline. No check result was judged; rerun this job."
             ) from err
+        self._check_api_cap(label)
         self.out.write(
             f"::warning::{label}: GitHub API HTTP {err.status}, retrying in {seconds} s\n"
         )
         self.sleep(seconds)
 
-    def _call_deadline(self) -> float:
+    def _call_deadline(self, label: str) -> float:
         """Per-call transport deadline capped by the remaining session budget."""
         remaining = self.deadline - self.now()
         if remaining <= 0:
             raise ApiFailureError(
-                f"Session deadline of {SESSION_DEADLINE_SECONDS} s reached before the next "
-                "GitHub API call. No check result was judged; rerun this job."
+                f"Session deadline of {SESSION_DEADLINE_SECONDS} s reached during {label}. "
+                "No check result was judged; rerun this job."
             )
         return min(forge.DEADLINE_SECONDS, remaining)
 
-    def request_json(self, label: str, path: str, *, method: str = "GET", **kw: object) -> object:
-        """Fetch and decode one JSON endpoint with bounded rate-limit and 5xx retries."""
+    def _check_api_cap(self, label: str) -> None:
         if self.max_api_calls is not None and self.api_calls >= self.max_api_calls:
             raise ApiCapReachedError(
                 f"Sweep API call cap of {self.max_api_calls} reached during {label}."
             )
+
+    def _request_once(self, label: str, path: str, method: str, **kw: object) -> object:
+        """Count every transport attempt, including failures and retries."""
+        self._check_api_cap(label)
+        deadline = self._call_deadline(label)
+        self.api_calls += 1
+        try:
+            _, _, body = self.transport(path, method=method, deadline=deadline, **kw)
+            return json.loads(body)
+        except forge.ResponseError:
+            raise
+        except (forge.ForgeError, ValueError) as err:
+            raise ApiFailureError(f"GitHub API error ({label}): {err}") from err
+
+    def wait_to_retry_post(self, failure: PostFailureError) -> None:
+        """Wait once for an HTTP write failure that can be retried from fresh evidence."""
+        err = failure.response
+        delay = forge.rate_limit_delay(err.status, err.headers, err.message, 0, self.now())
+        if delay is not None:
+            self._wait_rate_limit("post-status", err, delay, 0)
+        elif err.status is not None and 500 <= err.status < 600:
+            self._wait_server_error("post-status", err, 0)
+        else:
+            raise failure
+
+    def request_json(self, label: str, path: str, *, method: str = "GET", **kw: object) -> object:
+        """Decode one JSON endpoint. Only GET requests retry within the session."""
+        if method != "GET":
+            try:
+                return self._request_once(label, path, method, **kw)
+            except forge.ResponseError as err:
+                raise PostFailureError(label, err) from err
         server_attempts = 0
         rate_limit_waits = 0
         for _ in range(MAX_CALL_ATTEMPTS):
-            if self.now() >= self.deadline:
-                raise ApiFailureError(
-                    f"Session deadline of {SESSION_DEADLINE_SECONDS} s reached during {label}. "
-                    "No check result was judged; rerun this job."
-                )
             try:
-                call_deadline = self._call_deadline()
-                _, _, body = self.transport(path, method=method, deadline=call_deadline, **kw)
-                self.api_calls += 1
-                return json.loads(body)
+                return self._request_once(label, path, method, **kw)
             except forge.ResponseError as err:
                 delay = forge.rate_limit_delay(
                     err.status, err.headers, err.message, rate_limit_waits, self.now()
@@ -523,12 +522,10 @@ class ApiSession:
                     self._wait_rate_limit(label, err, delay, rate_limit_waits)
                     rate_limit_waits += 1
                     continue
-                if err.status is not None and err.status >= 500:
+                if err.status is not None and 500 <= err.status < 600:
                     self._wait_server_error(label, err, server_attempts)
                     server_attempts += 1
                     continue
-                raise ApiFailureError(f"GitHub API error ({label}): {err}") from err
-            except (forge.ForgeError, ValueError) as err:
                 raise ApiFailureError(f"GitHub API error ({label}): {err}") from err
         raise ApiFailureError(f"GitHub API error ({label}): retry bound reached")
 
@@ -583,11 +580,16 @@ def self_workflow_suites(workflow_runs: list[dict], self_workflow: str) -> set[i
     return suites
 
 
-def _workflow_anchor(workflow_runs: list[dict], self_workflow: str) -> float | None:
-    """Earliest created_at among non-self workflow runs."""
+def _workflow_anchor(
+    workflow_runs: list[dict], self_workflow: str, excluded_suites: set[int]
+) -> float | None:
+    """Earliest created_at among non-self workflow runs in eligible suites."""
     earliest: float | None = None
     for run in workflow_runs[:MAX_WORKFLOW_RUNS]:
-        if run.get("path") == self_workflow:
+        if (
+            run.get("path") == self_workflow
+            or _int_id(run.get("check_suite_id")) in excluded_suites
+        ):
             continue
         stamp = _iso_epoch(run.get("created_at"))
         if stamp <= 0:
@@ -613,7 +615,7 @@ def _commit_anchor(session: ApiSession, repository: str, sha: str) -> float:
 
 def _check_run_admitted(
     run: dict,
-    excluded_suites: set[int],
+    admitted_suites: set[int],
     apps: Mapping[str, str],
     self_context: str,
 ) -> tuple[str | None, str | None]:
@@ -627,8 +629,8 @@ def _check_run_admitted(
     if actual_app != expected_app:
         return None, f"{name} ({actual_app or 'missing'}, expected {expected_app})"
     suite = run.get("check_suite")
-    suite_id = suite.get("id") if isinstance(suite, dict) else None
-    if suite_id in excluded_suites:
+    suite_id = _int_id(suite.get("id")) if isinstance(suite, dict) else 0
+    if expected_app == DEFAULT_APP and suite_id not in admitted_suites:
         return None, None
     return name, None
 
@@ -640,18 +642,18 @@ def _check_run_rank(run: dict) -> tuple[float, int]:
 
 def newest_check_runs(
     check_runs: list[dict],
-    excluded_suites: set[int],
+    admitted_suites: set[int],
     apps: Mapping[str, str],
     required_names: frozenset[str],
     self_context: str,
 ) -> tuple[dict[str, dict], tuple[str, ...]]:
-    """Select the newest check run per name from its expected app outside foreign suites."""
+    """Select the newest check run per name from its expected app and, for Actions, own suite."""
     by_name: dict[str, dict] = {}
     ranks: dict[str, tuple[float, int]] = {}
     ignored: list[str] = []
     seen_ignored: set[str] = set()
     for run in check_runs[:MAX_CHECK_RUNS]:
-        admitted_name, foreign_note = _check_run_admitted(run, excluded_suites, apps, self_context)
+        admitted_name, foreign_note = _check_run_admitted(run, admitted_suites, apps, self_context)
         raw_name = run.get("name")
         if foreign_note and raw_name in required_names and raw_name not in seen_ignored:
             seen_ignored.add(str(raw_name))
@@ -665,20 +667,8 @@ def newest_check_runs(
     return by_name, tuple(ignored)
 
 
-def newest_statuses(statuses: list[dict], self_context: str) -> dict[str, dict]:
-    """Select the newest commit status per context except the self context."""
-    by_context: dict[str, dict] = {}
-    ranks: dict[str, tuple[float, int]] = {}
-    for entry in statuses[:MAX_STATUSES]:
-        context = entry.get("context")
-        if not isinstance(context, str) or not context or context == self_context:
-            continue
-        stamp = entry.get("updated_at") or entry.get("created_at")
-        rank = (_iso_epoch(stamp), _int_id(entry.get("id")))
-        if context not in ranks or rank >= ranks[context]:
-            ranks[context] = rank
-            by_context[context] = entry
-    return by_context
+def _status_timestamp(entry: Mapping[str, object]) -> float:
+    return max(_iso_epoch(entry.get("updated_at")), _iso_epoch(entry.get("created_at")))
 
 
 def _all_statuses(statuses: list[dict]) -> dict[str, dict]:
@@ -689,34 +679,64 @@ def _all_statuses(statuses: list[dict]) -> dict[str, dict]:
         context = entry.get("context")
         if not isinstance(context, str) or not context:
             continue
-        stamp = entry.get("updated_at") or entry.get("created_at")
-        rank = (_iso_epoch(stamp), _int_id(entry.get("id")))
+        rank = (_status_timestamp(entry), _int_id(entry.get("id")))
         if context not in ranks or rank >= ranks[context]:
             ranks[context] = rank
             by_context[context] = entry
     return by_context
 
 
+def newest_statuses(statuses: list[dict], self_context: str) -> dict[str, dict]:
+    """Select the newest commit status per context except the self context."""
+    recent = _all_statuses(statuses)
+    recent.pop(self_context, None)
+    return recent
+
+
 def read_statuses(session: ApiSession, repository: str, sha: str) -> dict[str, dict]:
     """Commit statuses on `sha`, including the self context."""
     path = f"repos/{repository}/commits/{sha}/statuses"
-    statuses = forge.paged(
-        path,
-        None,
-        max_pages=STATUS_MAX_PAGES,
-        fetch=lambda p: session.request_json("statuses", p),
-    )
+    try:
+        statuses = forge.paged(
+            path,
+            None,
+            max_pages=STATUS_MAX_PAGES,
+            fetch=lambda p: session.request_json("statuses", p),
+        )
+    except forge.ForgeError as err:
+        raise ApiFailureError(f"GitHub API error (statuses): {err}") from err
     return _all_statuses(statuses)
 
 
-def read_snapshot(
-    session: ApiSession,
-    config: Config,
-    statuses: list[dict] | Mapping[str, dict] | None = None,
-) -> Snapshot:
-    """Read check runs and workflow runs; reuse commit statuses when already fetched."""
-    checks_path = f"repos/{config.repository}/commits/{config.sha}/check-runs"
+def _read_workflow_runs(session: ApiSession, config: Config) -> list[dict]:
+    """Fail closed when the Actions workflow listing saturates the allowed pages."""
     runs_path = f"repos/{config.repository}/actions/runs?head_sha={config.sha}"
+    rows_seen = 0
+    row_cap = WORKFLOW_RUN_MAX_PAGES * forge.PER_PAGE
+
+    def fetch(path: str) -> object:
+        nonlocal rows_seen
+        data = session.request_json("workflow-runs", path)
+        rows = data.get("workflow_runs") if isinstance(data, dict) else None
+        if isinstance(rows, list):
+            rows_seen += len(rows)
+            if rows_seen >= row_cap:
+                raise ApiFailureError(
+                    f"GitHub API workflow-runs cap reached: {WORKFLOW_RUN_MAX_PAGES} full "
+                    f"pages ({row_cap} entries) on {config.sha}."
+                )
+        return data
+
+    return forge.paged(runs_path, "workflow_runs", max_pages=WORKFLOW_RUN_MAX_PAGES, fetch=fetch)
+
+
+def read_snapshot(session: ApiSession, config: Config) -> Snapshot | None:
+    """Read current evidence. Skip a settled success when the caller requests it."""
+    statuses = read_statuses(session, config.repository, config.sha)
+    self_status = statuses.pop(config.context, None)
+    if config.only_if_pending and self_status and self_status.get("state") == "success":
+        return None
+    checks_path = f"repos/{config.repository}/commits/{config.sha}/check-runs?filter=all"
     try:
         check_runs = forge.paged(
             checks_path,
@@ -724,38 +744,30 @@ def read_snapshot(
             max_pages=CHECK_RUN_MAX_PAGES,
             fetch=lambda p: session.request_json("check-runs", p),
         )
-        workflow_runs = forge.paged(
-            runs_path,
-            "workflow_runs",
-            max_pages=WORKFLOW_RUN_MAX_PAGES,
-            fetch=lambda p: session.request_json("workflow-runs", p),
-        )
-        if statuses is None:
-            status_list = list(read_statuses(session, config.repository, config.sha).values())
-        elif isinstance(statuses, Mapping):
-            status_list = list(statuses.values())
-        else:
-            status_list = list(statuses)
+        workflow_runs = _read_workflow_runs(session, config)
     except forge.ForgeError as err:
         raise ApiFailureError(f"GitHub API error: {err}") from err
     excluded = foreign_suites(workflow_runs, config.event_name, config.ref)
     if config.targets == TARGETS_OPEN_PULLS:
         excluded |= self_workflow_suites(workflow_runs, config.self_workflow)
+    listed = {_int_id(run.get("check_suite_id")) for run in workflow_runs[:MAX_WORKFLOW_RUNS]}
+    admitted = listed - excluded - {0}
     by_name, ignored = newest_check_runs(
         check_runs,
-        excluded,
+        admitted,
         config.apps,
         frozenset(config.required),
         config.context,
     )
-    anchor = _workflow_anchor(workflow_runs, config.self_workflow)
+    anchor = _workflow_anchor(workflow_runs, config.self_workflow, excluded)
     if anchor is None:
         anchor = _commit_anchor(session, config.repository, config.sha)
     return Snapshot(
         checks_by_name=by_name,
-        statuses_by_context=newest_statuses(status_list, config.context),
+        statuses_by_context=statuses,
         ignored_foreign_apps=ignored,
         anchor=anchor,
+        self_status=self_status,
     )
 
 
@@ -763,7 +775,7 @@ def exempt_reason(name: str, config: Config) -> str:
     """Exemption reason for `name` on this event, or empty string when `name` is owed."""
     if name in config.not_owed:
         return "not owed"
-    if name in config.pull_request_only and config.event_name not in PR_EVENTS:
+    if name in config.pull_request_only and config.event_name not in PROPOSAL_EVENTS:
         return f"pull-request-only on {config.event_name}"
     return ""
 
@@ -779,6 +791,14 @@ def _is_context_pending(run: dict | None, status: dict | None) -> bool:
     run_pending = run is not None and run.get("status") != "completed"
     status_pending = status is not None and status.get("state") == "pending"
     return run_pending or status_pending
+
+
+def _terminal_failure(run: dict | None, status: dict | None) -> bool:
+    check_failed = (
+        run is not None and run.get("status") == "completed" and run.get("conclusion") != "success"
+    )
+    status_failed = status is not None and status.get("state") not in ("pending", "success")
+    return check_failed or status_failed
 
 
 def owed_waiting(snapshot: Snapshot, config: Config) -> tuple[list[str], list[str]]:
@@ -811,20 +831,11 @@ def decide(
     """Return (state, description) with state in success, failure, or pending."""
     failures: list[str] = []
     for name in config.required[:MAX_CONTEXTS]:
-        reason = exempt_reason(name, config)
         run, status = _records_for(name, snapshot, config)
-        if reason:
+        if exempt_reason(name, config) or _terminal_failure(run, status):
             passed, line = judge_context(name, snapshot, config)
             if not passed:
                 failures.append(line)
-            continue
-        if run is None and status is None:
-            continue
-        if _is_context_pending(run, status):
-            continue
-        passed, line = judge_context(name, snapshot, config)
-        if not passed:
-            failures.append(line)
     if failures:
         desc = failures[0]
         if len(failures) > 1:
@@ -913,33 +924,16 @@ def _status_fields(config: Config, state: str, description: str) -> dict[str, st
     return fields
 
 
-def _should_post(
-    statuses: Mapping[str, dict], config: Config, state: str, description: str
-) -> bool:
-    newest = statuses.get(config.context)
-    if state == "pending" and (not newest or str(newest.get("state") or "") != "success"):
+def _should_post(newest: Mapping[str, object] | None, state: str, description: str) -> bool:
+    if state == "pending" and (not newest or newest.get("state") != "success"):
         return False
     if not newest:
         return True
-    return not (
-        str(newest.get("state") or "") == state
-        and str(newest.get("description") or "") == description
-    )
+    return newest.get("state") != state or newest.get("description") != description
 
 
-def post_commit_status(
-    session: ApiSession,
-    config: Config,
-    state: str,
-    description: str,
-    statuses: Mapping[str, dict],
-) -> None:
-    """POST a commit status when state or description changed."""
-    if not _should_post(statuses, config, state, description):
-        session.out.write(
-            f"No status post: {config.context} on {config.sha} already has {state!r}\n"
-        )
-        return
+def post_commit_status(session: ApiSession, config: Config, state: str, description: str) -> None:
+    """Attempt a single status POST from a checked evaluation."""
     path = f"repos/{config.repository}/statuses/{config.sha}"
     fields = _status_fields(config, state, description)
     session.request_json("post-status", path, method="POST", fields=fields)
@@ -951,81 +945,117 @@ def _warn_api_cap(err: TextIO, exc: ApiCapReachedError) -> int:
     return 0
 
 
-def _read_and_decide(
-    session: ApiSession,
-    config: Config,
-    statuses_map: Mapping[str, dict],
-    out: TextIO,
-    err: TextIO,
-) -> tuple[Snapshot, str, str, float] | None:
-    """Return snapshot, verdict, and wall time when the snapshot read finished."""
-    try:
-        snapshot = read_snapshot(session, config, statuses_map)
-    except ApiFailureError as exc:
-        err.write(f"::error::{exc}\n")
+def _read_and_decide(session: ApiSession, config: Config, out: TextIO) -> Evaluation | None:
+    """Read evidence and record the start and end of the read used for a verdict."""
+    read_started = session.now()
+    snapshot = read_snapshot(session, config)
+    if snapshot is None:
+        out.write(f"{config.sha}: {config.context} already settled\n")
         return None
     read_end = session.now()
     judge_snapshot(snapshot, config, out)
     state, description = decide(snapshot, config, session.now(), snapshot.anchor)
-    return snapshot, state, description, read_end
+    return Evaluation(snapshot, state, description, read_started, read_end)
 
 
-def evaluate_one(
-    session: ApiSession,
-    config: Config,
-    out: TextIO,
-    err: TextIO,
-    *,
-    statuses_map: Mapping[str, dict] | None = None,
-) -> int:
-    """Read, decide and post for one SHA; return 1 only on an evaluation error."""
-    if statuses_map is None:
-        try:
-            statuses_map = read_statuses(session, config.repository, config.sha)
-        except (ApiFailureError, ApiCapReachedError) as exc:
-            if isinstance(exc, ApiCapReachedError):
-                return _warn_api_cap(err, exc)
-            err.write(f"::error::{exc}\n")
-            return 1
-    newest = statuses_map.get(config.context)
-    if config.only_if_pending and newest:
-        settled = str(newest.get("state") or "")
-        if settled in ("success", "failure"):
-            out.write(f"{config.sha}: {config.context} already settled\n")
-            return 0
+def _post_age_problem(session: ApiSession, evaluation: Evaluation) -> str:
+    age = session.now() - evaluation.read_end
+    if age > POST_FRESH_SECONDS:
+        return f"snapshot read ended {age:.0f} s ago (limit {POST_FRESH_SECONDS} s)"
+    return ""
+
+
+def _owed_status_changed(
+    config: Config, snapshot: Snapshot, recent: Mapping[str, dict], *, complete: bool
+) -> bool:
+    for name in config.required[:MAX_CONTEXTS]:
+        if name in config.apps or (name not in recent and not complete):
+            continue
+        if recent.get(name) != snapshot.statuses_by_context.get(name):
+            return True
+    return False
+
+
+def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluation) -> str:
+    """Re-read the newest status page before a write to detect superseding evidence."""
+    path = (
+        f"repos/{config.repository}/commits/{config.sha}/statuses?per_page={forge.PER_PAGE}&page=1"
+    )
+    data = session.request_json("statuses", path)
+    if not isinstance(data, list):
+        raise ApiFailureError(f"GitHub API error (statuses): GET {path}: no list in the answer")
+    complete = len(data) < forge.PER_PAGE
+    recent = _all_statuses([entry for entry in data[: forge.PER_PAGE] if isinstance(entry, dict)])
+    newest = recent.get(config.context)
+    if newest is None and not complete:
+        return "the newest judge status is outside the pre-post status page"
+    if newest != evaluation.snapshot.self_status or (
+        newest is not None and _status_timestamp(newest) > evaluation.read_started
+    ):
+        return "the judge status moved during the evidence read"
+    if _owed_status_changed(config, evaluation.snapshot, recent, complete=complete):
+        return "required commit status evidence changed during the evidence read"
+    return _post_age_problem(session, evaluation)
+
+
+def _report_verdict(config: Config, evaluation: Evaluation, out: TextIO) -> None:
+    if evaluation.state == "failure":
+        out.write(f"{config.sha}: {evaluation.description}\n")
+    elif evaluation.state == "success":
+        out.write("All owed required checks reported success.\n")
+
+
+def _attempt_post(
+    session: ApiSession, config: Config, evaluation: Evaluation, *, can_retry: bool
+) -> bool:
+    """Return false after waiting for a retry that needs a new judgment."""
     try:
-        decided = _read_and_decide(session, config, statuses_map, out, err)
-    except ApiCapReachedError as exc:
-        return _warn_api_cap(err, exc)
-    if decided is None:
-        return 1
-    _snapshot, state, description, read_end = decided
-    if session.now() - read_end > POST_FRESH_SECONDS:
-        try:
-            decided = _read_and_decide(session, config, statuses_map, out, err)
-        except ApiCapReachedError as exc:
-            return _warn_api_cap(err, exc)
-        if decided is None:
-            return 1
-        _snapshot, state, description, read_end = decided
-    if session.now() - read_end > POST_FRESH_SECONDS:
-        err.write(
-            f"::warning::Posting skipped for {config.sha}: snapshot read ended "
-            f"{session.now() - read_end:.0f} s ago (limit {POST_FRESH_SECONDS} s).\n"
+        post_commit_status(session, config, evaluation.state, evaluation.description)
+    except PostFailureError as exc:
+        if not can_retry:
+            raise
+        session.wait_to_retry_post(exc)
+        return False
+    return True
+
+
+def _evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> None:
+    """Allow one preflight refresh and one retry of a transient status write."""
+    refreshed = False
+    retried_post = False
+    for _ in range(3):
+        evaluation = _read_and_decide(session, config, out)
+        if evaluation is None:
+            return
+        state, description = evaluation.state, evaluation.description
+        if not _should_post(evaluation.snapshot.self_status, state, description):
+            out.write(f"No status post: {config.context} on {config.sha} already has {state!r}\n")
+            _report_verdict(config, evaluation, out)
+            return
+        stale_reason = _post_age_problem(session, evaluation) or _status_preflight(
+            session, config, evaluation
         )
-        return 0
+        if stale_reason:
+            if refreshed:
+                err.write(f"::warning::Posting skipped for {config.sha}: {stale_reason}.\n")
+                return
+            refreshed = True
+            continue
+        if _attempt_post(session, config, evaluation, can_retry=not retried_post):
+            _report_verdict(config, evaluation, out)
+            return
+        retried_post = True
+
+
+def evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> int:
+    """Read, decide and post for one SHA; return 1 only on an evaluation error."""
     try:
-        post_commit_status(session, config, state, description, statuses_map)
+        _evaluate_one(session, config, out, err)
     except ApiCapReachedError as exc:
         return _warn_api_cap(err, exc)
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
         return 1
-    if state == "failure":
-        out.write(f"{config.sha}: {description}\n")
-        return 0
-    if state == "success":
-        out.write("All owed required checks reported success.\n")
     return 0
 
 
@@ -1048,38 +1078,32 @@ def _open_pull_head_shas(session: ApiSession, repository: str) -> list[str]:
     return heads
 
 
-def _head_priority(statuses_map: Mapping[str, dict], context: str) -> tuple[bool, float]:
-    """Sort key: never-judged heads first, then longest since the last judgment."""
-    entry = statuses_map.get(context)
-    if not entry:
-        return (False, 0.0)
-    stamp = _iso_epoch(entry.get("updated_at") or entry.get("created_at"))
-    return (True, stamp)
-
-
 def _sweep_evaluation_order(
-    session: ApiSession,
-    repository: str,
-    heads: list[str],
-    context: str,
-    max_targets: int,
-    out: TextIO,
-) -> list[tuple[str, dict[str, dict]]]:
-    """Read each head once, skip settled, return up to `max_targets` unsettled heads."""
-    pending: list[tuple[str, dict[str, dict], tuple[bool, float], int]] = []
-    for order, sha in enumerate(heads):
-        statuses_map = read_statuses(session, repository, sha)
-        newest = statuses_map.get(context)
-        if newest and str(newest.get("state") or "") in ("success", "failure"):
-            out.write(f"{sha}: {context} already settled\n")
+    session: ApiSession, config: Config, heads: list[str], start: float
+) -> list[str]:
+    """Rotate never-judged heads and order judged heads, with failures last."""
+    never_judged: list[str] = []
+    judged: list[tuple[bool, float, str]] = []
+    for sha in heads[:OPEN_PULLS_MAX]:
+        statuses = read_statuses(session, config.repository, sha)
+        newest = statuses.get(config.context)
+        if newest is None:
+            never_judged.append(sha)
             continue
-        pending.append((sha, statuses_map, _head_priority(statuses_map, context), order))
-    pending.sort(key=lambda row: (row[2], row[3]))
-    return [(sha, statuses_map) for sha, statuses_map, _, _ in pending[:max_targets]]
+        state = newest.get("state")
+        if state == "success":
+            session.out.write(f"{sha}: {config.context} already settled\n")
+            continue
+        judged.append((state == "failure", _status_timestamp(newest), sha))
+    if never_judged:
+        offset = int(start // 60) % len(never_judged)
+        never_judged = never_judged[offset:] + never_judged[:offset]
+    judged.sort(key=lambda row: (row[0], row[1]))
+    return (never_judged + [sha for _, _, sha in judged])[: config.max_targets]
 
 
-def _default_branch_head(session: ApiSession, repository: str) -> str:
-    """Head SHA of the repository default branch."""
+def _default_branch_head(session: ApiSession, repository: str) -> tuple[str, str]:
+    """Head SHA and name of the repository default branch."""
     repo = session.request_json("repository", f"repos/{repository}")
     if not isinstance(repo, dict):
         raise ApiFailureError("repository response was not an object")
@@ -1092,7 +1116,7 @@ def _default_branch_head(session: ApiSession, repository: str) -> str:
     sha = commit.get("sha")
     if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
         raise ApiFailureError("default branch commit has no sha")
-    return sha
+    return sha, branch
 
 
 def _sweep_deadline_passed(session: ApiSession, err: TextIO, what: str) -> bool:
@@ -1107,15 +1131,20 @@ def _sweep_deadline_passed(session: ApiSession, err: TextIO, what: str) -> bool:
 
 
 def _sweep_default_branch(
-    session: ApiSession, sweep_cfg: Config, default_sha: str, out: TextIO, err: TextIO
+    session: ApiSession,
+    sweep_cfg: Config,
+    default_head: tuple[str, str],
+    out: TextIO,
+    err: TextIO,
 ) -> int:
     """Judge the default branch head last, with the sweep's shared session."""
     if _sweep_deadline_passed(session, err, "the default branch"):
         return 1
-    default_cfg = Config(
-        **{**sweep_cfg.__dict__, "sha": default_sha, "event_name": "push", "ref": ""}
+    sha, branch = default_head
+    default_cfg = replace(
+        sweep_cfg, sha=sha, event_name="push", ref=f"refs/heads/{branch}", only_if_pending=True
     )
-    return 1 if evaluate_one(session, default_cfg, out, err) != 0 else 0
+    return evaluate_one(session, default_cfg, out, err)
 
 
 def run_sweep(
@@ -1128,53 +1157,40 @@ def run_sweep(
     err: TextIO = sys.stderr,
 ) -> int:
     """Judge open pull heads and the default branch head in one session."""
+    start = now()
     session = ApiSession(
-        deadline=now() + SESSION_DEADLINE_SECONDS,
+        deadline=start + SESSION_DEADLINE_SECONDS,
         now=now,
         sleep=sleep,
         transport=transport,
         out=out,
         max_api_calls=SWEEP_MAX_CALLS,
     )
-    sweep_cfg = Config(
-        **{**config.__dict__, "only_if_pending": True, "targets": TARGETS_OPEN_PULLS}
-    )
-    any_error = False
+    sweep_cfg = replace(config, only_if_pending=False, targets=TARGETS_OPEN_PULLS)
     try:
         heads = _open_pull_head_shas(session, config.repository)
-        to_eval = _sweep_evaluation_order(
-            session,
-            config.repository,
-            heads,
-            config.context,
-            config.max_targets,
-            out,
-        )
-        default_sha = _default_branch_head(session, config.repository)
+        to_eval = _sweep_evaluation_order(session, config, heads, start)
+        default_head = _default_branch_head(session, config.repository)
     except ApiCapReachedError as exc:
         return _warn_api_cap(err, exc)
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
         return 1
     pending = len(to_eval) + 1
-    for sha, statuses_map in to_eval:
+    for sha in to_eval[:MAX_TARGETS_MAX]:
         pending -= 1
         if _sweep_deadline_passed(session, err, sha):
             return 1
-        one = Config(**{**sweep_cfg.__dict__, "sha": sha, "event_name": "pull_request"})
-        result = evaluate_one(session, one, out, err, statuses_map=statuses_map)
-        if result != 0:
-            any_error = True
-            break
+        one = replace(sweep_cfg, sha=sha, event_name="pull_request")
+        if evaluate_one(session, one, out, err) != 0:
+            return 1
         if session.api_calls >= SWEEP_MAX_CALLS:
             err.write(
                 f"::warning::Sweep API call cap of {SWEEP_MAX_CALLS} reached; "
                 f"{pending} target(s) not judged.\n"
             )
             return 0
-    if any_error or session.api_calls >= SWEEP_MAX_CALLS:
-        return 1 if any_error else 0
-    return _sweep_default_branch(session, sweep_cfg, default_sha, out, err)
+    return _sweep_default_branch(session, sweep_cfg, default_head, out, err)
 
 
 def run_judge(
@@ -1232,34 +1248,32 @@ def _self_test_transport(
     workflow_runs: list[dict] | None = None,
     statuses: list[dict] | None = None,
     errors: list[forge.ResponseError] | None = None,
-    commit_date: str | None = None,
+    *,
+    posted_states: list[str] | None = None,
 ) -> Callable[..., tuple[int, dict[str, str], bytes]]:
     """Build an in-memory transport serving canned check-runs, workflow-runs and statuses."""
     pending_errors = list(errors or [])
     status_list = list(statuses or [])
-    posts: list[dict[str, str]] = []
-
-    def _base(path: str) -> str:
-        return path.split("?", 1)[0]
+    posts = [] if posted_states is None else posted_states
 
     def serve(
         path: str, *, method: str = "GET", fields: Mapping[str, str] | None = None, **_: object
     ):
         if method == "POST":
-            posts.append(dict(fields or {}))
-            return _ok_reply({"id": len(posts), "state": (fields or {}).get("state")})
+            state = (fields or {}).get("state", "")
+            posts.append(state)
+            return _ok_reply({"state": state})
         if pending_errors:
             raise pending_errors.pop(0)
-        base = _base(path)
+        base = path.split("?", 1)[0]
         if base.endswith("/check-runs"):
             return _ok_reply({"check_runs": check_runs})
         if "/actions/runs" in base:
             return _ok_reply({"workflow_runs": workflow_runs or []})
         if base.endswith("/statuses"):
             return _ok_reply(status_list)
-        if "/commits/" in base and "/check-runs" not in base:
-            date = commit_date or "2026-11-21T10:00:00Z"
-            return _ok_reply({"commit": {"committer": {"date": date}}})
+        if "/commits/" in base:
+            return _ok_reply({"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}})
         if base.endswith("/pulls"):
             return _ok_reply([])
         return _ok_reply(status_list)
@@ -1298,30 +1312,12 @@ def _decide_case(
     return decide(snapshot, config, now, snapshot.anchor)
 
 
-def _run_case_output(
-    config: Config,
-    *,
-    check_runs: list[dict],
-    workflow_runs: list[dict] | None = None,
-    statuses: list[dict] | None = None,
-    errors: list[forge.ResponseError] | None = None,
-    anchor_runs: list[dict] | None = None,
-) -> tuple[int, str]:
-    clock = _FakeClock(start=_iso_epoch("2026-11-21T12:00:00Z"))
-    sink = io.StringIO()
-    runs = workflow_runs if workflow_runs is not None else anchor_runs or []
-    transport = _self_test_transport(
-        check_runs, runs, statuses, errors, commit_date="2026-11-21T10:00:00Z"
-    )
-    rc = run_judge(
-        config,
-        transport=transport,
-        now=clock.now,
-        sleep=clock.sleep,
-        out=sink,
-        err=sink,
-    )
-    return rc, sink.getvalue()
+def _test_workflow_run(config: Config) -> dict:
+    return {
+        "check_suite_id": 1,
+        "event": config.event_name,
+        "head_branch": config.ref.removeprefix("refs/heads/"),
+    }
 
 
 def _run_case(
@@ -1331,36 +1327,46 @@ def _run_case(
     workflow_runs: list[dict] | None = None,
     statuses: list[dict] | None = None,
     errors: list[forge.ResponseError] | None = None,
-    anchor_runs: list[dict] | None = None,
+    expected_state: str | None = None,
 ) -> int:
-    rc, _ = _run_case_output(
+    clock = _FakeClock(start=_iso_epoch("2026-11-21T12:00:00Z"))
+    sink = io.StringIO()
+    runs = workflow_runs if workflow_runs is not None else [_test_workflow_run(config)]
+    posts: list[str] = []
+    transport = _self_test_transport(check_runs, runs, statuses, errors, posted_states=posts)
+    rc = run_judge(
         config,
-        check_runs=check_runs,
-        workflow_runs=workflow_runs,
-        statuses=statuses,
-        errors=errors,
-        anchor_runs=anchor_runs,
+        transport=transport,
+        now=clock.now,
+        sleep=clock.sleep,
+        out=sink,
+        err=sink,
     )
-    return rc
+    if rc != 0 or expected_state is None:
+        return rc
+    return int(posts != [expected_state])
 
 
-def _failure_verdict_case(
-    config: Config,
-    *,
-    check_runs: list[dict],
-    workflow_runs: list[dict] | None = None,
-    statuses: list[dict] | None = None,
-) -> int:
-    """Return 0 when the run exits cleanly and names a failure verdict line."""
-    rc, text = _run_case_output(
-        config,
-        check_runs=check_runs,
-        workflow_runs=workflow_runs,
-        statuses=statuses,
+def _self_test_success_case(base_kw: dict[str, str]) -> int:
+    config = parse_config(
+        RawInputs(
+            **base_kw,
+            required_json='["Build","Scan","Status","PR Gate","Optional"]',
+            pull_request_only_json='["PR Gate"]',
+            not_owed_json='["Optional"]',
+            apps_json='{"Scan":"code-scanning"}',
+        )
     )
-    if rc != 0 or f"{config.sha}:" not in text:
-        return 1
-    return 0
+    return _run_case(
+        config,
+        expected_state="success",
+        check_runs=[
+            _check_run(1, "Build", "success"),
+            _check_run(2, "Scan", "success", app="code-scanning"),
+            _check_run(3, "PR Gate", "skipped"),
+        ],
+        statuses=[{"id": 1, "context": "Status", "state": "success"}],
+    )
 
 
 def _self_test_outcome_cases(
@@ -1368,54 +1374,38 @@ def _self_test_outcome_cases(
 ) -> tuple[tuple[str, Callable[[], int], int], ...]:
     """Positive and negative self-test cases for check runs, apps and statuses."""
     kw = {**base_kw, "bound_minutes": 240}
+    build = parse_config(RawInputs(**kw, required_json='["Build"]'))
+    short_build = replace(build, bound_minutes=1)
     return (
-        (
-            "owed check and status pass",
-            lambda: _run_case(
-                parse_config(
-                    **kw,
-                    required_json='["Build","Scan","Status","PR Gate","Optional"]',
-                    pull_request_only_json='["PR Gate"]',
-                    not_owed_json='["Optional"]',
-                    apps_json='{"Scan":"code-scanning"}',
-                ),
-                check_runs=[
-                    _check_run(1, "Build", "success"),
-                    _check_run(2, "Scan", "success", app="code-scanning"),
-                    _check_run(3, "PR Gate", "skipped"),
-                ],
-                statuses=[{"id": 1, "context": "Status", "state": "success"}],
-            ),
-            0,
-        ),
+        ("owed check and status pass", lambda: _self_test_success_case(kw), 0),
         (
             "absent owed check fails",
-            lambda: _failure_verdict_case(
-                parse_config(**{**kw, "bound_minutes": 1}, required_json='["Build"]'),
-                check_runs=[],
-            ),
+            lambda: _run_case(short_build, expected_state="failure", check_runs=[]),
             0,
         ),
         (
             "skipped owed check fails",
-            lambda: _failure_verdict_case(
-                parse_config(**kw, required_json='["Build"]'),
+            lambda: _run_case(
+                build,
+                expected_state="failure",
                 check_runs=[_check_run(1, "Build", "skipped")],
             ),
             0,
         ),
         (
             "wrong app check run fails",
-            lambda: _failure_verdict_case(
-                parse_config(**{**kw, "bound_minutes": 1}, required_json='["Build"]'),
+            lambda: _run_case(
+                short_build,
+                expected_state="failure",
                 check_runs=[_check_run(1, "Build", "success", app="impostor-app")],
             ),
             0,
         ),
         (
             "failed commit status fails",
-            lambda: _failure_verdict_case(
-                parse_config(**kw, required_json='["External"]'),
+            lambda: _run_case(
+                parse_config(RawInputs(**kw, required_json='["External"]')),
+                expected_state="failure",
                 check_runs=[],
                 statuses=[{"id": 1, "context": "External", "state": "failure"}],
             ),
@@ -1433,7 +1423,8 @@ def _self_test_event_cases(
         (
             "other-event schedule failure ignored when own run succeeds",
             lambda: _run_case(
-                parse_config(**kw, required_json='["Build"]'),
+                parse_config(RawInputs(**kw, required_json='["Build"]')),
+                expected_state="success",
                 check_runs=[
                     _check_run(
                         1, "Build", "success", suite_id=10, started_at="2026-11-21T12:00:00Z"
@@ -1451,8 +1442,9 @@ def _self_test_event_cases(
         ),
         (
             "other-event schedule success does not satisfy owed check",
-            lambda: _failure_verdict_case(
-                parse_config(**{**kw, "bound_minutes": 1}, required_json='["Build"]'),
+            lambda: _run_case(
+                parse_config(RawInputs(**{**kw, "bound_minutes": 1}, required_json='["Build"]')),
+                expected_state="failure",
                 check_runs=[_check_run(2, "Build", "success", suite_id=20)],
                 workflow_runs=[
                     {"id": 20, "event": "schedule", "head_branch": "main", "check_suite_id": 20},
@@ -1475,7 +1467,7 @@ def _self_test_limit_cases(
         (
             "rate-limit wait within budget recovers",
             lambda: _run_case(
-                parse_config(**kw, required_json='["Build"]'),
+                parse_config(RawInputs(**kw, required_json='["Build"]')),
                 check_runs=[_check_run(1, "Build", "success")],
                 errors=[rl_err],
             ),
@@ -1484,7 +1476,7 @@ def _self_test_limit_cases(
         (
             "rate-limit wait over budget fails without judging",
             lambda: _run_case(
-                parse_config(**kw, required_json='["Build"]'),
+                parse_config(RawInputs(**kw, required_json='["Build"]')),
                 check_runs=[_check_run(1, "Build", "success")],
                 errors=[rl_err, rl_err, rl_err, rl_err],
             ),
@@ -1510,22 +1502,28 @@ def _self_test_pr_only_cases(
             "pull-request-only absent on push passes",
             lambda: _run_case(
                 parse_config(
-                    **base_kw,
-                    required_json='["Build","PR Gate"]',
-                    pull_request_only_json='["PR Gate"]',
+                    RawInputs(
+                        **base_kw,
+                        required_json='["Build","PR Gate"]',
+                        pull_request_only_json='["PR Gate"]',
+                    )
                 ),
+                expected_state="success",
                 check_runs=[_check_run(1, "Build", "success")],
             ),
             0,
         ),
         (
             "pull-request-only absent on pull_request_target fails",
-            lambda: _failure_verdict_case(
+            lambda: _run_case(
                 parse_config(
-                    **pr_target_kw,
-                    required_json='["Build","PR Gate"]',
-                    pull_request_only_json='["PR Gate"]',
+                    RawInputs(
+                        **pr_target_kw,
+                        required_json='["Build","PR Gate"]',
+                        pull_request_only_json='["PR Gate"]',
+                    )
                 ),
+                expected_state="failure",
                 check_runs=[_check_run(1, "Build", "success")],
             ),
             0,
@@ -1546,10 +1544,8 @@ def _self_test_vmafx_cases(
             clock = _FakeClock(start=_iso_epoch("2026-11-21T12:00:00Z"))
             merged = dict(base_kw)
             merged.update(sha=sha, required_json=json.dumps(names), bound_minutes=240)
-            cfg = parse_config(**merged)
-            transport = _self_test_transport(
-                checks, [], [], None, commit_date="2026-11-21T10:00:00Z"
-            )
+            cfg = parse_config(RawInputs(**merged))
+            transport = _self_test_transport(checks, [_test_workflow_run(cfg)])
             rc = run_judge(
                 cfg,
                 transport=transport,
@@ -1566,6 +1562,8 @@ def _self_test_vmafx_cases(
                 ),
                 cfg,
             )
+            if snap is None:
+                return False
             state, _ = decide(snap, cfg, clock.now(), snap.anchor)
             if state != "pending":
                 return False
@@ -1584,7 +1582,7 @@ def _self_test_decide_cases(
         by_name = {str(c["name"]): c for c in checks}
         return Snapshot(by_name, {}, (), anchor_val)
 
-    cfg = parse_config(**base_kw, required_json='["X","Y"]', bound_minutes=60)
+    cfg = parse_config(RawInputs(**base_kw, required_json='["X","Y"]', bound_minutes=60))
 
     def all_success() -> bool:
         state, _ = _decide_case(
@@ -1632,10 +1630,12 @@ def _self_test_foreign_app_decide_cases(
     """decide() at the bound when the only producer is a foreign app."""
     anchor = 1_700_000_000.0
     app_cfg = parse_config(
-        **base_kw,
-        required_json='["Scan"]',
-        apps_json='{"Scan":"code-scanning"}',
-        bound_minutes=60,
+        RawInputs(
+            **base_kw,
+            required_json='["Scan"]',
+            apps_json='{"Scan":"code-scanning"}',
+            bound_minutes=60,
+        )
     )
     empty = Snapshot({}, {}, (), anchor)
 
@@ -1745,35 +1745,40 @@ def main(
     prefix = "REQUIRED_CHECKS_"
     try:
         config = parse_config(
-            repository=_env_or(args.repository, environ, "REPOSITORY", ""),
-            event_name=_env_or(
-                args.event, environ, f"{prefix}EVENT", environ.get("EVENT_NAME", "")
-            ),
-            ref=_env_or(args.ref, environ, "REF", ""),
-            sha=_env_or(args.sha, environ, "SHA", ""),
-            commit_sha=environ.get("COMMIT_SHA", ""),
-            pr_head_sha=environ.get("PR_HEAD_SHA", ""),
-            required_json=_env_or(args.required, environ, "REQUIRED_JSON", ""),
-            pull_request_only_json=_env_or(
-                args.pull_request_only, environ, "PULL_REQUEST_ONLY_JSON", "[]"
-            ),
-            not_owed_json=_env_or(args.not_owed, environ, "NOT_OWED_JSON", "[]"),
-            apps_json=_env_or(args.apps, environ, "APPS_JSON", "{}"),
-            bound_minutes=_env_or(
-                args.bound_minutes, environ, f"{prefix}BOUND_MINUTES", str(BOUND_MINUTES_DEFAULT)
-            ),
-            context=_env_or(args.context, environ, f"{prefix}CONTEXT", DEFAULT_CONTEXT),
-            self_workflow=_env_or(
-                args.self_workflow, environ, f"{prefix}SELF_WORKFLOW", DEFAULT_SELF_WORKFLOW
-            ),
-            targets=_env_or(args.targets, environ, f"{prefix}TARGETS", TARGETS_SHA),
-            max_targets=_env_or(
-                args.max_targets, environ, f"{prefix}MAX_TARGETS", str(MAX_TARGETS_DEFAULT)
-            ),
-            only_if_pending=_env_or(
-                args.only_if_pending, environ, f"{prefix}ONLY_IF_PENDING", "false"
-            ),
-            target_url=_env_or(args.target_url, environ, f"{prefix}TARGET_URL", ""),
+            RawInputs(
+                repository=_env_or(args.repository, environ, "REPOSITORY", ""),
+                event_name=_env_or(
+                    args.event, environ, f"{prefix}EVENT", environ.get("EVENT_NAME", "")
+                ),
+                ref=_env_or(args.ref, environ, "REF", ""),
+                sha=_env_or(args.sha, environ, "SHA", ""),
+                commit_sha=environ.get("COMMIT_SHA", ""),
+                pr_head_sha=environ.get("PR_HEAD_SHA", ""),
+                required_json=_env_or(args.required, environ, "REQUIRED_JSON", ""),
+                pull_request_only_json=_env_or(
+                    args.pull_request_only, environ, "PULL_REQUEST_ONLY_JSON", "[]"
+                ),
+                not_owed_json=_env_or(args.not_owed, environ, "NOT_OWED_JSON", "[]"),
+                apps_json=_env_or(args.apps, environ, "APPS_JSON", "{}"),
+                bound_minutes=_env_or(
+                    args.bound_minutes,
+                    environ,
+                    f"{prefix}BOUND_MINUTES",
+                    str(BOUND_MINUTES_DEFAULT),
+                ),
+                context=_env_or(args.context, environ, f"{prefix}CONTEXT", DEFAULT_CONTEXT),
+                self_workflow=_env_or(
+                    args.self_workflow, environ, f"{prefix}SELF_WORKFLOW", DEFAULT_SELF_WORKFLOW
+                ),
+                targets=_env_or(args.targets, environ, f"{prefix}TARGETS", TARGETS_SHA),
+                max_targets=_env_or(
+                    args.max_targets, environ, f"{prefix}MAX_TARGETS", str(MAX_TARGETS_DEFAULT)
+                ),
+                only_if_pending=_env_or(
+                    args.only_if_pending, environ, f"{prefix}ONLY_IF_PENDING", "false"
+                ),
+                target_url=_env_or(args.target_url, environ, f"{prefix}TARGET_URL", ""),
+            )
         )
         config = _apply_workflow_ref(config, environ)
     except InputError as exc:

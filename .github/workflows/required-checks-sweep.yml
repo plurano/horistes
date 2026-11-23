@@ -19,7 +19,8 @@ on:
         type: string
         required: true
       pull-request-only:
-        description: JSON list of required contexts owed only on pull_request events.
+        description: >-
+          JSON list of required contexts owed only on pull_request, pull_request_target and merge_group events.
         type: string
         required: false
         default: "[]"

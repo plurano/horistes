@@ -11,8 +11,8 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Iterator
+from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +48,7 @@ from required_checks import (
 REPO = "plurano/horistes"
 SHA = "bfe95b5170e7e5e1e9681ea4d766c14d55e28851"
 SHA256 = "b" * 64
-CHECKS_URL = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=1"
+CHECKS_URL = f"repos/{REPO}/commits/{SHA}/check-runs?filter=all&per_page=100&page=1"
 RUNS_URL = f"repos/{REPO}/actions/runs?head_sha={SHA}&per_page=100&page=1"
 STATUSES_URL = f"repos/{REPO}/commits/{SHA}/statuses?per_page=100&page=1"
 WORKFLOW_PATH = ROOT / ".github/workflows/required-checks.yml"
@@ -158,48 +158,61 @@ def base_answers(
     }
 
 
+def _parse_config(**raw: Any) -> required_checks.Config:
+    return parse_config(required_checks.RawInputs(**raw))
+
+
+@dataclass(frozen=True)
+class JudgeOptions:
+    required: list[str] | tuple[str, ...] | str = ("Build",)
+    event: str = "push"
+    ref: str = "refs/heads/main"
+    pull_request_only: list[str] | tuple[str, ...] | str = ()
+    not_owed: list[str] | tuple[str, ...] | str = ()
+    apps: dict[str, str] | tuple[()] | str = ()
+    bound_minutes: int | str = BOUND_MINUTES_DEFAULT
+    only_if_pending: bool | str = False
+    runs: list[dict] | None = None
+
+
+def _fixture_json(value: list[str] | tuple[str, ...] | str) -> str:
+    return value if isinstance(value, str) else json.dumps(value)
+
+
 def invoke_with_forge(
     tree: Tree,
     monkeypatch: pytest.MonkeyPatch,
     answers: dict[str, object],
     *,
-    required: list[str] | str = ("Build",),
-    event: str = "push",
-    ref: str = "refs/heads/main",
-    pull_request_only: list[str] | str = (),
-    not_owed: list[str] | str = (),
-    apps: dict[str, str] | str = (),
-    bound_minutes: int | str = BOUND_MINUTES_DEFAULT,
-    only_if_pending: bool | str = False,
-    runs: list[dict] | None = None,
+    options: JudgeOptions | None = None,
 ) -> tuple[int, str, str, Clock]:
     """Run `run_judge` through `forge.request` backed by `conftest.FAKE_CLIENT`."""
+    if options is None:
+        options = JudgeOptions()
     answers = dict(answers)
-    if runs is not None:
-        answers[RUNS_URL] = {"workflow_runs": runs}
+    if options.runs is not None:
+        answers[RUNS_URL] = {"workflow_runs": options.runs}
     else:
         block = answers.get(RUNS_URL)
         listed = block.get("workflow_runs") if isinstance(block, dict) else None
         if not listed:
-            branch = "feat" if event in ("pull_request", "pull_request_target") else "main"
-            answers[RUNS_URL] = {"workflow_runs": [wf_run(1, event=event, head_branch=branch)]}
+            branch = "feat" if options.event in ("pull_request", "pull_request_target") else "main"
+            answers[RUNS_URL] = {
+                "workflow_runs": [wf_run(1, event=options.event, head_branch=branch)]
+            }
     for name, value in tree.forge(answers).items():
         monkeypatch.setenv(name, value)
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
-        event_name=event,
-        ref=ref,
+        event_name=options.event,
+        ref=options.ref,
         sha=SHA,
-        required_json=required if isinstance(required, str) else json.dumps(list(required)),
-        pull_request_only_json=(
-            pull_request_only
-            if isinstance(pull_request_only, str)
-            else json.dumps(list(pull_request_only))
-        ),
-        not_owed_json=not_owed if isinstance(not_owed, str) else json.dumps(list(not_owed)),
-        apps_json=apps if isinstance(apps, str) else json.dumps(dict(apps)),
-        bound_minutes=bound_minutes,
-        only_if_pending=only_if_pending,
+        required_json=_fixture_json(options.required),
+        pull_request_only_json=_fixture_json(options.pull_request_only),
+        not_owed_json=_fixture_json(options.not_owed),
+        apps_json=options.apps if isinstance(options.apps, str) else json.dumps(dict(options.apps)),
+        bound_minutes=options.bound_minutes,
+        only_if_pending=options.only_if_pending,
     )
     clock = Clock(start=required_checks._iso_epoch("2026-11-21T12:00:00Z"))
     out, err = io.StringIO(), io.StringIO()
@@ -318,12 +331,13 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
 
     script = str(isolated / "tools/required_checks.py")
     cmd_self = [sys.executable, "-I", "-B", script, "self-test"]
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed self-test argv
     done_self = subprocess.run(cmd_self, capture_output=True, text=True, check=False, timeout=30)
     assert done_self.returncode == 0, done_self.stdout + done_self.stderr
     assert all(line.startswith("ok ") for line in done_self.stdout.splitlines())
 
     fixture_tree = Tree(tmp_path / "forge-standin")
-    env = fixture_tree.forge(base_answers(checks=[check_item(1, "Gate", "success")]))
+    env = fixture_tree.forge(base_answers(checks=[check_item(1, "Gate")], runs=[wf_run(1)]))
     run_env = {
         **os.environ,
         **env,
@@ -334,6 +348,7 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
         "REQUIRED_JSON": '["Gate"]',
     }
     cmd_judge = [sys.executable, "-I", "-B", script, "judge"]
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed judge argv
     done_judge = subprocess.run(
         cmd_judge, capture_output=True, text=True, check=False, timeout=30, env=run_env
     )
@@ -341,6 +356,7 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
     assert "OK (success): Gate" in done_judge.stdout
 
     (isolated / "tools/results.py").unlink()
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed self-test argv
     broken = subprocess.run(cmd_self, capture_output=True, text=True, check=False, timeout=30)
     assert broken.returncode != 0
     assert "No module named 'results'" in broken.stderr
@@ -401,7 +417,7 @@ def test_self_test_passes_and_catches_planted_judge_defects(
 
 
 def test_parse_config_positive_and_boundaries() -> None:
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         event_name="pull_request",
         ref="refs/pull/12/merge",
@@ -421,7 +437,7 @@ def test_parse_config_positive_and_boundaries() -> None:
     assert cfg.bound_minutes == 1
 
     max_names = [f"check-{i}" for i in range(MAX_CONTEXTS)]
-    cfg_max = parse_config(
+    cfg_max = _parse_config(
         repository=REPO,
         event_name="push",
         commit_sha=SHA,
@@ -435,7 +451,7 @@ def test_parse_config_positive_and_boundaries() -> None:
     assert cfg_max.bound_minutes == 330
 
     for bound in (1, 330):
-        cfg_edge = parse_config(
+        cfg_edge = _parse_config(
             repository=REPO,
             event_name="push",
             sha=SHA,
@@ -513,7 +529,7 @@ def test_malformed_inputs_fail_before_polling(
     }
     kwargs.update(overrides)
     with pytest.raises(InputError, match=match):
-        parse_config(**kwargs)
+        _parse_config(**kwargs)
     assert tree.forge_calls() == []
 
 
@@ -584,8 +600,7 @@ def test_absent_and_still_running_owed_checks_fail_after_bound(
         tree,
         monkeypatch,
         base_answers(checks=[check_item(1, "Active", None)]),
-        required=["Active", "Missing"],
-        bound_minutes=1,
+        options=JudgeOptions(required=["Active", "Missing"], bound_minutes=1),
     )
     assert rc == 0
     assert clock.sleeps == []
@@ -607,8 +622,9 @@ def test_newest_check_run_and_app_slug_pinning(tree: Tree, monkeypatch: pytest.M
         tree,
         monkeypatch,
         base_answers(checks=checks),
-        required=["Build", "SameSecond", "CodeQL"],
-        apps={"CodeQL": "github-advanced-security"},
+        options=JudgeOptions(
+            required=["Build", "SameSecond", "CodeQL"], apps={"CodeQL": "github-advanced-security"}
+        ),
     )
     assert rc == 0, err
     assert "Build (other-app, expected github-actions)" in out
@@ -618,9 +634,9 @@ def test_newest_check_run_and_app_slug_pinning(tree: Tree, monkeypatch: pytest.M
         tree,
         monkeypatch,
         base_answers(checks=[check_item(8, "CodeQL", "success", app=None)]),
-        required=["CodeQL"],
-        apps={"CodeQL": "github-advanced-security"},
-        bound_minutes=1,
+        options=JudgeOptions(
+            required=["CodeQL"], apps={"CodeQL": "github-advanced-security"}, bound_minutes=1
+        ),
     )
     assert rc_bad == 0
     assert "CodeQL" in out_bad or "deadline" in out_bad
@@ -628,7 +644,7 @@ def test_newest_check_run_and_app_slug_pinning(tree: Tree, monkeypatch: pytest.M
 
 def test_foreign_app_logging_caps_at_twenty() -> None:
     names = [f"check-{i}" for i in range(22)]
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         event_name="push",
         sha=SHA,
@@ -637,7 +653,7 @@ def test_foreign_app_logging_caps_at_twenty() -> None:
     checks = [check_item(i, name, "success", app="foreign") for i, name in enumerate(names, 1)]
     checks += [check_item(100 + i, name, "success") for i, name in enumerate(names, 1)]
     by_name, ignored = required_checks.newest_check_runs(
-        checks, set(), cfg.apps, frozenset(cfg.required), cfg.context
+        checks, {1}, cfg.apps, frozenset(cfg.required), cfg.context
     )
     snap = required_checks.Snapshot(by_name, {}, ignored, 0.0)
     out = io.StringIO()
@@ -710,15 +726,14 @@ def test_foreign_workflow_runs_excluded_across_events(
         check_item(100 + s, "Gate", "failure", suite_id=s, started_at="2026-11-21T12:10:00Z")
         for s in foreign
     ]
-    rc, _, err, _ = invoke_with_forge(
+    rc, out, err, _ = invoke_with_forge(
         tree,
         monkeypatch,
         base_answers(checks=checks, runs=runs),
-        required=["Gate"],
-        event=event,
-        ref=ref,
+        options=JudgeOptions(required=["Gate"], event=event, ref=ref),
     )
     assert rc == 0, err
+    assert f"Posted success for required-checks on {SHA}" in out
 
 
 def test_commit_statuses_3d(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -728,7 +743,10 @@ def test_commit_statuses_3d(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None
         status_item(3, "ext/ci", "success", updated_at="2026-11-21T12:02:00Z"),
     ]
     rc, out, err, _ = invoke_with_forge(
-        tree, monkeypatch, base_answers(statuses=statuses), required=["ext/ci"]
+        tree,
+        monkeypatch,
+        base_answers(statuses=statuses),
+        options=JudgeOptions(required=["ext/ci"]),
     )
     assert rc == 0, err
     assert "OK (success): ext/ci" in out
@@ -738,8 +756,7 @@ def test_commit_statuses_3d(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None
             tree,
             monkeypatch,
             base_answers(statuses=[status_item(10, "ext/ci", bad_state)]),
-            required=["ext/ci"],
-            bound_minutes=1,
+            options=JudgeOptions(required=["ext/ci"], bound_minutes=1),
         )
         assert rc_bad == 0
         assert f"ext/ci: status {bad_state}" in out_bad
@@ -751,7 +768,7 @@ def test_commit_statuses_3d(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None
             checks=[check_item(1, "Dual", "success")],
             statuses=[status_item(2, "Dual", "failure")],
         ),
-        required=["Dual"],
+        options=JudgeOptions(required=["Dual"]),
     )
     assert rc_mixed == 0
     assert "Dual: status failure" in out_mixed
@@ -770,10 +787,12 @@ def test_pull_request_only_and_not_owed_pass_cases(
                 check_item(3, "Not-Owed-Skip", "skipped"),
             ]
         ),
-        required=["Build", "PR-Only", "PR-Absent", "Not-Owed-Skip", "Not-Owed-Absent"],
-        pull_request_only=["PR-Only", "PR-Absent"],
-        not_owed=["Not-Owed-Skip", "Not-Owed-Absent"],
-        event="push",
+        options=JudgeOptions(
+            required=["Build", "PR-Only", "PR-Absent", "Not-Owed-Skip", "Not-Owed-Absent"],
+            pull_request_only=["PR-Only", "PR-Absent"],
+            not_owed=["Not-Owed-Skip", "Not-Owed-Absent"],
+            event="push",
+        ),
     )
     assert rc == 0, err
     assert clock.sleeps == []
@@ -788,9 +807,9 @@ def test_pull_request_only_on_pr_and_failed_exemptions_fail(
         tree,
         monkeypatch,
         base_answers(checks=[check_item(1, "PR-Only", "skipped")]),
-        required=["PR-Only"],
-        pull_request_only=["PR-Only"],
-        event="pull_request",
+        options=JudgeOptions(
+            required=["PR-Only"], pull_request_only=["PR-Only"], event="pull_request"
+        ),
     )
     assert rc_pr == 0
     assert "PR-Only: skipped" in out_pr
@@ -801,8 +820,7 @@ def test_pull_request_only_on_pr_and_failed_exemptions_fail(
         base_answers(
             checks=[check_item(1, "Build", "success"), check_item(2, "Optional", "failure")]
         ),
-        required=["Build", "Optional"],
-        not_owed=["Optional"],
+        options=JudgeOptions(required=["Build", "Optional"], not_owed=["Optional"]),
     )
     assert rc_fail == 0
     assert "Optional: failure (ran although not owed)" in out_fail
@@ -814,15 +832,14 @@ def test_pull_request_only_on_pr_and_failed_exemptions_fail(
             checks=[check_item(1, "Build", "success")],
             statuses=[status_item(2, "Optional", "error")],
         ),
-        required=["Build", "Optional"],
-        not_owed=["Optional"],
+        options=JudgeOptions(required=["Build", "Optional"], not_owed=["Optional"]),
     )
     assert rc_sfail == 0
     assert "Optional: status error (reported although not owed)" in out_sfail
 
 
 def test_pull_request_target_sha_resolution_3d() -> None:
-    cfg_sha1 = parse_config(
+    cfg_sha1 = _parse_config(
         repository=REPO,
         event_name="pull_request_target",
         ref="refs/heads/main",
@@ -832,7 +849,7 @@ def test_pull_request_target_sha_resolution_3d() -> None:
     )
     assert cfg_sha1.sha == SHA
 
-    cfg_sha256 = parse_config(
+    cfg_sha256 = _parse_config(
         repository=REPO,
         event_name="pull_request_target",
         commit_sha="0" * 40,
@@ -841,7 +858,7 @@ def test_pull_request_target_sha_resolution_3d() -> None:
     )
     assert cfg_sha256.sha == SHA256
 
-    cfg_explicit = parse_config(
+    cfg_explicit = _parse_config(
         repository=REPO,
         event_name="pull_request_target",
         sha="f" * 40,
@@ -852,7 +869,7 @@ def test_pull_request_target_sha_resolution_3d() -> None:
     assert cfg_explicit.sha == "f" * 40
 
     with pytest.raises(InputError, match="sha: invalid commit SHA ''") as err_pr:
-        parse_config(
+        _parse_config(
             repository=REPO,
             event_name="pull_request",
             commit_sha=SHA,
@@ -861,7 +878,7 @@ def test_pull_request_target_sha_resolution_3d() -> None:
         )
     for empty_head in ("", "   "):
         with pytest.raises(InputError, match="sha: invalid commit SHA ''") as err_prt:
-            parse_config(
+            _parse_config(
                 repository=REPO,
                 event_name="pull_request_target",
                 commit_sha=SHA,
@@ -875,7 +892,8 @@ def test_pull_request_target_cli_and_pr_only_3d(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     answers = base_answers(
-        checks=[check_item(1, "Build", "success"), check_item(2, "PR-Only", "success")]
+        checks=[check_item(1, "Build", "success"), check_item(2, "PR-Only", "success")],
+        runs=[wf_run(1, "pull_request_target")],
     )
     forge_env = tree.forge(answers)
     for name, value in forge_env.items():
@@ -904,10 +922,12 @@ def test_pull_request_target_cli_and_pr_only_3d(
             tree,
             monkeypatch,
             base_answers(checks=[check_item(1, "Build", "success")]),
-            required=["Build", "PR-Only"],
-            pull_request_only=["PR-Only"],
-            event=pr_event,
-            bound_minutes=1,
+            options=JudgeOptions(
+                required=["Build", "PR-Only"],
+                pull_request_only=["PR-Only"],
+                event=pr_event,
+                bound_minutes=1,
+            ),
         )
         assert rc_abs == 0
         assert f"PR-Only: never reported on SHA {SHA}" in out_abs or "deadline" in out_abs
@@ -916,12 +936,15 @@ def test_pull_request_target_cli_and_pr_only_3d(
         tree,
         monkeypatch,
         base_answers(checks=[check_item(1, "Build", "success")]),
-        required=["Build", "PR-Only"],
-        pull_request_only=["PR-Only"],
-        event="merge_group",
+        options=JudgeOptions(
+            required=["Build", "PR-Only"],
+            pull_request_only=["PR-Only"],
+            event="merge_group",
+            bound_minutes=1,
+        ),
     )
     assert rc_mg == 0, err_mg
-    assert "OK (pull-request-only on merge_group): PR-Only" in out_mg
+    assert "deadline of 1 min passed; waiting on: PR-Only" in out_mg
 
 
 # ---------------------------------------------------------------------------
@@ -952,7 +975,7 @@ def test_transient_5xx_waits_at_most_three_backoffs_then_fails(
 def test_rate_limit_wait_modes_within_fixed_budget(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    start_epoch = 1_762_012_800
+    start_epoch = int(required_checks._iso_epoch("2026-11-21T12:00:00Z"))
     seq_headers = [
         {"http": 429, "headers": {"Retry-After": "45"}, "body": {"message": "slow down"}},
         {
@@ -969,8 +992,7 @@ def test_rate_limit_wait_modes_within_fixed_budget(
         tree, monkeypatch, base_answers(checks={"sequence": seq_headers})
     )
     assert rc == 0, err
-    assert clock.sleeps[:1] == [45]
-    assert sum(clock.sleeps) <= 300
+    assert clock.sleeps == [45, 25]
 
 
 def test_rate_limit_budget_and_deadline_bounds(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1042,13 +1064,15 @@ def test_one_shot_queued_checks_post_pending_without_sleep(
         tree,
         monkeypatch,
         answers,
-        required=["A", "B"],
-        bound_minutes=240,
+        options=JudgeOptions(required=["A", "B"], bound_minutes=240),
     )
     assert rc == 0, err
     assert clock.sleeps == []
-    assert "waiting on" in out or "Posted pending" in out
-    assert any("statuses" in call for call in tree.forge_calls())
+    assert f"Posted pending for required-checks on {SHA}" in out
+    target = f"repos/{REPO}/statuses/{SHA}"
+    assert target in tree.forge_calls()
+    calls = (tree.root / "forge.log").read_text(encoding="utf-8").splitlines()
+    assert any("POST" in line and target in line and "state=pending" in line for line in calls)
 
 
 def test_forge_request_parsing_and_cli_judge_end_to_end(
@@ -1111,7 +1135,7 @@ def test_forge_request_parsing_and_cli_judge_end_to_end(
 
 def test_decide_direct_outcomes() -> None:
     anchor = required_checks._iso_epoch("2026-11-21T10:00:00Z")
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         event_name="push",
         sha=SHA,
@@ -1142,7 +1166,7 @@ def test_decide_direct_outcomes() -> None:
     late_state, late_desc = decide(snap([check_item(1, "Other", None)]), cfg, anchor + 3601, anchor)
     assert late_state == "failure" and "deadline" in late_desc
 
-    pr_cfg = parse_config(
+    pr_cfg = _parse_config(
         repository=REPO,
         event_name="push",
         sha=SHA,
@@ -1160,17 +1184,20 @@ def test_self_exclusion_and_context_input(tree: Tree, monkeypatch: pytest.Monkey
         check_item(1, "required-checks", "failure", suite_id=self_suite),
         check_item(2, "Gate", "success", suite_id=10),
     ]
-    runs = [wf_run(1, suite_id=self_suite, path=required_checks.DEFAULT_SELF_WORKFLOW)]
+    runs = [
+        wf_run(1, suite_id=self_suite, path=required_checks.DEFAULT_SELF_WORKFLOW),
+        wf_run(2, suite_id=10),
+    ]
     rc, out, err, _ = invoke_with_forge(
         tree,
         monkeypatch,
         base_answers(checks=checks, runs=runs),
-        required=["Gate"],
+        options=JudgeOptions(required=["Gate"]),
     )
     assert rc == 0, err
     assert "All owed required checks reported success." in out
     with pytest.raises(InputError, match="required:"):
-        parse_config(
+        _parse_config(
             repository=REPO,
             event_name="push",
             sha=SHA,
@@ -1182,7 +1209,7 @@ def test_status_posting_records_post_and_skips_churn(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     anchor = required_checks._iso_epoch("2026-11-21T10:00:00Z")
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         event_name="push",
         sha=SHA,
@@ -1202,7 +1229,10 @@ def test_status_posting_records_post_and_skips_churn(
         STATUSES_URL: prior_success,
     }
     rc1, _, _, _ = invoke_with_forge(
-        tree, monkeypatch, pending_snapshot, required=["Build"], bound_minutes=240
+        tree,
+        monkeypatch,
+        pending_snapshot,
+        options=JudgeOptions(required=["Build"], bound_minutes=240),
     )
     assert rc1 == 0
     log = (tree.root / "forge.log").read_text(encoding="utf-8")
@@ -1218,8 +1248,7 @@ def test_status_posting_records_post_and_skips_churn(
         tree,
         monkeypatch,
         {**pending_snapshot, STATUSES_URL: [pending_status]},
-        required=["Build"],
-        bound_minutes=240,
+        options=JudgeOptions(required=["Build"], bound_minutes=240),
     )
     assert rc2 == 0
     assert "No status post" in out2
@@ -1232,7 +1261,7 @@ def test_only_if_pending_skips_check_runs_when_settled(
     answers = base_answers(statuses=statuses)
     answers[CHECKS_URL] = {"fail": "check-runs should not be read"}
     rc, out, _, _ = invoke_with_forge(
-        tree, monkeypatch, answers, required=["Build"], only_if_pending=True
+        tree, monkeypatch, answers, options=JudgeOptions(required=["Build"], only_if_pending=True)
     )
     assert rc == 0
     assert f"{SHA}: required-checks already settled" in out
@@ -1242,7 +1271,7 @@ def test_only_if_pending_skips_check_runs_when_settled(
 def test_target_url_https_only_and_http_omitted(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg_https = parse_config(
+    cfg_https = _parse_config(
         repository=REPO,
         event_name="push",
         sha=SHA,
@@ -1251,7 +1280,7 @@ def test_target_url_https_only_and_http_omitted(
     )
     assert cfg_https.target_url.startswith("https://")
     with pytest.raises(InputError, match="target-url"):
-        parse_config(
+        _parse_config(
             repository=REPO,
             event_name="push",
             sha=SHA,
@@ -1262,7 +1291,7 @@ def test_target_url_https_only_and_http_omitted(
         tree,
         monkeypatch,
         base_answers(checks=[check_item(1, "Build", "success")]),
-        required=["Build"],
+        options=JudgeOptions(required=["Build"]),
     )
     assert rc == 0
     log = (tree.root / "forge.log").read_text(encoding="utf-8")
@@ -1273,19 +1302,19 @@ def _statuses_get_count(calls: list[str]) -> int:
     return sum(1 for path in calls if "/commits/" in path and "/statuses" in path)
 
 
-def test_one_statuses_read_per_evaluated_sha(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_statuses_read_at_snapshot_and_prepost(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
     rc, _, err, _ = invoke_with_forge(
         tree,
         monkeypatch,
         base_answers(checks=[check_item(1, "Build", "success")]),
-        required=["Build"],
+        options=JudgeOptions(required=["Build"]),
     )
     assert rc == 0, err
-    assert _statuses_get_count(tree.forge_calls()) == 1
+    assert _statuses_get_count(tree.forge_calls()) == 2
 
 
 def test_parse_config_open_pulls_without_sha() -> None:
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         required_json='["Build"]',
         targets="open-pulls",
@@ -1296,7 +1325,7 @@ def test_parse_config_open_pulls_without_sha() -> None:
 
 def test_sha_mode_still_requires_valid_sha() -> None:
     with pytest.raises(InputError, match="sha: invalid commit SHA ''"):
-        parse_config(
+        _parse_config(
             repository=REPO,
             event_name="push",
             commit_sha="",
@@ -1312,19 +1341,19 @@ def test_failure_verdict_exits_zero_in_sha_mode(
         tree,
         monkeypatch,
         base_answers(checks=[check_item(1, "Build", "failure")]),
-        required=["Build"],
+        options=JudgeOptions(required=["Build"]),
     )
     assert rc == 0
     assert f"{SHA}:" in out
     assert "Build: failure" in out
     assert "Required checks did not pass" not in err
-    assert _statuses_get_count(tree.forge_calls()) == 1
+    assert _statuses_get_count(tree.forge_calls()) == 2
     assert "POST" in (tree.root / "forge.log").read_text(encoding="utf-8")
 
 
 def test_decide_foreign_app_only_at_bound() -> None:
     anchor = required_checks._iso_epoch("2026-11-21T10:00:00Z")
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         event_name="push",
         sha=SHA,
@@ -1362,7 +1391,8 @@ def _sweep_transport_factory(
         elif "/check-runs" in path:
             body = {"check_runs": [check_item(1, "Build", "failure")]}
         elif "/actions/runs" in path:
-            body = {"workflow_runs": [wf_run(1)]}
+            event = "push" if f"head_sha={'d' * 40}&" in path else "pull_request"
+            body = {"workflow_runs": [wf_run(1, event=event)]}
         elif path == f"repos/{REPO}":
             body = {"default_branch": "main"}
         elif path.endswith("/commits/main"):
@@ -1382,7 +1412,7 @@ def test_sweep_judges_all_unsettled_when_first_thirty_settled() -> None:
     heads = [f"{i:040x}" for i in range(1, 41)]
     settled = set(heads[:30])
     record: list[tuple[str, str]] = []
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         required_json='["Build"]',
         targets="open-pulls",
@@ -1404,13 +1434,13 @@ def test_sweep_judges_all_unsettled_when_first_thirty_settled() -> None:
     ]
     unsettled = [s for s in heads if s not in settled]
     assert all(s in checked for s in unsettled)
-    assert _statuses_get_count([p for _, p in record]) == len(heads) + 1
+    assert _statuses_get_count([p for _, p in record]) == len(heads) + 2 * (len(unsettled) + 1)
 
 
 def test_sweep_evaluates_never_judged_first_up_to_max_targets() -> None:
     heads = [f"{i:040x}" for i in range(1, 46)]
     record: list[tuple[str, str]] = []
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         required_json='["Build"]',
         targets="open-pulls",
@@ -1426,13 +1456,15 @@ def test_sweep_evaluates_never_judged_first_up_to_max_targets() -> None:
     )
     full_evals = [p.split("/commits/")[1].split("/")[0] for m, p in record if "/check-runs" in p]
     assert len(full_evals) == MAX_TARGETS_DEFAULT + 1
-    assert full_evals[:30] == heads[:30]
+    offset = int(1.0e9 // 60) % len(heads)
+    rotated = heads[offset:] + heads[:offset]
+    assert full_evals[:30] == rotated[:30]
 
 
 def test_sweep_caps_status_reads_and_evaluations_at_120_heads() -> None:
     heads = [f"{i:040x}" for i in range(1, 121)]
     record: list[tuple[str, str]] = []
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         required_json='["Build"]',
         targets="open-pulls",
@@ -1447,7 +1479,7 @@ def test_sweep_caps_status_reads_and_evaluations_at_120_heads() -> None:
         err=io.StringIO(),
     )
     paths = [p for _, p in record]
-    assert _statuses_get_count(paths) <= OPEN_PULLS_MAX + 1
+    assert _statuses_get_count(paths) <= OPEN_PULLS_MAX + 2 * (MAX_TARGETS_DEFAULT + 1)
     check_reads = sum(1 for p in paths if "/check-runs" in p)
     assert check_reads <= MAX_TARGETS_DEFAULT + 1
 
@@ -1534,13 +1566,16 @@ def _sweep_body(kind: str, path: str, heads: list[str], page_bound: bool) -> obj
     if kind == "open-pulls":
         return [{"head": {"sha": s}} for s in heads]
     if kind == "statuses":
-        full = [status_item(i, "ext", "pending") for i in range(forge.PER_PAGE)]
+        full = [
+            status_item(1, "required-checks", "pending", updated_at="2000-01-01T00:00:00Z"),
+            *(status_item(i, "ext", "pending") for i in range(2, forge.PER_PAGE + 1)),
+        ]
         rows = _sweep_page_rows(path, page_bound, required_checks.STATUS_MAX_PAGES, full)
         return [] if rows is None else rows
     if kind == "check-runs":
-        full = [check_item(i, "Build", "success") for i in range(forge.PER_PAGE)]
+        full = [check_item(i, "Build", "success", app="scan-app") for i in range(forge.PER_PAGE)]
         rows = _sweep_page_rows(path, page_bound, required_checks.CHECK_RUN_MAX_PAGES, full)
-        return {"check_runs": [check_item(1, "Build", "success")] if rows is None else rows}
+        return {"check_runs": [check_item(1, "Build", app="scan-app")] if rows is None else rows}
     if kind == "workflow-runs":
         full = [wf_run(i, path="other.yml", created_at="") for i in range(1, forge.PER_PAGE + 1)]
         rows = _sweep_page_rows(path, page_bound, required_checks.WORKFLOW_RUN_MAX_PAGES, full)
@@ -1552,15 +1587,22 @@ def _counting_sweep_transport(
     heads: list[str],
     *,
     page_bound: bool,
+    refresh_clock: Clock | None = None,
 ) -> tuple[Any, dict[str, int]]:
     """Stub forge for run_sweep that counts every call per kind, unknown calls under "other"."""
     counts = dict.fromkeys(SWEEP_CALL_KINDS, 0)
+    statuses_per_path: dict[str, int] = {}
 
     def transport(
         path: str, method: str = "GET", **kwargs: object
     ) -> tuple[int, dict[str, str], bytes]:
         kind = _classify_sweep_call(method, path)
         counts[kind] += 1
+        if kind == "statuses" and refresh_clock is not None:
+            statuses_per_path[path] = statuses_per_path.get(path, 0) + 1
+            prepost = 2 if f"/commits/{SWEEP_FIXED_BODIES['default-commit']['sha']}/" in path else 3
+            if statuses_per_path[path] == prepost:
+                refresh_clock.current += required_checks.POST_FRESH_SECONDS + 1
         if kind == "post":
             return 201, {}, json.dumps({"id": 1, "state": "pending"}).encode()
         return 200, {}, json.dumps(_sweep_body(kind, path, heads, page_bound)).encode()
@@ -1568,33 +1610,22 @@ def _counting_sweep_transport(
     return transport, counts
 
 
-@pytest.mark.parametrize(
-    ("page_bound", "expected_total"),
-    [
-        (
-            False,
-            1 + (OPEN_PULLS_MAX + 1) + 2 + (MAX_TARGETS_DEFAULT + 1) * 4,
-        ),
-        (
-            True,
-            required_checks.SWEEP_MAX_CALLS,
-        ),
-    ],
-)
-def test_sweep_transport_call_counts_measured_at_defaults(
-    page_bound: bool, expected_total: int
-) -> None:
-    heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
-    transport, counts = _counting_sweep_transport(heads, page_bound=page_bound)
-    cfg = parse_config(
+def _sweep_count_config() -> required_checks.Config:
+    return _parse_config(
         repository=REPO,
         required_json='["Build"]',
+        apps_json='{"Build":"scan-app"}',
         targets="open-pulls",
-        max_targets=MAX_TARGETS_DEFAULT,
     )
+
+
+@pytest.mark.parametrize("page_bound", [False, True])
+def test_sweep_transport_call_counts_measured_at_defaults(page_bound: bool) -> None:
+    heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
+    transport, counts = _counting_sweep_transport(heads, page_bound=page_bound)
     err = io.StringIO()
     rc = run_sweep(
-        cfg,
+        _sweep_count_config(),
         transport=transport,
         now=lambda: 1.0e9,
         sleep=lambda _: None,
@@ -1603,23 +1634,42 @@ def test_sweep_transport_call_counts_measured_at_defaults(
     )
     assert rc == 0, err.getvalue()
     assert "::error::" not in err.getvalue()
-    total = sum(counts.values())
+    assert "Sweep API call cap" in err.getvalue()
     assert counts["other"] == 0
-    assert total == expected_total
+    assert sum(counts.values()) == required_checks.SWEEP_MAX_CALLS
+    assert counts["open-pulls"] == 1
     if page_bound:
-        assert counts["open-pulls"] == 1
-        assert "Sweep API call cap" in err.getvalue()
-        assert total == required_checks.SWEEP_MAX_CALLS
+        assert counts["statuses"] == required_checks.SWEEP_MAX_CALLS - 1
+        assert counts["post"] == 0
     else:
-        assert counts["open-pulls"] == 1
-        assert counts["statuses"] == OPEN_PULLS_MAX + 1
-        assert counts["repository"] == 1
-        assert counts["default-commit"] == 1
-        eval_heads = MAX_TARGETS_DEFAULT + 1
-        assert counts["check-runs"] == eval_heads
-        assert counts["workflow-runs"] == eval_heads
-        assert counts["commit"] == eval_heads
-        assert counts["post"] == eval_heads
+        assert counts["check-runs"] == 25
+        assert counts["post"] == 24
+
+
+@pytest.mark.parametrize(
+    ("page_bound", "status_pages", "expected_total"), [(False, 1, 289), (True, 20, 3646)]
+)
+def test_sweep_capless_call_counts(
+    page_bound: bool, status_pages: int, expected_total: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", 10_000)
+    heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
+    transport, counts = _counting_sweep_transport(heads, page_bound=page_bound)
+    err = io.StringIO()
+    rc = run_sweep(
+        _sweep_count_config(),
+        transport=transport,
+        now=lambda: 1.0e9,
+        sleep=lambda _: None,
+        out=io.StringIO(),
+        err=err,
+    )
+    assert rc == 0, err.getvalue()
+    assert err.getvalue() == ""
+    assert sum(counts.values()) == expected_total
+    eval_heads = MAX_TARGETS_DEFAULT + 1
+    assert counts["statuses"] == (OPEN_PULLS_MAX + eval_heads) * status_pages + eval_heads
+    assert counts["post"] == counts["commit"] == eval_heads
 
 
 def _mixed_sweep_transport(
@@ -1642,7 +1692,8 @@ def _mixed_sweep_transport(
         elif "/check-runs" in path:
             body = {"check_runs": [check_item(1, "Build", "success")]}
         elif "/actions/runs" in path:
-            body = {"workflow_runs": [wf_run(1)]}
+            event = "push" if f"head_sha={'d' * 40}&" in path else "pull_request"
+            body = {"workflow_runs": [wf_run(1, event=event)]}
         elif path == f"repos/{REPO}":
             body = {"default_branch": "main"}
         elif path.endswith("/commits/main"):
@@ -1657,6 +1708,7 @@ def _mixed_sweep_transport(
 
 
 def test_sweep_settled_heads_skip_eval_slots_and_log_once() -> None:
+    start = required_checks._iso_epoch("2026-11-23T12:00:00Z")
     ctx = "required-checks"
     settled_old = [
         status_item(1, ctx, "success", updated_at="2026-11-20T10:00:00Z"),
@@ -1678,7 +1730,7 @@ def test_sweep_settled_heads_skip_eval_slots_and_log_once() -> None:
         heads[3]: pending_mid[0],
     }
     record: list[tuple[str, str]] = []
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         required_json='["Build"]',
         targets="open-pulls",
@@ -1688,7 +1740,7 @@ def test_sweep_settled_heads_skip_eval_slots_and_log_once() -> None:
     rc = run_sweep(
         cfg,
         transport=_mixed_sweep_transport(heads, status_by_sha, record=record),
-        now=lambda: 1.0e9,
+        now=lambda: start,
         sleep=lambda _: None,
         out=out,
         err=io.StringIO(),
@@ -1696,8 +1748,8 @@ def test_sweep_settled_heads_skip_eval_slots_and_log_once() -> None:
     assert rc == 0
     stdout = out.getvalue()
     assert stdout.count(f"{heads[0]}: {ctx} already settled") == 1
-    assert stdout.count(f"{heads[1]}: {ctx} already settled") == 1
-    settled_shas = {heads[0], heads[1]}
+    assert f"{heads[1]}: {ctx} already settled" not in stdout
+    settled_shas = {heads[0]}
     check_shas = {
         p.split("/commits/")[1].split("/")[0]
         for m, p in record
@@ -1710,6 +1762,7 @@ def test_sweep_settled_heads_skip_eval_slots_and_log_once() -> None:
 
 
 def test_sweep_pending_priority_orders_never_judged_before_oldest_judged() -> None:
+    start = required_checks._iso_epoch("2026-11-23T12:00:00Z")
     ctx = "required-checks"
     judged_newer = status_item(1, ctx, "pending", updated_at="2026-11-22T12:00:00Z")
     judged_older = status_item(2, ctx, "pending", updated_at="2026-11-22T11:00:00Z")
@@ -1719,7 +1772,7 @@ def test_sweep_pending_priority_orders_never_judged_before_oldest_judged() -> No
     pull_order = [heads[0], heads[1], heads[2], heads[3]]
     status_by_sha = {heads[0]: judged_newer, heads[1]: judged_older}
     record: list[tuple[str, str]] = []
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         required_json='["Build"]',
         targets="open-pulls",
@@ -1728,7 +1781,7 @@ def test_sweep_pending_priority_orders_never_judged_before_oldest_judged() -> No
     run_sweep(
         cfg,
         transport=_mixed_sweep_transport(pull_order, status_by_sha, record=record),
-        now=lambda: 1.0e9,
+        now=lambda: start,
         sleep=lambda _: None,
         out=io.StringIO(),
         err=io.StringIO(),
@@ -1738,13 +1791,15 @@ def test_sweep_pending_priority_orders_never_judged_before_oldest_judged() -> No
         for m, p in record
         if m == "GET" and "/check-runs" in p and p.split("/commits/")[1].split("/")[0] in heads
     ]
-    assert pull_checks == [heads[2], heads[3], heads[1]]
+    never_judged = [heads[2], heads[3]]
+    offset = int(start // 60) % len(never_judged)
+    assert pull_checks == never_judged[offset:] + never_judged[:offset] + [heads[1]]
     assert heads[0] not in pull_checks
 
     tie_record: list[tuple[str, str]] = []
     tie_heads = [f"{(i + 20):040x}" for i in range(1, 3)]
     tie_status = {tie_heads[0]: judged_tie_a, tie_heads[1]: judged_tie_b}
-    tie_cfg = parse_config(
+    tie_cfg = _parse_config(
         repository=REPO,
         required_json='["Build"]',
         targets="open-pulls",
@@ -1753,7 +1808,7 @@ def test_sweep_pending_priority_orders_never_judged_before_oldest_judged() -> No
     run_sweep(
         tie_cfg,
         transport=_mixed_sweep_transport(tie_heads, tie_status, record=tie_record),
-        now=lambda: 1.0e9,
+        now=lambda: start,
         sleep=lambda _: None,
         out=io.StringIO(),
         err=io.StringIO(),
@@ -1786,7 +1841,8 @@ def test_session_deadline_stops_sweep_and_passes_bounded_deadline() -> None:
         elif "/check-runs" in path:
             body = {"check_runs": [check_item(1, "Build", "success")]}
         elif "/actions/runs" in path:
-            body = {"workflow_runs": [wf_run(1)]}
+            event = "push" if f"head_sha={'d' * 40}&" in path else "pull_request"
+            body = {"workflow_runs": [wf_run(1, event=event)]}
         elif path == f"repos/{REPO}":
             body = {"default_branch": "main"}
         elif path.endswith("/commits/main"):
@@ -1798,7 +1854,7 @@ def test_session_deadline_stops_sweep_and_passes_bounded_deadline() -> None:
     def now() -> float:
         return tick[0]
 
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO, required_json='["Build"]', targets="open-pulls", max_targets=5
     )
     err = io.StringIO()
@@ -1819,8 +1875,8 @@ def test_sweep_open_pulls_and_default_branch(tree: Tree, monkeypatch: pytest.Mon
         CHECKS_URL.replace(SHA, SHA): {"check_runs": [check_item(1, "Build", "success")]},
         CHECKS_URL.replace(SHA, "c" * 40): {"check_runs": [check_item(2, "Build", "success")]},
         CHECKS_URL.replace(SHA, "d" * 40): {"check_runs": [check_item(3, "Build", "success")]},
-        RUNS_URL: {"workflow_runs": [wf_run(1)]},
-        RUNS_URL.replace(SHA, "c" * 40): {"workflow_runs": [wf_run(2)]},
+        RUNS_URL: {"workflow_runs": [wf_run(1, event="pull_request")]},
+        RUNS_URL.replace(SHA, "c" * 40): {"workflow_runs": [wf_run(2, event="pull_request")]},
         RUNS_URL.replace(SHA, "d" * 40): {"workflow_runs": [wf_run(3)]},
         STATUSES_URL: [],
         STATUSES_URL.replace(SHA, "c" * 40): [],
@@ -1829,7 +1885,7 @@ def test_sweep_open_pulls_and_default_branch(tree: Tree, monkeypatch: pytest.Mon
     }
     for path in (COMMIT_URL, COMMIT_URL.replace(SHA, "c" * 40), COMMIT_URL.replace(SHA, "d" * 40)):
         answers.setdefault(path, {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}})
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         event_name="push",
         sha=SHA,
@@ -1852,6 +1908,7 @@ def test_sweep_open_pulls_and_default_branch(tree: Tree, monkeypatch: pytest.Mon
 
 def test_forge_post_error_names_method(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail_post(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed POST argv
         return subprocess.CompletedProcess(
             args, 1, b"HTTP/2.0 502 Bad Gateway\r\n\r\n", b"gh: HTTP 502"
         )
@@ -1880,7 +1937,7 @@ def test_boundary_edge_cases_for_parsers_and_snapshot(
 
     over_apps = {f"c-{i}": "github-actions" for i in range(MAX_CONTEXTS + 1)}
     with pytest.raises(InputError, match="apps: 501 entries exceeds limit"):
-        parse_config(
+        _parse_config(
             repository=REPO,
             event_name="push",
             sha=SHA,
@@ -1903,8 +1960,7 @@ def test_boundary_edge_cases_for_parsers_and_snapshot(
         tree,
         monkeypatch,
         base_answers(checks=checks, statuses=statuses),
-        required=["Build", "Optional"],
-        not_owed=["Optional"],
+        options=JudgeOptions(required=["Build", "Optional"], not_owed=["Optional"]),
     )
     assert rc == 0, err
 
@@ -1941,9 +1997,9 @@ def test_last_tail_posts_success_after_four_gates(
             tree,
             monkeypatch,
             snap,
-            required=list(GATES),
-            event="pull_request",
-            ref="refs/pull/1/head",
+            options=JudgeOptions(
+                required=list(GATES), event="pull_request", ref="refs/pull/1/head"
+            ),
         )
         assert rc == 0, err
         log = (tree.root / "forge.log").read_text(encoding="utf-8")
@@ -1969,7 +2025,7 @@ def test_fork_tail_makes_no_api_calls(tmp_path: Path, monkeypatch: pytest.Monkey
         ),
         encoding="utf-8",
     )
-    cfg = parse_config(
+    cfg = _parse_config(
         repository=REPO,
         event_name="pull_request",
         sha=SHA,
@@ -2014,9 +2070,7 @@ def test_tail_sha_counts_own_gate_result_check_run(
         tree,
         monkeypatch,
         answers,
-        required=["Licence"],
-        event="pull_request",
-        ref="refs/pull/1/head",
+        options=JudgeOptions(required=["Licence"], event="pull_request", ref="refs/pull/1/head"),
     )
     assert rc == 0, err
     assert "OK (success): Licence" in out
@@ -2028,7 +2082,9 @@ def test_pending_posts_only_over_success(tree: Tree, monkeypatch: pytest.MonkeyP
     """T4: pending verdict posts only when the existing status is success."""
     queued = [check_item(1, "Build", None, status="queued")]
     over_none = base_answers(checks=queued)
-    rc0, _, err0, _ = invoke_with_forge(tree, monkeypatch, over_none, required=["Build"])
+    rc0, _, err0, _ = invoke_with_forge(
+        tree, monkeypatch, over_none, options=JudgeOptions(required=["Build"])
+    )
     assert rc0 == 0
     assert "POST" not in (tree.root / "forge.log").read_text(encoding="utf-8")
 
@@ -2036,262 +2092,621 @@ def test_pending_posts_only_over_success(tree: Tree, monkeypatch: pytest.MonkeyP
         **over_none,
         STATUSES_URL: [status_item(1, "required-checks", "success")],
     }
-    rc1, _, _, _ = invoke_with_forge(tree, monkeypatch, over_success, required=["Build"])
+    rc1, _, _, _ = invoke_with_forge(
+        tree, monkeypatch, over_success, options=JudgeOptions(required=["Build"])
+    )
     assert rc1 == 0
     assert "state=pending" in (tree.root / "forge.log").read_text(encoding="utf-8")
 
     over_failure = {**over_none, STATUSES_URL: [status_item(2, "required-checks", "failure")]}
-    rc2, out2, _, _ = invoke_with_forge(tree, monkeypatch, over_failure, required=["Build"])
+    rc2, out2, _, _ = invoke_with_forge(
+        tree, monkeypatch, over_failure, options=JudgeOptions(required=["Build"])
+    )
     assert rc2 == 0
     assert "Posted pending" not in out2
 
 
-def test_freshness_rereads_then_skips_stale_post(
-    tree: Tree, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """T5: stale snapshot read skips POST after one re-read."""
-    ticks = {"n": 0}
-    anchor = required_checks._iso_epoch("2026-11-21T12:00:00Z")
-
-    def stepped_now() -> float:
-        ticks["n"] += 1
-        return anchor + (ticks["n"] - 1) * (required_checks.POST_FRESH_SECONDS + 5)
-
-    answers = base_answers(checks=[check_item(1, "Gate", "success")])
-    for name, value in tree.forge(answers).items():
-        monkeypatch.setenv(name, value)
-    cfg = parse_config(
-        repository=REPO,
-        event_name="push",
-        sha=SHA,
-        required_json='["Gate"]',
-    )
-    err = io.StringIO()
-    rc = run_judge(cfg, now=stepped_now, sleep=lambda _: None, err=err, out=io.StringIO())
-    assert rc == 0
-    assert "Posting skipped" in err.getvalue()
-
-
-def _sweep_capless_totals(heads: list[str]) -> tuple[int, int, int]:
-    """Return total API calls, status posts, and setup calls for an uncapped sweep."""
-    saved = required_checks.SWEEP_MAX_CALLS
-    required_checks.SWEEP_MAX_CALLS = 10_000
-    transport, counts = _counting_sweep_transport(heads, page_bound=False)
-    cfg = parse_config(
-        repository=REPO,
-        required_json='["Build"]',
-        targets="open-pulls",
-        max_targets=MAX_TARGETS_DEFAULT,
-    )
-    try:
-        rc = run_sweep(
-            cfg,
-            transport=transport,
-            now=lambda: 1.0e9,
-            sleep=lambda _: None,
-            out=io.StringIO(),
-            err=io.StringIO(),
-        )
-        assert rc == 0
-        setup = 1 + len(heads) + 2
-        return sum(counts.values()), counts["post"], setup
-    finally:
-        required_checks.SWEEP_MAX_CALLS = saved
-
-
-def _sweep_posts_at_cap(cap: int, total: int, full_posts: int, setup: int) -> int:
-    """Status posts after a sweep stopped at `cap` calls (no post for a cut target)."""
-    if cap >= total:
-        return full_posts
-    if cap <= setup:
-        return 0
-    complete = (cap - setup) // 4
-    if cap == total - 1 and (cap - setup) % 4 == 0:
-        return min(full_posts, complete - 1)
-    return min(full_posts, complete)
-
-
-def test_sweep_api_cap_every_call_site(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every API call index from after open-pulls through a full sweep stops cleanly at the cap."""
+@pytest.mark.parametrize("refresh", [False, True], ids=["snapshot", "freshness-refresh"])
+def test_sweep_api_cap_every_call_site(refresh: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every call index stops at the cap, including preflight and refresh reads."""
     heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
-    total, full_posts, setup = _sweep_capless_totals(heads)
-    first_after_open_pulls = 2
-    caps = list(range(first_after_open_pulls, total))
-    cfg = parse_config(
-        repository=REPO,
-        required_json='["Build"]',
-        targets="open-pulls",
-        max_targets=MAX_TARGETS_DEFAULT,
-    )
-    for cap in caps:
+    setup_calls = 1 + len(heads) + 2
+    calls_per_eval = 11 if refresh else 6
+    eval_heads = MAX_TARGETS_DEFAULT + 1
+    complete_sweep_calls = setup_calls + calls_per_eval * eval_heads
+    for cap in range(2, complete_sweep_calls):
         monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
-        transport, counts = _counting_sweep_transport(heads, page_bound=False)
+        clock = Clock(1.0e9)
+        transport, counts = _counting_sweep_transport(
+            heads, page_bound=False, refresh_clock=clock if refresh else None
+        )
         err = io.StringIO()
         rc = run_sweep(
-            cfg,
+            _sweep_count_config(),
             transport=transport,
-            now=lambda: 1.0e9,
-            sleep=lambda _: None,
+            now=clock.now,
+            sleep=clock.sleep,
             out=io.StringIO(),
             err=err,
         )
         assert rc == 0, f"cap={cap}: {err.getvalue()}"
         assert "Sweep API call cap" in err.getvalue(), err.getvalue()
         assert sum(counts.values()) == cap
-        assert counts["post"] == _sweep_posts_at_cap(cap, total, full_posts, setup)
-
-
-@contextmanager
-def _sweep_refresh_clock() -> Iterator[Callable[[], float]]:
-    """Yield a sweep clock that triggers POST_FRESH refresh on every pull evaluation."""
-    base = 1.0e9
-    bump = float(required_checks.POST_FRESH_SECONDS + 1)
-    stale_gate = {"armed": False}
-    read_pass = {"n": 0}
-    real_read = required_checks._read_and_decide
-    real_evaluate = required_checks.evaluate_one
-
-    def now() -> float:
-        if stale_gate["armed"]:
-            stale_gate["armed"] = False
-            return base + bump
-        return base
-
-    def read_and_decide(
-        session: required_checks.ApiSession,
-        config: required_checks.Config,
-        statuses_map: Mapping[str, dict],
-        out: io.TextIO,
-        err: io.TextIO,
-    ) -> tuple[object, str, str, float] | None:
-        read_pass["n"] += 1
-        decided = real_read(session, config, statuses_map, out, err)
-        if decided is not None and read_pass["n"] % 2 == 1:
-            stale_gate["armed"] = True
-        return decided
-
-    def evaluate_one(
-        session: required_checks.ApiSession,
-        config: required_checks.Config,
-        out: io.TextIO,
-        err: io.TextIO,
-        *,
-        statuses_map: Mapping[str, dict] | None = None,
-    ) -> int:
-        read_pass["n"] = 0
-        return real_evaluate(session, config, out, err, statuses_map=statuses_map)
-
-    required_checks._read_and_decide = read_and_decide
-    required_checks.evaluate_one = evaluate_one
-    try:
-        yield now
-    finally:
-        required_checks._read_and_decide = real_read
-        required_checks.evaluate_one = real_evaluate
-
-
-def _sweep_refresh_capless_totals(heads: list[str]) -> tuple[int, int, int, int]:
-    """Totals for an uncapped sweep where every head does a POST_FRESH refresh read."""
-    saved = required_checks.SWEEP_MAX_CALLS
-    required_checks.SWEEP_MAX_CALLS = 10_000
-    transport, counts = _counting_sweep_transport(heads, page_bound=False)
-    cfg = parse_config(
-        repository=REPO,
-        required_json='["Build"]',
-        targets="open-pulls",
-        max_targets=MAX_TARGETS_DEFAULT,
-    )
-    err = io.StringIO()
-    try:
-        with _sweep_refresh_clock() as now:
-            rc = run_sweep(
-                cfg,
-                transport=transport,
-                now=now,
-                sleep=lambda _: None,
-                out=io.StringIO(),
-                err=err,
-            )
-        assert rc == 0, err.getvalue()
-        eval_heads = MAX_TARGETS_DEFAULT + 1
-        assert counts["check-runs"] == eval_heads * 2, counts
-        assert counts["workflow-runs"] == eval_heads * 2, counts
-        assert counts["commit"] == eval_heads * 2, counts
-        assert counts["post"] == eval_heads
-        setup = 1 + len(heads) + 2
-        return sum(counts.values()), counts["post"], setup, eval_heads
-    finally:
-        required_checks.SWEEP_MAX_CALLS = saved
-
-
-def _sweep_posts_at_refresh_cap(cap: int, total: int, full_posts: int, setup: int) -> int:
-    """Status posts after a refresh sweep stopped at `cap` (seven API calls per full eval)."""
-    calls_per_eval = 7
-    if cap >= total:
-        return full_posts
-    if cap <= setup:
-        return 0
-    complete = (cap - setup) // calls_per_eval
-    if cap == total - 1 and (cap - setup) % calls_per_eval == 0:
-        return min(full_posts, complete - 1)
-    return min(full_posts, complete)
-
-
-def test_sweep_api_cap_refresh_read_every_call_site(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Every API call index of a refresh sweep, refresh read included, stops cleanly at the cap."""
-    heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
-    total, full_posts, setup, eval_heads = _sweep_refresh_capless_totals(heads)
-    assert full_posts == eval_heads
-    first_after_open_pulls = 2
-    caps = list(range(first_after_open_pulls, total))
-    cfg = parse_config(
-        repository=REPO,
-        required_json='["Build"]',
-        targets="open-pulls",
-        max_targets=MAX_TARGETS_DEFAULT,
-    )
-    with _sweep_refresh_clock() as now:
-        for cap in caps:
-            monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
-            transport, counts = _counting_sweep_transport(heads, page_bound=False)
-            err = io.StringIO()
-            rc = run_sweep(
-                cfg,
-                transport=transport,
-                now=now,
-                sleep=lambda _: None,
-                out=io.StringIO(),
-                err=err,
-            )
-            assert rc == 0, f"cap={cap}: {err.getvalue()}"
-            assert "Sweep API call cap" in err.getvalue(), err.getvalue()
-            assert sum(counts.values()) == cap
-            assert counts["post"] == _sweep_posts_at_refresh_cap(cap, total, full_posts, setup)
+        assert counts["post"] == max(0, (cap - setup_calls) // calls_per_eval)
 
 
 def test_sweep_call_count_at_fourteen_open_pulls() -> None:
-    """D9: measured sweep at 14 open pull heads, one page per read."""
+    """Measured sweep at 14 open pull heads, one page per read and commit fallback."""
     heads = [f"{i:040x}" for i in range(1, 15)]
     transport, counts = _counting_sweep_transport(heads, page_bound=False)
-    cfg = parse_config(
-        repository=REPO,
-        required_json='["Build"]',
-        targets="open-pulls",
-        max_targets=MAX_TARGETS_DEFAULT,
-    )
+    err = io.StringIO()
     assert (
         run_sweep(
-            cfg,
+            _sweep_count_config(),
             transport=transport,
             now=lambda: 1.0e9,
             sleep=lambda _: None,
             out=io.StringIO(),
-            err=io.StringIO(),
+            err=err,
         )
         == 0
+    ), err.getvalue()
+    assert counts["post"] == 15
+    assert sum(counts.values()) == 107
+
+
+def test_forge_review_request_documents_explicit_post() -> None:
+    assert 'method="POST"' in (forge.request.__doc__ or "")
+
+
+@pytest.mark.parametrize("overflow", [False, True], ids=["exact-cap", "extra-row"])
+def test_forge_review_paged_confirms_overflow(overflow: bool) -> None:
+    calls: list[str] = []
+    first_page = [{"id": item} for item in range(forge.PER_PAGE)]
+    extra_page = [{"id": forge.PER_PAGE}] if overflow else []
+
+    def fetch(path: str) -> list[dict]:
+        calls.append(path)
+        return first_page if path.endswith("page=1") else extra_page
+
+    if overflow:
+        with pytest.raises(forge.ForgeError, match="more than 100 entries"):
+            forge.paged("listing", None, max_pages=1, fetch=fetch)
+    else:
+        assert forge.paged("listing", None, max_pages=1, fetch=fetch) == first_page
+    assert calls == ["listing?per_page=100&page=1", "listing?per_page=100&page=2"]
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "reset", "expected"),
+    [("1.5", "121", 26), ("30", "121", 30), ("0", "99", 5)],
+    ids=["reset-wins", "retry-after-wins", "past-reset"],
+)
+def test_forge_review_rate_limit_uses_larger_delay(
+    retry_after: str, reset: str, expected: int
+) -> None:
+    headers = {
+        "retry-after": retry_after,
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": reset,
+    }
+    assert forge.rate_limit_delay(403, headers, "", 0, 100.0) == expected
+
+
+def test_forge_review_subprocess_has_both_targeted_exceptions() -> None:
+    source = (ROOT / "tools/forge.py").read_text(encoding="utf-8")
+    ignore_word = "no" + "semgrep"
+    directive = re.search(
+        rf"# {ignore_word}: (.+) expires 2027-03-09 category D:[^\n]+\n\s*return subprocess\.run\(",
+        source,
     )
-    eval_heads = min(14, MAX_TARGETS_DEFAULT) + 1
-    expected = 1 + (14 + 1) + 2 + eval_heads * 4
-    assert sum(counts.values()) == expected
+    assert directive is not None
+    rules = {rule.strip() for rule in directive[1].split(",")}
+    assert rules == {
+        (
+            "python.lang.security.audit.dangerous-subprocess-use-tainted-env-args."
+            "dangerous-subprocess-use-tainted-env-args"
+        ),
+        "dangerous-subprocess-use-audit",
+    }
+
+
+# Review regressions use in-memory API replies so races and backoffs are deterministic.
+REVIEW_EPOCH = required_checks._iso_epoch("2026-11-21T12:00:00Z")
+REVIEW_POST_PATH = f"repos/{REPO}/statuses/{SHA}"
+
+
+class ReviewTransport:
+    def __init__(self) -> None:
+        self.answers: dict[str, object] = base_answers()
+        self.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build")]}
+        self.answers[RUNS_URL] = {"workflow_runs": [wf_run(1)]}
+        self.replies: dict[str, Iterator[object]] = {}
+        self.calls: list[tuple[str, str]] = []
+        self.posts: list[tuple[str, str]] = []
+        self.post_errors: Iterator[forge.ResponseError] = iter(())
+        self.clock = Clock(REVIEW_EPOCH)
+        self.advance_on_reply: dict[str, Iterator[int]] = {}
+
+    def __call__(
+        self, path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        self.calls.append((method, path))
+        if method == "POST":
+            self.posts.append((path, kwargs["fields"]["state"]))
+            error = next(self.post_errors, None)
+            if error is not None:
+                raise error
+            return 201, {}, b'{"id": 1}'
+        if "/check-runs?" in path and path not in self.answers and path not in self.replies:
+            path = path.replace("/check-runs?per_page=", "/check-runs?filter=all&per_page=")
+        answer = self.answers.get(path, [])
+        if path in self.replies:
+            answer = next(self.replies[path], answer)
+        if path in self.advance_on_reply:
+            seconds = next(self.advance_on_reply[path], 0)
+            self.clock.current += seconds
+        return 200, {}, json.dumps(answer).encode()
+
+
+def _review_config(**overrides: Any) -> required_checks.Config:
+    return _parse_config(
+        **{
+            "repository": REPO,
+            "event_name": "push",
+            "ref": "refs/heads/main",
+            "sha": SHA,
+            "required_json": '["Build"]',
+            **overrides,
+        }
+    )
+
+
+def _review_judge(transport: ReviewTransport, **overrides: Any) -> tuple[int, str, str, Clock]:
+    clock = transport.clock
+    out, err = io.StringIO(), io.StringIO()
+    rc = run_judge(
+        _review_config(**overrides),
+        transport=transport,
+        now=clock.now,
+        sleep=clock.sleep,
+        out=out,
+        err=err,
+    )
+    return rc, out.getvalue(), err.getvalue(), clock
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [("push", "success"), ("pull_request", "failure"), ("merge_group", "failure")],
+)
+def test_review_signoff_owed_on_proposal_events(event: str, expected: str) -> None:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": []}
+    rc, _, err, _ = _review_judge(
+        fake,
+        event_name=event,
+        required_json='["Sign-off"]',
+        bound_minutes=1,
+        pull_request_only_json='["Sign-off"]',
+    )
+    assert rc == 0, err
+    assert fake.posts == [(REVIEW_POST_PATH, expected)]
+
+
+@pytest.mark.parametrize("moves_twice", [False, True])
+def test_review_prepost_newer_self_status_refreshes_verdict(moves_twice: bool) -> None:
+    fake = ReviewTransport()
+    first = status_item(41, "required-checks", "failure", updated_at="2026-11-21T12:00:01Z")
+    latest = status_item(42, "required-checks", "failure", updated_at="2026-11-21T12:00:02Z")
+    fake.replies[STATUSES_URL] = iter([[], [first], [first], [latest if moves_twice else first]])
+    fake.advance_on_reply[STATUSES_URL] = iter([0, 1, 0, int(moves_twice)])
+    fake.replies[CHECKS_URL] = iter(
+        [
+            {"check_runs": [check_item(1, "Build")]},
+            {"check_runs": [check_item(2, "Build", "failure")]},
+        ]
+    )
+    rc, _, err, clock = _review_judge(fake)
+    assert rc == 0, err
+    assert clock.sleeps == []
+    assert fake.posts == ([] if moves_twice else [(REVIEW_POST_PATH, "failure")])
+    assert sum("/check-runs?" in path for _, path in fake.calls) == 2
+    if moves_twice:
+        assert "::warning::" in err
+
+
+@pytest.mark.parametrize(
+    ("app", "suite_id", "event", "expected"),
+    [
+        ("github-actions", 777, "push", "failure"),
+        ("github-actions", None, "push", "failure"),
+        ("github-actions", 1, "push", "success"),
+        ("scan-app", 1, "schedule", "success"),
+    ],
+)
+def test_review_actions_checks_require_eligible_suite(
+    app: str, suite_id: int | None, event: str, expected: str
+) -> None:
+    fake = ReviewTransport()
+    fake.answers[RUNS_URL] = {"workflow_runs": [wf_run(1, event)]}
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", app=app, suite_id=suite_id)]}
+    rc, out, err, _ = _review_judge(fake, bound_minutes=1, apps_json=json.dumps({"Build": app}))
+    assert rc == 0, err
+    assert fake.posts == [(REVIEW_POST_PATH, expected)]
+    if expected == "failure":
+        assert "deadline of 1 min passed; waiting on: Build" in out
+
+
+def test_review_full_workflow_listing_refuses_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ReviewTransport()
+    monkeypatch.setattr(required_checks, "WORKFLOW_RUN_MAX_PAGES", 1)
+    fake.answers[RUNS_URL] = {"workflow_runs": [wf_run(1)] * forge.PER_PAGE}
+    fake.answers[RUNS_URL.replace("page=1", "page=2")] = {"workflow_runs": []}
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 1
+    assert "::error::" in err and "workflow" in err and "cap" in err.lower()
+    assert fake.posts == []
+
+
+def test_review_requests_all_checks_to_find_eligible_run() -> None:
+    fake = ReviewTransport()
+    fake.answers[RUNS_URL] = {"workflow_runs": [wf_run(1), wf_run(2, "schedule", suite_id=2)]}
+    other_check = check_item(2, "Build", "failure", suite_id=2)
+    eligible = check_item(1, "Build")
+    fake.answers[CHECKS_URL.replace("filter=all&", "")] = {"check_runs": [other_check]}
+    fake.answers[CHECKS_URL] = {"check_runs": [other_check, eligible]}
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0, err
+    assert ("GET", CHECKS_URL) in fake.calls
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
+def test_review_foreign_and_self_runs_do_not_age_owed_checks() -> None:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", None)]}
+    fake.answers[RUNS_URL] = {
+        "workflow_runs": [
+            wf_run(1, created_at="2026-11-21T12:00:00Z"),
+            wf_run(2, "schedule", suite_id=2, created_at="2026-11-21T08:00:00Z"),
+            wf_run(
+                3,
+                suite_id=3,
+                created_at="2026-11-21T08:00:00Z",
+                path=required_checks.DEFAULT_SELF_WORKFLOW,
+            ),
+        ]
+    }
+    rc, _, err, _ = _review_judge(fake, bound_minutes=1)
+    assert rc == 0, err
+    assert fake.posts == []
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "state", "expected"),
+    [
+        ("failure", "pending", "failure"),
+        (None, "error", "failure"),
+        (None, "pending", "pending"),
+        ("success", "pending", "pending"),
+    ],
+)
+def test_review_terminal_failure_beats_pending_peer(
+    conclusion: str | None, state: str, expected: str
+) -> None:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", conclusion)]}
+    fake.answers[STATUSES_URL] = [
+        status_item(1, "Build", state),
+        status_item(2, "required-checks", "success"),
+    ]
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0, err
+    assert fake.posts == [(REVIEW_POST_PATH, expected)]
+
+
+@pytest.mark.parametrize(
+    ("error_status", "repeat", "wait", "expected_rc"),
+    [(502, False, 30, 0), (429, False, 20, 0), (502, True, 30, 1), (403, False, 0, 1)],
+)
+def test_review_post_retry_rereads_before_next_attempt(
+    error_status: int, repeat: bool, wait: int, expected_rc: int
+) -> None:
+    fake = ReviewTransport()
+    headers = {"retry-after": "20"} if error_status == 429 else {}
+    error = forge.ResponseError("write failed", status=error_status, headers=headers)
+    fake.post_errors = iter([error] * (2 if repeat else 1))
+    fake.replies[CHECKS_URL] = iter(
+        [
+            {"check_runs": [check_item(1, "Build")]},
+            {"check_runs": [check_item(2, "Build", "failure")]},
+        ]
+    )
+    rc, _, err, clock = _review_judge(fake)
+    assert clock.sleeps == ([wait] if wait else [])
+    expected_posts = [(REVIEW_POST_PATH, "success")]
+    if wait:
+        expected_posts.append((REVIEW_POST_PATH, "failure"))
+    assert fake.posts == expected_posts
+    assert rc == expected_rc, err
+    assert ("::error::" in err) == (expected_rc == 1)
+
+
+@pytest.mark.parametrize(("limit", "expected_attempts", "fails"), [(1, 1, True), (2, 2, False)])
+def test_review_api_cap_counts_failed_attempts(
+    limit: int, expected_attempts: int, fails: bool
+) -> None:
+    attempts = []
+    clock = Clock(REVIEW_EPOCH)
+
+    def read(path: str, **kwargs: object) -> tuple[int, dict[str, str], bytes]:
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise forge.ResponseError("read failed", status=502)
+        return 200, {}, b"[]"
+
+    session = ApiSession(
+        now=clock.now,
+        sleep=clock.sleep,
+        transport=read,
+        deadline=REVIEW_EPOCH + 120,
+        max_api_calls=limit,
+        out=io.StringIO(),
+    )
+    if fails:
+        with pytest.raises(required_checks.ApiCapReachedError):
+            session.request_json("statuses", STATUSES_URL)
+    else:
+        assert session.request_json("statuses", STATUSES_URL) == []
+    assert session.api_calls == len(attempts) == expected_attempts
+
+
+def _review_sweep_transport(
+    heads: list[str],
+    *,
+    app: str = "github-actions",
+    conclusion: str | None = "success",
+) -> ReviewTransport:
+    fake = ReviewTransport()
+    fake.answers.update(
+        {
+            f"repos/{REPO}/pulls?state=open&per_page=100": [
+                {"head": {"sha": sha}} for sha in heads
+            ],
+            f"repos/{REPO}": {"default_branch": "main"},
+            f"repos/{REPO}/commits/main": {"sha": SHA},
+        }
+    )
+    for sha in [*heads, SHA]:
+        fake.answers[CHECKS_URL.replace(SHA, sha)] = {
+            "check_runs": [check_item(1, "Build", conclusion, app=app)]
+        }
+        event = "push" if sha == SHA else "pull_request"
+        fake.answers[RUNS_URL.replace(SHA, sha)] = {"workflow_runs": [wf_run(1, event=event)]}
+        fake.answers[STATUSES_URL.replace(SHA, sha)] = []
+    return fake
+
+
+def _review_sweep(
+    fake: ReviewTransport, now: float = REVIEW_EPOCH, **overrides: Any
+) -> tuple[int, str]:
+    err = io.StringIO()
+    cfg = _review_config(targets="open-pulls", **overrides)
+    rc = run_sweep(
+        cfg, transport=fake, now=lambda: now, sleep=lambda _: None, out=io.StringIO(), err=err
+    )
+    return rc, err.getvalue()
+
+
+def test_review_sweep_reads_statuses_after_triage() -> None:
+    pull = "1" * 40
+    fake = _review_sweep_transport([pull])
+    owed = status_item(1, "Build", "failure")
+    fake.replies[STATUSES_URL.replace(SHA, pull)] = iter([[], [owed], [owed]])
+    rc, err = _review_sweep(fake)
+    assert rc == 0, err
+    assert (REVIEW_POST_PATH.replace(SHA, pull), "failure") in fake.posts
+
+
+def test_review_sweep_rechecks_failures_after_unsettled_heads() -> None:
+    first, second, waiting, success = ("1" * 40, "2" * 40, "3" * 40, "4" * 40)
+    fake = _review_sweep_transport([second, success, first, waiting], app="external")
+    for id_, sha, state in [(1, first, "failure"), (2, second, "failure"), (3, success, "success")]:
+        stamp = f"2026-11-21T10:00:0{id_}Z"
+        fake.answers[STATUSES_URL.replace(SHA, sha)] = [
+            status_item(id_, "required-checks", state, updated_at=stamp)
+        ]
+    rc, err = _review_sweep(fake, max_targets=2, apps_json='{"Build":"external"}')
+    assert rc == 0, err
+    pulls = [(path, state) for path, state in fake.posts if path != REVIEW_POST_PATH]
+    assert pulls == [(REVIEW_POST_PATH.replace(SHA, sha), "success") for sha in (waiting, first)]
+
+
+def test_review_sweep_rotates_thirty_one_waiting_heads() -> None:
+    heads = [f"{i:040x}" for i in range(1, 32)]
+    fake = _review_sweep_transport(heads, app="external", conclusion=None)
+    start = (int(REVIEW_EPOCH // 60) // len(heads)) * len(heads) * 60
+    for offset in (0, 1):
+        rc, err = _review_sweep(fake, start + offset * 60, apps_json='{"Build":"external"}')
+        assert rc == 0, err
+        paths = [path for method, path in fake.calls if method == "GET" and "/check-runs?" in path]
+        assert [path.split("/commits/")[1].split("/")[0] for path in paths[-31:-1]] == (
+            heads[offset : offset + 30]
+        )
+    assert fake.posts == []
+
+
+def test_review_default_branch_excludes_newer_release_push() -> None:
+    fake = _review_sweep_transport([])
+    fake.answers[RUNS_URL] = {
+        "workflow_runs": [
+            wf_run(1),
+            wf_run(2, suite_id=2, head_branch="release"),
+        ]
+    }
+    fake.answers[CHECKS_URL] = {
+        "check_runs": [
+            check_item(1, "Build", "failure"),
+            check_item(2, "Build", suite_id=2, started_at="2026-11-21T12:01:00Z"),
+        ]
+    }
+    rc, err = _review_sweep(fake)
+    assert rc == 0, err
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+
+
+@pytest.mark.parametrize("sweep", [False, True])
+def test_review_bad_status_shape_reports_api_error(sweep: bool) -> None:
+    fake = _review_sweep_transport([SHA])
+    fake.answers[STATUSES_URL] = {"wrong": []}
+    if sweep:
+        rc, err = _review_sweep(fake)
+    else:
+        rc, _, err, _ = _review_judge(fake)
+    assert rc == 1
+    assert "::error::" in err and "no list" in err
+    assert fake.posts == []
+
+
+@pytest.mark.parametrize("digits", ["0000001", "9" * 5_000], ids=["seven", "conversion-limit"])
+def test_review_oversized_integer_reports_invalid_input(digits: str) -> None:
+    out, err = io.StringIO(), io.StringIO()
+    rc = main(
+        ["judge", "--bound-minutes", digits],
+        env={
+            "REPOSITORY": REPO,
+            "EVENT_NAME": "push",
+            "COMMIT_SHA": SHA,
+            "REQUIRED_JSON": '["Build"]',
+        },
+        out=out,
+        err=err,
+    )
+    assert rc == 2
+    assert "Invalid required-checks input" in err.getvalue() and "bound-minutes" in err.getvalue()
+
+
+def test_review_positive_self_test_rejects_failure_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_decide = required_checks.decide
+
+    def replace_success(*args: Any) -> tuple[str, str]:
+        state, description = real_decide(*args)
+        return ("failure", "planted bad verdict") if state == "success" else (state, description)
+
+    monkeypatch.setattr(required_checks, "decide", replace_success)
+    out = io.StringIO()
+    assert self_test(out) == 1
+    assert "FAIL owed check and status pass" in out.getvalue()
+
+
+def test_review_tree_forge_calls_extracts_post_endpoint(tree: Tree) -> None:
+    get_arguments = ["api", "--include", STATUSES_URL]
+    post_arguments = ["api", "--include", "-X", "POST", REVIEW_POST_PATH, "-f", "state=pending"]
+    tree.write({"forge.log": "\n".join(map(json.dumps, [get_arguments, post_arguments])) + "\n"})
+    assert tree.forge_calls() == [STATUSES_URL, REVIEW_POST_PATH]
+
+
+def test_review_config_uses_frozen_raw_inputs() -> None:
+    raw_type = getattr(required_checks, "RawInputs", None)
+    assert raw_type is not None
+    raw: Any = raw_type(repository=REPO, event_name="push", sha=SHA, required_json='["Build"]')
+    assert parse_config(raw).required == ("Build",)
+    with pytest.raises(FrozenInstanceError):
+        raw.sha = SHA256
+
+
+def test_review_subprocess_audit_exceptions_cover_fixed_argv() -> None:
+    source = Path(__file__).read_text(encoding="utf-8").splitlines()
+    markers = ("subprocess." + "run(", "return subprocess." + "CompletedProcess(")
+    calls = [index for index, line in enumerate(source) if any(key in line for key in markers)]
+    assert len(calls) == 4
+    ignore_word = "no" + "semgrep"
+    for index in calls:
+        assert (
+            f"# {ignore_word}: dangerous-subprocess-use-audit expires 2027-03-13 category D:"
+            in source[index - 1]
+        )
+
+
+@pytest.mark.parametrize("elapsed", [10, 11])
+def test_freshness_rereads_then_skips_stale_post(elapsed: int) -> None:
+    fake = ReviewTransport()
+    fake.advance_on_reply[STATUSES_URL] = iter([0, elapsed, 0, elapsed])
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0, err
+    if elapsed == required_checks.POST_FRESH_SECONDS:
+        assert fake.posts == [(REVIEW_POST_PATH, "success")]
+    else:
+        assert "Posting skipped" in err
+        assert not fake.posts
+        assert sum("/check-runs?" in path for _, path in fake.calls) == 2
+
+
+def test_review_prepost_owed_status_change_refreshes_verdict() -> None:
+    fake = ReviewTransport()
+    previously = status_item(1, "Build")
+    latest = status_item(2, "Build", "failure", updated_at="2026-11-21T12:00:01Z")
+    fake.replies[STATUSES_URL] = iter([[previously], [latest], [latest], [latest]])
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0, err
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+
+
+def test_review_sweep_dedupes_failure_that_still_applies() -> None:
+    pull = "1" * 40
+    fake = _review_sweep_transport([pull], conclusion="failure")
+    existing = {
+        **status_item(1, "required-checks", "failure"),
+        "description": "Build: failure",
+    }
+    fake.answers[STATUSES_URL.replace(SHA, pull)] = [existing]
+    rc, err = _review_sweep(fake)
+    assert rc == 0, err
+    assert ("GET", CHECKS_URL.replace(SHA, pull)) in fake.calls
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+
+
+@pytest.mark.parametrize(
+    ("has_workflow_stamp", "post", "expected_calls"),
+    [(True, True, 5), (False, True, 6), (True, False, 3), (False, False, 4)],
+)
+def test_review_tail_call_count(has_workflow_stamp: bool, post: bool, expected_calls: int) -> None:
+    fake = ReviewTransport()
+    stamp = "2026-11-21T10:00:00Z" if has_workflow_stamp else ""
+    fake.answers[RUNS_URL] = {"workflow_runs": [wf_run(1, created_at=stamp)]}
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", "success" if post else None)]}
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0, err
+    assert fake.posts == ([(REVIEW_POST_PATH, "success")] if post else [])
+    assert len(fake.calls) == expected_calls
+
+
+def _review_judge_function(name: str) -> ast.FunctionDef:
+    source = (ROOT / "tools/required_checks.py").read_text(encoding="utf-8")
+    return next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def test_review_judge_function_limits() -> None:
+    source = (ROOT / "tools/required_checks.py").read_text(encoding="utf-8")
+    functions = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef)]
+    decisions = (ast.If, ast.IfExp, ast.For, ast.While, ast.ExceptHandler)
+    for function in functions:
+        branches = sum(isinstance(node, decisions) for node in ast.walk(function))
+        assert branches <= 9, function.name
+        assert function.end_lineno is not None
+        assert function.end_lineno - function.lineno + 1 <= 60, function.name
+
+
+def test_review_bool_parser_does_not_assign_token() -> None:
+    function = _review_judge_function("_parse_bool")
+    assert all(
+        node.id != "token"
+        for node in ast.walk(function)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    )

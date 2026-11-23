@@ -7,6 +7,7 @@ keeps it in .github/workflows/required-checks-caller.yml. It posts the
 required-checks commit status on fork pull requests, producers without a
 gating tail, and heads that missed a one-shot tail. Inputs come from
 .RequiredChecks; the reusable call is required-checks-sweep.yml (ADR-0108).
+The render context doubles apostrophes in each single-quoted JSON input.
 */ -%>
 # SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
 # SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>

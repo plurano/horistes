@@ -408,11 +408,11 @@ class Tree:
         }
 
     def forge_calls(self) -> list[str]:
-        """The path of every request the stand-in client received; anything but a GET fails."""
+        """The endpoint of each GET or POST request the stand-in client received."""
         log = self.root / "forge.log"
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         assert all(call[0] == "api" for call in calls), calls
-        return [call[-1] for call in calls]
+        return [call[call.index("-X") + 2] if "-X" in call else call[-1] for call in calls]
 
     def git(self, *args: str) -> str:
         """Run git with fixture identity, isolated environment and a timeout."""

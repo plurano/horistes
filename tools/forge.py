@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: EUPL-1.2
 """Reads the runs of a trial from the forge into the shape verdict.py judges.
 
-Every request is a GET through the forge's command-line client (`gh api`),
-so the reader changes nothing on the forge. It asks no host but the forge;
+The trial reader issues GET requests through the forge's command-line client
+(`gh api`). It asks no host but the forge;
 the download of an artifact is answered with a redirect to the forge's
 artifact storage, which the client follows. The client is taken from the
 environment variable GH when it is set.
@@ -110,8 +110,8 @@ def _gh_run(
     """Run one bounded `gh api` command and return its completed process."""
     command = [*shlex.split(os.environ.get("GH", "gh")), "api", *args]
     env = {**os.environ, "GH_TOKEN": token} if token is not None else None
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args, dangerous-subprocess-use-audit expires 2027-03-09 category D: direct gh api argv with no shell and a binary override for test stand-ins  # noqa: E501
     return subprocess.run(
-        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args expires 2027-03-09 category D: the GH variable picks the gh binary so tests run a stand-in  # noqa: E501
         command,
         capture_output=True,
         check=False,
@@ -210,7 +210,7 @@ def request(
     token: str | None = None,
     deadline: float = DEADLINE_SECONDS,
 ) -> tuple[int, dict[str, str], bytes]:
-    """One `gh api --include` call; GET by default, POST when `fields` are set."""
+    """One `gh api --include` call. Writes require explicit `method="POST"`."""
     if method not in ALLOWED_METHODS:
         raise ValueError(f"unsupported HTTP method {method!r}")
     args = ["--include", *HEADERS, "-X", method, path]
@@ -280,11 +280,13 @@ def rate_limit_delay(
     if not is_rate_limit(status, headers, message):
         return None
     retry_after = _finite_number(headers.get("retry-after"))
-    if retry_after is not None and retry_after >= 0:
-        return int(retry_after) if retry_after.is_integer() else retry_after
     reset = _finite_number(headers.get("x-ratelimit-reset"))
     if headers.get("x-ratelimit-remaining") == "0" and reset is not None:
-        return max(0, int(reset) - math.floor(now)) + 5
+        reset_delay = max(0, int(reset) - math.floor(now)) + 5
+        if retry_after is None or reset_delay >= retry_after:
+            return reset_delay
+    if retry_after is not None and retry_after >= 0:
+        return int(retry_after) if retry_after.is_integer() else retry_after
     return min(60 * (2**repeat), 960)
 
 
@@ -305,20 +307,22 @@ def paged(
 ) -> list[dict]:
     """Every entry of a listing; `key` names the list inside the answer, None when it is the answer.
 
-    A listing longer than `max_pages` pages is an error, never a silent cut.
+    One additional read distinguishes an exactly full listing from overflow.
     """
     reader = api if fetch is None else fetch
     entries: list[dict] = []
     joint = "&" if "?" in path else "?"
-    for page in range(1, max_pages + 1):
+    for page in range(1, max_pages + 2):
         answer = reader(f"{path}{joint}per_page={PER_PAGE}&page={page}")
         batch = answer.get(key) if key and isinstance(answer, dict) else answer
         if not isinstance(batch, list):
             raise ForgeError(f"GET {path}: no list{' ' + key if key else ''} in the answer")
+        if page > max_pages and batch:
+            raise ForgeError(f"GET {path}: more than {max_pages * PER_PAGE} entries")
         entries.extend(entry for entry in batch if isinstance(entry, dict))
         if len(batch) < PER_PAGE:
-            return entries
-    raise ForgeError(f"GET {path}: more than {max_pages * PER_PAGE} entries")
+            break
+    return entries
 
 
 def _time(value: object) -> datetime | None:

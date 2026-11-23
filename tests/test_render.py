@@ -10,6 +10,7 @@ some of it, and none of it is needed by a caller.
 
 from __future__ import annotations
 
+import json
 import sys
 
 import pytest
@@ -87,6 +88,9 @@ DRAFT_ERROR = (
 )
 TAIL_CONCURRENCY_GROUP = (
     "required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}"
+)
+RENDERED_REQUIRED = (
+    '["Licence", "Secret scan", "Sign-off", "Workflow check", "Developer\'\'s certificate"]'
 )
 RENDERED = f"""\
 # SPDX-FileCopyrightText: 2026 Owner <owner@example.org>
@@ -175,8 +179,8 @@ jobs:
     uses: owner/shared/.github/workflows/required-checks.yml@{COMMIT} # v1.2.3
     with:
       runner: ubuntu-26.04
-      required: '["Licence", "Secret scan", "Sign-off", "Workflow check"]'
-      pull-request-only: '[]'
+      required: '{RENDERED_REQUIRED}'
+      pull-request-only: '["Sign-off"]'
       not-owed: '[]'
       apps: '{{}}'
 """
@@ -305,6 +309,64 @@ def rendered_real_template(template=REAL):
 
 def test_licence_template_renders_into_the_recorded_caller():
     assert rendered_real_template() == RENDERED
+
+
+@pytest.mark.parametrize(
+    "template",
+    [REAL, "templates/callers/required-checks.yml.tmpl"],
+    ids=["licence", "sweep"],
+)
+def test_required_checks_quoted_json_round_trips(template):
+    name = "Developer's certificate"
+    inputs = {
+        "required": [name, "Issuer's review"],
+        "pull-request-only": [name],
+        "not-owed": ["Issuer's review"],
+        "apps": {name: "external-app"},
+    }
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {
+            field: json.dumps(inputs[key])
+            for field, key in zip(
+                ("Required", "PullRequestOnly", "NotOwed", "Apps"), inputs, strict=True
+            )
+        },
+    }
+    source = (ROOT / template).read_text(encoding="utf-8")
+    doc = ciwf.loads(render.render(source, context, template), template)
+    passed = doc["jobs"]["required-checks"]["with"]
+    assert {key: json.loads(passed[key]) for key in inputs} == inputs
+
+
+@pytest.mark.parametrize(
+    ("required", "override", "expected"),
+    [
+        (["Licence", "Sign-off"], {}, ["Sign-off"]),
+        (["Licence"], {}, []),
+        (["Licence", "Sign-off"], {"PullRequestOnly": '["Licence"]'}, ["Licence"]),
+    ],
+    ids=["proposal-only", "absent", "explicit-override"],
+)
+def test_rendered_sign_off_defaults_to_proposals(required, override, expected):
+    producer = "templates/callers/sign-off.yml.tmpl"
+    assert set(ciwf.triggers(ciwf.loads(rendered_real_template(producer), producer))) == {
+        "pull_request",
+        "merge_group",
+    }
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {
+            "Required": json.dumps(required),
+            "NotOwed": "[]",
+            "Apps": "{}",
+            **override,
+        },
+    }
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    doc = ciwf.loads(render.render(source, context, REAL), REAL)
+    passed = doc["jobs"]["required-checks"]["with"]
+    assert json.loads(passed["pull-request-only"]) == expected
 
 
 def test_scorecard_template_renders_into_the_recorded_caller():
@@ -468,6 +530,12 @@ PLANTED = [
         GOOD + f"  second:\n{USES}",
         "exactly one job",
         id="two-jobs",
+    ),
+    pytest.param(GOOD + "  stray: {}\n", "job `stray` is not classified", id="stray-job"),
+    pytest.param(
+        GOOD + "  required-checks: null\n",
+        "job `required-checks` is not classified",
+        id="malformed-tail",
     ),
     pytest.param(
         GOOD.replace("on:\n  pull_request:\n", "on: <% hostedGateOn %>\n"),
@@ -945,8 +1013,7 @@ CopyrightText = "2026 Owner <owner@example.org>"
 Identifier = "EUPL-1.2"
 
 [RequiredChecks]
-Required = '["Licence", "Secret scan", "Sign-off", "Workflow check"]'
-PullRequestOnly = "[]"
+Required = '''["Licence", "Secret scan", "Sign-off", "Workflow check", "Developer's certificate"]'''
 NotOwed = "[]"
 Apps = "{{}}"
 """

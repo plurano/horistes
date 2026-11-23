@@ -31,7 +31,6 @@ OWN_CONTEXT = {
             '["Python 3.12 floor", "Fuzz the result reader", "Verification gate", '
             '"CodeQL", "Licence", "Action pins", "Sign-off"]'
         ),
-        "PullRequestOnly": "[]",
         "NotOwed": "[]",
         "Apps": "{}",
     },
@@ -131,6 +130,12 @@ def test_own_caller_equals_rendered_template(template_path: str, own_path: str) 
         if own_path.endswith(("licence-check.yml", "sign-off-check.yml"))
         else render.SAMPLE
     )
+    if own_path.endswith("sign-off-check.yml"):
+        # This caller's tail only runs on proposal events.
+        context = {
+            **context,
+            "RequiredChecks": {**context["RequiredChecks"], "PullRequestOnly": "[]"},
+        }
     template_text = (ROOT / template_path).read_text(encoding="utf-8")
     rendered = render.render(template_text, context, template_path)
     own = (ROOT / own_path).read_text(encoding="utf-8")
@@ -172,6 +177,18 @@ def test_own_tail_required_matches_ruleset(own_path: str) -> None:
     tail = doc["jobs"]["required-checks"]
     listed = set(json.loads(tail["with"]["required"]))
     assert listed == _ruleset_required_contexts()
+
+
+@pytest.mark.parametrize(
+    "caller",
+    ["licence-check.yml", "required-checks-caller.yml"],
+    ids=["licence", "sweep"],
+)
+def test_own_licence_and_sweep_exempt_sign_off_on_push(caller: str) -> None:
+    doc = yaml.safe_load((ROOT / ".github/workflows" / caller).read_text(encoding="utf-8"))
+    inputs = doc["jobs"]["required-checks"]["with"]
+    assert "Sign-off" in json.loads(inputs["required"])
+    assert json.loads(inputs["pull-request-only"]) == ["Sign-off"]
 
 
 def test_comparable_equal_planted_cases() -> None:

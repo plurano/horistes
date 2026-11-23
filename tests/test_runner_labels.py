@@ -11,7 +11,7 @@ into one of those places.
 
 from __future__ import annotations
 
-import shlex
+import re
 import sys
 
 import pytest
@@ -77,9 +77,9 @@ def line_of(text: str, part: str) -> int:
     return text[: text.index(part)].count("\n") + 1
 
 
-def run(tree, workflow=GOOD, env=None):
+def run(tree, workflow=GOOD):
     tree.write({WORKFLOW: workflow})
-    return tree.tool("pins.py", "runners", env=env)
+    return tree.tool("pins.py", "runners")
 
 
 def test_workflow_on_releases_passes_whatever_its_names_and_commands_say(tree):
@@ -219,13 +219,15 @@ def test_value_shared_by_many_aliases_is_read_once(tree):
     assert f"{MATRIX}: `ubuntu-latest`" in done.stderr
 
 
-def test_check_starts_no_engine_and_asks_no_client(tree):
-    marker = tree.root / "started"
-    starts = shlex.join([sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"])
-    names = ("GH_TOKEN", "GITHUB_TOKEN", "ZIZMOR_GITHUB_TOKEN")
-    done = run(tree, env={"ZIZMOR": starts, "GH": starts, **dict.fromkeys(names, "")})
-    assert done.returncode == 0, done.stderr
-    assert not marker.exists()
+def test_check_starts_no_engine_and_asks_no_client(tree, monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("the runner-label check entered a client or engine path")
+
+    tree.write({WORKFLOW: GOOD})
+    for hook in ("_engine", "_run", "_token"):
+        monkeypatch.setattr(pins, hook, unexpected)
+    monkeypatch.setattr(sys, "argv", ["pins.py", "runners", "--root", str(tree.root)])
+    assert pins.main() == 0
 
 
 def test_action_file_chooses_no_machine_and_is_not_read(tree):
@@ -330,7 +332,7 @@ def test_caller_passing_pinned_runner_is_accepted_and_floating_label_is_refused(
             ".github/workflows/sign-off-check.yml",
         ),
         (
-            ".github/workflows/required-checks.yml",
+            ".github/workflows/required-checks-sweep.yml",
             "templates/callers/required-checks.yml.tmpl",
             ".github/workflows/required-checks-caller.yml",
         ),
@@ -351,13 +353,19 @@ def test_caller_without_runner_input_relies_on_pinned_workflow_default(
     # A caller omitting the runner input passes while the workflow default is pinned.
     tmpl = (ROOT / template_file).read_text(encoding="utf-8")
     caller = render.render(tmpl, render.SAMPLE, template_file)
-    only_runner = f"    with:\n      runner: {default}\n"
-    without_runner = (
-        caller.replace(f"      runner: {default}\n", "")
-        if f"{only_runner}      " in caller
-        else caller.replace(only_runner, "")
+    jobs = ciwf.loads(caller, template_file)["jobs"]
+    assert any(job.get("uses", "").split("@")[0].endswith(workflow_file) for job in jobs.values())
+    runner_line = re.escape(f"      runner: {default}\n")
+    without_runner = re.sub(
+        rf"^    with:\n{runner_line}(?!      )|^{runner_line}", "", caller, flags=re.MULTILINE
     )
     assert without_runner != caller
+    for key, job in ciwf.loads(without_runner, caller_file)["jobs"].items():
+        expected = {
+            name: value for name, value in jobs[key].get("with", {}).items() if name != "runner"
+        }
+        assert job.get("with", {}) == expected
+        assert ("with" in job) == bool(expected)
     workflow_text = workflow_path.read_text(encoding="utf-8")
     tree.write(
         {

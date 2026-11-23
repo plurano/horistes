@@ -17,6 +17,9 @@ outside it, this tool reads the part of that syntax a thin caller needs:
 Anything else between the delimiters (a function, a pipeline, a condition) is
 refused, and so is a field the context does not hold. The context of `render`
 is a TOML file; `check` renders every template with the sample context below.
+The four `.RequiredChecks` values are JSON text inserted into single-quoted
+YAML, so the render context doubles apostrophes on output. If `PullRequestOnly`
+is omitted, it includes `Sign-off` when `Required` names that check.
 
 `check` then reads the result as a workflow: its one calling job must call a
 workflow file of this repository by a full commit id, pass only inputs that
@@ -37,6 +40,7 @@ Exit codes: 0 pass, 1 a template fails the check, 3 input error.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import tomllib
@@ -87,6 +91,14 @@ TAIL_WITH = (
     "not-owed",
     "apps",
 )
+REQUIRED_CHECK_FIELDS = frozenset(
+    {
+        ".RequiredChecks.Required",
+        ".RequiredChecks.PullRequestOnly",
+        ".RequiredChecks.NotOwed",
+        ".RequiredChecks.Apps",
+    }
+)
 WS_FOLD = re.compile(r"\s+")
 STEP_KEYS = ("if", "name", "run", "shell")
 ECHO = re.compile(r'echo "[^"$`\\]*"')
@@ -106,8 +118,9 @@ SAMPLE = {
         "Identifier": "EUPL-1.2",
     },
     "RequiredChecks": {
-        "Required": '["Licence", "Secret scan", "Sign-off", "Workflow check"]',
-        "PullRequestOnly": "[]",
+        "Required": json.dumps(
+            ["Licence", "Secret scan", "Sign-off", "Workflow check", "Developer's certificate"]
+        ),
         "NotOwed": "[]",
         "Apps": "{}",
     },
@@ -119,11 +132,29 @@ HEADER = (
 )
 
 
+def _default_pull_request_only(fields: dict, where: str) -> str:
+    """Default Sign-off to proposals because its caller has no push trigger."""
+    required = fields.get("Required")
+    if not isinstance(required, str):
+        raise ciwf.ReadError(f"{where}: .RequiredChecks.Required must be a JSON list")
+    try:
+        names = json.loads(required)
+    except json.JSONDecodeError as err:
+        raise ciwf.ReadError(f"{where}: invalid .RequiredChecks.Required JSON: {err}") from err
+    if not isinstance(names, list):
+        raise ciwf.ReadError(f"{where}: .RequiredChecks.Required must be a JSON list")
+    return '["Sign-off"]' if "Sign-off" in names else "[]"
+
+
 def _value(name: str, context: dict, where: str) -> str:
     """The text of one field of the context, as the engine prints it."""
     node: object = context
     for part in name[1:].split("."):
-        if not isinstance(node, dict) or part not in node:
+        if not isinstance(node, dict):
+            raise ciwf.ReadError(f"{where}: the context holds no field {name}")
+        if part not in node:
+            if part == "PullRequestOnly" and name == ".RequiredChecks.PullRequestOnly":
+                return _default_pull_request_only(node, where)
             raise ciwf.ReadError(f"{where}: the context holds no field {name}")
         node = node[part]
     if isinstance(node, bool):
@@ -165,7 +196,10 @@ def _action(text: str, start: int, context: dict, where: str) -> tuple[str, int,
             f"{where}: `{LEFT} {body} {RIGHT}` is neither a field nor a note; this tool renders "
             f"nothing else, the engine will ({ENGINE_ISSUE})"
         )
-    return _value(body, context, where), end + len(RIGHT), trim_before, trim_after
+    value = _value(body, context, where)
+    if body in REQUIRED_CHECK_FIELDS:
+        value = value.replace("'", "''")
+    return value, end + len(RIGHT), trim_before, trim_after
 
 
 def render(text: str, context: dict, name: str) -> str:
@@ -501,7 +535,7 @@ def caller_problems(text: str, root: Path) -> list[str]:
         if key == RESULT:
             continue
         if isinstance(job, dict) and "steps" in job and "uses" not in job:
-            return ["the job has steps of its own; a caller only calls"]
+            return [f"job `{key}` has steps of its own; a caller only calls"]
     raw_tail = jobs.get(TAIL)
     tail = (
         raw_tail
@@ -527,12 +561,12 @@ def caller_problems(text: str, root: Path) -> list[str]:
         return ["the caller holds more than one required-checks tail"]
     if isinstance(raw_tail, dict) and raw_tail.get("needs") == RESULT and tail is None:
         return [f"job `{TAIL}` is not a reusable workflow call"]
-    job = jobs[gate_keys[0]]
-    if "steps" in job:
-        return ["the job has steps of its own; a caller only calls"]
-    problems = _job_problems(job, doc, root)
+    gate_key = gate_keys[0]
+    classified = {gate_key, RESULT} if tail is None else {gate_key, RESULT, TAIL}
+    problems = [f"job `{key}` is not classified" for key in jobs if key not in classified]
+    problems += _job_problems(jobs[gate_key], doc, root)
     problems += _caller_tail_problems(tail, jobs, doc, root)
-    problems += _result_problems(jobs, gate_keys[0], doc)
+    problems += _result_problems(jobs, gate_key, doc)
     if not text.startswith(HEADER):
         problems.append("the rendered caller does not start with the two SPDX header lines")
     if f"@{SAMPLE['Shared']['Commit']} # {SAMPLE['Shared']['Version']}\n" not in text:
