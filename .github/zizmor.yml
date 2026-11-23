@@ -14,4 +14,4 @@ rules:
       - scorecard-check.yml # expires 2026-12-31 category D: actionlint refuses the `$/` form
       - secret-scan.yml # expires 2026-12-31 category D: the path is our checkout; `$/` names the caller
       - sign-off-check.yml # expires 2026-12-31 category D: actionlint refuses the `$/` form
-      - required-checks-caller.yml # expires 2027-03-22 category D: actionlint refuses the `$/` form
+      - required-checks-caller.yml # expires 2026-12-31 category D: actionlint refuses the `$/` form
