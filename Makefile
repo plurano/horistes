@@ -191,7 +191,7 @@ test: tools
 	esac
 	data=$$(mktemp -d) && \
 	trap 'rm -rf "$$data"' EXIT && \
-	PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
+	PYTHONDONTWRITEBYTECODE=1 PYTHONOPTIMIZE= PYTEST_ADDOPTS= ACTIONLINT="$(ACTIONLINT)" ZIZMOR="$(BIN)/zizmor" REUSE="$(BIN)/reuse" GITLEAKS="$(GITLEAKS)" \
 		YAMLLINT="$(BIN)/yamllint" RUFF="$(BIN)/ruff" LEFTHOOK_BIN="$(BIN)/lefthook" \
 		$(BIN)/python -X dev -B -m coverage run --rcfile=pyproject.toml --data-file="$$data/.coverage" -m pytest -n auto --maxprocesses=$(TEST_WORKERS) --junitxml="$$data/junit.xml" && \
 	$(BIN)/python -B tools/suite_minutes.py check "$$data/junit.xml" --budget-seconds $(TEST_BUDGET_SECONDS) && \
