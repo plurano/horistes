@@ -193,8 +193,10 @@ def _probe_coverage_run(tmp_path: Path, cleared: bool, inherited: dict[str, str]
     assert done.returncode == 0, done.stdout + done.stderr
     log = (tmp_path / "probe.jsonl").read_text(encoding="utf-8").splitlines()
     calls = [json.loads(line) for line in log]
-    assert len(calls) == 4, calls
-    steps = [call["argv"][call["argv"].index("coverage") + 1] for call in calls]
+    assert len(calls) == 5, calls
+    coverage_calls = [call for call in calls if "coverage" in call["argv"]]
+    assert len(coverage_calls) == 4, coverage_calls
+    steps = [call["argv"][call["argv"].index("coverage") + 1] for call in coverage_calls]
     assert steps == ["run", "combine", "report", "report"], calls
     assert calls[0]["argv"][:2] == ["-X", "dev"], calls
     return calls[0]
