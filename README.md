@@ -69,7 +69,7 @@ pins a full commit of the default branch
 | `.github/workflows/secret-scan.yml` | scan of the caller's full history with Gitleaks on fingerprint-scoped exceptions that expire (`.gitleaksignore`), self-tested on planted keys first ([ADR-0055](docs/adr/0055-a-shared-secret-scan-keeps-dated-exceptions.md)) | `runner` (label, default `ubuntu-26.04`, the newest working image) | `<calling job> / Secret scan` | none |
 | `.github/workflows/sign-off.yml` | each pull-request commit has a sign-off matching its author name and email, with bot and clean merge exemptions ([ADR-0095](docs/adr/0095-pull-requests-check-the-full-sign-off-ident.md)) | `runner` (label, default `ubuntu-26.04`) | `<calling job> / Sign-off` | none |
 | `.github/workflows/workflow-check.yml` | lint of the caller's workflows with actionlint and pin check of outside actions and called workflows with zizmor ([ADR-0057](docs/adr/0057-a-shared-workflow-check.md)) | `runner` (label, default `ubuntu-26.04`, the newest working image) | `<calling job> / Workflow check` | `pypi.org`, `files.pythonhosted.org` until 2027-01-20 ([ADR-0005](docs/adr/0005-host-exception-with-an-end.md), [ADR-0057](docs/adr/0057-a-shared-workflow-check.md)); the zizmor and PyYAML wheels are hash-pinned |
-| `.github/workflows/scorecard.yml` | the supply-chain checks of the OpenSSF Scorecard action, reported to code scanning and kept as the artifact `scorecard-result` | `outside_hosts` (boolean, default false: the run fails, [ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)); `publish` (boolean, default false) | `<calling job> / Public repository`, `<calling job> / Analysis`; with `outside_hosts` false, `Analysis` is the failed refusal and the analysis job reports as `Analysis (not started)` | with `outside_hosts`: `www.bestpractices.dev`, `api.deps.dev`, `api.osv.dev`, `oss-fuzz-build-logs.storage.googleapis.com`; with `publish`: `api.scorecard.dev`, `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
+| `.github/workflows/scorecard.yml` | the supply-chain checks of the OpenSSF Scorecard action, reported to code scanning and kept as the artifact `scorecard-result` | `outside_hosts` (boolean, default false: the run fails, [ADR-0026](docs/adr/0026-a-call-that-analyses-nothing-fails.md)); `publish` (boolean, default false). The repository's own caller and the consumer template enable both inputs for public repositories, publishing the result under the caller's name ([ADR-0115](docs/adr/0115-scorecard-callers-publish-by-visibility.md)) | `<calling job> / Public repository`, `<calling job> / Analysis`; with `outside_hosts` false, `Analysis` is the failed refusal and the analysis job reports as `Analysis (not started)` | with `outside_hosts`: `www.bestpractices.dev`, `api.deps.dev`, `api.osv.dev`, `oss-fuzz-build-logs.storage.googleapis.com`; with `publish`: `api.scorecard.dev`, `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` ([ADR-0013](docs/adr/0013-scorecard-behind-a-switch.md)) |
 | `.github/workflows/draft-release.yml` | creates a draft release for a pushed tag from an artifact holding the release files | `runner` (label, default `ubuntu-26.04`); `artifact` (name of the artifact holding the files, default `release-files`) | `<calling job> / Store the files in a draft release` | none |
 | `.github/workflows/release-please.yml` | proposes release pull requests and creates forge releases from Conventional Commits through a GitHub App token ([ADR-0056](docs/adr/0056-release-please-and-the-commit-hook-are-shared.md)); the release commit is written by the app, so the caller's config sets a top-level `signoff` to the app bot's commit address (`<app-slug>[bot] <<user id>+<app-slug>[bot]@users.noreply.github.com>`), else a commit-message check that requires `Signed-off-by` refuses the release pull request | `runner` (label, default `ubuntu-26.04`); `app_client_id` (required); `config_file` (default `release-please-config.json`); `manifest_file` (default `.release-please-manifest.json`); secret `app_private_key` (required) | `<calling job> / Release please`, never a check of a pull request | none |
 | `.github/workflows/hook-copy.yml` | verifies that the caller's copy of the commit-msg hook files matches the repository source at the pinned commit and passes its test suite ([ADR-0056](docs/adr/0056-release-please-and-the-commit-hook-are-shared.md)) | `runner` (label, default `ubuntu-26.04`); `hooks_path` (default `.config/hooks`) | `<calling job> / Hook copy` | none |
@@ -176,6 +176,17 @@ uses `workflow_dispatch` with a required string `train_run_id` input and grants
 `actions: read` to read the train run and artifact; a person with write access may
 dispatch it by hand with a train run id, and its release legs use the app token
 limited to each repository.
+The `release_off` input accepts at most 50 space-separated `owner/name` entries.
+Opt-outs follow repository transfers and renames through forge metadata; the
+summary names each opted-out repository by its current full name. Once another
+repository takes a moved repository's former name, the forge drops the redirect
+and an entry under that name matches the new repository, so callers rename the
+entry to the current full name before the former name is reused. A 404 for an
+entry is not a resolution failure: the entry matches nothing, release runs
+continue and no warning is written. If resolution fails for any other reason,
+including a spent sweep budget before a lookup, that installation receives no
+release runs for this sweep and the summary warns with the entry and reason
+([ADR-0100](docs/adr/0100-release-off-follows-a-moved-repository.md)).
 A push trigger counts only when its branch and tag filters admit the default
 branch ([ADR-0088](docs/adr/0088-a-push-trigger-counts-only-for-the-default-branch.md)).
 The app is one public app installed on every account
@@ -340,7 +351,12 @@ hashes.
   from a pin in `tools/anchors.py`: the source text that opens and closes the
   range, and the answers that must link it. `tests/test_bestpractices.py`
   fails when an anchor matches no pin of its answer or a pin's answer does not
-  link it. `make fix-anchors` moves anchors through `ANCHORS_BASE`, a revision
+  link it. The `anchors` pre-commit job runs `make check-anchors`, which judges
+  the staged contents, so a commit that moves pinned lines is refused until
+  `make fix-anchors` runs. After that, stage the repaired `.bestpractices.json`
+  (`git add .bestpractices.json`) before you retry the commit: the check
+  compares staged anchors against staged sources, not unstaged edits.
+  `make fix-anchors` moves anchors through `ANCHORS_BASE`, a revision
   whose files hold the source at the lines the current anchors record (for a
   committed change, usually `git merge-base HEAD main`); `main` works only
   while it still holds those lines, and nothing is written if mapping fails.

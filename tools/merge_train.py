@@ -90,6 +90,8 @@ RETRY_CODES = (502, 503, 504)
 SWEEP_SECONDS = 1500
 MAX_PAGES = 20
 JWT_SECONDS = 540
+RELEASE_OFF_NOT_FOUND = object()
+MAX_RELEASE_OFF = 50
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 # NIST SP 800-57 Part 1: 112-bit security is 2048-bit RSA; OpenSSF Best Practices crypto_keylength.
 MIN_KEY_BITS = 2048
@@ -324,6 +326,34 @@ query($owner: String!, $name: String!, $number: Int!) {
       commits(first: 100) {
         totalCount
         nodes { commit { message committedDate } }
+      }
+      headChecks: commits(last: 1) {
+        totalCount
+        nodes {
+          commit {
+            oid
+            coderabbit: checkSuites(first: 5, filterBy: {appId: 347564}) {
+              totalCount
+              nodes {
+                app { slug databaseId }
+                checkRuns(first: 5, filterBy: {checkName: "CodeRabbit"}) {
+                  totalCount
+                  nodes { name status conclusion summary }
+                }
+              }
+            }
+            sourcery: checkSuites(first: 5, filterBy: {appId: 48477}) {
+              totalCount
+              nodes {
+                app { slug databaseId }
+                checkRuns(first: 5, filterBy: {checkName: "Sourcery review"}) {
+                  totalCount
+                  nodes { name status conclusion summary }
+                }
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -618,6 +648,13 @@ def check_review_bots(value):
     return frozenset(logins)
 
 
+def release_off_setting(raw):
+    """At most MAX_RELEASE_OFF entries, repeats counted, then the owner/name parse."""
+    if len(raw.split()) > MAX_RELEASE_OFF:
+        raise InvalidSettingError(f"release_off accepts at most {MAX_RELEASE_OFF} entries")
+    return check_release_off(raw, InvalidSettingError)
+
+
 def checked_train_modes(env):
     """Validate the sweep mode, merge method, states and minimum age."""
     switch = env["TRAIN_SWITCH"]
@@ -641,7 +678,7 @@ def settings(env):
     if not env.get("TRAIN_APP_CLIENT_ID", "").strip():
         raise InvalidSettingError("app_client_id is empty")
     check_app_key(env.get("TRAIN_APP_KEY", ""))
-    release_off = check_release_off(env["TRAIN_RELEASE_OFF"], InvalidSettingError)
+    release_off = release_off_setting(env["TRAIN_RELEASE_OFF"])
     hold = check_hold_labels(env["TRAIN_HOLD_LABELS"], InvalidSettingError)
     required_status = check_required_status(
         env.get("TRAIN_REQUIRED_STATUS", ""), InvalidSettingError
@@ -2308,8 +2345,73 @@ def revoke(env, token):
         )
 
 
-def repositories(env, conf, installation, identity):
-    """The installation's repositories the train serves, read with a read-only token.
+def release_off_get(url, token):
+    """Read metadata without automatic redirects or exposing response bodies in failures."""
+    try:
+        return call(url, token, "GET", redirect=False)
+    except RefusedError as err:
+        cause = err.__cause__
+        if isinstance(cause, urllib.error.HTTPError):
+            if cause.code == 404:
+                return RELEASE_OFF_NOT_FOUND
+            raise ValueError(f"HTTP {cause.code}") from None
+        raise ValueError("repository metadata request failed") from None
+    except (ValueError, UnicodeError):
+        raise ValueError("invalid repository metadata") from None
+
+
+def release_off_repository_id(api, token, entry):
+    """Resolve an entry's ID, following at most one allow-listed redirect on the API origin."""
+    answer = release_off_get(f"{api}/repos/{urllib.parse.quote(entry, safe='/')}", token)
+    if isinstance(answer, dict) and "location" in answer:
+        location = answer["location"]
+        allowed = rf"{re.escape(api)}/(?:repositories/[0-9]+|repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+        if not isinstance(location, str) or not re.fullmatch(allowed, location):
+            raise ValueError("unsafe repository redirect")
+        answer = release_off_get(location, token)
+        if isinstance(answer, dict) and "location" in answer:
+            raise ValueError("second repository redirect")
+    if answer is RELEASE_OFF_NOT_FOUND:
+        return None
+    repo_id = answer.get("id") if isinstance(answer, dict) else None
+    if isinstance(repo_id, bool) or not isinstance(repo_id, int):
+        raise ValueError("invalid repository metadata: missing integer id")
+    return repo_id
+
+
+def over_budget(started):
+    """Whether the sweep has run past SWEEP_SECONDS."""
+    return time.monotonic() - started > SWEEP_SECONDS
+
+
+def release_off_fallback(installation, listed, entry, reason):
+    """All listed repository IDs and the summary warning when release_off resolution stops."""
+    warning = (
+        f"::warning title=Merge train::release_off entry {entry}: {reason}; "
+        f"release train off for installation {installation['id']}"
+    )
+    return frozenset(target["id"] for target in listed), [warning]
+
+
+def release_off_ids(env, conf, installation, token, listed, started):
+    """Resolve at most MAX_RELEASE_OFF unmatched entries; any failure opts out all listed IDs."""
+    exact = {target["full_name"].casefold() for target in listed}
+    resolved = set()
+    for entry in sorted(conf["release_off"] - exact):
+        if over_budget(started):
+            reason = f"sweep budget of {SWEEP_SECONDS} s spent"
+            return release_off_fallback(installation, listed, entry, reason)
+        try:
+            repo_id = release_off_repository_id(env["GITHUB_API_URL"], token, entry)
+        except ValueError as err:
+            return release_off_fallback(installation, listed, entry, err)
+        if repo_id is not None:
+            resolved.add(repo_id)
+    return frozenset(resolved), []
+
+
+def repositories(env, conf, installation, identity, started):
+    """Served repositories, resolved release-off IDs and warnings, read with a read-only token.
 
     The first call fills identity with the bot login and id, using that token.
     """
@@ -2318,9 +2420,11 @@ def repositories(env, conf, installation, identity):
         if not identity:
             identity["bot_login"], identity["bot_id"] = bot_identity(env, conf, token)
         listed = pages(env, token, "/installation/repositories", "repositories")
+        resolved, warnings = release_off_ids(env, conf, installation, token, listed, started)
     finally:
         revoke(env, token)
-    return [r for r in listed if not r.get("archived") and not r.get("disabled")]
+    targets = [r for r in listed if not r.get("archived") and not r.get("disabled")]
+    return targets, resolved, warnings
 
 
 def close_issues(env, conf, installation, target, now):
@@ -2411,6 +2515,11 @@ def one(env, conf, installation, target, now):
     )
 
 
+def release_is_off(target, conf, resolved):
+    """Match the casefolded current name or a resolved repository ID; the reported name stays."""
+    return target["full_name"].casefold() in conf["release_off"] or target["id"] in resolved
+
+
 def sweep(env, conf, started):
     """Run the train in every repository; the per-account tally, the sections, the refusals."""
     accounts, sections, refusals, skipped, releases, off, identity = {}, [], [], [], [], [], {}
@@ -2421,15 +2530,16 @@ def sweep(env, conf, started):
             accounts[account] = "suspended"
             continue
         try:
-            targets = repositories(env, conf, installation, identity)
+            targets, resolved, warnings = repositories(env, conf, installation, identity, started)
         except RefusedError as err:
             refusals.append(f"{account}: {err}")
             accounts[account] = "refused"
             continue
+        sections.extend(warnings)
         tally = {"repositories": 0, "landed": 0, "updated": 0, "refused": 0}
         accounts[account] = tally
         for index, target in enumerate(targets):
-            if time.monotonic() - started > SWEEP_SECONDS:
+            if over_budget(started):
                 skipped.append(target["full_name"])
                 continue
             tally["repositories"] += 1
@@ -2457,7 +2567,7 @@ def sweep(env, conf, started):
             sections.append(section)
             unsigned_bots.extend(unsigned)
             if release:
-                if target["full_name"].lower() in conf["release_off"]:
+                if release_is_off(target, conf, resolved):
                     off.append(target["full_name"])
                 else:
                     releases.append({"owner": account, "name": target["name"]})
