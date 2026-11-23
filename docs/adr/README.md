@@ -101,4 +101,8 @@ record that supersedes it.
 | [0095](0095-pull-requests-check-the-full-sign-off-ident.md) | 2026-11-17 | Pull requests check the full sign-off ident | Accepted |
 | [0096](0096-the-release-labels-module-leaves-the-release-step.md) | 2026-11-19 | The release labels module leaves the release step | Accepted |
 | [0098](0098-the-release-fan-out-runs-in-its-own-workflow-run.md) | 2026-11-20 | The release fan-out runs in its own workflow run | Accepted |
+| [0100](0100-release-off-follows-a-moved-repository.md) | 2026-11-20 | Release-off follows a moved repository | Accepted |
 | [0105](0105-the-train-asks-the-update-bot-to-recreate-an-unsigned-update.md) | 2026-11-21 | The train asks the update bot to recreate an unsigned update | Accepted |
+| [0112](0112-the-test-stage-runs-on-parallel-workers.md) | 2026-11-22 | The test stage runs on parallel workers | Accepted |
+| [0114](0114-a-sourcery-budget-skip-yields-to-a-coderabbit-review-on-the-head.md) | 2026-11-22 | A Sourcery budget skip yields to a CodeRabbit review on the head | Accepted |
+| [0115](0115-scorecard-callers-publish-by-visibility.md) | 2026-11-23 | Scorecard callers publish results for public repositories | Accepted |

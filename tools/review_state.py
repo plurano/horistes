@@ -46,7 +46,7 @@ LIMIT_NOTICE_RE = re.compile(
     r"(?:(?:rate[- ]limit|review[- ]limit)[ \t]+(?:was[ \t]+)?(?:reached|exceeded|hit)"
     r"(?:[ \t]+for[ \t]+(?:this[ \t]+(?:repository|organization)"
     r"|commit[ \t]+[0-9a-f]{7,40}))?"
-    r"|Sorry @[^\s,]+, you've used your own review budget[^\r\n]*"
+    r"|Sorry @(?P<budget>[^\s,]+, you've used your own review budget[^\r\n]*)"
     r"|(?P<paused>reviews[ \t]+paused)"
     r"|(?P<allowance>(?:Included review availability:[^\r\n]*;[ \t]*)?"
     r"0[ \t]+remain[ \t]+after[ \t]+this[ \t]+review)"
@@ -72,12 +72,15 @@ REVIEWED_RANGE_RE = re.compile(
     r"([0-9a-f]{40}) and ([0-9a-f]{40})\.[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
-REVIEWED_RANGE_LINE_RE = re.compile(
-    r"^[ \t]*Reviewing files that changed from the base of the PR and between "
-    r"\S+ and \S+\.[ \t]*\r?$",
-    re.IGNORECASE | re.MULTILINE,
-)
-FENCE_RE = re.compile(r"^ {0,3}(?:```|~~~)")
+MAX_HEAD_CHECK_SUITES = 5
+MAX_HEAD_CHECK_RUNS = 5
+CODERABBIT_APP_ID = 347564
+CODERABBIT_SLUG = "coderabbitai"
+CODERABBIT_RUN = "CodeRabbit"
+CODERABBIT_SUCCESS_LINE = "Result: Success - Review completed"
+SOURCERY_APP_ID = 48477
+SOURCERY_SLUG = "sourcery-ai"
+SOURCERY_RUN = "Sourcery review"
 
 
 def _pr_node(pr: dict) -> dict:
@@ -219,20 +222,39 @@ def _paused_block(lines: list[str], notice_idx: int) -> list[str]:
     return lines[notice_idx + 1 : end][:MAX_LINES]
 
 
-def _paused_head_reviewed(body: str, head: str) -> bool:
-    """Exempt only pause notices with unambiguous, block-local evidence for the full head."""
-    if not re.fullmatch(r"[0-9a-f]{40}", head):
-        return False
+def _pause_allowance_notices(body: str) -> tuple[list, bool, bool]:
+    """Limit notices in body and whether the body is mixed pause plus allowance only."""
     lines = body.splitlines()
     if len(lines) > MAX_LINES:
-        return False
+        return [], False, False
     notices = [
         (idx, match)
         for idx, line in enumerate(lines[:MAX_LINES])
         if (match := LIMIT_NOTICE_RE.search(line))
     ]
-    if not notices or any(not match.group("paused") for _idx, match in notices[:MAX_LINES]):
+    if not notices:
+        return notices, False, False
+    foreign = any(
+        not match.group("paused") and not match.group("allowance")
+        for _idx, match in notices[:MAX_LINES]
+    )
+    has_paused = any(match.group("paused") for _idx, match in notices[:MAX_LINES])
+    has_allowance = any(match.group("allowance") for _idx, match in notices[:MAX_LINES])
+    mixed = has_paused and has_allowance and not foreign
+    return notices, mixed, foreign
+
+
+def _paused_head_reviewed(body: str, head: str) -> bool:
+    """Exempt only pause notices with unambiguous, block-local evidence for the full head."""
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
         return False
+    notices, mixed, foreign = _pause_allowance_notices(body)
+    if not notices or foreign:
+        return False
+    pause_notices = [(idx, match) for idx, match in notices[:MAX_LINES] if match.group("paused")]
+    if not pause_notices:
+        return False
+    lines = body.splitlines()
     reviewed = {
         match.group(1).lower()
         for line in lines[:MAX_LINES]
@@ -240,10 +262,13 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
     }
     if reviewed != {head}:
         return False
-    return all(
+    pause_ok = all(
         any(LAST_REVIEWED_RE.fullmatch(line) for line in _paused_block(lines, idx)[:MAX_LINES])
-        for idx, _match in notices[:MAX_LINES]
+        for idx, _match in pause_notices[:MAX_LINES]
     )
+    if mixed:
+        return pause_ok and _allowance_head_reviewed(body, head)
+    return pause_ok
 
 
 def _without_fenced_code(body: str) -> str:
@@ -529,10 +554,7 @@ def review_incomplete(pr: dict, me: str = "") -> str:
         login = _login(comment)
         if login.lower().removesuffix("[bot]") in answerers:
             continue
-        _prefix, cut = _notice_read(str(comment.get("body") or ""))
-        if cut and _unread_notice_holds(comment, head, last_commit):
-            return f"review incomplete: {login or 'reviewer'} notice body exceeds the read bound"
-        if _notice_holds(comment, head, last_commit, evidence):
+        if _notice_holds(comment, head, last_commit, evidence, node):
             when = _body_at(comment)
             stamp = when.isoformat().replace("+00:00", "Z") if when is not None else "head"
             return f"review incomplete: {login or 'reviewer'} limit reached at {stamp}"
