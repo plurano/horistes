@@ -16,7 +16,7 @@ from conftest import ROOT
 sys.path.insert(0, str(ROOT / "tools"))
 import render
 
-CALL_USES = re.compile(r"^    uses: \S+(?: # \S+)?$")
+CALL_USES = re.compile(r"^    uses: (\S+)(?: # \S+)?$")
 REQUIRED_LINE = re.compile(r"^      required: ")
 FOLDED_INDENT = " " * 8
 RULESET = ROOT / ".github/rulesets/main.json"
@@ -101,9 +101,9 @@ def comparable(text: str) -> list[str]:
                 out.append("# <ALLOW-LISTED-HEADER-COMMENT>")
             continue
 
-        if CALL_USES.match(line):
-            path = re.search(r"uses: (\S+)", line).group(1)  # type: ignore[union-attr]
-            leaf = path.split("/")[-1].split("@")[0]
+        call = CALL_USES.match(line)
+        if call:
+            leaf = call.group(1).split("/")[-1].split("@")[0]
             out.append(f"    uses: <ALLOW-LISTED:{leaf}>")
             i += 1
             continue

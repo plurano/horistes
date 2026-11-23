@@ -1264,7 +1264,6 @@ def _self_test_transport(
             return _ok_reply([])
         return _ok_reply(status_list)
 
-    serve.posts = posts  # type: ignore[attr-defined]
     return serve
 
 
