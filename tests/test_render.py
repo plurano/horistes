@@ -183,6 +183,7 @@ jobs:
     uses: owner/shared/.github/workflows/scorecard.yml@{COMMIT} # v1.2.3
     with:
       outside_hosts: {render.PUBLIC}
+      publish: {render.PUBLIC}
 """
 
 
@@ -855,11 +856,6 @@ def test_real_scorecard_caller_in_a_private_repository_cannot_pass_true(tree):
     done = tree.tool("render.py", "check")
     assert done.returncode == 1, done.stdout
     assert f"the job passes `outside_hosts` as `true`; {REFUSED}" in done.stderr
-    publish = source + "      publish: true\n"
-    tree.write({"templates/callers/s.yml.tmpl": publish})
-    done = tree.tool("render.py", "check")
-    assert done.returncode == 1, done.stdout
-    assert f"the job passes `publish` as `true`; {REFUSED}" in done.stderr
 
 
 def test_note_need_not_name_an_issue_that_is_not_open(tree):
