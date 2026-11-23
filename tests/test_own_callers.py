@@ -18,6 +18,7 @@ import render
 
 CALL_USES = re.compile(r"^    uses: \S+(?: # \S+)?$")
 REQUIRED_LINE = re.compile(r"^      required: ")
+FOLDED_INDENT = " " * 8
 RULESET = ROOT / ".github/rulesets/main.json"
 OWN_CONTEXT = {
     **render.SAMPLE,
@@ -61,6 +62,23 @@ jobs:
 """
 
 
+INLINE_REQUIRED = "required: '[\"A\"]'"
+FOLDED_REQUIRED = 'required: \'["A",\n        "B"]\''
+
+
+def _past_required(lines: list[str], i: int) -> int:
+    """Index after the required line at `i` and the lines its quoted value folds onto."""
+    value = lines[i].split(": ", 1)[1]
+    if not value.startswith("'") or (len(value) > 1 and value.endswith("'")):
+        return i + 1
+    for j in range(i + 1, len(lines)):
+        if not lines[j].startswith(FOLDED_INDENT):
+            return j
+        if lines[j].endswith("'"):
+            return j + 1
+    return len(lines)
+
+
 def comparable(text: str) -> list[str]:
     """The lines of a caller with allow-listed copyright, headers, uses, and required."""
     lines = text.splitlines()
@@ -92,7 +110,7 @@ def comparable(text: str) -> list[str]:
 
         if REQUIRED_LINE.match(line):
             out.append("      required: <ALLOW-LISTED>")
-            i += 1
+            i = _past_required(lines, i)
             continue
 
         out.append(line)
@@ -179,9 +197,20 @@ def test_comparable_equal_planted_cases() -> None:
     variant_required = BASE_INLINE.replace("required: '[\"A\"]'", "required: '[\"B\"]'")
     assert comparable(BASE_INLINE) == comparable(variant_required)
 
+    variant_folded = BASE_INLINE.replace(INLINE_REQUIRED, FOLDED_REQUIRED)
+    assert comparable(BASE_INLINE) == comparable(variant_folded)
+
 
 def test_comparable_unequal_planted_cases() -> None:
     """Planted cases where disallowed differences cause inequality in both directions."""
+    folded = BASE_INLINE.replace(INLINE_REQUIRED, FOLDED_REQUIRED)
+    assert comparable(folded) != comparable(folded + "      extra: x\n")
+
+    closed_then_indented = BASE_INLINE.replace(
+        "required: '[\"A\"]'", "required: '[\"A\"]'\n        stray: x"
+    )
+    assert comparable(BASE_INLINE) != comparable(closed_then_indented)
+
     variant_jobs_comment = BASE_INLINE.replace(
         "    # A comment inside jobs",
         "    # A different comment inside jobs",

@@ -28,7 +28,8 @@ jobs:
     uses: ./.github/workflows/required-checks-sweep.yml
     with:
       runner: ubuntu-26.04
-      required: '["Python 3.12 floor", "Fuzz the result reader", "Verification gate", "CodeQL", "Licence", "Action pins", "Sign-off"]'
+      required: '["Python 3.12 floor", "Fuzz the result reader", "Verification gate", "CodeQL",
+        "Licence", "Action pins", "Sign-off"]'
       pull-request-only: '[]'
       not-owed: '[]'
       apps: '{}'
