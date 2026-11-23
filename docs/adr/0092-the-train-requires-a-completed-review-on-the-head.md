@@ -72,10 +72,11 @@ malformed, or naive timestamps are unknown. Any unknown commit time, or no
 commits, makes the latest commit unknown. Unknown ordering holds. A notice at
 the commit instant holds; one second earlier does not, unless it names the
 head. Exhausted allowances require reviewed-head coverage or later same-login
-head evidence. A body that mixes an allowance notice with another notice holds
-while either part holds under its own rule, checked by
-`test_read_body_mixed_notices`. `E-*` cases in `test_adr92_reader_planted`
-cover these rules.
+head evidence. The check-run completion form is CodeRabbit's successful check
+run on the head, read through the headChecks reader of ADR-0114.
+A body that mixes an allowance notice with another notice holds while either
+part holds under its own rule, checked by `test_read_body_mixed_notices`.
+`E-*` cases in `test_adr92_reader_planted` cover these rules.
 
 F. Unreadable or truncated connections hold before either review reader runs.
 Non-list `nodes` never raise in the bounded reader. Missing detail head uses

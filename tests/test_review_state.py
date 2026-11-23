@@ -11,6 +11,7 @@ import pytest
 from review_state import (
     MAX_COMMENTS,
     MAX_LINES,
+    MAX_SUMMARY_CHARS,
     is_bot_dependency,
     review_evidence,
     review_incomplete,
@@ -626,28 +627,6 @@ def test_review_incomplete_gate_cases(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
 
 
-@pytest.mark.parametrize(("pr", "on_head"), _mixed_pause_allowance_evidence_cases())
-def test_review_evidence_mixed_pause_allowance(pr, on_head):
-    evidence = review_evidence(pr)
-    if on_head:
-        assert len(evidence) == 1
-        assert evidence[0][2] is True
-        return
-    assert not any(entry[2] for entry in evidence)
-
-
-def test_review_evidence_paused_notice_matches_main():
-    """Pure pause bodies keep the head-evidence shape origin/main already had."""
-    _name, block, head, _expected = bodies[0]
-    pr = _fixture_golusoris_1266()
-    pr["headRefOid"] = head
-    pr["comments"]["nodes"] = [
-        {"author": {"login": "coderabbitai"}, "createdAt": "2026-11-14T04:25:24Z", "body": block}
-    ]
-    evidence = review_evidence(pr)
-    assert len(evidence) == 1 and evidence[0][2] is True
-
-
 @pytest.mark.parametrize("envelope", [False, True], ids=["node", "data-repository-envelope"])
 def test_review_incomplete_pr3507_replay(envelope):
     payload = _fixture("pr3507-review-state.json")
@@ -861,8 +840,72 @@ def test_adr92_unfinished_allowance_review_keeps_notice(state):
     assert adr92_reader().review_incomplete(adr92_pull(reviews=[review]))
 
 
+ADR114_BUDGET = (
+    "Sorry @person, you've used your own review budget of 250,000 diff characters "
+    "for the last 7 days."
+)
+ADR114_CR_SUCCESS = "Result: Success - Review completed\n"
+ADR114_SOURCERY_LOGIN = "sourcery-ai[bot]"
+
+
+def adr114_check_run(name, conclusion, summary, *, status="COMPLETED"):
+    return {"name": name, "status": status, "conclusion": conclusion, "summary": summary}
+
+
+def adr114_head_suite(app_id, slug, runs):
+    return {
+        "app": {"slug": slug, "databaseId": app_id},
+        "checkRuns": {"totalCount": len(runs), "nodes": list(runs)},
+    }
+
+
+def adr114_head_checks(
+    head=ADR92_HEAD,
+    *,
+    coderabbit_runs=None,
+    sourcery_runs=None,
+    sourcery_total=None,
+    oid=None,
+    coderabbit_total=None,
+    commits_total=1,
+):
+    cr_runs = (
+        [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)]
+        if coderabbit_runs is None
+        else list(coderabbit_runs)
+    )
+    sr_runs = (
+        [adr114_check_run("Sourcery review", "SKIPPED", ADR114_BUDGET)]
+        if sourcery_runs is None
+        else list(sourcery_runs)
+    )
+    cr_suites = [adr114_head_suite(347564, "coderabbitai", cr_runs)] if cr_runs else []
+    sr_suites = [adr114_head_suite(48477, "sourcery-ai", sr_runs)] if sr_runs else []
+    commit_oid = head if oid is None else oid
+    return {
+        "totalCount": commits_total,
+        "nodes": [
+            {
+                "commit": {
+                    "oid": commit_oid,
+                    "coderabbit": {
+                        "totalCount": (
+                            len(cr_suites) if coderabbit_total is None else coderabbit_total
+                        ),
+                        "nodes": cr_suites,
+                    },
+                    "sourcery": {
+                        "totalCount": len(sr_suites) if sourcery_total is None else sourcery_total,
+                        "nodes": sr_suites,
+                    },
+                }
+            }
+        ],
+    }
+
+
 def completed_head_run(slug="coderabbitai", conclusion="SUCCESS", status="COMPLETED"):
-    """Build one app-owned check run without a forge read."""
+    """Legacy check-run dict for parametrized cases; only CodeRabbit maps to headChecks."""
     return {
         "__typename": "CheckRun",
         "status": status,
@@ -871,27 +914,40 @@ def completed_head_run(slug="coderabbitai", conclusion="SUCCESS", status="COMPLE
     }
 
 
-def completed_head_pull(*runs, summary=None, notice_login="coderabbitai"):
+def _legacy_runs_to_head_checks(runs):
+    """Translate PR headCommit check-run fixtures into ADR-0114 headChecks."""
+    cr_runs = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        suite = run.get("checkSuite") if isinstance(run.get("checkSuite"), dict) else {}
+        app = suite.get("app") if isinstance(suite.get("app"), dict) else {}
+        slug = str(app.get("slug") or "").lower().removesuffix("[bot]")
+        if slug != "coderabbitai":
+            continue
+        conclusion = run.get("conclusion")
+        status = run.get("status") or "QUEUED"
+        summary = (
+            ADR114_CR_SUCCESS
+            if conclusion == "SUCCESS" and status == "COMPLETED"
+            else "Result: Failed\n"
+        )
+        cr_runs.append(
+            adr114_check_run("CodeRabbit", conclusion or "FAILURE", summary, status=status)
+        )
+    return adr114_head_checks(coderabbit_runs=cr_runs)
+
+
+def completed_head_pull(*runs, summary=None, notice_login="coderabbitai", head_checks=None):
     """Old allowance, newer push, and independent completion evidence on that head."""
     pr = adr92_pull(
         adr92_comment("0 remain after this review", "2026-11-15T19:45:04Z", notice_login)
     )
-    pr["headCommit"] = {
-        "nodes": [
-            {
-                "commit": {
-                    "oid": ADR92_HEAD,
-                    "statusCheckRollup": {
-                        "contexts": {
-                            "totalCount": len(runs),
-                            "pageInfo": {"hasNextPage": False},
-                            "nodes": list(runs),
-                        }
-                    },
-                }
-            }
-        ]
-    }
+    if head_checks is None:
+        head_checks = (
+            _legacy_runs_to_head_checks(runs) if runs else adr114_head_checks(coderabbit_runs=[])
+        )
+    pr["headChecks"] = head_checks
     if summary is not None:
         pr["comments"]["nodes"].append(adr92_comment(summary))
     return pr
@@ -958,8 +1014,11 @@ def test_completed_head_run_states(conclusion, status, holds):
 )
 def test_completed_head_check_oid(oid, holds):
     """A prefix or any other commit cannot cover the PR head."""
-    pr = completed_head_pull(completed_head_run())
-    pr["headCommit"]["nodes"][0]["commit"]["oid"] = oid
+    pr = completed_head_pull(head_checks=adr114_head_checks())
+    if oid is None:
+        pr["headChecks"]["nodes"][0]["commit"].pop("oid", None)
+    else:
+        pr["headChecks"]["nodes"][0]["commit"]["oid"] = oid
     assert bool(review_incomplete(pr)) is holds
 
 
@@ -986,8 +1045,8 @@ def test_completed_head_check_oid(oid, holds):
         pytest.param(
             "coderabbitai", [completed_head_run("coderabbitai[bot]")], False, id="app-suffix"
         ),
-        pytest.param("copilot[bot]", [completed_head_run("copilot")], False, id="copilot-own"),
-        pytest.param("sourcery-ai", [completed_head_run("sourcery-ai")], False, id="sourcery-own"),
+        pytest.param("copilot[bot]", [completed_head_run("copilot")], True, id="copilot-own"),
+        pytest.param("sourcery-ai", [completed_head_run("sourcery-ai")], True, id="sourcery-own"),
         pytest.param("coderabbitai", [completed_head_run("unlisted")], True, id="unlisted-app"),
         pytest.param("unlisted", [completed_head_run("unlisted")], True, id="unlisted-own"),
         pytest.param("unlisted", [completed_head_run()], True, id="unlisted-notice"),
@@ -999,38 +1058,40 @@ def test_completed_head_same_check_reviewer(notice_login, runs, holds):
     assert bool(review_incomplete(completed_head_pull(*runs, notice_login=notice_login))) is holds
 
 
-CHECK_COMMIT = ("headCommit", "nodes", 0, "commit")
-CHECK_CONTEXTS = (*CHECK_COMMIT, "statusCheckRollup", "contexts")
-CHECK_RUN = (*CHECK_CONTEXTS, "nodes", 0)
+HC_ROOT = ("headChecks",)
+HC_NODES = (*HC_ROOT, "nodes")
+HC_COMMIT = (*HC_NODES, 0, "commit")
+HC_CODERABBIT = (*HC_COMMIT, "coderabbit")
+HC_CR_RUNS = (*HC_CODERABBIT, "nodes", 0, "checkRuns")
 
 
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        pytest.param(("headCommit",), None, id="unread-head"),
-        pytest.param(("headCommit", "nodes"), [], id="empty-head"),
-        pytest.param(("headCommit", "nodes"), {}, id="unread-head-nodes"),
-        pytest.param(("headCommit", "nodes"), [None], id="null-head-node"),
-        pytest.param(CHECK_COMMIT, None, id="unread-commit"),
-        pytest.param((*CHECK_COMMIT, "statusCheckRollup"), None, id="unread-rollup"),
-        pytest.param(CHECK_CONTEXTS, None, id="unread-contexts"),
-        pytest.param((*CHECK_CONTEXTS, "nodes"), {}, id="unread-context-nodes"),
-        pytest.param((*CHECK_CONTEXTS, "nodes"), [None], id="null-context-node"),
-        pytest.param((*CHECK_CONTEXTS, "nodes"), [], id="count-mismatch"),
-        pytest.param((*CHECK_CONTEXTS, "totalCount"), None, id="missing-count"),
-        pytest.param((*CHECK_CONTEXTS, "totalCount"), True, id="bool-count"),
-        pytest.param((*CHECK_CONTEXTS, "totalCount"), "1", id="string-count"),
-        pytest.param((*CHECK_CONTEXTS, "totalCount"), -1, id="negative-count"),
-        pytest.param((*CHECK_CONTEXTS, "totalCount"), 2, id="truncated-count"),
-        pytest.param((*CHECK_CONTEXTS, "totalCount"), 101, id="oversized-count"),
-        pytest.param((*CHECK_CONTEXTS, "pageInfo"), None, id="missing-page"),
-        pytest.param((*CHECK_CONTEXTS, "pageInfo"), {}, id="missing-next-page"),
-        pytest.param((*CHECK_CONTEXTS, "pageInfo", "hasNextPage"), True, id="truncated-page"),
-        pytest.param((*CHECK_CONTEXTS, "pageInfo", "hasNextPage"), 0, id="not-false-page"),
-        pytest.param((*CHECK_RUN, "__typename"), "StatusContext", id="legacy-status"),
-        pytest.param((*CHECK_RUN, "checkSuite"), None, id="missing-suite"),
-        pytest.param((*CHECK_RUN, "checkSuite", "app"), None, id="missing-app"),
-        pytest.param((*CHECK_RUN, "checkSuite", "app"), {}, id="empty-app"),
+        pytest.param(HC_ROOT, None, id="unread-head"),
+        pytest.param(HC_NODES, [], id="empty-head"),
+        pytest.param(HC_NODES, {}, id="unread-head-nodes"),
+        pytest.param(HC_NODES, [None], id="null-head-node"),
+        pytest.param(HC_COMMIT, None, id="unread-commit"),
+        pytest.param(HC_CODERABBIT, None, id="unread-suites"),
+        pytest.param((*HC_CODERABBIT, "nodes"), {}, id="unread-suite-nodes"),
+        pytest.param((*HC_CODERABBIT, "nodes"), [None], id="null-suite-node"),
+        pytest.param((*HC_CODERABBIT, "nodes"), [], id="suite-count-mismatch"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), None, id="missing-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), True, id="bool-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), "1", id="string-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), -1, id="negative-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), 2, id="truncated-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), 6, id="oversized-suite-count"),
+        pytest.param(HC_CR_RUNS, None, id="unread-runs"),
+        pytest.param((*HC_CR_RUNS, "nodes"), {}, id="unread-run-nodes"),
+        pytest.param((*HC_CR_RUNS, "nodes"), [None], id="null-run-node"),
+        pytest.param((*HC_CR_RUNS, "nodes"), [], id="run-count-mismatch"),
+        pytest.param((*HC_CR_RUNS, "totalCount"), None, id="missing-run-count"),
+        pytest.param((*HC_CR_RUNS, "totalCount"), True, id="bool-run-count"),
+        pytest.param((*HC_CR_RUNS, "totalCount"), 6, id="oversized-run-count"),
+        pytest.param((*HC_CR_RUNS, "nodes", 0, "summary"), "Wrong line", id="bad-summary"),
+        pytest.param((*HC_CR_RUNS, "nodes", 0, "name"), "Other", id="bad-name"),
     ],
 )
 def test_completed_head_unread_check_context(path, value):
@@ -1043,18 +1104,21 @@ def test_completed_head_unread_check_context(path, value):
     assert review_incomplete(pr)
 
 
-@pytest.mark.parametrize("count", [100, 101])
+@pytest.mark.parametrize("count", [5, 6])
 def test_completed_head_check_context_bound(count):
-    """The exact connection bound qualifies; one extra context invalidates the read."""
-    pr = completed_head_pull(*([completed_head_run()] * count))
-    assert bool(review_incomplete(pr)) is (count > 100)
+    """The exact headChecks run bound qualifies; one extra run invalidates the read."""
+    runs = [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)] * min(count, 5)
+    pr = completed_head_pull(head_checks=adr114_head_checks(coderabbit_runs=runs))
+    conn = pr["headChecks"]["nodes"][0]["commit"]["coderabbit"]["nodes"][0]["checkRuns"]
+    conn["totalCount"] = count
+    assert bool(review_incomplete(pr)) is (count > 5)
 
 
 @pytest.mark.parametrize("extra", [None, {}, {"commit": {"oid": ADR92_HEAD}}])
 def test_completed_head_commit_connection_bound(extra):
     """The query selects exactly one commit; malformed extra nodes cannot be dropped."""
     pr = completed_head_pull(completed_head_run())
-    pr["headCommit"]["nodes"].append(extra)
+    pr["headChecks"]["nodes"].append(extra)
     assert review_incomplete(pr)
 
 
@@ -1182,7 +1246,7 @@ def test_completed_head_summary_body_bound(kind, position):
 def test_completed_head_without_notice_unchanged():
     """An unreadable check connection creates no new hold when no limit notice exists."""
     pr = adr92_pull(adr92_comment("Ordinary summary."))
-    pr["headCommit"] = None
+    pr["headChecks"] = None
     assert review_incomplete(pr) == ""
 
 
@@ -1191,7 +1255,7 @@ def test_completed_head_unlisted_notice_barrier():
     reader = adr92_reader()
     comment = adr92_comment("0 remain after this review", login="unlisted")
     evidence = ([], [], {"unlisted"})
-    assert reader._notice_holds(comment, ADR92_HEAD, reader._instant(ADR92_COMMIT), evidence)
+    assert reader._notice_holds(comment, ADR92_HEAD, reader._instant(ADR92_COMMIT), evidence, {})
 
 
 def test_completed_head_unlisted_app_barrier():
@@ -1236,12 +1300,11 @@ def test_completed_head_query_contract():
         )
     )
     query = " ".join(ast.literal_eval(assignment.value).split())
-    assert (
-        "headCommit: commits(last: 1) { nodes { commit { oid "
-        "statusCheckRollup { contexts(first: 100) { totalCount pageInfo { hasNextPage } "
-        "nodes { __typename ... on CheckRun { "
-        "status conclusion checkSuite { app { slug } commit { oid } }"
-    ) in query
+    assert "headChecks: commits(last: 1)" in query
+    assert "filterBy: {appId: 347564}" in query
+    assert 'checkRuns(first: 5, filterBy: {checkName: "CodeRabbit"})' in query
+    assert "headCommit" not in query
+    assert "statusCheckRollup" not in query
     assert "commits(first: 100) { totalCount nodes { commit { message committedDate } } }" in query
 
 
@@ -1252,7 +1315,7 @@ def test_completed_head_query_contract():
         pytest.param(ADR92_HEAD[:7], False, True, id="prefix-suite"),
         pytest.param(ADR92_HEAD[:7] + "0" * 33, True, True, id="old-suite-other-green"),
         pytest.param(ADR92_HEAD, False, False, id="exact-suite"),
-        pytest.param(ADR92_HEAD.upper(), False, False, id="uppercase-suite"),
+        pytest.param(ADR92_HEAD.upper(), False, True, id="uppercase-suite"),
         pytest.param(None, False, True, id="missing-suite-commit"),
         pytest.param("z" * 40, False, True, id="nonhex-suite"),
         pytest.param(ADR92_HEAD + "0", False, True, id="long-suite"),
@@ -1260,22 +1323,27 @@ def test_completed_head_query_contract():
     ],
 )
 def test_completed_head_suite_commit(oid, other_app, holds):
-    """A successful rollup run must independently name the full head in its own suite."""
-    run = completed_head_run()
-    if oid is None:
-        run["checkSuite"].pop("commit")
+    """A successful CodeRabbit run requires the headChecks commit oid to match the head."""
+    if other_app:
+        checks = _legacy_runs_to_head_checks([completed_head_run(), completed_head_run("copilot")])
     else:
-        run["checkSuite"]["commit"]["oid"] = oid
-    runs = [run, completed_head_run("copilot")] if other_app else [run]
-    assert bool(review_incomplete(completed_head_pull(*runs))) is holds
+        checks = adr114_head_checks()
+    if oid is None:
+        checks["nodes"][0]["commit"].pop("oid", None)
+    else:
+        checks["nodes"][0]["commit"]["oid"] = oid
+    assert bool(review_incomplete(completed_head_pull(head_checks=checks))) is holds
 
 
 @pytest.mark.parametrize("commit", [None, {}, "not-a-commit", {"oid": None}])
 def test_completed_head_malformed_suite_commit(commit):
-    """Unreadable suite commit objects grant no completion evidence."""
-    run = completed_head_run()
-    run["checkSuite"]["commit"] = commit
-    assert review_incomplete(completed_head_pull(run))
+    """Unreadable headChecks commit objects grant no completion evidence."""
+    checks = adr114_head_checks()
+    if not isinstance(commit, dict):
+        checks["nodes"][0] = commit
+    else:
+        checks["nodes"][0]["commit"] = commit
+    assert review_incomplete(completed_head_pull(head_checks=checks))
 
 
 @pytest.mark.parametrize("size", [65536, 65537, 65748])
@@ -1411,14 +1479,14 @@ def test_unread_tail_cannot_prove_completion(form):
     [
         pytest.param(True, 1, True, id="bool"),
         pytest.param(1.0, 1, True, id="float"),
-        pytest.param(4, 4, False, id="integer-four"),
+        pytest.param(1, 1, False, id="integer-one"),
     ],
 )
 def test_completed_check_count_integer_only(count, runs, holds):
     """Refuse bool and float counts even when equal to length; accept integer four."""
     pr = completed_head_pull(*[completed_head_run()] * runs)
-    contexts = pr["headCommit"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
-    contexts["totalCount"] = count
+    runs = pr["headChecks"]["nodes"][0]["commit"]["coderabbit"]["nodes"][0]["checkRuns"]
+    runs["totalCount"] = count
     assert bool(review_incomplete(pr)) is holds
 
 
@@ -1499,69 +1567,26 @@ def test_adr93_paused_notice(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
 
 
-# ADR-0114: Sourcery budget skip yields when CodeRabbit completed on the head.
-ADR114_BUDGET = (
-    "Sorry @person, you've used your own review budget of 250,000 diff characters "
-    "for the last 7 days."
-)
-ADR114_CR_SUCCESS = "Result: Success - Review completed\n"
-ADR114_SOURCERY_LOGIN = "sourcery-ai[bot]"
+@pytest.mark.parametrize(("pr", "on_head"), _mixed_pause_allowance_evidence_cases())
+def test_review_evidence_mixed_pause_allowance(pr, on_head):
+    evidence = review_evidence(pr)
+    if on_head:
+        assert len(evidence) == 1
+        assert evidence[0][2] is True
+        return
+    assert not any(entry[2] for entry in evidence)
 
 
-def adr114_check_run(name, conclusion, summary, *, status="COMPLETED"):
-    return {"name": name, "status": status, "conclusion": conclusion, "summary": summary}
-
-
-def adr114_head_suite(app_id, slug, runs):
-    return {
-        "app": {"slug": slug, "databaseId": app_id},
-        "checkRuns": {"totalCount": len(runs), "nodes": list(runs)},
-    }
-
-
-def adr114_head_checks(
-    head=ADR92_HEAD,
-    *,
-    coderabbit_runs=None,
-    sourcery_runs=None,
-    sourcery_total=None,
-    oid=None,
-    coderabbit_total=None,
-    commits_total=1,
-):
-    cr_runs = (
-        [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)]
-        if coderabbit_runs is None
-        else list(coderabbit_runs)
-    )
-    sr_runs = (
-        [adr114_check_run("Sourcery review", "SKIPPED", ADR114_BUDGET)]
-        if sourcery_runs is None
-        else list(sourcery_runs)
-    )
-    cr_suites = [adr114_head_suite(347564, "coderabbitai", cr_runs)] if cr_runs else []
-    sr_suites = [adr114_head_suite(48477, "sourcery-ai", sr_runs)] if sr_runs else []
-    commit_oid = head if oid is None else oid
-    return {
-        "totalCount": commits_total,
-        "nodes": [
-            {
-                "commit": {
-                    "oid": commit_oid,
-                    "coderabbit": {
-                        "totalCount": (
-                            len(cr_suites) if coderabbit_total is None else coderabbit_total
-                        ),
-                        "nodes": cr_suites,
-                    },
-                    "sourcery": {
-                        "totalCount": len(sr_suites) if sourcery_total is None else sourcery_total,
-                        "nodes": sr_suites,
-                    },
-                }
-            }
-        ],
-    }
+def test_review_evidence_paused_notice_matches_main():
+    """Pure pause bodies keep the head-evidence shape origin/main already had."""
+    _name, block, head, _expected = bodies[0]
+    pr = _fixture_golusoris_1266()
+    pr["headRefOid"] = head
+    pr["comments"]["nodes"] = [
+        {"author": {"login": "coderabbitai"}, "createdAt": "2026-11-14T04:25:24Z", "body": block}
+    ]
+    evidence = review_evidence(pr)
+    assert len(evidence) == 1 and evidence[0][2] is True
 
 
 def adr114_budget_pull(*comments, reviews=(), head_checks=None, **fields):
@@ -1931,8 +1956,9 @@ def test_read_body_mixed_notices(case, expected):
     if case in {"check-run", "short-suite-oid", "fresh-check-run"}:
         run = completed_head_run()
         if case == "short-suite-oid":
-            run["checkSuite"]["commit"]["oid"] = ADR92_HEAD[:7]
-        pr = completed_head_pull(run)
+            pr = completed_head_pull(head_checks=adr114_head_checks(oid="a" * 40))
+        else:
+            pr = completed_head_pull(run)
         when = ADR92_NOTICE if case == "fresh-check-run" else old
         pr["comments"]["nodes"] = [adr92_comment(mixed, when)]
     elif case == "formal-review":

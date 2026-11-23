@@ -8666,7 +8666,7 @@ def test_row_with_other_hold_reason_skips_review_bodies_fetch(tmp_path):
 
 
 def test_review_bodies_query_fields(tmp_path, monkeypatch):
-    """REVIEW_BODIES selects bounded bodies and each head check run's own suite commit."""
+    """REVIEW_BODIES selects bounded bodies and head check runs via the headChecks reader."""
     merge_train = load_train(tmp_path, monkeypatch)
     q = " ".join(merge_train.REVIEW_BODIES.split())
     for token in (
@@ -8685,10 +8685,8 @@ def test_review_bodies_query_fields(tmp_path, monkeypatch):
         "nodes { body createdAt updatedAt url authorAssociation author { login __typename } }",
         "commits(first: 100)",
         "commit { message committedDate }",
-        "headCommit: commits(last: 1)",
-        "status conclusion checkSuite { app { slug } commit { oid } }",
     ):
-        assert token in q
+        assert " ".join(token.split()) in q
     assert "headChecks: commits(last: 1)" in q
     assert "filterBy: {appId: 347564}" in q
     assert q.count("totalCount") == 8
@@ -11117,33 +11115,38 @@ def test_allowance_head_check_review_body_hold(tmp_path, monkeypatch):
     }
     hold = merge_train.review_body_hold(p, detail)
     assert hold is not None and "limit reached" in hold
-    run = {
-        "__typename": "CheckRun",
-        "status": "COMPLETED",
-        "conclusion": "SUCCESS",
-        "checkSuite": {
-            "app": {"slug": "coderabbitai"},
-            "commit": {"oid": p["headRefOid"]},
-        },
-    }
-    detail["headCommit"] = {
+    detail["headChecks"] = {
+        "totalCount": 1,
         "nodes": [
             {
                 "commit": {
                     "oid": p["headRefOid"],
-                    "statusCheckRollup": {
-                        "contexts": {
-                            "totalCount": 1,
-                            "pageInfo": {"hasNextPage": False},
-                            "nodes": [run],
-                        }
+                    "coderabbit": {
+                        "totalCount": 1,
+                        "nodes": [
+                            {
+                                "app": {"slug": "coderabbitai", "databaseId": 347564},
+                                "checkRuns": {
+                                    "totalCount": 1,
+                                    "nodes": [
+                                        {
+                                            "name": "CodeRabbit",
+                                            "status": "COMPLETED",
+                                            "conclusion": "SUCCESS",
+                                            "summary": "Result: Success - Review completed\n",
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
                     },
+                    "sourcery": {"totalCount": 0, "nodes": []},
                 }
             }
-        ]
+        ],
     }
     assert merge_train.review_body_hold(p, detail) is None
-    run["checkSuite"]["commit"]["oid"] = p["headRefOid"][:7]
+    detail["headChecks"]["nodes"][0]["commit"]["oid"] = p["headRefOid"][:7]
     short_hold = merge_train.review_body_hold(p, detail)
     assert short_hold is not None and "limit reached" in short_hold
 
@@ -11958,7 +11961,7 @@ def test_adr93_mutations_reject_defects(tmp_path, section, module_name, old, new
         (root / "tools" / f"{name}.py").write_text((ROOT / "tools" / f"{name}.py").read_text())
     path = workflow if module_name == "rules" else root / "tools" / f"{module_name}.py"
     source = path.read_text()
-    # B1 drops the pause from every standing-notice site: later evidence and both time rules.
+    # B1 drops pause from every standing-notice site: later evidence and both time rules.
     expected_count = 3 if section == "B1" else 1
     assert source.count(old) == expected_count, (section, old)
     control = adr92_mutation_run(root, selector, tmp_path / "control.log")
