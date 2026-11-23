@@ -17,7 +17,8 @@
 # there, and a space, quote or $ stays part of the path.
 # The pre-commit anchors job checks the staged contents through
 # make check-anchors: a commit whose staged .bestpractices.json anchors no
-# longer match their pins is refused until make fix-anchors moves them.
+# longer match their pins is refused until make fix-anchors moves them and
+# the repaired .bestpractices.json is staged.
 ---
 agent-checkpoint-tool:
   commands:

@@ -341,7 +341,9 @@ hashes.
   fails when an anchor matches no pin of its answer or a pin's answer does not
   link it. The `anchors` pre-commit job runs `make check-anchors`, which judges
   the staged contents, so a commit that moves pinned lines is refused until
-  `make fix-anchors` runs.
+  `make fix-anchors` runs. After that, stage the repaired `.bestpractices.json`
+  (`git add .bestpractices.json`) before you retry the commit: the check
+  compares staged anchors against staged sources, not unstaged edits.
   `make fix-anchors` moves anchors through `ANCHORS_BASE`, a revision
   whose files hold the source at the lines the current anchors record (for a
   committed change, usually `git merge-base HEAD main`); `main` works only

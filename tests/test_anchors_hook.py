@@ -207,6 +207,42 @@ def test_anchors_check_index_alternate(tmp_path: Path, monkeypatch: pytest.Monke
     assert anchors.main(["check", "--index", "--root", str(tree.root)]) == 0
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param("positive-clean", id="positive-clean"),
+        pytest.param("negative-staged-drift", id="negative-staged-drift"),
+        pytest.param("boundary-worktree-drift", id="boundary-worktree-drift"),
+    ],
+)
+def test_anchors_check_index_skip_worktree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    """check --index reads skip-worktree index entries from the index, never the worktree."""
+    tree = _init_planted_repo(tmp_path)
+    rel = anchors.PINS[0].path
+    target = tree.root / rel
+    expected = 0
+    if case == "negative-staged-drift":
+        _insert_drift(tree)
+        tree.git("add", rel)
+        expected = 1
+    tree.git("update-index", "--skip-worktree", rel)
+    if case == "boundary-worktree-drift":
+        _insert_drift(tree)
+        drifted = target.read_text(encoding="utf-8")
+        assert drifted != _committed_text(tree, rel)
+    else:
+        target.unlink()
+    capsys.readouterr()
+    assert anchors.main(["check", "--index", "--root", str(tree.root)]) == expected
+    assert "source file is missing" not in capsys.readouterr().err
+    if case == "boundary-worktree-drift":
+        assert target.read_text(encoding="utf-8") == drifted
+    else:
+        assert not target.exists()
+
+
 def test_anchors_fix_index_usage() -> None:
     """fix --index is a usage error."""
     with pytest.raises(SystemExit) as caught:

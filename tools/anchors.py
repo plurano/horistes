@@ -277,7 +277,10 @@ def _index_env() -> dict[str, str]:
 
 
 def _checkout_index(root: Path, prefix: Path) -> None:
-    """Materialise the active index under prefix for a bounded read-only check."""
+    """Materialise the active index under prefix for a bounded read-only check.
+
+    Skip-worktree index entries are included; the caller's working tree is not written.
+    """
     destination = prefix.resolve()
     destination.mkdir(parents=True, exist_ok=True)
     trail = str(destination)
@@ -285,7 +288,15 @@ def _checkout_index(root: Path, prefix: Path) -> None:
         trail += os.sep
     try:
         done = subprocess.run(
-            ["git", "-C", str(root), "checkout-index", "-a", f"--prefix={trail}"],
+            [
+                "git",
+                "-C",
+                str(root),
+                "checkout-index",
+                "-a",
+                "--ignore-skip-worktree-bits",
+                f"--prefix={trail}",
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
