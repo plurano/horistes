@@ -103,5 +103,6 @@ record that supersedes it.
 | [0098](0098-the-release-fan-out-runs-in-its-own-workflow-run.md) | 2026-11-20 | The release fan-out runs in its own workflow run | Accepted |
 | [0105](0105-the-train-asks-the-update-bot-to-recreate-an-unsigned-update.md) | 2026-11-21 | The train asks the update bot to recreate an unsigned update | Accepted |
 | [0112](0112-the-test-stage-runs-on-parallel-workers.md) | 2026-11-22 | The test stage runs on parallel workers | Accepted |
+| [0114](0114-a-sourcery-budget-skip-yields-to-a-coderabbit-review-on-the-head.md) | 2026-11-22 | A Sourcery budget skip yields to a CodeRabbit review on the head | Accepted |
 | [0115](0115-the-shared-update-header-names-no-command.md) | 2026-11-23 | The shared update header names no command | Accepted |
 | [0116](0116-undated-images-outside-docker-hub-keep-the-waiting-time.md) | 2026-11-23 | Undated images outside Docker Hub keep the waiting time | Accepted |
