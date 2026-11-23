@@ -18,9 +18,7 @@ the checklist named repository-specific gates (`make verify-all`,
 extends the preset without those commands would still show that checklist.
 
 Renovate 44.257.9 compiles `prHeader` with
-[`template.compile(config.prHeader, config)`](https://github.com/renovatebot/renovate/blob/44.257.9/lib/workers/repository/update/pr/body/header.ts)
-(see also
-`.lane-input/preset/renovate-src/lib_workers_repository_update_pr_body_header.ts`).
+[`template.compile(config.prHeader, config)`](https://github.com/renovatebot/renovate/blob/44.257.9/lib/workers/repository/update/pr/body/header.ts#L5-L9).
 The template sees only fields on the merged configuration, not files in a
 consumer repository, so the preset cannot learn which commands a repository
 adopted.

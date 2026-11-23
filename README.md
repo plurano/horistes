@@ -712,10 +712,11 @@ update of a container image skips the waiting time too, because a re-pushed tag
 restarts it; version updates of outside images keep three days, and the last
 package rule keeps fork image digests at three days
 ([ADR-0078](docs/adr/0078-docker-digest-updates-wait-for-no-release-age.md)).
-Version or digest updates from GHCR, Quay, ECR, or other registries without a
-release timestamp stay pending under Renovate’s default `timestamp-required`
-behaviour until a person requests them on the Dependency Dashboard; see
-[ADR-0116](docs/adr/0116-undated-images-outside-docker-hub-keep-the-waiting-time.md).
+Version updates of outside images on GHCR, Quay, ECR, or other registries
+other than Docker Hub carry no release timestamp in Renovate; they stay pending
+under the default `timestamp-required` behaviour until a person requests them
+on the Dependency Dashboard ([ADR-0116](docs/adr/0116-undated-images-outside-docker-hub-keep-the-waiting-time.md)).
+Fork image digests still keep three days through the last package rule.
 The digest rule adds a `prBodyNotes` explanation to the proposal.
 
 A fix of a known vulnerability skips the waiting time
