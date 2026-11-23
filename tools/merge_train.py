@@ -327,6 +327,34 @@ query($owner: String!, $name: String!, $number: Int!) {
         totalCount
         nodes { commit { message committedDate } }
       }
+      headChecks: commits(last: 1) {
+        totalCount
+        nodes {
+          commit {
+            oid
+            coderabbit: checkSuites(first: 5, filterBy: {appId: 347564}) {
+              totalCount
+              nodes {
+                app { slug databaseId }
+                checkRuns(first: 5, filterBy: {checkName: "CodeRabbit"}) {
+                  totalCount
+                  nodes { name status conclusion summary }
+                }
+              }
+            }
+            sourcery: checkSuites(first: 5, filterBy: {appId: 48477}) {
+              totalCount
+              nodes {
+                app { slug databaseId }
+                checkRuns(first: 5, filterBy: {checkName: "Sourcery review"}) {
+                  totalCount
+                  nodes { name status conclusion summary }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }
