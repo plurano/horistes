@@ -2611,6 +2611,17 @@ def called_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     }
 
 
+def include_callers(dependencies: dict[str, set[str]], callees: set[str]) -> set[str]:
+    """Include direct and transitive callers of the given functions."""
+    known = callees.copy()
+    for _ in range(len(dependencies)):
+        added = {name for name, calls in dependencies.items() if calls & known} - known
+        if not added:
+            break
+        known.update(added)
+    return known
+
+
 def derive_key_builders(module: ast.Module) -> set[str]:
     """Follow module-level callers back to openssl, one layer at a time."""
     dependencies = {
@@ -2618,19 +2629,35 @@ def derive_key_builders(module: ast.Module) -> set[str]:
         for function in module.body
         if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    builders = {"openssl"}
-    for _ in range(len(dependencies)):
-        added = {name for name, calls in dependencies.items() if calls & builders} - builders
-        if not added:
-            break
-        builders.update(added)
-    return builders
+    return include_callers(dependencies, {"openssl"})
+
+
+def derive_patching_helpers(module: ast.Module) -> set[str]:
+    """Find module-level helpers that patch shared modules directly or through a call."""
+    helpers = [
+        function
+        for function in module.body
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not function.name.startswith("test_")
+    ]
+    direct_patchers = {
+        function.name
+        for function in helpers
+        if any(
+            isinstance(node, ast.Call) and patches_key_build_module(node)
+            for statement in function.body
+            for node in ast.walk(statement)
+        )
+    }
+    dependencies = {function.name: called_names(function) for function in helpers}
+    return include_callers(dependencies, direct_patchers)
 
 
 def key_builds_after_shared_module_patch(source: str) -> list[str]:
     """Find test functions with a key build later in the source than a shared patch."""
     module = ast.parse(source)
     builders = derive_key_builders(module)
+    patching_helpers = derive_patching_helpers(module)
     offenders = []
     for test in ast.walk(module):
         if not isinstance(test, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2643,6 +2670,7 @@ def key_builds_after_shared_module_patch(source: str) -> list[str]:
                 (call.end_lineno, call.end_col_offset)
                 for call in calls
                 if patches_key_build_module(call)
+                or (isinstance(call.func, ast.Name) and call.func.id in patching_helpers)
             ),
             default=None,
         )
@@ -2667,6 +2695,11 @@ def test_no_key_build_after_shared_module_patch():
 def test_derived_builders_include_key_helpers():
     module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
     assert {"openssl", "app_key", "non_rsa_app_key"} <= derive_key_builders(module)
+
+
+def test_derived_patching_helpers_include_shared_module_helpers():
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    assert {"patch_openssl_which", "shrink_pipes"} <= derive_patching_helpers(module)
 
 
 @pytest.mark.parametrize(
@@ -2738,12 +2771,39 @@ def test_derived_builders_include_key_helpers():
             [],
             id="key-at-same-line-boundary",
         ),
+        pytest.param(
+            "shrink(monkeypatch)",
+            "app_key()",
+            ["test_example"],
+            id="patching-helper-before-key",
+        ),
+        pytest.param(
+            "shrink_indirectly(monkeypatch)",
+            "app_key()",
+            ["test_example"],
+            id="transitive-patching-helper-before-key",
+        ),
+        pytest.param(
+            "app_key()",
+            "shrink(monkeypatch)",
+            [],
+            id="key-before-patching-helper",
+        ),
+        pytest.param(
+            "patch_train_module(monkeypatch)",
+            "app_key()",
+            [],
+            id="safe-patching-helper-before-key",
+        ),
     ],
 )
 def test_key_build_order_check(first, second, expected):
     source = (
         "def non_rsa_app_key(kind):\n    return app_key()\n"
         'def app_key():\n    return openssl("genpkey")\n'
+        'def shrink(monkeypatch):\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+        "def shrink_indirectly(monkeypatch):\n    shrink(monkeypatch)\n"
+        'def patch_train_module(monkeypatch):\n    monkeypatch.setattr(train_mod, "call", fake)\n'
         f"def test_example(monkeypatch):\n    {first}\n    {second}\n"
     )
     assert key_builds_after_shared_module_patch(source) == expected
