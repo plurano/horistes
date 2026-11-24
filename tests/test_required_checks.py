@@ -4308,3 +4308,91 @@ def test_success_post_definitive_rejection_status_boundaries(
     assert fake.posts == [(REVIEW_POST_PATH, state) for state in expected_states]
     assert session.withdrawal_reserved is False
     assert session.api_calls == expected_calls
+
+
+def test_check_run_missing_started_at_with_other_stamps_counts_as_pending() -> None:
+    unstamped = check_item(7, "Build", "success", status="completed", started_at=None)
+    unstamped["created_at"] = "2026-11-21T12:00:00Z"
+    unstamped["completed_at"] = "2026-11-21T12:10:00Z"
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [unstamped]}
+    fake.answers[STATUSES_URL] = [status_item(1, PUSH_CONTEXT, "success")]
+    rc, out, err, _ = _review_judge(fake)
+    assert rc == 0 and err == ""
+    assert fake.posts == [(REVIEW_POST_PATH, "pending")]
+    assert "OK (success): Build" not in out
+
+    snap = required_checks.Snapshot({"Build": unstamped}, {}, (), REVIEW_EPOCH)
+    assert decide(snap, _review_config(), REVIEW_EPOCH, REVIEW_EPOCH)[0] == "pending"
+
+
+def test_check_run_missing_started_at_beats_queued_rerun_and_stays_pending() -> None:
+    run_a = check_item(5, "Build", "success", status="completed", started_at=None)
+    run_a["completed_at"] = "2026-11-21T12:10:00Z"
+    rerun_b = check_item(9, "Build", None, status="queued", started_at="2026-11-21T12:05:00Z")
+    config = _review_config()
+    for runs in ([run_a, rerun_b], [rerun_b, run_a]):
+        selected, ignored = required_checks.newest_check_runs(
+            runs, {1}, {}, frozenset({"Build"}), "required-checks"
+        )
+        assert selected["Build"]["id"] == 5
+        snap = required_checks.Snapshot(selected, {}, ignored, REVIEW_EPOCH)
+        verdict, _ = decide(snap, config, REVIEW_EPOCH, REVIEW_EPOCH)
+        assert verdict == "pending"
+        fake = ReviewTransport()
+        fake.answers[CHECKS_URL] = {"check_runs": runs}
+        fake.answers[STATUSES_URL] = [status_item(1, PUSH_CONTEXT, "success")]
+        rc, _, err, _ = _review_judge(fake)
+        assert rc == 0 and err == ""
+        assert fake.posts == [(REVIEW_POST_PATH, "pending")]
+
+
+def test_check_run_started_at_judges_and_orders_ignoring_completed_at() -> None:
+    lone = check_item(5, "Build", "success", status="completed", started_at="2026-11-21T12:00:00Z")
+    lone["completed_at"] = "2026-11-21T12:10:00Z"
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [lone]}
+    rc, out, err, _ = _review_judge(fake)
+    assert rc == 0 and err == ""
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+    assert "OK (success): Build" in out
+
+    run_a = check_item(5, "Build", "success", status="completed", started_at="2026-11-21T12:00:00Z")
+    run_a["completed_at"] = "2026-11-21T12:10:00Z"
+    run_b = check_item(9, "Build", "failure", status="completed", started_at="2026-11-21T12:05:00Z")
+    run_b["completed_at"] = "2026-11-21T12:06:00Z"
+    config = _review_config()
+    for runs in ([run_a, run_b], [run_b, run_a]):
+        selected, ignored = required_checks.newest_check_runs(
+            runs, {1}, {}, frozenset({"Build"}), "required-checks"
+        )
+        assert selected["Build"]["id"] == 9
+        snap = required_checks.Snapshot(selected, {}, ignored, REVIEW_EPOCH)
+        assert decide(snap, config, REVIEW_EPOCH, REVIEW_EPOCH)[0] == "failure"
+        fake_order = ReviewTransport()
+        fake_order.answers[CHECKS_URL] = {"check_runs": runs}
+        rc_order, _, err_order, _ = _review_judge(fake_order)
+        assert rc_order == 0 and err_order == ""
+        assert fake_order.posts == [(REVIEW_POST_PATH, "failure")]
+
+
+@pytest.mark.parametrize(
+    "bad_started_at",
+    ["", "not-a-time", "2026-11-21T12:00:00"],
+    ids=["empty", "unparsable", "zoneless"],
+)
+def test_check_run_unparsable_started_at_with_completed_at_counts_as_pending(
+    bad_started_at: str,
+) -> None:
+    run = check_item(7, "Build", "success", status="completed", started_at=bad_started_at)
+    run["completed_at"] = "2026-11-21T12:10:00Z"
+    assert required_checks._check_run_key(run) == (1, 0.0, 7)
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [run]}
+    fake.answers[STATUSES_URL] = [status_item(1, PUSH_CONTEXT, "success")]
+    rc, out, err, _ = _review_judge(fake)
+    assert rc == 0 and err == ""
+    assert fake.posts == [(REVIEW_POST_PATH, "pending")]
+    assert "OK (success): Build" not in out
+    snap = required_checks.Snapshot({"Build": run}, {}, (), REVIEW_EPOCH)
+    assert decide(snap, _review_config(), REVIEW_EPOCH, REVIEW_EPOCH)[0] == "pending"

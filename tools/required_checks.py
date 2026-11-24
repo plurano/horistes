@@ -773,11 +773,10 @@ def _check_run_admitted(
 
 
 def _check_run_epoch(run: dict) -> float:
-    return (
-        _iso_epoch(run.get("started_at"))
-        or _iso_epoch(run.get("created_at"))
-        or _iso_epoch(run.get("completed_at"))
-    )
+    """Epoch of the run's `started_at`, or 0.0 when absent or unparsable;
+    `created_at` and `completed_at` never stand in.
+    """
+    return _iso_epoch(run.get("started_at"))
 
 
 def _check_run_key(run: dict) -> tuple[int, float, int]:
