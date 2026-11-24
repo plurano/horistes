@@ -77,6 +77,7 @@ REVIEWED_RANGE_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+LIST_ITEM_RE = re.compile(r"^( {0,3})([-+*]|[0-9]{1,9}[.)])( {1,4})\S")
 MAX_HEAD_CHECK_SUITES = 5
 MAX_HEAD_CHECK_RUNS = 5
 CODERABBIT_APP_ID = 347564
@@ -280,26 +281,62 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
     return pause_ok
 
 
+def _fence_opener(line: str) -> tuple[str, int] | None:
+    """Return (fence_char, run_length) when line opens a Markdown fenced block."""
+    match = FENCE_OPEN_RE.fullmatch(line)
+    if not match or (match.group(1)[0] == "`" and "`" in match.group(2)):
+        return None
+    return match.group(1)[0], len(match.group(1))
+
+
+def _fence_closer(line: str, char: str, length: int) -> bool:
+    """Return True when line closes an open Markdown fence of char and length."""
+    match = FENCE_OPEN_RE.fullmatch(line)
+    return bool(
+        match
+        and match.group(1)[0] == char
+        and len(match.group(1)) >= length
+        and not match.group(2).strip(" ")
+    )
+
+
+def _next_item_col(line: str, item_col: int, prev_blank: bool, opens_fence: bool) -> int:
+    """Return the active list-item content column after an outside Markdown line."""
+    if not line.strip(" \t"):
+        return item_col
+    if item := LIST_ITEM_RE.match(line):
+        return item.end(3)
+    indent = len(line) - len(line.lstrip(" "))
+    if item_col and indent < item_col and (prev_blank or opens_fence):
+        return 0
+    return item_col
+
+
 def _without_fenced_code(body: str) -> str:
-    """Return bounded summary text with fenced Markdown blocks removed."""
-    kept = []
-    fence_char = ""
-    fence_len = 0
+    """Return bounded summary text with fenced Markdown blocks removed.
+
+    A fence opened inside a list item closes when a less-indented non-blank line closes that item.
+    """
+    kept: list[str] = []
+    fence_char, fence_len, fence_col = "", 0, 0
+    item_col = 0
+    prev_blank = False
     for line in body.splitlines()[:MAX_LINES]:
-        match = FENCE_OPEN_RE.fullmatch(line)
+        blank = not line.strip(" \t")
+        indent = len(line) - len(line.lstrip(" "))
+        if fence_col and not blank and indent < fence_col:
+            fence_char, fence_len, fence_col, item_col = "", 0, 0, 0
         if fence_len:
-            if (
-                match
-                and match.group(1)[0] == fence_char
-                and len(match.group(1)) >= fence_len
-                and not match.group(2).strip(" ")
-            ):
-                fence_char = ""
-                fence_len = 0
+            if _fence_closer(line, fence_char, fence_len):
+                fence_char, fence_len, fence_col = "", 0, 0
+            prev_blank = blank
             continue
-        if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
-            fence_char = match.group(1)[0]
-            fence_len = len(match.group(1))
+        opener = _fence_opener(line)
+        item_col = _next_item_col(line, item_col, prev_blank, opener is not None)
+        prev_blank = blank
+        if opener is not None:
+            fence_char, fence_len = opener
+            fence_col = item_col
             continue
         kept.append(line)
     return "\n".join(kept)

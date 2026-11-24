@@ -1995,6 +1995,55 @@ def test_completed_head_second_range_declarations(extra_range, holds):
             True,
             id="tilde-info-with-backtick-opens",
         ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\n  ```\n  code\n\n"
+            "Actionable comments posted: 1",
+            True,
+            id="nested-unclosed-fence-item-ends-after-blank",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ```\n  code\nActionable comments posted: 1",
+            True,
+            id="nested-unclosed-fence-item-ends-unindented",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\nlazy\n  ```\n  code\n\n"
+            "Actionable comments posted: 1",
+            True,
+            id="nested-fence-lazy-line-keeps-item",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n1. item\n   ```\n   code\n\n"
+            "Actionable comments posted: 1",
+            True,
+            id="nested-fence-ordered-item",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ```\n"
+            "  Actionable comments posted: 1\n  ```",
+            False,
+            id="nested-closed-fence-hides-count",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ```\n\n  Actionable comments posted: 1",
+            False,
+            id="nested-fence-blank-then-indented-stays-hidden",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\ntext\n```\nActionable comments posted: 1",
+            False,
+            id="top-level-unclosed-after-item-closed",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\n ```\nActionable comments posted: 1",
+            False,
+            id="fence-below-item-column-is-top-level",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n```\nActionable comments posted: 1",
+            False,
+            id="fence-opener-below-item-column-is-top-level",
+        ),
     ],
 )
 def test_completed_head_summary_fenced_code(statement, holds):
@@ -2064,6 +2113,12 @@ def test_unread_tail_mixed_notices(tail, expected):
             "```\nActionable comments posted: 1\n```\nActionable comments posted: 0",
             False,
             id="fenced-one-standalone-zero-clears",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\n  ```\n  code\n\n"
+            "Actionable comments posted: 1",
+            True,
+            id="nested-unclosed-fence-count-holds",
         ),
     ],
 )
