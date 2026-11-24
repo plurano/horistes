@@ -1147,6 +1147,81 @@ def test_completed_head_check_context_bound(count):
     assert bool(review_incomplete(pr)) is (count > 5)
 
 
+def _cr_suite(
+    succeeded: bool = True,
+    *,
+    truncated: bool = False,
+    unread_nodes: bool = False,
+    app: tuple[int, str] = (347564, "coderabbitai"),
+) -> dict:
+    """Build one headChecks suite fixture with optional connection defects."""
+    run = (
+        adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)
+        if succeeded
+        else adr114_check_run("CodeRabbit", "FAILURE", "Result: Failed\n")
+    )
+    suite = adr114_head_suite(app[0], app[1], [run])
+    if truncated:
+        suite["checkRuns"]["totalCount"] += 1
+    if unread_nodes:
+        suite["checkRuns"]["nodes"] = {}
+    return suite
+
+
+@pytest.mark.parametrize(
+    ("suites", "holds"),
+    [
+        pytest.param(
+            [_cr_suite(), _cr_suite(False, truncated=True)],
+            True,
+            id="success-then-truncated",
+        ),
+        pytest.param(
+            [_cr_suite(False, truncated=True), _cr_suite()],
+            True,
+            id="truncated-then-success",
+        ),
+        pytest.param(
+            [_cr_suite(), _cr_suite(False, unread_nodes=True)],
+            True,
+            id="success-then-unread-nodes",
+        ),
+        pytest.param(
+            [_cr_suite(False), _cr_suite()],
+            False,
+            id="two-readable-one-success",
+        ),
+        pytest.param(
+            [_cr_suite(), _cr_suite(False)],
+            False,
+            id="two-readable-success-first",
+        ),
+        pytest.param(
+            [_cr_suite(), _cr_suite(False, truncated=True, app=(999999, "other-app"))],
+            False,
+            id="other-app-truncated-ignored",
+        ),
+        pytest.param(
+            [_cr_suite(), _cr_suite(), _cr_suite(), _cr_suite(), _cr_suite(False, truncated=True)],
+            True,
+            id="five-suites-last-truncated",
+        ),
+        pytest.param(
+            [_cr_suite(False), _cr_suite(False), _cr_suite(False), _cr_suite(False), _cr_suite()],
+            False,
+            id="five-suites-all-readable",
+        ),
+    ],
+)
+def test_completed_head_coderabbit_suites(suites: list[dict], holds: bool) -> None:
+    """Every matching CodeRabbit suite must be readable regardless of suite order."""
+    pr = completed_head_pull(head_checks=adr114_head_checks())
+    coderabbit = pr["headChecks"]["nodes"][0]["commit"]["coderabbit"]
+    coderabbit["nodes"] = copy.deepcopy(suites)
+    coderabbit["totalCount"] = len(suites)
+    assert bool(review_incomplete(pr)) is holds
+
+
 @pytest.mark.parametrize("extra", [None, {}, {"commit": {"oid": ADR92_HEAD}}])
 def test_completed_head_commit_connection_bound(extra):
     """The query selects exactly one commit; malformed extra nodes cannot be dropped."""

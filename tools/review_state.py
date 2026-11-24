@@ -425,6 +425,16 @@ def _coderabbit_evidence_on_head(evidence: list) -> bool:
     return False
 
 
+def _coderabbit_run_succeeded(run: dict) -> bool:
+    """Whether a check run is a completed, successful CodeRabbit review."""
+    return (
+        run.get("name") == CODERABBIT_RUN
+        and run.get("status") == "COMPLETED"
+        and run.get("conclusion") == "SUCCESS"
+        and _run_summary_first_line(run.get("summary")) == CODERABBIT_SUCCESS_LINE
+    )
+
+
 def _coderabbit_check_on_head(head_checks) -> bool:
     """Whether headChecks records a successful CodeRabbit check run on the head commit."""
     commit = _head_checks_commit(head_checks)
@@ -433,6 +443,7 @@ def _coderabbit_check_on_head(head_checks) -> bool:
     suites, ok = _bounded_connection(commit.get("coderabbit"), MAX_HEAD_CHECK_SUITES)
     if not ok:
         return False
+    found = False
     for suite in suites[:MAX_HEAD_CHECK_SUITES]:
         if not _suite_app_matches(suite, CODERABBIT_APP_ID, CODERABBIT_SLUG):
             continue
@@ -440,14 +451,9 @@ def _coderabbit_check_on_head(head_checks) -> bool:
         if not runs_ok:
             return False
         for run in runs[:MAX_HEAD_CHECK_RUNS]:
-            if (
-                run.get("name") == CODERABBIT_RUN
-                and run.get("status") == "COMPLETED"
-                and run.get("conclusion") == "SUCCESS"
-                and _run_summary_first_line(run.get("summary")) == CODERABBIT_SUCCESS_LINE
-            ):
-                return True
-    return False
+            if _coderabbit_run_succeeded(run):
+                found = True
+    return found
 
 
 def _sourcery_budget_skip_on_head(head_checks) -> bool:
