@@ -2578,8 +2578,13 @@ def test_app_jwt_pipe_oserror_on_cold_key_cache(tmp_path, monkeypatch):
     test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch)
 
 
+KEY_BUILD_SAFE_TARGETS = frozenset(
+    {"train_mod", "mod", "merge_train.urllib.request", "sys.modules[__name__]"}
+)
+
+
 def patches_key_build_module(call: ast.Call) -> bool:
-    """Identify monkeypatch.setattr calls on the shared subprocess dependencies."""
+    """Identify monkeypatch.setattr calls outside the known safe targets."""
     if ast.unparse(call.func) != "monkeypatch.setattr":
         return False
     target = (
@@ -2588,18 +2593,46 @@ def patches_key_build_module(call: ast.Call) -> bool:
         else next((keyword.value for keyword in call.keywords if keyword.arg == "target"), None)
     )
     if target is None:
-        return False
+        return True
     if isinstance(target, ast.Constant) and isinstance(target.value, str):
         module_name = target.value.rpartition(".")[0]
     else:
         module_name = ast.unparse(target)
-    return module_name in {"os", "subprocess", "train_mod.os", "train_mod.subprocess"}
+    return module_name not in KEY_BUILD_SAFE_TARGETS
+
+
+def called_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Collect direct function names called in the function body."""
+    return {
+        node.func.id
+        for statement in function.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
+def derive_key_builders(module: ast.Module) -> set[str]:
+    """Follow module-level callers back to openssl, one layer at a time."""
+    dependencies = {
+        function.name: called_names(function)
+        for function in module.body
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    builders = {"openssl"}
+    for _ in range(len(dependencies)):
+        added = {name for name, calls in dependencies.items() if calls & builders} - builders
+        if not added:
+            break
+        builders.update(added)
+    return builders
 
 
 def key_builds_after_shared_module_patch(source: str) -> list[str]:
     """Find test functions with a key build later in the source than a shared patch."""
+    module = ast.parse(source)
+    builders = derive_key_builders(module)
     offenders = []
-    for test in ast.walk(ast.parse(source)):
+    for test in ast.walk(module):
         if not isinstance(test, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if not test.name.startswith("test_"):
@@ -2615,7 +2648,7 @@ def key_builds_after_shared_module_patch(source: str) -> list[str]:
         )
         if patched_at is not None and any(
             isinstance(call.func, ast.Name)
-            and call.func.id in {"app_key", "openssl"}
+            and call.func.id in builders
             and (call.lineno, call.col_offset) >= patched_at
             for call in calls
         ):
@@ -2626,8 +2659,14 @@ def key_builds_after_shared_module_patch(source: str) -> list[str]:
 def test_no_key_build_after_shared_module_patch():
     offenders = key_builds_after_shared_module_patch(Path(__file__).read_text(encoding="utf-8"))
     assert not offenders, (
-        f"Build the test key before patching os or subprocess in: {', '.join(offenders)}"
+        "Build the test key before monkeypatching a target outside the allow-list in: "
+        f"{', '.join(offenders)}"
     )
+
+
+def test_derived_builders_include_key_helpers():
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    assert {"openssl", "app_key", "non_rsa_app_key"} <= derive_key_builders(module)
 
 
 @pytest.mark.parametrize(
@@ -2648,7 +2687,7 @@ def test_no_key_build_after_shared_module_patch():
         pytest.param(
             'monkeypatch.setattr(train_mod.shutil, "which", mock_which)',
             "app_key(2048)",
-            [],
+            ["test_example"],
             id="unrelated-patch",
         ),
         pytest.param(
@@ -2669,10 +2708,44 @@ def test_no_key_build_after_shared_module_patch():
             ["test_example"],
             id="shared-subprocess-keyword-target",
         ),
+        pytest.param(
+            'monkeypatch.setattr(train_mod.time, "monotonic", lambda: 1.0)',
+            "app_key()",
+            ["test_example"],
+            id="time-patch-before-key",
+        ),
+        pytest.param(
+            'monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)',
+            "app_key()",
+            ["test_example"],
+            id="threading-patch-before-key",
+        ),
+        pytest.param(
+            'monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)',
+            'non_rsa_app_key("ec")',
+            ["test_example"],
+            id="non-rsa-after-os-patch",
+        ),
+        pytest.param(
+            'monkeypatch.setattr(train_mod, "call", fake)',
+            "app_key()",
+            [],
+            id="train-module-attribute-patch",
+        ),
+        pytest.param(
+            'app_key(); monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)',
+            "pass",
+            [],
+            id="key-at-same-line-boundary",
+        ),
     ],
 )
 def test_key_build_order_check(first, second, expected):
-    source = f"def test_example(monkeypatch):\n    {first}\n    {second}\n"
+    source = (
+        "def non_rsa_app_key(kind):\n    return app_key()\n"
+        'def app_key():\n    return openssl("genpkey")\n'
+        f"def test_example(monkeypatch):\n    {first}\n    {second}\n"
+    )
     assert key_builds_after_shared_module_patch(source) == expected
 
 
@@ -2805,6 +2878,7 @@ def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):
     script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     script.chmod(0o755)
 
+    key = app_key(2048)[0]
     monkeypatch.setattr(
         train_mod.shutil,
         "which",
@@ -2821,7 +2895,7 @@ def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):
         event.set()
 
     monkeypatch.setattr(train_mod, "write_key", wrapped_write_key)
-    assert train_mod.key_bits(app_key(2048)[0]) is None
+    assert train_mod.key_bits(key) is None
     assert event.is_set()
 
 
