@@ -1176,16 +1176,35 @@ def _status_in_context(entry: Mapping[str, object], key: str) -> bool:
     return isinstance(context, str) and context.casefold() == key
 
 
+def _read_status_pages(
+    session: ApiSession,
+    config: Config,
+    start_page: int,
+    statuses: list[dict],
+    covered: Callable[[list[dict]], bool],
+) -> tuple[list[dict], bool, bool]:
+    """Read status pages from `start_page` until `complete`, `covered`, or `STATUS_MAX_PAGES`."""
+    if covered(statuses):
+        return statuses, False, True
+    for page in range(start_page, STATUS_MAX_PAGES + 1):
+        rows, complete = _read_status_page(session, config, page)
+        statuses.extend(rows)
+        if complete or covered(statuses):
+            return statuses, complete, True
+    return statuses, False, False
+
+
 def _preflight_statuses(
     session: ApiSession, config: Config, key: str
 ) -> tuple[dict[str, dict], bool]:
-    statuses: list[dict] = []
-    for page in range(1, STATUS_MAX_PAGES + 1):
-        rows, complete = _read_status_page(session, config, page)
-        statuses.extend(rows)
-        if complete or any(_status_in_context(row, key) for row in rows[: forge.PER_PAGE]):
-            return _all_statuses(statuses), complete
-    return _all_statuses(statuses), False
+    statuses, complete, _ = _read_status_pages(
+        session,
+        config,
+        1,
+        [],
+        lambda rows: any(_status_in_context(row, key) for row in rows[:MAX_STATUSES]),
+    )
+    return _all_statuses(statuses), complete
 
 
 def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluation) -> str:
@@ -1204,26 +1223,76 @@ def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluatio
     return _post_age_problem(session, evaluation)
 
 
+def _own_contender_cutoff(
+    rows: list[dict], key: str, status_id: int, checked_at: float, read_started: float
+) -> int | None:
+    """Map the judge's server `created_at` stamp back by runner elapsed time to the read start."""
+    for entry in rows[: forge.PER_PAGE]:
+        if _status_in_context(entry, key) and entry.get("id") == status_id:
+            own_created = _iso_epoch(entry.get("created_at"))
+            if own_created <= 0:
+                return None
+            return floor(own_created - max(0.0, checked_at - read_started))
+    return None
+
+
+def _owed_status_keys(config: Config) -> frozenset[str]:
+    return frozenset(
+        name.casefold() for name in config.required[:MAX_CONTEXTS] if name not in config.apps
+    )
+
+
+def _statuses_covered(rows: list[dict], owed_keys: frozenset[str], oldest_contender: int) -> bool:
+    """Confirm every owed status context appears and the last row read precedes the cutoff."""
+    if not rows or _status_timestamp(rows[-1]) >= oldest_contender:
+        return False
+    if not owed_keys:
+        return True
+    seen: set[str] = set()
+    for entry in rows[:MAX_STATUSES]:
+        context = entry.get("context")
+        if isinstance(context, str) and context:
+            seen.add(context.casefold())
+    return owed_keys <= seen
+
+
+def _has_contender(rows: list[dict], key: str, status_id: int, oldest_contender: int) -> bool:
+    for entry in rows[:MAX_STATUSES]:
+        if (
+            _status_in_context(entry, key)
+            and entry.get("id") != status_id
+            and _iso_epoch(entry.get("created_at")) >= oldest_contender
+        ):
+            return True
+    return False
+
+
 def _post_is_contested(
     session: ApiSession, config: Config, evaluation: Evaluation, status_id: int
 ) -> bool:
-    """Detect judge writes or required status changes since the evidence read."""
-    statuses, complete = _read_status_page_one(session, config)
-    if _owed_status_changed(
-        config, evaluation.snapshot, _all_statuses(statuses), complete=complete
-    ):
-        return True
+    """Detect judge writes via server-clock timestamps or status changes across covered pages."""
+    checked_at = session.now()
+    rows, complete = _read_status_page_one(session, config)
     key = status_context(config).casefold()
-    oldest_contender = floor(evaluation.read_started)
-    own_status_seen = False
-    for entry in statuses[: forge.PER_PAGE]:
-        if not _status_in_context(entry, key):
-            continue
-        if entry.get("id") == status_id:
-            own_status_seen = True
-        elif _iso_epoch(entry.get("created_at")) >= oldest_contender:
+    oldest_contender = _own_contender_cutoff(
+        rows, key, status_id, checked_at, evaluation.read_started
+    )
+    if oldest_contender is None:
+        return True
+    owed_keys = _owed_status_keys(config)
+    if not complete:
+        rows, complete, confirmed = _read_status_pages(
+            session,
+            config,
+            2,
+            rows,
+            lambda read_rows: _statuses_covered(read_rows, owed_keys, oldest_contender),
+        )
+        if not confirmed:
             return True
-    return not own_status_seen
+    if _owed_status_changed(config, evaluation.snapshot, _all_statuses(rows), complete=complete):
+        return True
+    return _has_contender(rows, key, status_id, oldest_contender)
 
 
 def _report_verdict(config: Config, evaluation: Evaluation, out: TextIO) -> None:

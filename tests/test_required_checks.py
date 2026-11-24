@@ -1711,7 +1711,10 @@ def _sweep_body(kind: str, path: str, heads: list[str], page_bound: bool) -> obj
         context = PUSH_CONTEXT if f"/commits/{sha}/" in path else "required-checks"
         full = [
             status_item(1, context, "pending", updated_at="2000-01-01T00:00:00Z"),
-            *(status_item(i, "ext", "pending") for i in range(2, forge.PER_PAGE + 1)),
+            *(
+                status_item(i, "ext", "pending", updated_at="2000-01-01T00:00:00Z")
+                for i in range(2, forge.PER_PAGE + 1)
+            ),
         ]
         rows = _sweep_page_rows(path, page_bound, required_checks.STATUS_MAX_PAGES, full)
         return [] if rows is None else rows
@@ -2409,7 +2412,12 @@ REVIEW_POST_PATH = f"repos/{REPO}/statuses/{SHA}"
 
 
 class ReviewTransport:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        status_history: list[dict] | None = None,
+        server_offset: float = 0.0,
+    ) -> None:
         self.answers: dict[str, object] = base_answers()
         self.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build")]}
         self.answers[RUNS_URL] = {"workflow_runs": [wf_run(1)]}
@@ -2421,6 +2429,8 @@ class ReviewTransport:
         self.advance_on_reply: dict[str, Iterator[int]] = {}
         self.before_post: Callable[[], None] | None = None
         self.post_answers: Iterator[object] = iter(())
+        self.status_history: list[dict] | None = status_history
+        self.server_offset: float = server_offset
 
     def __call__(
         self, path: str, method: str = "GET", **kwargs: Any
@@ -2430,7 +2440,16 @@ class ReviewTransport:
             return self._post(path, kwargs["fields"])
         if "/check-runs?" in path and path not in self.answers and path not in self.replies:
             path = path.replace("/check-runs?per_page=", "/check-runs?filter=all&per_page=")
-        answer = self.answers.get(path, [])
+        if self.status_history is not None and path.startswith(
+            f"repos/{REPO}/commits/{SHA}/statuses?"
+        ):
+            match = re.search(r"[?&]page=(\d+)", path)
+            assert match is not None, path
+            page = int(match.group(1))
+            start = (page - 1) * forge.PER_PAGE
+            answer: object = self.status_history[start : start + forge.PER_PAGE]
+        else:
+            answer = self.answers.get(path, [])
         if path in self.replies:
             answer = next(self.replies[path], answer)
         if path in self.advance_on_reply:
@@ -2447,11 +2466,16 @@ class ReviewTransport:
             raise error
         sha = path.rsplit("/", 1)[1]
         statuses_path = STATUSES_URL.replace(SHA, sha)
-        stamp = datetime.fromtimestamp(self.clock.now(), UTC).isoformat(timespec="seconds")
+        stamp = datetime.fromtimestamp(self.clock.now() + self.server_offset, UTC).isoformat(
+            timespec="seconds"
+        )
         row = {**status_item(1000 + len(self.posts), fields["context"], updated_at=stamp), **fields}
-        statuses = self.answers.get(statuses_path, [])
-        assert isinstance(statuses, list)
-        self.answers[statuses_path] = [row, *statuses][: forge.PER_PAGE]
+        if self.status_history is not None and sha == SHA:
+            self.status_history.insert(0, row)
+        else:
+            statuses = self.answers.get(statuses_path, [])
+            assert isinstance(statuses, list)
+            self.answers[statuses_path] = [row, *statuses][: forge.PER_PAGE]
         return 201, {}, json.dumps(next(self.post_answers, row)).encode()
 
 
@@ -3183,7 +3207,7 @@ def test_preflight_reads_short_second_page_when_no_judge_status_exists() -> None
         ("GET", STATUSES_URL),
         ("GET", _status_page(2)),
     ]
-    assert fake.calls.count(("GET", _status_page(2))) == 2
+    assert fake.calls.count(("GET", _status_page(2))) == 3
     assert fake.posts == [(REVIEW_POST_PATH, "success")]
 
 
@@ -3201,7 +3225,7 @@ def test_preflight_compares_judge_status_on_second_page() -> None:
     )
     rc, _, err, _ = _review_judge(fake)
     assert rc == 0 and not err, err
-    assert fake.calls.count(("GET", _status_page(2))) == 4
+    assert fake.calls.count(("GET", _status_page(2))) == 5
     assert fake.posts == [(REVIEW_POST_PATH, "failure")]
 
 
@@ -4447,34 +4471,134 @@ def test_post_verification_keeps_success_when_required_status_unchanged() -> Non
     assert len(fake.calls) == len(baseline.calls) == 6
 
 
-@pytest.mark.parametrize("complete_page", [False, True], ids=["full-page", "short-page"])
-def test_post_verification_absent_required_status_depends_on_page_completeness(
-    complete_page: bool,
-) -> None:
-    fake = ReviewTransport()
-    fake.answers[STATUSES_URL] = [status_item(1, "External", "success")]
+@dataclass(frozen=True)
+class _ServerClockCase:
+    server_offset: float
+    checks_elapsed: int
+    competitor_delta: int
+    expected_states: tuple[str, ...]
+
+
+def _iso_seconds(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _ServerClockCase(-5.0, 0, 0, ("success", "failure")),
+        _ServerClockCase(-5.0, 0, -1, ("success",)),
+        _ServerClockCase(0.0, 3, 1, ("success", "failure")),
+    ],
+    ids=[
+        "runner-ahead-competitor-after-preflight",
+        "runner-ahead-competitor-before-read-start",
+        "competitor-mid-window-elapsed",
+    ],
+)
+def test_post_verification_contender_uses_server_clock(case: _ServerClockCase) -> None:
+    fake = ReviewTransport(server_offset=case.server_offset)
+    server_read_start = fake.clock.now() + fake.server_offset
+    if case.checks_elapsed:
+        fake.advance_on_reply[CHECKS_URL] = iter([case.checks_elapsed])
     fake.advance_on_reply[STATUSES_URL] = iter([0, 0, 1])
-    other_count = 1 if complete_page else forge.PER_PAGE - 1
 
-    def drop_external_from_page_one() -> None:
+    def interleave() -> None:
+        stamp = (
+            _iso_seconds(fake.clock.now() + fake.server_offset)
+            if case.competitor_delta == 0
+            else _iso_seconds(server_read_start + case.competitor_delta)
+        )
+        _interleave_sweep_failure(fake, stamp)
+
+    fake.before_post = interleave
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0 and err == "", err
+    assert fake.posts == [(REVIEW_POST_PATH, state) for state in case.expected_states]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "short-page-external-gone",
+        "full-page-external-unchanged-on-page-two",
+        "full-page-external-failed-on-page-two",
+        "full-page-bound-unconfirmed",
+    ],
+)
+def test_post_verification_absent_required_status_depends_on_page_completeness(
+    mode: str,
+) -> None:
+    fake = ReviewTransport(status_history=[status_item(1, "External", "success")])
+    fake.advance_on_reply[STATUSES_URL] = iter([0, 0, 1])
+
+    def mutate_before_post() -> None:
         fake.before_post = None
-        fake.answers[STATUSES_URL] = [status_item(10 + idx, "other") for idx in range(other_count)]
+        assert fake.status_history is not None
+        if mode == "short-page-external-gone":
+            fake.status_history = [status_item(10, "other")]
+            return
+        if mode == "full-page-external-unchanged-on-page-two":
+            others = [status_item(10 + idx, "other") for idx in range(forge.PER_PAGE)]
+            fake.status_history = [*others, *fake.status_history]
+            return
+        if mode == "full-page-external-failed-on-page-two":
+            failed = status_item(2, "External", "failure")
+            others = [status_item(10 + idx, "other") for idx in range(forge.PER_PAGE)]
+            fake.status_history = [*others, failed, *fake.status_history]
+            return
+        bound_count = required_checks.STATUS_MAX_PAGES * forge.PER_PAGE
+        others = [status_item(10 + idx, "other") for idx in range(bound_count)]
+        fake.status_history = [*others, *fake.status_history]
 
-    fake.before_post = drop_external_from_page_one
+    fake.before_post = mutate_before_post
     rc, _, err, _ = _review_judge(fake, required_json='["Build", "External"]')
-    assert rc == 0 and err == ""
-    statuses = fake.answers[STATUSES_URL]
-    assert isinstance(statuses, list)
-    standing = required_checks._all_statuses(statuses)[PUSH_CONTEXT]["state"]
-    if complete_page:
-        assert fake.calls.count(("GET", CHECKS_URL)) == 2
+    assert fake.status_history is not None
+    standing = required_checks._all_statuses(fake.status_history)[PUSH_CONTEXT]["state"]
+    if mode == "short-page-external-gone":
+        assert rc == 0 and err == "", err
         assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
         assert standing == "pending"
-    else:
-        assert len(statuses) == forge.PER_PAGE
-        assert fake.calls.count(("GET", CHECKS_URL)) == 1
+    elif mode == "full-page-external-unchanged-on-page-two":
+        assert rc == 0 and err == "", err
         assert fake.posts == [(REVIEW_POST_PATH, "success")]
         assert standing == "success"
+        post_index = fake.calls.index(("POST", REVIEW_POST_PATH))
+        assert ("GET", _status_page(2)) in fake.calls[post_index + 1 :]
+    elif mode == "full-page-external-failed-on-page-two":
+        assert rc == 0 and err == "", err
+        assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
+        assert standing == "failure"
+    else:
+        assert rc == 1 and "more than" in err
+        assert standing != "success"
+        assert standing == "pending"
+        assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+
+
+def test_post_verification_reads_contender_displaced_to_page_two() -> None:
+    fake = ReviewTransport(status_history=[])
+    fake.advance_on_reply[STATUSES_URL] = iter([0, 0, 1])
+
+    def displace_contender_to_page_two() -> None:
+        fake.before_post = None
+        assert fake.status_history is not None
+        stamp = _iso_seconds(fake.clock.now() + fake.server_offset)
+        failed = status_item(41, PUSH_CONTEXT, "failure", updated_at=stamp)
+        others = [
+            status_item(100 + idx, "other", updated_at=stamp) for idx in range(forge.PER_PAGE)
+        ]
+        fake.status_history = [*others, failed, *fake.status_history]
+        fake.answers[CHECKS_URL] = {"check_runs": [check_item(2, "Build", "failure")]}
+
+    fake.before_post = displace_contender_to_page_two
+    rc, _, err, _ = _review_judge(
+        fake,
+        required_json='["Build"]',
+        apps_json='{"Build": "github-actions"}',
+    )
+    assert rc == 0 and err == "", err
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
 
 
 def test_post_verification_required_status_change_withdraws_when_retry_fails() -> None:
