@@ -2653,8 +2653,55 @@ def derive_patching_helpers(module: ast.Module) -> set[str]:
     return include_callers(dependencies, direct_patchers)
 
 
+def own_scope_calls(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[list[ast.Call], list[ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """Collect calls in the function's own scope and its direct nested definitions."""
+    calls: list[ast.Call] = []
+    nested: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    stack: list[ast.AST] = list(reversed(function.body))
+    for _ in range(len(list(ast.walk(function)))):
+        if not stack:
+            break
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            nested.append(node)
+            body_ids = {id(statement) for statement in node.body}
+            children = [child for child in ast.iter_child_nodes(node) if id(child) not in body_ids]
+        else:
+            if isinstance(node, ast.Call):
+                calls.append(node)
+            children = list(ast.iter_child_nodes(node))
+        stack.extend(reversed(children))
+    return calls, nested
+
+
+def nested_roles(
+    nested: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    builders: set[str],
+    patchers: set[str],
+) -> tuple[set[str], set[str]]:
+    """Classify nested functions that build keys or patch shared modules when called."""
+    dependencies: dict[str, set[str]] = {}
+    direct_patchers: set[str] = set()
+    for function in nested:
+        calls = called_names(function)
+        dependencies.setdefault(function.name, set()).update(calls)
+        if calls & patchers or any(
+            isinstance(node, ast.Call) and patches_key_build_module(node)
+            for statement in function.body
+            for node in ast.walk(statement)
+        ):
+            direct_patchers.add(function.name)
+    direct_builders = {name for name, calls in dependencies.items() if calls & builders}
+    return (
+        include_callers(dependencies, direct_builders),
+        include_callers(dependencies, direct_patchers),
+    )
+
+
 def key_builds_after_shared_module_patch(source: str) -> list[str]:
-    """Find functions with a key build later in the source than a shared patch."""
+    """Find functions whose own scope builds a key at or after a shared patch."""
     module = ast.parse(source)
     builders = derive_key_builders(module)
     patching_helpers = derive_patching_helpers(module)
@@ -2662,19 +2709,22 @@ def key_builds_after_shared_module_patch(source: str) -> list[str]:
     for function in ast.walk(module):
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+        calls, nested = own_scope_calls(function)
+        nested_builders, nested_patchers = nested_roles(nested, builders, patching_helpers)
+        scope_builders = builders | nested_builders
+        scope_patchers = patching_helpers | nested_patchers
         patched_at = min(
             (
                 (call.end_lineno, call.end_col_offset)
                 for call in calls
                 if patches_key_build_module(call)
-                or (isinstance(call.func, ast.Name) and call.func.id in patching_helpers)
+                or (isinstance(call.func, ast.Name) and call.func.id in scope_patchers)
             ),
             default=None,
         )
         if patched_at is not None and any(
             isinstance(call.func, ast.Name)
-            and call.func.id in builders
+            and call.func.id in scope_builders
             and (call.lineno, call.col_offset) >= patched_at
             for call in calls
         ):
@@ -2850,6 +2900,73 @@ def test_key_build_order_inside_helpers(first, second, expected):
         'def shrink(monkeypatch):\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
         f"def case_helper(monkeypatch):\n    {first}\n    {second}\n"
         "def test_example(monkeypatch):\n    case_helper(monkeypatch)\n"
+    )
+    assert key_builds_after_shared_module_patch(source) == expected
+
+
+NESTED_KEY_BUILD_CASES = [
+    pytest.param(
+        'def inner():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\napp_key()\ninner()',
+        [],
+        id="review-case",
+    ),
+    pytest.param(
+        'def inner():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\napp_key()',
+        [],
+        id="never-called",
+    ),
+    pytest.param(
+        'def inner():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\ninner()\napp_key()',
+        ["test_example"],
+        id="called-before",
+    ),
+    pytest.param(
+        "def make():\n    return app_key()\nshrink(monkeypatch)\nmake()",
+        ["test_example"],
+        id="nested-key-builder",
+    ),
+    pytest.param(
+        "def inner():\n    shrink(monkeypatch)\ninner()\napp_key()",
+        ["test_example"],
+        id="nested-through-module-helper",
+    ),
+    pytest.param(
+        (
+            'def a():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+            "def b():\n    a()\nb()\napp_key()"
+        ),
+        ["test_example"],
+        id="transitive-nested",
+    ),
+    pytest.param(
+        (
+            'def inner():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+            "    app_key()\ninner()"
+        ),
+        ["inner"],
+        id="nested-own-order",
+    ),
+    pytest.param(
+        "shrink(monkeypatch)\n@app_key()\ndef inner():\n    pass",
+        ["test_example"],
+        id="decorator-boundary",
+    ),
+    pytest.param(
+        "shrink(monkeypatch)\ndef inner(key=app_key()):\n    pass",
+        ["test_example"],
+        id="default-arg-boundary",
+    ),
+]
+
+
+@pytest.mark.parametrize(("body", "expected"), NESTED_KEY_BUILD_CASES)
+def test_key_build_order_nested_functions(body, expected):
+    """Attribute nested patches and key builds to the parent at each call, not at definition."""
+    indented = body.replace("\n", "\n    ")
+    source = (
+        'def app_key():\n    return openssl("genpkey")\n'
+        'def shrink(monkeypatch):\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+        f"def test_example(monkeypatch):\n    {indented}\n"
     )
     assert key_builds_after_shared_module_patch(source) == expected
 
