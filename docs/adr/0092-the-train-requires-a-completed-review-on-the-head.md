@@ -78,6 +78,10 @@ A body that mixes an allowance notice with another notice holds while either
 part holds under its own rule, checked by `test_read_body_mixed_notices`.
 A mixed pause and allowance body proves the head only when its unfenced text
 carries zero-action evidence.
+Fenced blocks follow GitHub Flavored Markdown 0.29 section 4.5 (closing with
+the same character at least as long and only trailing spaces, opening nothing
+when a backtick fence has a backtick in its info string, and running to the end
+when unclosed), checked by `test_completed_head_summary_fenced_code`.
 `E-*` cases in `test_adr92_reader_planted` cover these rules.
 
 F. Unreadable or truncated connections hold before either review reader runs.

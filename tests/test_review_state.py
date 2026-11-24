@@ -1825,10 +1825,19 @@ def test_bot_dependency_count_rejects_boolean():
             True,
             id="second-range-full-oid",
         ),
+        pytest.param(
+            "\n```\n~~~\nReviewing files that changed from the base of the PR and between "
+            + "a" * 40
+            + " and "
+            + "c" * 40
+            + ".\n```",
+            False,
+            id="fenced-second-range-with-tilde",
+        ),
     ],
 )
 def test_completed_head_second_range_declarations(extra_range, holds):
-    """Any second reviewed-range declaration line invalidates summary coverage."""
+    """Any unfenced second reviewed-range declaration line invalidates summary coverage."""
     body = completed_head_summary() + extra_range
     assert bool(adr92_reader().review_incomplete(completed_head_pull(summary=body))) is holds
 
@@ -1855,6 +1864,61 @@ def test_completed_head_second_range_declarations(extra_range, holds):
             "~~~\nActionable comments posted: 0\n~~~",
             True,
             id="tilde-fence",
+        ),
+        pytest.param(
+            "```\n~~~\nActionable comments posted: 0\n```",
+            True,
+            id="mixed-tilde-inside-backtick",
+        ),
+        pytest.param(
+            "~~~\n```\nActionable comments posted: 0\n~~~",
+            True,
+            id="mixed-backtick-inside-tilde",
+        ),
+        pytest.param(
+            "````\n```\nActionable comments posted: 0\n````",
+            True,
+            id="shorter-closer",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n````\nActionable comments posted: 0",
+            False,
+            id="longer-closer-closes",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n``` x\nActionable comments posted: 0",
+            True,
+            id="closer-with-text-stays-open",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n```   \nActionable comments posted: 0",
+            False,
+            id="closer-trailing-spaces-closes",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n```\t\nActionable comments posted: 0",
+            True,
+            id="closer-trailing-tab-stays-open",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n   ```\nActionable comments posted: 0",
+            False,
+            id="closer-indent-three-closes",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n    ```\nActionable comments posted: 0",
+            True,
+            id="closer-indent-four-stays-open",
+        ),
+        pytest.param(
+            "```a`b\nActionable comments posted: 0",
+            False,
+            id="backtick-info-with-backtick-opens-nothing",
+        ),
+        pytest.param(
+            "~~~a`b\nActionable comments posted: 0\n~~~",
+            True,
+            id="tilde-info-with-backtick-opens",
         ),
     ],
 )

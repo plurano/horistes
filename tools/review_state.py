@@ -76,7 +76,7 @@ REVIEWED_RANGE_LINE_RE = re.compile(
     r"\S+ and \S+\.[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
-FENCE_RE = re.compile(r"^ {0,3}(?:```|~~~)")
+FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 MAX_HEAD_CHECK_SUITES = 5
 MAX_HEAD_CHECK_RUNS = 5
 CODERABBIT_APP_ID = 347564
@@ -283,13 +283,25 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
 def _without_fenced_code(body: str) -> str:
     """Return bounded summary text with fenced Markdown blocks removed."""
     kept = []
-    in_fence = False
+    fence_char = ""
+    fence_len = 0
     for line in body.splitlines()[:MAX_LINES]:
-        if FENCE_RE.match(line):
-            in_fence = not in_fence
+        match = FENCE_OPEN_RE.fullmatch(line)
+        if fence_len:
+            if (
+                match
+                and match.group(1)[0] == fence_char
+                and len(match.group(1)) >= fence_len
+                and not match.group(2).strip(" ")
+            ):
+                fence_char = ""
+                fence_len = 0
             continue
-        if not in_fence:
-            kept.append(line)
+        if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+            fence_char = match.group(1)[0]
+            fence_len = len(match.group(1))
+            continue
+        kept.append(line)
     return "\n".join(kept)
 
 
