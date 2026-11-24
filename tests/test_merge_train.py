@@ -2495,8 +2495,8 @@ def shrink_pipes(train_mod, monkeypatch):
 def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
     """key_bits reads an RSA key longer than the 4096-byte pipe buffer without hanging."""
     train_mod = load_train(tmp_path, monkeypatch)
-    shrink_pipes(train_mod, monkeypatch)
     key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
+    shrink_pipes(train_mod, monkeypatch)
     result = {}
 
     def worker():
@@ -2517,8 +2517,8 @@ def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
 def test_key_longer_than_pipe_capacity_app_jwt(tmp_path, monkeypatch):
     """app_jwt signs a JWT using a key longer than the 4096-byte pipe buffer without hanging."""
     train_mod = load_train(tmp_path, monkeypatch)
-    shrink_pipes(train_mod, monkeypatch)
     key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
+    shrink_pipes(train_mod, monkeypatch)
     env = {"TRAIN_APP_KEY": key}
     conf = {"client_id": "test-client-id"}
     result = {}
@@ -2547,9 +2547,10 @@ def test_key_bits_pipe_oserror_raises_invalid_setting_error(tmp_path, monkeypatc
     def mock_pipe():
         raise OSError(errno.EMFILE, "Too many open files")
 
+    key = app_key(2048)[0]
     monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
     with pytest.raises(train_mod.InvalidSettingError) as exc_info:
-        train_mod.key_bits(app_key(2048)[0])
+        train_mod.key_bits(key)
     msg = str(exc_info.value)
     assert "Too many open files" in msg or "EMFILE" in msg
     assert f"at least {train_mod.MIN_KEY_BITS} bits are required" in msg
@@ -2562,13 +2563,117 @@ def test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch):
     def mock_pipe():
         raise OSError(errno.EMFILE, "Too many open files")
 
-    monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
     env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
     conf = {"client_id": "test-client-id"}
     with pytest.raises(train_mod.RefusedError) as exc_info:
         train_mod.app_jwt(env, conf)
     msg = str(exc_info.value)
     assert "Too many open files" in msg or "EMFILE" in msg
+
+
+def test_app_jwt_pipe_oserror_on_cold_key_cache(tmp_path, monkeypatch):
+    """Exercise the pipe failure when this worker has no cached app keys."""
+    app_key.cache_clear()
+    test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch)
+
+
+def patches_key_build_module(call: ast.Call) -> bool:
+    """Identify monkeypatch.setattr calls on the shared subprocess dependencies."""
+    if ast.unparse(call.func) != "monkeypatch.setattr":
+        return False
+    target = (
+        call.args[0]
+        if call.args
+        else next((keyword.value for keyword in call.keywords if keyword.arg == "target"), None)
+    )
+    if target is None:
+        return False
+    if isinstance(target, ast.Constant) and isinstance(target.value, str):
+        module_name = target.value.rpartition(".")[0]
+    else:
+        module_name = ast.unparse(target)
+    return module_name in {"os", "subprocess", "train_mod.os", "train_mod.subprocess"}
+
+
+def key_builds_after_shared_module_patch(source: str) -> list[str]:
+    """Find test functions with a key build later in the source than a shared patch."""
+    offenders = []
+    for test in ast.walk(ast.parse(source)):
+        if not isinstance(test, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not test.name.startswith("test_"):
+            continue
+        calls = [node for node in ast.walk(test) if isinstance(node, ast.Call)]
+        patched_at = min(
+            (
+                (call.end_lineno, call.end_col_offset)
+                for call in calls
+                if patches_key_build_module(call)
+            ),
+            default=None,
+        )
+        if patched_at is not None and any(
+            isinstance(call.func, ast.Name)
+            and call.func.id in {"app_key", "openssl"}
+            and (call.lineno, call.col_offset) >= patched_at
+            for call in calls
+        ):
+            offenders.append(test.name)
+    return offenders
+
+
+def test_no_key_build_after_shared_module_patch():
+    offenders = key_builds_after_shared_module_patch(Path(__file__).read_text(encoding="utf-8"))
+    assert not offenders, (
+        f"Build the test key before patching os or subprocess in: {', '.join(offenders)}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        pytest.param(
+            'monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)',
+            'env = {"TRAIN_APP_KEY": app_key(2048)[0]}',
+            ["test_example"],
+            id="patch-before-key",
+        ),
+        pytest.param(
+            'env = {"TRAIN_APP_KEY": app_key(2048)[0]}',
+            'monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)',
+            [],
+            id="key-before-patch",
+        ),
+        pytest.param(
+            'monkeypatch.setattr(train_mod.shutil, "which", mock_which)',
+            "app_key(2048)",
+            [],
+            id="unrelated-patch",
+        ),
+        pytest.param(
+            'monkeypatch.setattr(os, "pipe", mock_pipe)',
+            "app_key()",
+            ["test_example"],
+            id="direct-os",
+        ),
+        pytest.param(
+            'monkeypatch.setattr("subprocess.run", mock_run)',
+            'openssl("genpkey")',
+            ["test_example"],
+            id="direct-subprocess-dotted-path",
+        ),
+        pytest.param(
+            'monkeypatch.setattr(target=train_mod.subprocess, name="run", value=mock_run)',
+            'openssl("genpkey")',
+            ["test_example"],
+            id="shared-subprocess-keyword-target",
+        ),
+    ],
+)
+def test_key_build_order_check(first, second, expected):
+    source = f"def test_example(monkeypatch):\n    {first}\n    {second}\n"
+    assert key_builds_after_shared_module_patch(source) == expected
 
 
 def test_os_failure_names_the_type_and_description_only(tmp_path, monkeypatch):
@@ -2590,10 +2695,11 @@ def test_key_bits_thread_runtime_error_raises_invalid_setting_error_and_leaks_no
         def start(self):
             raise RuntimeError("thread creation failed")
 
+    key = app_key(2048)[0]
     monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
     fds_before = len(os.listdir(FD_DIR))
     with pytest.raises(train_mod.InvalidSettingError) as exc_info:
-        train_mod.key_bits(app_key(2048)[0])
+        train_mod.key_bits(key)
     fds_after = len(os.listdir(FD_DIR))
     assert fds_after == fds_before
     msg = str(exc_info.value)
@@ -2610,8 +2716,8 @@ def test_app_jwt_thread_runtime_error_raises_refused_error_and_leaks_no_fds(tmp_
         def start(self):
             raise RuntimeError("thread creation failed")
 
-    monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
     env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
     conf = {"client_id": "test-client-id"}
     fds_before = len(os.listdir(FD_DIR))
     with pytest.raises(train_mod.RefusedError) as exc_info:
@@ -2647,9 +2753,9 @@ def patch_openssl_which(tmp_path, monkeypatch, train_mod, marker):
     return str(wrapper), calls
 
 
-def run_app_jwt(train_mod):
-    """Sign a token with a fresh 2048-bit key and return it."""
-    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+def run_app_jwt(train_mod, key: str):
+    """Sign a token with the supplied key and return it."""
+    env = {"TRAIN_APP_KEY": key}
     conf = {"client_id": "test-client-id"}
     return train_mod.app_jwt(env, conf)
 
@@ -2658,8 +2764,9 @@ def test_key_bits_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
     """key_bits runs the openssl that shutil.which found."""
     train_mod = load_train(tmp_path, monkeypatch)
     marker = tmp_path / "marker_key_bits"
+    key = app_key(2048)[0]
     patch_openssl_which(tmp_path, monkeypatch, train_mod, marker)
-    assert train_mod.key_bits(app_key(2048)[0]) == 2048
+    assert train_mod.key_bits(key) == 2048
     assert marker.is_file()
 
 
@@ -2667,24 +2774,27 @@ def test_app_jwt_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
     """app_jwt runs the openssl that shutil.which found."""
     train_mod = load_train(tmp_path, monkeypatch)
     marker = tmp_path / "marker_app_jwt"
+    key = app_key(2048)[0]
     patch_openssl_which(tmp_path, monkeypatch, train_mod, marker)
-    assert len(run_app_jwt(train_mod).split(".")) == 3
+    assert len(run_app_jwt(train_mod, key).split(".")) == 3
     assert marker.is_file()
 
 
 def test_key_bits_passes_literal_openssl_and_executable_path(tmp_path, monkeypatch):
     """key_bits passes the literal "openssl" first and the which path as executable."""
     train_mod = load_train(tmp_path, monkeypatch)
+    key = app_key(2048)[0]
     which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
-    assert train_mod.key_bits(app_key(2048)[0]) == 2048
+    assert train_mod.key_bits(key) == 2048
     assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
 
 
 def test_app_jwt_passes_literal_openssl_and_executable_path(tmp_path, monkeypatch):
     """app_jwt passes the literal "openssl" first and the which path as executable."""
     train_mod = load_train(tmp_path, monkeypatch)
+    key = app_key(2048)[0]
     which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
-    assert len(run_app_jwt(train_mod).split(".")) == 3
+    assert len(run_app_jwt(train_mod, key).split(".")) == 3
     assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
 
 
