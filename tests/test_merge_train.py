@@ -386,6 +386,7 @@ class Forge:
         # Downloads of an artifact still to cut; absent, every download is cut.
         self.storage_cuts_left: dict[int, int] = {}
         self.storage_reads: list[int] = []
+        self.storage_targets: list[str] = []
         self.storage_auth_seen: list[str] = []
         self.users_auth_seen: list[str] = []
         self.artifact_redirect_locations: dict[int, str | None] = {}
@@ -420,6 +421,7 @@ class Forge:
         self.rights: dict[str, str] = {}
         self.right_refusals: dict[str, int] = {}
         self.right_faults: dict[str, list[int]] = {}
+        self.right_message = "Permission read refused"
         self.right_calls: list[str] = []
         self.retry_histories: dict[int, dict] = {}
         self.retry_refusals: dict[int, str] = {}
@@ -1022,6 +1024,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         art_id = int(path.removeprefix("/storage/"))
         self.server.forge.storage_reads.append(art_id)
+        self.server.forge.storage_targets.append(self.path)
         if art_id in self.server.forge.storage_errors:
             self.answer(
                 self.server.forge.storage_errors[art_id],
@@ -1088,9 +1091,9 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(403, {"message": "Resource not accessible by integration"})
         elif login in forge.right_faults and forge.right_faults[login]:
             status = forge.right_faults[login].pop(0)
-            self.answer(status, {"message": "Permission read refused"})
+            self.answer(status, {"message": forge.right_message})
         elif login in forge.right_refusals:
-            self.answer(forge.right_refusals[login], {"message": "Permission read refused"})
+            self.answer(forge.right_refusals[login], {"message": forge.right_message})
         elif login in forge.rights:
             permission = forge.rights[login]
             self.answer(200, {"permission": permission, "role_name": permission})
@@ -1370,6 +1373,42 @@ def test_call_http_error_message_closed(tmp_path, monkeypatch):
     assert caught.value.__cause__ is err
     assert "refused message" in str(caught.value)
     assert err.closed
+
+
+def test_http_status_reads_the_cause_code(tmp_path, monkeypatch):
+    """Boundary: http_status reads only an HTTPError cause's code, never message text."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+
+    err_404 = urllib.error.HTTPError(
+        "https://api.github.test/call", 404, "Not Found", {}, io.BytesIO(b"")
+    )
+    err_404.close()
+    try:
+        raise merge_train.RefusedError("GET x: HTTP 404") from err_404
+    except merge_train.RefusedError as refused:
+        assert merge_train.http_status(refused) == 404
+
+    monkeypatch.setattr(
+        merge_train.urllib.request,
+        "build_opener",
+        lambda *h: _raising_opener(
+            urllib.error.HTTPError(
+                "https://api.github.test/call", 502, "Bad Gateway", {}, io.BytesIO(b"gw")
+            )
+        ),
+    )
+    with pytest.raises(merge_train.UnreadError) as unread:
+        merge_train.call("https://api.github.test/call", method="GET")
+    assert merge_train.http_status(unread.value) == 502
+
+    try:
+        raise merge_train.RefusedError("GET x: dropped") from urllib.error.URLError("dropped")
+    except merge_train.RefusedError as url_refused:
+        assert merge_train.http_status(url_refused) is None
+
+    assert merge_train.http_status(merge_train.RefusedError("plain failure")) is None
+    assert merge_train.http_status(merge_train.RefusedError("GET x: HTTP 404 Not Found")) is None
 
 
 class _UnreadableBody(io.BytesIO):
@@ -2302,6 +2341,37 @@ def test_installation_without_the_rights_is_skipped_and_the_others_run(tmp_path)
     assert refusal in done.stdout
     assert "| denied | 2 | 0 | 0 | 2 |" in summary
     assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_mint_checks_http_status_not_text(tmp_path, monkeypatch):
+    """Boundary: mint raises UngrantedError only when the HTTPError cause code is 422."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "app_jwt", lambda _env, _conf: "jwt")
+    env = {"GITHUB_API_URL": "https://api.github.test"}
+    conf = {"client_id": CLIENT_ID}
+
+    def raise_status(code: int, message: str):
+        def fake_call(url, *_args, **_kwargs):
+            http_err = urllib.error.HTTPError(url, code, "Error", {}, io.BytesIO(b""))
+            http_err.close()
+            raise merge_train.RefusedError(message) from http_err
+
+        return fake_call
+
+    monkeypatch.setattr(
+        merge_train, "call", raise_status(422, f"POST x: HTTP 422 {merge_train.UNGRANTED}")
+    )
+    with pytest.raises(merge_train.UngrantedError):
+        merge_train.mint(env, conf, {"id": 7}, {"metadata": "read"})
+
+    monkeypatch.setattr(
+        merge_train,
+        "call",
+        raise_status(500, f"POST x: HTTP 500 body says HTTP 422 {merge_train.UNGRANTED}"),
+    )
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.mint(env, conf, {"id": 7}, {"metadata": "read"})
+    assert not isinstance(caught.value, merge_train.UngrantedError)
 
 
 def test_without_the_installation_skip_each_repository_asks_again(tmp_path):
@@ -3682,6 +3752,35 @@ def test_dependency_pull_with_valid_artifact_commits_generated_files(tmp_path):
     assert "| fleet | 1 | 0 | 1 | 0 |" in summary
 
 
+def test_exhausted_head_file_read_echoing_404_is_not_read(tmp_path):
+    """An exhausted head-file read echoing HTTP 404 warns not read instead of committing."""
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt", "wasm/module.wasm"])
+    forge.contents[("fleet/app", "notices.txt", head)] = (
+        502,
+        {"message": "HTTP 404 Not Found"},
+    )
+    zip_bytes = make_artifact_zip(
+        head, {"notices.txt": b"licenses", "wasm/module.wasm": b"\x00asm\x01\x00\x00\x00"}
+    )
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+        workflow_run_id=456,
+        html_url="https://github.com/fleet/app/actions/runs/456",
+    )
+    done, summary = train(tmp_path, forge)
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert_not_read(done, summary, "fleet/app")
+    assert "| #1 | BLOCKED | generated files refused:" in summary
+
+
 def test_negative_no_allowlist_file(tmp_path):
     """Regeneration is refused when no allowlist file exists on the default branch."""
     head = f"{1:040x}"
@@ -3699,6 +3798,29 @@ def test_negative_no_allowlist_file(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0
     assert not any(w[0] == "commit" for w in forge.writes)
+
+
+def test_exhausted_allowlist_read_echoing_404_is_not_read(tmp_path):
+    """An exhausted allowlist read echoing HTTP 404 names the repository not read."""
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.contents[("fleet/app", ".github/generated-files", "main")] = (
+        502,
+        {"message": "HTTP 404 Not Found"},
+    )
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert forge.writes == []
+    assert_not_read(done, summary, "fleet/app")
 
 
 def test_negative_path_not_in_allowlist(tmp_path):
@@ -3938,6 +4060,7 @@ def test_storage_download_still_reaches_signed_url(tmp_path):
     assert any(w[0] == "commit" for w in forge.writes)
     assert "planted-storage-signature" not in summary
     assert forge.storage_reads == [101]
+    assert forge.storage_targets == [f"/storage/101?{PLANTED_STORAGE_QUERY}"]
 
 
 @pytest.mark.parametrize("code", [502, 503, 504])
@@ -5542,6 +5665,35 @@ def test_a_label_already_gone_still_counts_as_refreshed(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == refreshed(1)[:1]
     assert "### fleet/app: refreshed #1" in summary
+
+
+def test_toggle_refresh_checks_http_status_not_text(tmp_path, monkeypatch):
+    """Boundary: toggle_refresh ignores DELETE 404 by cause code, not error message text."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    env = {
+        "GITHUB_API_URL": "https://api.github.test",
+        "GITHUB_REPOSITORY": "fleet/app",
+        "TRAIN_TOKEN": "token",
+    }
+
+    def fake_delete(code: int, message: str):
+        def fake_call(url, _token=None, method="POST", *_args, **_kwargs):
+            if method == "POST":
+                return {}
+            http_err = urllib.error.HTTPError(url, code, "Error", {}, io.BytesIO(b""))
+            http_err.close()
+            raise merge_train.RefusedError(message) from http_err
+
+        return fake_call
+
+    monkeypatch.setattr(
+        merge_train, "call", fake_delete(500, "DELETE x: HTTP 500 body says HTTP 404")
+    )
+    with pytest.raises(merge_train.RefusedError):
+        merge_train.toggle_refresh(env, {"number": 1})
+
+    monkeypatch.setattr(merge_train, "call", fake_delete(404, "DELETE x: HTTP 404 Not Found"))
+    assert merge_train.toggle_refresh(env, {"number": 1}) is None
 
 
 @pytest.mark.parametrize(
@@ -9570,6 +9722,20 @@ def test_exhausted_permission_read_warns_and_holds(tmp_path, monkeypatch, capsys
     assert forge.right_calls == ["maintainer"] * 3
 
 
+def test_exhausted_permission_read_echoing_404_warns_and_holds(tmp_path, monkeypatch, capsys):
+    """An exhausted permission read whose 502 body echoes HTTP 404 still warns and holds."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_refusals = {"maintainer": 502}
+    forge.right_message = "upstream said HTTP 404 Not Found"
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert "| #1 | CLEAN | review body: cannot read the right of maintainer:" in summary
+    assert forge.writes == []
+    assert_not_read(done, summary, "fleet/app")
+    assert len(result.unread) == 1
+    assert result.refusals == []
+    assert forge.right_calls == ["maintainer"] * 3
+
+
 def test_nontransient_permission_read_holds_without_warning(tmp_path, monkeypatch, capsys):
     """A non-transient permission read refusal holds without a not-read warning."""
     forge = _maintainer_forge(comments=[_maintainer_answer()])
@@ -12499,6 +12665,20 @@ def test_two_exhausted_hold_reads_name_repository_once(tmp_path, monkeypatch, ca
     assert "HTTP 504" not in result.unread[0]
     assert result.refusals == []
     assert not any(forge.hold_faults.values())
+
+
+def test_no_status_text_match_in_merge_train():
+    """No HTTP status classification matches error text in tools/merge_train.py."""
+    pattern = re.compile(r'"HTTP \d{3} ?"\s+(not\s+)?in\s+str\(')
+    source = (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8")
+    assert pattern.search(source) is None
+    planted = source.replace(
+        "if http_status(err) == 404:\n            return False",
+        'if "HTTP 404" in str(err):\n            return False',
+        1,
+    )
+    assert planted != source
+    assert pattern.search(planted) is not None
 
 
 REFUSED_CATCH_ALLOWED = {

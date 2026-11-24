@@ -745,6 +745,12 @@ def error_text(err):
         return content.decode(errors="replace")[:ERROR_TEXT]
 
 
+def http_status(err):
+    """The HTTP status code of a refused request's HTTPError cause, or None."""
+    cause = err.__cause__
+    return cause.code if isinstance(cause, urllib.error.HTTPError) else None
+
+
 def transient(err):
     """Whether a refused request failed at the gateway or lost its connection (record 0080)."""
     cause = err.__cause__
@@ -1177,7 +1183,7 @@ def toggle_refresh(env, pull):
     try:
         call(f"{url}/{name}", env["TRAIN_TOKEN"], "DELETE")
     except RefusedError as err:
-        if "HTTP 404" not in str(err):
+        if http_status(err) != 404:
             raise
 
 
@@ -1246,7 +1252,7 @@ def apply_dependency_holds(env, rows, additions, removals, notes):
         try:
             call(f"{api}/issues/{number}/labels/{name}", env["TRAIN_TOKEN"], "DELETE")
         except RefusedError as err:
-            if "HTTP 404" not in str(err):
+            if http_status(err) != 404:
                 raise
         changes.setdefault(number, []).append(note)
     notes.update({number: "; ".join(messages) for number, messages in changes.items()})
@@ -1272,7 +1278,7 @@ def allowlist_paths(env, default_branch):
     try:
         data = call(url, env["TRAIN_TOKEN"], "GET")
     except RefusedError as err:
-        if "HTTP 404" in str(err):
+        if http_status(err) == 404:
             return None
         raise
     if not isinstance(data, dict) or "content" not in data:
@@ -1435,7 +1441,7 @@ def filter_changed_files(env, pull, file_bytes):
         try:
             head_file = call(url, env["TRAIN_TOKEN"], "GET")
         except RefusedError as err:
-            if "HTTP 404" in str(err):
+            if http_status(err) == 404:
                 head_file = None
             else:
                 raise
@@ -1921,7 +1927,7 @@ def collaborator_right(env, login):
     try:
         answer = call(url, env["TRAIN_TOKEN"], "GET")
     except RefusedError as err:
-        if "HTTP 404" in str(err):
+        if http_status(err) == 404:
             return False
         raise
     return answer.get("permission") in ("admin", "write")
@@ -2397,7 +2403,7 @@ def mint(env, conf, installation, rights, repositories=None):
     try:
         return call(url, app_jwt(env, conf), "POST", body)["token"]
     except RefusedError as err:
-        if "HTTP 422 " in str(err) and UNGRANTED in str(err):
+        if http_status(err) == 422 and UNGRANTED in str(err):
             raise UngrantedError(str(err)) from err
         raise
 

@@ -256,7 +256,9 @@ The train outlasts short forge faults (decision records 0080 and 0101). A read
 502, 503 or 504, drops the connection or cuts the body short; a write runs once
 and a 500 stays a refusal. An exhausted transient read names the repository or
 account as not read, warns, and leaves the sweep green for the next run to read
-it again; the initial installation-list read still fails the job. A failed token
+it again. A read exhausted inside a hold keeps the hold, and the repository
+stays served; a later refusal of that repository still fails the sweep.
+The initial installation-list read still fails the job. A failed token
 revocation is a warning, since the token expires within the hour. A merge or
 enqueue refused as not mergeable after another merge moved the pull request is a
 note, and the next run serves its new state. A failed release pull request step
