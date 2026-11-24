@@ -186,6 +186,51 @@ def _fixture_json(value: list[str] | tuple[str, ...] | str) -> str:
     return value if isinstance(value, str) else json.dumps(value)
 
 
+def _forge_env(tree: Tree, answers: dict[str, object]) -> dict[str, str]:
+    """Build `tree.forge` stand-in that echoes POSTed commit statuses onto page 1."""
+    env = tree.forge(answers)
+    fake_script = tree.root / "fake_gh.py"
+    created_hdr = "HTTP/2.0 201 Created\\r\\nContent-Type: application/json\\r\\n\\r\\n"
+    old_post = "\n".join(
+        [
+            "if post_fields is not None:",
+            '    body = json.dumps({"id": 1, "state": post_fields.get("state", "pending")})',
+            f'    sys.stdout.write(f"{created_hdr}{{body}}")',
+            "    sys.exit(0)",
+            "",
+        ]
+    )
+    new_post = "\n".join(
+        [
+            "if post_fields is not None:",
+            '    forge_path = os.environ["FAKE_FORGE"]',
+            '    with open(forge_path, encoding="utf-8") as source:',
+            "        stored = json.load(source)",
+            '    status_id = int(stored.get("_next_status_id", 1000)) + 1',
+            '    stored["_next_status_id"] = status_id',
+            '    stamp = "2026-11-21T12:00:00Z"',
+            '    row = {"id": status_id, "created_at": stamp, "updated_at": stamp, **post_fields}',
+            '    if endpoint and "/statuses/" in endpoint:',
+            '        repo_prefix, target_sha = endpoint.split("/statuses/", 1)',
+            '        suffix = "statuses?per_page=100&page=1"',
+            '        statuses_key = f"{repo_prefix}/commits/{target_sha}/{suffix}"',
+            "        existing = stored.get(statuses_key)",
+            "        if isinstance(existing, list):",
+            "            stored[statuses_key] = [row, *existing][:100]",
+            '    with open(forge_path, "w", encoding="utf-8") as target:',
+            "        json.dump(stored, target)",
+            "    body = json.dumps(row)",
+            f'    sys.stdout.write(f"{created_hdr}{{body}}")',
+            "    sys.exit(0)",
+            "",
+        ]
+    )
+    script_text = fake_script.read_text(encoding="utf-8")
+    assert old_post in script_text
+    fake_script.write_text(script_text.replace(old_post, new_post, 1), encoding="utf-8")
+    return env
+
+
 def invoke_with_forge(
     tree: Tree,
     monkeypatch: pytest.MonkeyPatch,
@@ -207,7 +252,7 @@ def invoke_with_forge(
             answers[RUNS_URL] = {
                 "workflow_runs": [wf_run(1, event=options.event, head_branch=branch)]
             }
-    for name, value in tree.forge(answers).items():
+    for name, value in _forge_env(tree, answers).items():
         monkeypatch.setenv(name, value)
     cfg = _parse_config(
         repository=REPO,
@@ -358,7 +403,7 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
     assert all(line.startswith("ok ") for line in done_self.stdout.splitlines())
 
     fixture_tree = Tree(tmp_path / "forge-standin")
-    env = fixture_tree.forge(base_answers(checks=[check_item(1, "Gate")], runs=[wf_run(1)]))
+    env = _forge_env(fixture_tree, base_answers(checks=[check_item(1, "Gate")], runs=[wf_run(1)]))
     run_env = {
         **os.environ,
         **env,
@@ -921,7 +966,7 @@ def test_pull_request_target_cli_and_pr_only_3d(
         checks=[check_item(1, "Build", "success"), check_item(2, "PR-Only", "success")],
         runs=[wf_run(1, "pull_request_target")],
     )
-    forge_env = tree.forge(answers)
+    forge_env = _forge_env(tree, answers)
     for name, value in forge_env.items():
         monkeypatch.setenv(name, value)
     out, err = io.StringIO(), io.StringIO()
@@ -1120,7 +1165,7 @@ def test_forge_request_parsing_and_cli_judge_end_to_end(
         STATUSES_URL: [],
         COMMIT_URL: {"commit": {"committer": {"date": "2026-11-21T10:00:00Z"}}, "sha": SHA},
     }
-    for name, value in tree.forge(answers).items():
+    for name, value in _forge_env(tree, answers).items():
         monkeypatch.setenv(name, value)
 
     status, headers, body = forge.request("repos/x/redirect")
@@ -1140,7 +1185,7 @@ def test_forge_request_parsing_and_cli_judge_end_to_end(
     assert forge.rate_limit_delay(429, {"retry-after": "bad"}, "rate limit", 1, 100.0) == 120
     assert forge.rate_limit_delay(404, {"retry-after": "10"}, "rate limit", 0, 100.0) is None
 
-    forge_env = tree.forge(answers)
+    forge_env = _forge_env(tree, answers)
     for name, value in forge_env.items():
         monkeypatch.setenv(name, value)
     out, err = io.StringIO(), io.StringIO()
@@ -1473,13 +1518,27 @@ def _sweep_transport_factory(
     *,
     record: list[tuple[str, str]],
 ) -> Any:
+    posted_by_sha: dict[str, list[dict]] = {}
+    next_id = 1000
+
     def transport(
         path: str, method: str = "GET", **kwargs: object
     ) -> tuple[int, dict[str, str], bytes]:
+        nonlocal next_id
         record.append((method, path))
-        body = _sweep_response_body(path, heads, settled)
         if method == "POST":
-            return 201, {}, json.dumps({"id": 1, "state": "failure"}).encode()
+            next_id += 1
+            sha = path.rsplit("/", 1)[1]
+            raw_fields = kwargs.get("fields")
+            fields = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+            stamp = "2026-11-23T12:00:00Z"
+            row = {"id": next_id, "created_at": stamp, "updated_at": stamp, **fields}
+            posted_by_sha.setdefault(sha, []).insert(0, row)
+            return 201, {}, json.dumps(row).encode()
+        body = _sweep_response_body(path, heads, settled)
+        if (path.endswith("/statuses") or "/statuses?" in path) and isinstance(body, list):
+            sha = path.split("/commits/")[1].split("/")[0]
+            body = [*posted_by_sha.get(sha, ()), *body][: forge.PER_PAGE]
         return 200, {}, json.dumps(body).encode()
 
     return transport
@@ -1676,10 +1735,13 @@ def _counting_sweep_transport(
     """Stub forge for run_sweep that counts every call per kind, unknown calls under "other"."""
     counts = dict.fromkeys(SWEEP_CALL_KINDS, 0)
     statuses_per_path: dict[str, int] = {}
+    posted_by_sha: dict[str, list[dict]] = {}
+    next_id = 1000
 
     def transport(
         path: str, method: str = "GET", **kwargs: object
     ) -> tuple[int, dict[str, str], bytes]:
+        nonlocal next_id
         kind = _classify_sweep_call(method, path)
         counts[kind] += 1
         if kind == "statuses" and refresh_clock is not None:
@@ -1688,8 +1750,19 @@ def _counting_sweep_transport(
             if statuses_per_path[path] == prepost:
                 refresh_clock.current += required_checks.POST_FRESH_SECONDS + 1
         if kind == "post":
-            return 201, {}, json.dumps({"id": 1, "state": "pending"}).encode()
-        return 200, {}, json.dumps(_sweep_body(kind, path, heads, page_bound)).encode()
+            next_id += 1
+            sha = path.rsplit("/", 1)[1]
+            raw_fields = kwargs.get("fields")
+            fields = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+            stamp = "2001-09-09T01:46:40Z"
+            row = {"id": next_id, "created_at": stamp, "updated_at": stamp, **fields}
+            posted_by_sha.setdefault(sha, []).insert(0, row)
+            return 201, {}, json.dumps(row).encode()
+        body = _sweep_body(kind, path, heads, page_bound)
+        if kind == "statuses" and path.endswith("page=1") and isinstance(body, list):
+            sha = path.split("/commits/")[1].split("/")[0]
+            body = [*posted_by_sha.get(sha, ()), *body][: forge.PER_PAGE]
+        return 200, {}, json.dumps(body).encode()
 
     return transport, counts
 
@@ -1721,14 +1794,17 @@ def test_sweep_transport_call_counts_measured_at_defaults(page_bound: bool) -> N
     assert "::error::" not in err.getvalue()
     assert "Sweep API call cap" in err.getvalue()
     assert counts["other"] == 0
-    assert sum(counts.values()) == required_checks.SWEEP_MAX_CALLS
+    expected_total = (
+        required_checks.SWEEP_MAX_CALLS if page_bound else required_checks.SWEEP_MAX_CALLS - 2
+    )
+    assert sum(counts.values()) == expected_total
     assert counts["open-pulls"] == 1
     if page_bound:
         assert counts["statuses"] == 164
         assert counts["check-runs"] == 59
         assert counts["post"] == 2
     else:
-        assert counts["check-runs"] == 22
+        assert counts["check-runs"] == 21
         assert counts["post"] == 20
 
 
@@ -1764,17 +1840,29 @@ def _mixed_sweep_transport(
     *,
     record: list[tuple[str, str]],
 ) -> Any:
+    posted_by_sha: dict[str, list[dict]] = {}
+    next_id = 1000
+
     def transport(
         path: str, method: str = "GET", **kwargs: object
     ) -> tuple[int, dict[str, str], bytes]:
+        nonlocal next_id
         record.append((method, path))
         if "/pulls?" in path:
-            body = [{"head": {"sha": s}} for s in pull_order]
+            body: object = [{"head": {"sha": s}} for s in pull_order]
         elif method == "POST" and "/statuses/" in path:
-            return 201, {}, json.dumps({"id": 1}).encode()
+            next_id += 1
+            sha = path.rsplit("/", 1)[1]
+            raw_fields = kwargs.get("fields")
+            fields = dict(raw_fields) if isinstance(raw_fields, dict) else {}
+            stamp = "2026-11-23T12:00:00Z"
+            row = {"id": next_id, "created_at": stamp, "updated_at": stamp, **fields}
+            posted_by_sha.setdefault(sha, []).insert(0, row)
+            return 201, {}, json.dumps(row).encode()
         elif "/statuses" in path:
             sha = path.split("/commits/")[1].split("/")[0]
-            body = [status_by_sha[sha]] if sha in status_by_sha else []
+            initial = [status_by_sha[sha]] if sha in status_by_sha else []
+            body = [*posted_by_sha.get(sha, ()), *initial][: forge.PER_PAGE]
         elif "/check-runs" in path:
             body = {"check_runs": [check_item(1, "Build", "success")]}
         elif "/actions/runs" in path:
@@ -1978,7 +2066,7 @@ def test_sweep_open_pulls_and_default_branch(tree: Tree, monkeypatch: pytest.Mon
         run_number=1,
         max_targets=1,
     )
-    for name, value in tree.forge(answers).items():
+    for name, value in _forge_env(tree, answers).items():
         monkeypatch.setenv(name, value)
     rc = run_judge(
         cfg,
@@ -2186,6 +2274,18 @@ def test_pending_replaces_only_a_terminal_status(previous: str | None) -> None:
         assert f"No status post: required-checks on {SHA} keeps {kept}; verdict pending" in out
 
 
+def _expected_capped_sweep_calls(cap: int, setup_calls: int, calls_per_eval: int) -> int:
+    first_pull = setup_calls + calls_per_eval
+    if cap <= first_pull:
+        return cap
+    rem = (cap - first_pull) % calls_per_eval
+    if rem == 0:
+        return cap - 2
+    if rem == calls_per_eval - 1:
+        return cap - 1
+    return cap
+
+
 @pytest.mark.parametrize("refresh", [False, True], ids=["snapshot", "freshness-refresh"])
 def test_sweep_api_cap_every_call_site(refresh: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     """Every call index stops at the cap, including preflight and refresh reads."""
@@ -2211,8 +2311,10 @@ def test_sweep_api_cap_every_call_site(refresh: bool, monkeypatch: pytest.Monkey
         )
         assert rc == 0, f"cap={cap}: {err.getvalue()}"
         assert "Sweep API call cap" in err.getvalue(), err.getvalue()
-        # The last target cannot spend its two reserved calls on a POST.
-        assert sum(counts.values()) == min(cap, complete_sweep_calls - 2), f"cap={cap}"
+        # A pull head whose POST cannot reserve verification + withdrawal stops the sweep.
+        assert sum(counts.values()) == _expected_capped_sweep_calls(
+            cap, setup_calls, calls_per_eval
+        ), f"cap={cap}"
         assert counts["post"] == max(0, (cap - setup_calls - 1) // calls_per_eval), f"cap={cap}"
 
 
@@ -2721,13 +2823,13 @@ def test_review_sweep_rotates_failure_in_with_thirty_waiting_heads() -> None:
     assert fake.posts == [(REVIEW_POST_PATH.replace(SHA, recovered), "success")]
 
 
-@pytest.mark.parametrize("run_number", [1, 2, 10**9])
-def test_review_sweep_keeps_order_at_exact_budget(run_number: int) -> None:
+@pytest.mark.parametrize(("run_number", "start"), [(1, 0), (2, 1), (10**9, 9)])
+def test_review_sweep_keeps_order_at_exact_budget(run_number: int, start: int) -> None:
     heads = [f"{i:040x}" for i in range(1, 31)]
     fake = _review_sweep_transport(heads, app="external", conclusion=None)
     rc, err = _review_sweep(fake, run_number=run_number, apps_json='{"Build":"external"}')
     assert rc == 0, err
-    assert _review_evaluated_pulls(fake) == heads
+    assert _review_evaluated_pulls(fake) == [*heads[start:], *heads[:start]]
 
 
 def test_review_default_branch_excludes_newer_release_push() -> None:
@@ -3797,3 +3899,254 @@ def test_sweep_cap_excludes_head_finishing_at_exact_cap(
     monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap + 3)
     rc_all, err_all = _review_sweep(fake_all)
     assert rc_all == 0 and err_all == ""
+
+
+def _run_transport_failure_post_case(
+    conclusion: str,
+) -> tuple[int, str, ReviewTransport, ApiSession]:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", conclusion)]}
+    post_count = 0
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        nonlocal post_count
+        if method == "POST":
+            post_count += 1
+            if post_count == 1:
+                fake.posts.append((path, kwargs["fields"]["state"]))
+                raise forge.ForgeError(f"POST {path}: timed out after send")
+        return fake(path, method=method, **kwargs)
+
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=transport,
+        out=io.StringIO(),
+    )
+    err = io.StringIO()
+    rc = required_checks.evaluate_one(session, _review_config(), io.StringIO(), err)
+    return rc, err.getvalue(), fake, session
+
+
+def test_success_post_transport_failure_withdraws_and_reports_error() -> None:
+    rc, err, fake, session = _run_transport_failure_post_case("success")
+    assert rc == 1
+    assert "::error::GitHub API error (post-status):" in err
+    assert "timed out after send" in err
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    assert fake.answers[STATUSES_URL][0]["state"] == "pending"
+    assert (
+        fake.answers[STATUSES_URL][0]["description"] == "contested write; the next judgment decides"
+    )
+    assert session.withdrawal_reserved is False
+    assert session.api_calls == 6
+
+
+def test_failure_post_transport_failure_posts_no_withdrawal() -> None:
+    rc, err, fake, session = _run_transport_failure_post_case("failure")
+    assert rc == 1
+    assert "timed out after send" in err
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+    assert session.withdrawal_reserved is False
+    assert session.api_calls == 5
+
+
+def test_success_post_refused_before_send_posts_no_withdrawal() -> None:
+    fake = ReviewTransport()
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=fake,
+        out=io.StringIO(),
+        max_api_calls=6,
+    )
+    err = io.StringIO()
+    rc = required_checks.evaluate_one(session, _review_config(), io.StringIO(), err)
+    assert rc == 0
+    assert "Sweep API call cap of 6" in err.getvalue()
+    assert fake.posts == []
+    assert session.withdrawal_reserved is False
+    assert session.api_calls == 4
+
+    fake_cut = ReviewTransport()
+    fake_cut.advance_on_reply[STATUSES_URL] = iter([0, required_checks.WORK_DEADLINE_SECONDS])
+    session_cut = ApiSession(
+        deadline=fake_cut.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake_cut.clock.now,
+        sleep=fake_cut.clock.sleep,
+        transport=fake_cut,
+        out=io.StringIO(),
+    )
+    err_cut = io.StringIO()
+    rc_cut = required_checks.evaluate_one(session_cut, _review_config(), io.StringIO(), err_cut)
+    assert rc_cut == 1
+    assert fake_cut.posts == []
+    assert session_cut.withdrawal_reserved is False
+
+
+def test_sweep_rotates_single_block_within_max_targets() -> None:
+    heads = [f"{i:040x}" for i in range(1, 31)]
+    fake = _review_sweep_transport(heads, app="external", conclusion=None)
+    fake.answers[STATUSES_URL.replace(SHA, heads[0])] = [
+        status_item(1, "required-checks", "pending", updated_at="2026-11-21T11:00:00Z")
+    ]
+    fake.answers[STATUSES_URL.replace(SHA, heads[1])] = [
+        status_item(2, "required-checks", "pending", updated_at="2026-11-21T10:00:00Z")
+    ]
+    priority = [*heads[2:], heads[1], heads[0]]
+
+    rc1, judged1, err1 = _sweep_judged_pulls(
+        fake, run_number=1, max_targets=30, apps_json='{"Build":"external"}'
+    )
+    assert rc1 == 0 and err1 == ""
+    assert judged1 == priority
+
+    rc2, judged2, err2 = _sweep_judged_pulls(
+        fake, run_number=2, max_targets=30, apps_json='{"Build":"external"}'
+    )
+    assert rc2 == 0 and err2 == ""
+    assert judged2 == [*priority[1:], priority[0]]
+
+
+def test_sweep_single_and_empty_candidate_rotation_boundaries() -> None:
+    only = "1" * 40
+    fake_one = _review_sweep_transport([only], app="external", conclusion=None)
+    for run_number in (1, 2, 7):
+        rc, judged, err = _sweep_judged_pulls(
+            fake_one, run_number=run_number, apps_json='{"Build":"external"}'
+        )
+        assert (rc, judged, err) == (0, [only], "")
+
+    fake_empty = _review_sweep_transport([], app="external", conclusion=None)
+    for run_number in (1, 2):
+        rc, judged, err = _sweep_judged_pulls(
+            fake_empty, run_number=run_number, apps_json='{"Build":"external"}'
+        )
+        assert (rc, judged, err) == (0, [], "")
+
+
+def test_sweep_capped_thirty_heads_rotates_uncovered_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake, heads = _deep_failure_sweep_transport(30, check_pages=6)
+    rc1, judged1, err1 = _sweep_judged_pulls(fake, run_number=1, max_targets=30)
+    rc2, judged2, err2 = _sweep_judged_pulls(fake, run_number=2, max_targets=30)
+    assert rc1 == 0 and "4 target(s) not judged." in err1 and len(judged1) == 26
+    assert rc2 == 0 and "4 target(s) not judged." in err2 and len(judged2) == 26
+    assert judged1 == heads[:26] and judged2 == heads[1:27]
+    uncovered1 = [sha for sha in heads if sha not in judged1]
+    uncovered2 = [sha for sha in heads if sha not in judged2]
+    assert uncovered1 == heads[26:30]
+    assert uncovered2 == [heads[0], *heads[27:30]]
+    assert uncovered1 != uncovered2
+
+    seen = set(judged1) | set(judged2)
+    for run_number in range(3, 30 - 26 + 2):
+        rc_n, judged_n, _ = _sweep_judged_pulls(fake, run_number=run_number, max_targets=30)
+        assert rc_n == 0 and len(judged_n) == 26
+        seen.update(judged_n)
+    assert seen == set(heads)
+
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", 36 + 29 * 8 + 1)
+    _, judged29_1, _ = _sweep_judged_pulls(fake, run_number=1, max_targets=30)
+    _, judged29_2, _ = _sweep_judged_pulls(fake, run_number=2, max_targets=30)
+    assert len(judged29_1) == 29 and len(judged29_2) == 29
+    assert set(judged29_1) | set(judged29_2) == set(heads)
+
+
+def test_sweep_cap_on_refused_post_stops_before_next_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = ["1" * 40, "2" * 40, "3" * 40]
+    fake = _review_sweep_transport(heads)
+    cap = 18
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+    rc, err = _review_sweep(fake)
+    assert rc == 0
+    assert f"::warning::Sweep API call cap of {cap} reached; 3 target(s) not judged." in err
+    assert not any(heads[1] in path or heads[2] in path for _, path in fake.calls[6:])
+    assert len(fake.calls) == 16
+
+    fake_err = _review_sweep_transport(heads)
+    fake_err.answers[CHECKS_URL] = {}
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", 14)
+    rc_err, err_out = _review_sweep(fake_err)
+    assert rc_err == 1
+    assert "::warning::Sweep API call cap of 14 reached; 3 target(s) not judged." in err_out
+    assert not any(heads[1] in path or heads[2] in path for _, path in fake_err.calls[6:])
+
+
+def test_sweep_cap_on_refused_post_skips_404_on_next_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = ["1" * 40, "2" * 40, "3" * 40]
+    fake = _review_sweep_transport(heads)
+    head2_statuses = STATUSES_URL.replace(SHA, heads[1])
+    seen_head2 = 0
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        nonlocal seen_head2
+        if method == "GET" and path == head2_statuses:
+            seen_head2 += 1
+            if seen_head2 >= 2:
+                raise forge.ResponseError("GET statuses: HTTP 404", status=404, message="Not Found")
+        return fake(path, method=method, **kwargs)
+
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", 18)
+    err = io.StringIO()
+    cfg = _review_config(targets="open-pulls", run_number=1)
+    rc = run_sweep(
+        cfg,
+        transport=transport,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=io.StringIO(),
+        err=err,
+    )
+    assert rc == 0
+    assert "::error::" not in err.getvalue() and "404" not in err.getvalue()
+    assert "::warning::Sweep API call cap of 18 reached; 3 target(s) not judged." in err.getvalue()
+    assert seen_head2 == 1
+
+
+def test_short_verification_page_missing_own_id_retries_then_withdraws() -> None:
+    other = [status_item(5, "other")]
+    fake_once = ReviewTransport()
+    fake_once.replies[STATUSES_URL] = iter([[], [], other])
+    rc1, err1 = _contested_status_write(fake_once)
+    assert rc1 == 0 and err1 == ""
+    assert fake_once.calls.count(("GET", CHECKS_URL)) == 2
+    assert fake_once.posts == [(REVIEW_POST_PATH, "success")]
+
+    fake_twice = ReviewTransport()
+    fake_twice.replies[STATUSES_URL] = iter([[], [], other, [], [], other])
+    rc2, err2 = _contested_status_write(fake_twice)
+    assert rc2 == 0
+    assert f"::warning::Status write contested again for {SHA}." in err2
+    assert fake_twice.posts == [
+        (REVIEW_POST_PATH, "success"),
+        (REVIEW_POST_PATH, "success"),
+        (REVIEW_POST_PATH, "pending"),
+    ]
+    assert fake_twice.answers[STATUSES_URL][0]["state"] == "pending"
+    assert (
+        fake_twice.answers[STATUSES_URL][0]["description"]
+        == "contested write; the next judgment decides"
+    )
+
+
+def test_short_verification_page_with_own_id_accepts_without_reread() -> None:
+    fake = ReviewTransport()
+    short_with_own = [status_item(5, "other"), status_item(1001, PUSH_CONTEXT, "success")]
+    fake.replies[STATUSES_URL] = iter([[], [], short_with_own])
+    rc, err = _contested_status_write(fake)
+    assert rc == 0 and err == ""
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+    assert fake.calls.count(("GET", CHECKS_URL)) == 1
+    assert _statuses_get_count([path for _, path in fake.calls]) == 3

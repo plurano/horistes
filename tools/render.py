@@ -515,6 +515,9 @@ def _tail_policy_problems(passed: dict) -> list[str]:
         for key in TAIL_WITH
         if key in passed and not isinstance(passed[key], str)
     ]
+    runner = passed.get("runner")
+    if isinstance(runner, str) and not runner.strip():
+        problems.append(f"job {TAIL} passes an empty `runner` value")
     if any(key not in passed or not isinstance(passed[key], str) for key in policy_fields):
         return problems
     try:

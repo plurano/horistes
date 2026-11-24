@@ -81,6 +81,10 @@ class ApiFailureError(Exception):
     """Unrecoverable API error, transient 5xx timeout, or rate-limit bound exceeded."""
 
 
+class TransportFailureError(ApiFailureError):
+    """A transport attempt failed after sending without an HTTP response."""
+
+
 class ApiCapReachedError(Exception):
     """Sweep session reached SWEEP_MAX_CALLS before every target was judged."""
 
@@ -574,7 +578,7 @@ class ApiSession:
         except forge.ResponseError:
             raise
         except forge.ForgeError as err:
-            raise ApiFailureError(f"GitHub API error ({label}): {err}") from err
+            raise TransportFailureError(f"GitHub API error ({label}): {err}") from err
 
     def wait_to_retry_post(self, failure: PostFailureError) -> None:
         """Wait once for an HTTP write failure that can be retried from fresh evidence."""
@@ -606,6 +610,10 @@ class ApiSession:
             )
         except forge.ResponseError as err:
             raise PostFailureError(label, err) from err
+        except TransportFailureError:
+            if reserve_withdrawal:
+                self.withdrawal_reserved = True
+            raise
         if reserve_withdrawal is not None:
             self.withdrawal_reserved = reserve_withdrawal
         return _decode_json(label, body)
@@ -1188,7 +1196,7 @@ def _post_is_contested(
     session: ApiSession, config: Config, evaluation: Evaluation, status_id: int
 ) -> bool:
     """Detect judge writes made since the evidence read, including the same second."""
-    statuses, complete = _read_status_page_one(session, config)
+    statuses, _ = _read_status_page_one(session, config)
     key = status_context(config).casefold()
     oldest_contender = floor(evaluation.read_started)
     own_status_seen = False
@@ -1199,7 +1207,7 @@ def _post_is_contested(
             own_status_seen = True
         elif _iso_epoch(entry.get("created_at")) >= oldest_contender:
             return True
-    return not complete and not own_status_seen
+    return not own_status_seen
 
 
 def _report_verdict(config: Config, evaluation: Evaluation, out: TextIO) -> None:
@@ -1376,10 +1384,10 @@ def _sweep_evaluation_order(session: ApiSession, config: Config, heads: list[str
     pr_config = replace(config, event_name="pull_request")
     judged = _sweep_triage(session, pr_config, heads)
     candidates = sorted(heads[:OPEN_PULLS_MAX], key=lambda sha: _triage_priority(judged.get(sha)))
+    if not candidates:
+        return []
     n = len(candidates)
     budget = config.max_targets
-    if n <= budget:
-        return candidates
     blocks = ceil(n / budget)
     index = config.run_number - 1
     block = index % blocks
@@ -1462,10 +1470,10 @@ def _sweep_pull_heads(
         one = replace(sweep_cfg, sha=sha, event_name="pull_request")
         if evaluate_one(session, one, out, err) != 0:
             result = 1
-        if not session.cap_reached:
-            unjudged -= 1
-    if unjudged > 0 and session.cap_reached:
-        _warn_unjudged_targets(err, unjudged)
+        if session.cap_reached:
+            _warn_unjudged_targets(err, unjudged)
+            return result
+        unjudged -= 1
     return result
 
 
@@ -1571,9 +1579,13 @@ def _self_test_transport(
         path: str, *, method: str = "GET", fields: Mapping[str, str] | None = None, **_: object
     ):
         if method == "POST":
-            state = (fields or {}).get("state", "")
+            body = dict(fields or {})
+            state = body.get("state", "")
             posts.append(state)
-            return _ok_reply({"id": 1, "state": state})
+            stamp = "2026-11-21T12:00:00Z"
+            row = {"id": 1000 + len(posts), "created_at": stamp, "updated_at": stamp, **body}
+            status_list.insert(0, row)
+            return _ok_reply(row)
         if pending_errors:
             raise pending_errors.pop(0)
         base = path.split("?", 1)[0]

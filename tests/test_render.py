@@ -452,11 +452,23 @@ def test_tail_runner_input_requires_string(tree):
     target = "      runner: <% .RunnerTag %>\n      required:"
     rendered_target = "      runner: ubuntu-26.04\n      required:"
 
-    empty_tail, empty_doc = _tail_documents(
-        RENDERED.replace(rendered_target, '      runner: ""\n      required:')
+    for blank in ('""', '"   "'):
+        empty_tail, empty_doc = _tail_documents(
+            RENDERED.replace(rendered_target, f"      runner: {blank}\n      required:")
+        )
+        assert render._tail_problems(empty_tail, empty_doc, ROOT) == [
+            "job required-checks passes an empty `runner` value"
+        ]
+        tree.write({REAL: source.replace(target, f"      runner: {blank}\n      required:")})
+        done_empty = tree.tool("render.py", "check")
+        assert done_empty.returncode == 1, done_empty.stdout
+        assert "job required-checks passes an empty `runner` value" in done_empty.stderr
+
+    one_char_tail, one_char_doc = _tail_documents(
+        RENDERED.replace(rendered_target, "      runner: x\n      required:")
     )
-    assert render._tail_problems(empty_tail, empty_doc, ROOT) == []
-    tree.write({REAL: source.replace(target, '      runner: ""\n      required:')})
+    assert render._tail_problems(one_char_tail, one_char_doc, ROOT) == []
+    tree.write({REAL: source.replace(target, "      runner: x\n      required:")})
     assert tree.tool("render.py", "check").returncode == 0
 
     seq_tail, seq_doc = _tail_documents(
