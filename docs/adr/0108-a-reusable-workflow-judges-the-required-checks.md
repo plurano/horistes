@@ -6,7 +6,7 @@ SPDX-License-Identifier: EUPL-1.2
 # ADR-0108: A reusable workflow judges the required checks
 
 - **Status**: Accepted
-- **Date**: 2026-11-21 (amended 2026-11-22 and 2026-11-23, decision **b**)
+- **Date**: 2026-11-21 (amended 2026-11-22, 2026-11-23 and 2026-11-24, decision **b**)
 - **Authors**: Lusoris
 
 ## Context
@@ -40,20 +40,20 @@ Only `statuses` is write scope in tail and sweep jobs.
 
 - **Self exclusion** by workflow path: `open-pulls` only (`GITHUB_WORKFLOW_REF`); `sha` tail counts the gate's own `result` check run.
 - **Fork tail stop** on `pull_request` when head repo ≠ `GITHUB_REPOSITORY` (zero API calls).
-- **Proposal checks** remain owed on `pull_request`, `pull_request_target` and `merge_group` (`exempt_reason`). The [licence tail](../../.github/workflows/licence-check.yml) and [sweep caller](../../.github/workflows/required-checks-caller.yml) mark `Sign-off` proposal-only because the [Sign-off caller](../../.github/workflows/sign-off-check.yml) runs on pull requests and merge groups.
-- **Check-run admission** requests `filter=all` and selects the newest eligible run per name. Actions checks require a suite in the workflow-run listing after event, branch, and applicable self-workflow exclusions. External checks use the configured app slug. Ten full workflow-run pages exhaust the listing budget and stop judgment (`read_snapshot`, `_read_workflow_runs`).
+- **Proposal checks** remain owed on `pull_request`, `pull_request_target` and `merge_group` (`exempt_reason`). The [licence tail](../../.github/workflows/licence-check.yml) and [sweep caller](../../.github/workflows/required-checks-caller.yml) mark `Sign-off` proposal-only because the [Sign-off caller](../../.github/workflows/sign-off-check.yml) runs on pull requests and merge groups. Rulesets require `required-checks`, the proposal policy. Push-class judgments use `required-checks (push)`. Both judge contexts are excluded from the evidence.
+- **Check-run admission** requests `filter=all` and selects the newest eligible run per exact name. It compares run IDs when either run has no timestamp. Commit-status contexts are case-insensitive. Actions checks require a suite in the workflow-run listing after event, branch, and applicable self-workflow exclusions. External checks use the configured app slug. Ten full workflow-run pages exhaust the listing budget and stop judgment (`read_snapshot`, `_read_workflow_runs`).
 - **Waiting and failure** use the earliest eligible non-self workflow timestamp, with the commit date as fallback. A terminal failure in either record takes precedence over a pending peer (`_workflow_anchor`, `decide`).
-- **Status writes** require a changed verdict. A pending verdict can replace only a success (`_should_post`).
-- **Freshness** requires a write within `POST_FRESH_SECONDS` (10) of the snapshot read starting. Before each write, `_status_preflight` reads the newest commit-status page. A self status created or updated after the snapshot began, a change in the observed status evidence, or a full page without the self status triggers a fresh snapshot. A second stale read emits `::warning::` and exits 0. After a successful POST, the judge verifies the created status ID against page 1. A different status in the judge context created at or after the second in which the snapshot began, or a full page missing the created status ID, triggers one fresh judgment. A second contested write warns with the SHA and exits 0.
+- **Status writes** require a changed verdict. A pending verdict can replace a success or failure (`_should_post`). Checks without a tail are settled by the sweep within one cron interval when their head fits in the sweep budget.
+- **Freshness** requires a write within `POST_FRESH_SECONDS` (10) of the snapshot read starting. Before a write, `_status_preflight` reads up to 20 status pages in order, stopping at the first page with a judge status or a short page. A judge status that has moved, a change in observed required status evidence, or reaching the page bound without finding the judge status triggers a fresh snapshot. A second stale read emits `::warning::` and exits 0. After a successful POST, the judge verifies the created status ID against page 1. A different status in the judge context created at or after the second in which the snapshot began, or a full page missing the created status ID, triggers one fresh judgment. If the judge cannot confirm a contested success, it spends a reserved call to replace it with pending and reports the warning or error that stopped judgment. If the withdrawal fails, the judge emits `::error::` with the SHA and exits 1.
 - **Write recovery** makes one POST attempt per evaluation. A rate limit or 5xx allows one additional read-decide-post cycle after the bounded wait. Other write errors and a second failed POST emit `::error::` and exit 1 (`ApiSession.request_json`, `_evaluate_one`).
-- **Sweep ordering** skips success heads during triage. The candidate list contains never-judged heads in pull order, previously judged waiting heads oldest first, and previous failures oldest first. When the list exceeds `max_targets`, each sweep takes a block of that size starting at `((run_number - 1) * max_targets) % len(candidates)`, wrapping at the end. With a stable list and consecutive caller workflow run numbers, every head is selected within `ceil(len(candidates) / max_targets)` sweeps. Each evaluation reads statuses afresh and deduplicates an unchanged failure. The default head is evaluated last using its branch ref (`_sweep_evaluation_order`, `_sweep_default_branch`).
-- **Sweep cap** counts every transport attempt against the 250-call session budget, including retries and failures. A POST requires one remaining call for verification (`ApiSession._request_once`).
+- **Sweep ordering** starts with never-judged and unknown pull heads in pull order, then waiting heads, failures, and successes, oldest first within each group. When the list exceeds `max_targets`, each sweep takes a block starting at `((run_number - 1) * max_targets) % len(candidates)`, wrapping at the end. With a stable list and consecutive caller workflow run numbers, every head is selected within `ceil(len(candidates) / max_targets)` sweeps. After triage, the judge evaluates the default head with its branch ref before evaluating the selected pull heads. Each evaluation reads statuses afresh and deduplicates an unchanged verdict (`_sweep_evaluation_order`, `_sweep_default_branch`).
+- **Sweep cap** counts every transport attempt against the 250-call session budget, including retries and failures. Triage reads the first status page for up to 100 pull heads and stops at 120 attempts. Heads with no judge status on page one or no completed triage read are treated as never judged. A normal POST reserves two more calls, one for verification and one for a possible withdrawal (`ApiSession.request_json`).
 
 Render context `[RequiredChecks]` (Required, PullRequestOnly, NotOwed, Apps) is the single source for tail and sweep template inputs. When `PullRequestOnly` is omitted, the renderer includes `Sign-off` if it is required ([tools/render.py](../../tools/render.py)).
 
 ## Budget
 
-The steady-state rows use one page per listing and no retries or freshness refresh. A complete snapshot reads statuses, checks and workflow runs, plus the commit if no eligible timestamp is available. A write adds the status preflight, one POST, and the verification read. Sweep triage adds the open-pull listing, one status listing per head, and two default-branch requests. The sweep fixtures exercise commit-date fallback. See `test_sweep_call_count_at_fourteen_open_pulls`, `test_sweep_capless_call_counts` and `test_sweep_transport_call_counts_measured_at_defaults` in [tests/test_required_checks.py](../../tests/test_required_checks.py).
+The steady-state rows use one page per listing and no retries or freshness refresh. A complete snapshot reads statuses, checks and workflow runs, plus the commit if no eligible timestamp is available. A write adds the status preflight, one POST, and the verification read. A contested success may require one withdrawal POST. Sweep setup adds the open-pull listing, one status page per triaged head, and two default-branch requests. The sweep fixtures exercise commit-date fallback. See `test_sweep_call_count_at_fourteen_open_pulls`, `test_sweep_capless_call_counts` and `test_sweep_transport_call_counts_measured_at_defaults` in [tests/test_required_checks.py](../../tests/test_required_checks.py).
 
 | Scenario | API calls |
 | :--- | ---: |
@@ -62,10 +62,10 @@ The steady-state rows use one page per listing and no retries or freshness refre
 | One-page sweep, 14 open heads + default | 122 |
 | One-page sweep, 100 open heads + default, cap disabled in test | 320 |
 | One-page sweep, 100 open heads, cap enforced | 250 |
-| Page-bound sweep, cap disabled in test | 3,677 |
+| Page-bound sweep, cap disabled in test | 1,777 |
 | Page-bound sweep, cap enforced | 250 |
 
-At 100 open heads, the capped one-page fixture posts for 21 pull heads before the session stops. Two scheduled sweeps per hour can spend up to 500 calls in total.
+At 100 open heads, the capped one-page fixture posts for the default head and 19 pull heads. The capped page-bound fixture posts for the default head and one pull head. Two scheduled sweeps per hour can spend up to 500 calls in total.
 
 ## Alternatives rejected
 

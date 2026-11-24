@@ -367,6 +367,77 @@ def test_rendered_sign_off_defaults_to_proposals(required, override, expected):
     doc = ciwf.loads(render.render(source, context, REAL), REAL)
     passed = doc["jobs"]["required-checks"]["with"]
     assert json.loads(passed["pull-request-only"]) == expected
+    assert render._tail_problems(doc["jobs"]["required-checks"], doc, ROOT) == []
+
+
+def _tail_documents(source=RENDERED):
+    doc = ciwf.loads(source, REAL)
+    return doc["jobs"]["required-checks"], doc
+
+
+@pytest.mark.parametrize("value", [7, ["a"], "x", None])
+def test_tail_non_mapping_with_reports_one_problem(value):
+    tail, doc = _tail_documents()
+    tail["with"] = value
+    assert render._tail_problems(tail, doc, ROOT) == [
+        "job required-checks passes a with that is not a mapping"
+    ]
+
+
+def test_tail_empty_with_reports_missing_fields():
+    tail, doc = _tail_documents()
+    tail["with"] = {}
+    problems = render._tail_problems(tail, doc, ROOT)
+    assert all(
+        f"job `required-checks` does not pass `{key}`" in problems for key in render.TAIL_WITH
+    )
+
+
+def test_tail_refuses_non_string_input_keys():
+    tail, doc = _tail_documents()
+    tail["with"].update({"extra": "value", 7: "value"})
+    problems = render._tail_problems(tail, doc, ROOT)
+    assert "job `required-checks` passes `7`, which the tail does not declare" in problems
+    assert "job `required-checks` passes `extra`, which the tail does not declare" in problems
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("required", "not JSON", "required: invalid JSON"),
+        ("apps", "[]", "apps: must be a JSON object"),
+        ("pull-request-only", '["Missing"]', "pull-request-only: unknown context"),
+        ("required", 7, "passes `required` as a non-string policy value"),
+        ("required", "[]", "required: must not be empty"),
+    ],
+)
+def test_tail_reports_invalid_judge_policy(field, value, message):
+    tail, doc = _tail_documents()
+    tail["with"][field] = value
+    problems = render._tail_problems(tail, doc, ROOT)
+    assert len(problems) == 1
+    assert message in problems[0]
+    if isinstance(value, str):
+        assert problems[0].startswith("job required-checks passes a policy the judge refuses: ")
+
+
+@pytest.mark.parametrize("name", ["Build", "Bob's check"])
+def test_tail_accepts_smallest_policy_with_default_proposal_subset(name):
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {"Required": json.dumps([name]), "NotOwed": "[]", "Apps": "{}"},
+    }
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    rendered = render.render(source, context, REAL)
+    tail, doc = _tail_documents(rendered)
+    assert json.loads(tail["with"]["required"]) == [name]
+    assert tail["with"]["pull-request-only"] == "[]"
+    assert render._tail_problems(tail, doc, ROOT) == []
+
+
+def test_tail_accepts_sample_policy():
+    tail, doc = _tail_documents()
+    assert render._tail_problems(tail, doc, ROOT) == []
 
 
 def test_scorecard_template_renders_into_the_recorded_caller():

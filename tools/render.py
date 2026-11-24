@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ciwf
 import exceptions
 import hosts
+import required_checks
 
 TEMPLATES = "templates/callers"
 SUFFIX = ".tmpl"
@@ -246,7 +247,7 @@ def _with_problems(job: dict, called: dict, path: str, public: set[str]) -> list
     passed = job.get("with") or {}
     problems = [
         f"the job passes `{key}`, which {path} does not declare"
-        for key in sorted(set(passed) - set(inputs))
+        for key in sorted(set(passed) - set(inputs), key=str)
     ]
     for key, spec in sorted(inputs.items()):
         if (spec or {}).get("required") and key not in passed:
@@ -478,7 +479,7 @@ def _tail_concurrency_problems(concurrency: object) -> list[str]:
     return problems
 
 
-def _tail_workflow_problems(tail: dict, doc: dict, root: Path) -> list[str]:
+def _tail_workflow_problems(tail: dict, doc: dict, root: Path, *, check_inputs: bool) -> list[str]:
     """Check the tail's reusable workflow reference, grants and input values."""
     problems: list[str] = []
     call = CALL.fullmatch(str(tail.get("uses", "")))
@@ -495,13 +496,40 @@ def _tail_workflow_problems(tail: dict, doc: dict, root: Path) -> list[str]:
         problems.append(f"{TAIL_WORKFLOW} is no reusable workflow of this repository")
     else:
         problems += _grant_problems(tail, doc, called, TAIL_WORKFLOW)
-        problems += _with_problems(tail, called, TAIL_WORKFLOW, _public_inputs(root, TAIL_WORKFLOW))
+        if check_inputs:
+            problems += _with_problems(
+                tail, called, TAIL_WORKFLOW, _public_inputs(root, TAIL_WORKFLOW)
+            )
+    return problems
+
+
+def _tail_policy_problems(passed: dict) -> list[str]:
+    fields = TAIL_WITH[1:]
+    problems = [
+        f"job {TAIL} passes `{key}` as a non-string policy value"
+        for key in fields
+        if key in passed and not isinstance(passed[key], str)
+    ]
+    if problems or any(key not in passed for key in fields):
+        return problems
+    try:
+        required_checks.parse_policy(*(passed[key] for key in fields))
+    except required_checks.InputError as err:
+        problems.append(f"job {TAIL} passes a policy the judge refuses: {err}")
+    return problems
+
+
+def _tail_input_problems(passed: dict) -> list[str]:
+    problems = [f"job `{TAIL}` does not pass `{key}`" for key in TAIL_WITH if key not in passed]
+    extra = sorted(set(passed) - set(TAIL_WITH), key=str)
+    problems += [f"job `{TAIL}` passes `{key}`, which the tail does not declare" for key in extra]
+    problems += _tail_policy_problems(passed)
     return problems
 
 
 def _tail_problems(tail: dict, doc: dict, root: Path) -> list[str]:
     """What keeps the required-checks tail job from matching the contract."""
-    if sorted(tail) != sorted(TAIL_KEYS):
+    if set(tail) != set(TAIL_KEYS):
         return [f"job `{TAIL}` has keys other than {', '.join(TAIL_KEYS)}"]
     problems: list[str] = []
     if tail.get("name") != TAIL_NAME:
@@ -512,13 +540,13 @@ def _tail_problems(tail: dict, doc: dict, root: Path) -> list[str]:
     if folded != _fold_ws(TAIL_IF):
         problems.append(f"job `{TAIL}` has an `if` that does not match the tail contract")
     problems += _tail_concurrency_problems(tail.get("concurrency"))
-    problems += _tail_workflow_problems(tail, doc, root)
-    passed = tail.get("with") or {}
-    for key in TAIL_WITH:
-        if key not in passed:
-            problems.append(f"job `{TAIL}` does not pass `{key}`")
-    extra = sorted(set(passed) - set(TAIL_WITH))
-    problems += [f"job `{TAIL}` passes `{key}`, which the tail does not declare" for key in extra]
+    passed = tail.get("with")
+    mapping = isinstance(passed, dict)
+    problems += _tail_workflow_problems(tail, doc, root, check_inputs=mapping)
+    if not mapping:
+        problems.append(f"job {TAIL} passes a with that is not a mapping")
+    else:
+        problems += _tail_input_problems(passed)
     return problems
 
 

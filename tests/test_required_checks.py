@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -49,6 +49,7 @@ from required_checks import (
 REPO = "plurano/horistes"
 SHA = "bfe95b5170e7e5e1e9681ea4d766c14d55e28851"
 SHA256 = "b" * 64
+PUSH_CONTEXT = "required-checks (push)"
 CHECKS_URL = f"repos/{REPO}/commits/{SHA}/check-runs?filter=all&per_page=100&page=1"
 RUNS_URL = f"repos/{REPO}/actions/runs?head_sha={SHA}&per_page=100&page=1"
 STATUSES_URL = f"repos/{REPO}/commits/{SHA}/statuses?per_page=100&page=1"
@@ -80,7 +81,7 @@ def check_item(
     status: str | None = None,
     app: str | None = "github-actions",
     suite_id: int | None = 1,
-    started_at: str = "2026-11-21T12:00:00Z",
+    started_at: str | None = "2026-11-21T12:00:00Z",
 ) -> dict:
     """Build one check-run API dictionary."""
     default_status = "in_progress" if conclusion is None else "completed"
@@ -223,6 +224,14 @@ def invoke_with_forge(
     out, err = io.StringIO(), io.StringIO()
     rc = run_judge(cfg, now=clock.now, sleep=clock.sleep, out=out, err=err)
     return rc, out.getvalue(), err.getvalue(), clock
+
+
+def _forge_post_records(tree: Tree) -> list[list[str]]:
+    log = tree.root / "forge.log"
+    if not log.exists():
+        return []
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    return [call for call in calls if "POST" in call]
 
 
 def _imported_module(node: ast.AST) -> list[str]:
@@ -744,7 +753,12 @@ def test_foreign_workflow_runs_excluded_across_events(
         options=JudgeOptions(required=["Gate"], event=event, ref=ref),
     )
     assert rc == 0, err
-    assert f"Posted success for required-checks on {SHA}" in out
+    context = (
+        "required-checks"
+        if event in ("pull_request", "pull_request_target", "merge_group")
+        else PUSH_CONTEXT
+    )
+    assert f"Posted success for {context} on {SHA}" in out
 
 
 def test_commit_statuses_3d(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -973,6 +987,9 @@ def test_transient_5xx_waits_at_most_three_backoffs_then_fails(
     rc, _, err, clock = invoke_with_forge(tree, monkeypatch, answers_recover)
     assert rc == 0, err
     assert clock.sleeps == list(API_BACKOFF_SECONDS)
+    recovered_posts = _forge_post_records(tree)
+    assert len(recovered_posts) == 1
+    assert "state=success" in recovered_posts[0]
 
     answers_outage = base_answers(checks={"sequence": [err_502] * 4})
     rc_fail, out_fail, err_fail, clock_fail = invoke_with_forge(tree, monkeypatch, answers_outage)
@@ -1069,7 +1086,7 @@ def test_one_shot_queued_checks_post_pending_without_sleep(
     queued = [check_item(i, name, None, status="queued") for i, name in enumerate(["A", "B"], 1)]
     answers = {
         **base_answers(checks=queued),
-        STATUSES_URL: [status_item(1, "required-checks", "success")],
+        STATUSES_URL: [status_item(1, PUSH_CONTEXT, "success")],
     }
     rc, out, err, clock = invoke_with_forge(
         tree,
@@ -1079,7 +1096,7 @@ def test_one_shot_queued_checks_post_pending_without_sleep(
     )
     assert rc == 0, err
     assert clock.sleeps == []
-    assert f"Posted pending for required-checks on {SHA}" in out
+    assert f"Posted pending for {PUSH_CONTEXT} on {SHA}" in out
     target = f"repos/{REPO}/statuses/{SHA}"
     assert target in tree.forge_calls()
     calls = (tree.root / "forge.log").read_text(encoding="utf-8").splitlines()
@@ -1234,7 +1251,7 @@ def test_status_posting_records_post_and_skips_churn(
         anchor,
     )
     _, desc = decide(snap, cfg, required_checks._iso_epoch("2026-11-21T12:00:00Z"), anchor)
-    prior_success = [status_item(0, "required-checks", "success")]
+    prior_success = [status_item(0, PUSH_CONTEXT, "success")]
     pending_snapshot = {
         **base_answers(checks=[check_item(1, "Build", None)]),
         STATUSES_URL: prior_success,
@@ -1250,7 +1267,7 @@ def test_status_posting_records_post_and_skips_churn(
     assert "-X" in log and "POST" in log and "state=pending" in log
     pending_status = {
         "id": 1,
-        "context": "required-checks",
+        "context": PUSH_CONTEXT,
         "state": "pending",
         "description": desc,
         "updated_at": "2026-11-21T12:01:00Z",
@@ -1268,14 +1285,14 @@ def test_status_posting_records_post_and_skips_churn(
 def test_only_if_pending_skips_check_runs_when_settled(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    statuses = [status_item(1, "required-checks", "success")]
+    statuses = [status_item(1, PUSH_CONTEXT, "success")]
     answers = base_answers(statuses=statuses)
     answers[CHECKS_URL] = {"fail": "check-runs should not be read"}
     rc, out, _, _ = invoke_with_forge(
         tree, monkeypatch, answers, options=JudgeOptions(required=["Build"], only_if_pending=True)
     )
     assert rc == 0
-    assert f"{SHA}: required-checks already settled" in out
+    assert f"{SHA}: {PUSH_CONTEXT} already settled" in out
     assert CHECKS_URL not in tree.forge_calls()
 
 
@@ -1467,7 +1484,7 @@ def _sweep_transport_factory(
     return transport
 
 
-def test_sweep_judges_all_unsettled_when_first_thirty_settled() -> None:
+def test_sweep_judges_never_judged_before_successes() -> None:
     heads = [f"{i:040x}" for i in range(1, 41)]
     settled = set(heads[:30])
     record: list[tuple[str, str]] = []
@@ -1481,7 +1498,7 @@ def test_sweep_judges_all_unsettled_when_first_thirty_settled() -> None:
     rc = run_sweep(
         cfg,
         transport=_sweep_transport_factory(heads, settled, record=record),
-        now=lambda: 1.0e9,
+        now=lambda: required_checks._iso_epoch("2026-11-23T12:00:00Z"),
         sleep=lambda _: None,
         out=io.StringIO(),
         err=io.StringIO(),
@@ -1494,7 +1511,7 @@ def test_sweep_judges_all_unsettled_when_first_thirty_settled() -> None:
     ]
     unsettled = [s for s in heads if s not in settled]
     assert all(s in checked for s in unsettled)
-    assert _statuses_get_count([p for _, p in record]) == len(heads) + 3 * (len(unsettled) + 1)
+    assert _statuses_get_count([p for _, p in record]) == len(heads) + 3 * (MAX_TARGETS_DEFAULT + 1)
 
 
 def test_sweep_evaluates_never_judged_first_up_to_max_targets() -> None:
@@ -1517,7 +1534,7 @@ def test_sweep_evaluates_never_judged_first_up_to_max_targets() -> None:
     )
     full_evals = [p.split("/commits/")[1].split("/")[0] for m, p in record if "/check-runs" in p]
     assert len(full_evals) == MAX_TARGETS_DEFAULT + 1
-    assert full_evals[:30] == heads[:30]
+    assert full_evals == ["d" * 40, *heads[:30]]
 
 
 def test_sweep_caps_status_reads_and_evaluations_at_120_heads() -> None:
@@ -1626,8 +1643,10 @@ def _sweep_body(kind: str, path: str, heads: list[str], page_bound: bool) -> obj
     if kind == "open-pulls":
         return [{"head": {"sha": s}} for s in heads]
     if kind == "statuses":
+        sha = SWEEP_FIXED_BODIES["default-commit"]["sha"]
+        context = PUSH_CONTEXT if f"/commits/{sha}/" in path else "required-checks"
         full = [
-            status_item(1, "required-checks", "pending", updated_at="2000-01-01T00:00:00Z"),
+            status_item(1, context, "pending", updated_at="2000-01-01T00:00:00Z"),
             *(status_item(i, "ext", "pending") for i in range(2, forge.PER_PAGE + 1)),
         ]
         rows = _sweep_page_rows(path, page_bound, required_checks.STATUS_MAX_PAGES, full)
@@ -1700,15 +1719,16 @@ def test_sweep_transport_call_counts_measured_at_defaults(page_bound: bool) -> N
     assert sum(counts.values()) == required_checks.SWEEP_MAX_CALLS
     assert counts["open-pulls"] == 1
     if page_bound:
-        assert counts["statuses"] == required_checks.SWEEP_MAX_CALLS - 1
-        assert counts["post"] == 0
+        assert counts["statuses"] == 164
+        assert counts["check-runs"] == 59
+        assert counts["post"] == 2
     else:
-        assert counts["check-runs"] == 21
-        assert counts["post"] == 21
+        assert counts["check-runs"] == 22
+        assert counts["post"] == 20
 
 
 @pytest.mark.parametrize(
-    ("page_bound", "status_pages", "expected_total"), [(False, 1, 320), (True, 20, 3677)]
+    ("page_bound", "status_pages", "expected_total"), [(False, 1, 320), (True, 20, 1777)]
 )
 def test_sweep_capless_call_counts(
     page_bound: bool, status_pages: int, expected_total: int, monkeypatch: pytest.MonkeyPatch
@@ -1729,7 +1749,7 @@ def test_sweep_capless_call_counts(
     assert err.getvalue() == ""
     assert sum(counts.values()) == expected_total
     eval_heads = MAX_TARGETS_DEFAULT + 1
-    assert counts["statuses"] == (OPEN_PULLS_MAX + eval_heads) * status_pages + 2 * eval_heads
+    assert counts["statuses"] == OPEN_PULLS_MAX + eval_heads * (status_pages + 2)
     assert counts["post"] == counts["commit"] == eval_heads
 
 
@@ -1768,7 +1788,7 @@ def _mixed_sweep_transport(
     return transport
 
 
-def test_sweep_settled_heads_skip_eval_slots_and_log_once() -> None:
+def test_sweep_priority_rotates_successes_after_pending_and_failures() -> None:
     start = required_checks._iso_epoch("2026-11-23T12:00:00Z")
     ctx = "required-checks"
     settled_old = [
@@ -1798,29 +1818,21 @@ def test_sweep_settled_heads_skip_eval_slots_and_log_once() -> None:
         run_number=1,
         max_targets=4,
     )
-    out = io.StringIO()
     rc = run_sweep(
-        cfg,
+        replace(cfg, run_number=2),
         transport=_mixed_sweep_transport(heads, status_by_sha, record=record),
         now=lambda: start,
         sleep=lambda _: None,
-        out=out,
+        out=io.StringIO(),
         err=io.StringIO(),
     )
     assert rc == 0
-    stdout = out.getvalue()
-    assert stdout.count(f"{heads[0]}: {ctx} already settled") == 1
-    assert f"{heads[1]}: {ctx} already settled" not in stdout
-    settled_shas = {heads[0]}
-    check_shas = {
+    check_shas = [
         p.split("/commits/")[1].split("/")[0]
         for m, p in record
         if m == "GET" and "/check-runs" in p
-    }
-    assert settled_shas.isdisjoint(check_shas)
-    pending_shas = {heads[2], heads[3]}
-    assert pending_shas.issubset(check_shas)
-    assert {heads[4], heads[5]}.issubset(check_shas)
+    ]
+    assert check_shas == ["d" * 40, heads[1], heads[0], heads[4], heads[5]]
 
 
 def test_sweep_pending_priority_orders_never_judged_before_oldest_judged() -> None:
@@ -2051,16 +2063,11 @@ def test_last_tail_posts_success_after_four_gates(
     tree: Tree, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """T1: tails 1-3 post nothing while waiting; tail 4 posts success once."""
-    posts: list[str] = []
-    answers = base_answers(
-        checks=[check_item(i, name, "success") for i, name in enumerate(GATES, 1)]
-    )
-    answers[STATUSES_URL] = []
-
-    for idx, finished in enumerate((1, 2, 3, 4)):
+    for finished in (1, 2, 3, 4):
         subset = list(GATES[:finished])
         checks = [check_item(i, name, "success") for i, name in enumerate(subset, 1)]
         snap = base_answers(checks=checks, statuses=[])
+        previous_count = len(_forge_post_records(tree))
         rc, out, err, _ = invoke_with_forge(
             tree,
             monkeypatch,
@@ -2070,13 +2077,12 @@ def test_last_tail_posts_success_after_four_gates(
             ),
         )
         assert rc == 0, err
-        log = (tree.root / "forge.log").read_text(encoding="utf-8")
-        post_lines = [line for line in log.splitlines() if "state=success" in line]
-        posts.append(post_lines[-1] if post_lines else "")
-        if idx < 3:
-            assert "POST" not in log or "state=success" not in log
+        new_posts = _forge_post_records(tree)[previous_count:]
+        if finished < len(GATES):
+            assert new_posts == []
         else:
-            assert "state=success" in log
+            assert len(new_posts) == 1
+            assert "state=success" in new_posts[0]
             assert "All owed required checks reported success." in out
 
 
@@ -2119,9 +2125,7 @@ def test_fork_tail_makes_no_api_calls(tmp_path: Path, monkeypatch: pytest.Monkey
     assert "Fork pull request" in err.getvalue()
 
 
-def test_tail_sha_counts_own_gate_result_check_run(
-    tree: Tree, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_tail_sha_counts_own_gate_result_check_run(monkeypatch: pytest.MonkeyPatch) -> None:
     """T3: sha target still counts the gate caller result when GITHUB_WORKFLOW_REF is set."""
     gate_suite = 7
     checks = [check_item(1, "Licence", "success", suite_id=gate_suite)]
@@ -2130,48 +2134,51 @@ def test_tail_sha_counts_own_gate_result_check_run(
             1, event="pull_request", suite_id=gate_suite, path=".github/workflows/licence-check.yml"
         )
     ]
-    answers = {
-        **base_answers(checks=checks, runs=runs),
-        STATUSES_URL: [status_item(1, "required-checks", "success")],
-    }
-    rc, out, err, _ = invoke_with_forge(
-        tree,
-        monkeypatch,
-        answers,
-        options=JudgeOptions(required=["Licence"], event="pull_request", ref="refs/pull/1/head"),
+    fake = ReviewTransport()
+    fake.answers.update(base_answers(checks=checks, runs=runs))
+    out, err = io.StringIO(), io.StringIO()
+
+    def judge(config: required_checks.Config, **kwargs: Any) -> int:
+        assert config.self_workflow == ".github/workflows/licence-check.yml"
+        return run_judge(config, transport=fake, now=fake.clock.now, **kwargs)
+
+    monkeypatch.setattr(required_checks, "run_judge", judge)
+    rc = main(
+        [
+            "judge",
+            "--repository",
+            REPO,
+            "--event",
+            "pull_request",
+            "--sha",
+            SHA,
+            "--required",
+            '["Licence"]',
+        ],
+        env={"GITHUB_WORKFLOW_REF": f"{REPO}/.github/workflows/licence-check.yml@refs/pull/1/head"},
+        out=out,
+        err=err,
     )
+    assert rc == 0, err.getvalue()
+    assert "OK (success): Licence" in out.getvalue()
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
+@pytest.mark.parametrize("previous", [None, "pending", "success", "failure"])
+def test_pending_replaces_only_a_terminal_status(previous: str | None) -> None:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", None, status="queued")]}
+    if previous is not None:
+        fake.answers[STATUSES_URL] = [status_item(1, "required-checks", previous)]
+    fake.answers[RUNS_URL] = {"workflow_runs": [wf_run(1, event="pull_request")]}
+    rc, out, err, _ = _review_judge(fake, event_name="pull_request")
     assert rc == 0, err
-    assert "OK (success): Licence" in out
-    # Planted mutant (manual): in read_snapshot, apply self_workflow_suites on sha
-    # targets too → same fixture then omits Licence and posts pending instead.
-
-
-def test_pending_posts_only_over_success(tree: Tree, monkeypatch: pytest.MonkeyPatch) -> None:
-    """T4: pending verdict posts only when the existing status is success."""
-    queued = [check_item(1, "Build", None, status="queued")]
-    over_none = base_answers(checks=queued)
-    rc0, _, err0, _ = invoke_with_forge(
-        tree, monkeypatch, over_none, options=JudgeOptions(required=["Build"])
-    )
-    assert rc0 == 0
-    assert "POST" not in (tree.root / "forge.log").read_text(encoding="utf-8")
-
-    over_success = {
-        **over_none,
-        STATUSES_URL: [status_item(1, "required-checks", "success")],
-    }
-    rc1, _, _, _ = invoke_with_forge(
-        tree, monkeypatch, over_success, options=JudgeOptions(required=["Build"])
-    )
-    assert rc1 == 0
-    assert "state=pending" in (tree.root / "forge.log").read_text(encoding="utf-8")
-
-    over_failure = {**over_none, STATUSES_URL: [status_item(2, "required-checks", "failure")]}
-    rc2, out2, _, _ = invoke_with_forge(
-        tree, monkeypatch, over_failure, options=JudgeOptions(required=["Build"])
-    )
-    assert rc2 == 0
-    assert "Posted pending" not in out2
+    if previous in ("success", "failure"):
+        assert fake.posts == [(REVIEW_POST_PATH, "pending")]
+    else:
+        assert fake.posts == []
+        kept = previous or "no status"
+        assert f"No status post: required-checks on {SHA} keeps {kept}; verdict pending" in out
 
 
 @pytest.mark.parametrize("refresh", [False, True], ids=["snapshot", "freshness-refresh"])
@@ -2199,10 +2206,9 @@ def test_sweep_api_cap_every_call_site(refresh: bool, monkeypatch: pytest.Monkey
         )
         assert rc == 0, f"cap={cap}: {err.getvalue()}"
         assert "Sweep API call cap" in err.getvalue(), err.getvalue()
-        # The last target can leave a single call unused to reserve verification.
-        expected_calls = cap - int(cap == complete_sweep_calls - 1)
-        assert sum(counts.values()) == expected_calls
-        assert counts["post"] == max(0, (cap - setup_calls) // calls_per_eval)
+        # The last target cannot spend its two reserved calls on a POST.
+        assert sum(counts.values()) == min(cap, complete_sweep_calls - 2), f"cap={cap}"
+        assert counts["post"] == max(0, (cap - setup_calls - 1) // calls_per_eval), f"cap={cap}"
 
 
 def test_sweep_call_count_at_fourteen_open_pulls() -> None:
@@ -2303,7 +2309,7 @@ class ReviewTransport:
         self.replies: dict[str, Iterator[object]] = {}
         self.calls: list[tuple[str, str]] = []
         self.posts: list[tuple[str, str]] = []
-        self.post_errors: Iterator[forge.ResponseError] = iter(())
+        self.post_errors: Iterator[forge.ResponseError | None] = iter(())
         self.clock = Clock(REVIEW_EPOCH)
         self.advance_on_reply: dict[str, Iterator[int]] = {}
         self.before_post: Callable[[], None] | None = None
@@ -2390,8 +2396,8 @@ def test_review_signoff_owed_on_proposal_events(event: str, expected: str) -> No
 @pytest.mark.parametrize("moves_twice", [False, True])
 def test_review_prepost_newer_self_status_refreshes_verdict(moves_twice: bool) -> None:
     fake = ReviewTransport()
-    first = status_item(41, "required-checks", "failure", updated_at="2026-11-21T12:00:01Z")
-    latest = status_item(42, "required-checks", "failure", updated_at="2026-11-21T12:00:02Z")
+    first = status_item(41, PUSH_CONTEXT, "failure", updated_at="2026-11-21T12:00:01Z")
+    latest = status_item(42, PUSH_CONTEXT, "failure", updated_at="2026-11-21T12:00:02Z")
     fake.replies[STATUSES_URL] = iter([[], [first], [first], [latest if moves_twice else first]])
     fake.advance_on_reply[STATUSES_URL] = iter([0, 1, 0, int(moves_twice)])
     fake.replies[CHECKS_URL] = iter(
@@ -2491,7 +2497,7 @@ def test_review_terminal_failure_beats_pending_peer(
     fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", conclusion)]}
     fake.answers[STATUSES_URL] = [
         status_item(1, "Build", state),
-        status_item(2, "required-checks", "success"),
+        status_item(2, PUSH_CONTEXT, "success"),
     ]
     rc, _, err, _ = _review_judge(fake)
     assert rc == 0, err
@@ -2801,7 +2807,7 @@ def _interleave_sweep_failure(fake: ReviewTransport, created_at: str) -> None:
     fake.before_post = None
     assert fake.calls[-2] == ("GET", STATUSES_URL)
     fake.clock.current = max(fake.clock.now(), required_checks._iso_epoch(created_at))
-    failed = status_item(41, "required-checks", "failure", updated_at=created_at)
+    failed = status_item(41, PUSH_CONTEXT, "failure", updated_at=created_at)
     fake.answers[STATUSES_URL] = [failed]
     fake.answers[CHECKS_URL] = {"check_runs": [check_item(2, "Build", "failure")]}
 
@@ -2817,7 +2823,7 @@ def test_review_post_verification_repairs_interleaved_failure(only_if_pending: b
     assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
     statuses = fake.answers[STATUSES_URL]
     assert isinstance(statuses, list)
-    assert required_checks._all_statuses(statuses)["required-checks"]["state"] == "failure"
+    assert required_checks._all_statuses(statuses)[PUSH_CONTEXT]["state"] == "failure"
 
 
 def test_review_post_verification_reads_page_once_without_contention() -> None:
@@ -2834,7 +2840,7 @@ def test_review_post_verification_checks_full_page_for_own_status(own_id_visible
     fake = ReviewTransport()
     foreign = [status_item(i, "other") for i in range(1, forge.PER_PAGE + 1)]
     if own_id_visible:
-        foreign[-1] = status_item(1001, "required-checks", "success")
+        foreign[-1] = status_item(1001, PUSH_CONTEXT, "success")
     fake.replies[STATUSES_URL] = iter([[], [], foreign])
     rc, _, err, _ = _review_judge(fake)
     assert rc == 0 and not err, err
@@ -2842,7 +2848,7 @@ def test_review_post_verification_checks_full_page_for_own_status(own_id_visible
     assert fake.calls.count(("GET", CHECKS_URL)) == (1 if own_id_visible else 2)
 
 
-def test_review_second_contested_post_warns_and_stops() -> None:
+def test_review_second_contested_failure_warns_without_withdrawal() -> None:
     fake = ReviewTransport()
     fake.before_post = lambda: _interleave_sweep_failure(fake, "2026-11-21T12:00:00Z")
     rc, _, err, _ = _review_judge(fake)
@@ -2877,6 +2883,7 @@ def test_review_post_answer_requires_integer_id(answer: object) -> None:
     rc, _, err, _ = _review_judge(fake)
     assert rc == 1
     assert "post-status" in err and "integer id" in err and SHA in err
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
 
 
 def test_review_prepost_owed_status_change_refreshes_verdict() -> None:
@@ -2916,6 +2923,325 @@ def test_review_tail_call_count(has_workflow_stamp: bool, post: bool, expected_c
     assert rc == 0, err
     assert fake.posts == ([(REVIEW_POST_PATH, "success")] if post else [])
     assert len(fake.calls) == expected_calls
+
+
+@pytest.mark.parametrize(
+    ("stamps", "expected"),
+    [
+        (("2026-11-21T12:00:00Z", None), 9),
+        ((None, None), 9),
+        (("2026-11-21T12:00:00Z", "2026-11-21T12:00:00Z"), 9),
+    ],
+)
+def test_check_run_rerun_uses_newer_id_if_unstamped_or_tied(
+    stamps: tuple[str | None, str | None], expected: int
+) -> None:
+    completed = check_item(5, "Build", started_at=stamps[0])
+    queued = check_item(9, "Build", None, status="queued", started_at=stamps[1])
+    config = _review_config()
+    for runs in ([completed, queued], [queued, completed]):
+        selected, ignored = required_checks.newest_check_runs(
+            runs, {1}, {}, frozenset({"Build"}), "required-checks"
+        )
+        assert selected["Build"]["id"] == expected
+        snapshot = required_checks.Snapshot(selected, {}, ignored, REVIEW_EPOCH)
+        assert decide(snapshot, config, REVIEW_EPOCH, REVIEW_EPOCH)[0] == "pending"
+
+
+@pytest.mark.parametrize(
+    ("older_context", "newer_context"),
+    [("Build", "build"), ("build", "Build"), ("Build", "Build")],
+    ids=["lowercase-newer", "uppercase-newer", "identical"],
+)
+def test_newest_commit_status_wins_across_context_case(
+    older_context: str, newer_context: str
+) -> None:
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = [
+        status_item(1, older_context),
+        status_item(2, newer_context, "failure"),
+    ]
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0, err
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+
+
+def test_check_run_names_stay_case_sensitive() -> None:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {
+        "check_runs": [check_item(1, "Build"), check_item(2, "build", "failure")]
+    }
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0, err
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
+def test_judge_status_is_self_status_across_context_case() -> None:
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = [status_item(1, PUSH_CONTEXT.upper())]
+    rc, _, err, _ = _review_judge(fake, only_if_pending=True)
+    assert rc == 0, err
+    assert fake.calls == [("GET", STATUSES_URL)]
+    assert fake.posts == []
+
+
+def test_both_judge_statuses_are_excluded_from_evidence() -> None:
+    statuses = [
+        status_item(1, "REQUIRED-CHECKS"),
+        status_item(2, PUSH_CONTEXT.upper()),
+        status_item(3, "Build"),
+    ]
+    assert required_checks.newest_statuses(statuses, "required-checks") == {"build": statuses[2]}
+
+
+@pytest.mark.parametrize(
+    ("required_json", "message"),
+    [
+        ('["Build","build"]', "differ only by case"),
+        ('["REQUIRED-CHECKS"]', "must not appear in required"),
+        ('["Required-Checks (PUSH)"]', "must not appear in required"),
+    ],
+)
+def test_policy_rejects_case_collisions_and_both_self_contexts(
+    required_json: str, message: str
+) -> None:
+    with pytest.raises(InputError, match=message):
+        _review_config(required_json=required_json)
+
+
+def _full_unrelated_status_page() -> list[dict]:
+    return [status_item(i, "other") for i in range(1, forge.PER_PAGE + 1)]
+
+
+def _status_page(page: int) -> str:
+    return STATUSES_URL.removesuffix("1") + str(page)
+
+
+def test_preflight_reads_short_second_page_when_no_judge_status_exists() -> None:
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = _full_unrelated_status_page()
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0 and not err, err
+    post_index = fake.calls.index(("POST", REVIEW_POST_PATH))
+    assert fake.calls[post_index - 2 : post_index] == [
+        ("GET", STATUSES_URL),
+        ("GET", _status_page(2)),
+    ]
+    assert fake.calls.count(("GET", _status_page(2))) == 2
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
+def test_preflight_compares_judge_status_on_second_page() -> None:
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = _full_unrelated_status_page()
+    older = status_item(101, PUSH_CONTEXT, "failure")
+    latest = status_item(102, PUSH_CONTEXT.upper(), "failure")
+    fake.replies[_status_page(2)] = iter([[older], [latest], [latest], [latest]])
+    fake.replies[CHECKS_URL] = iter(
+        [
+            {"check_runs": [check_item(1, "Build")]},
+            {"check_runs": [check_item(2, "Build", "failure")]},
+        ]
+    )
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0 and not err, err
+    assert fake.calls.count(("GET", _status_page(2))) == 4
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+
+
+def test_preflight_refuses_at_status_page_bound() -> None:
+    fake = ReviewTransport()
+    for page in range(1, required_checks.STATUS_MAX_PAGES + 1):
+        fake.answers[_status_page(page)] = _full_unrelated_status_page()
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0, err
+    assert "the newest judge status is outside the pre-post status page" in err
+    assert fake.posts == []
+    assert fake.calls.count(("GET", _status_page(required_checks.STATUS_MAX_PAGES))) == 4
+    assert fake.calls.count(("GET", _status_page(required_checks.STATUS_MAX_PAGES + 1))) == 2
+
+
+def _contested_status_write(
+    fake: ReviewTransport, *, cap: int | None = None, conclusion: str = "success"
+) -> tuple[int, str]:
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", conclusion)]}
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=fake,
+        out=io.StringIO(),
+        max_api_calls=cap,
+    )
+    err = io.StringIO()
+    rc = required_checks.evaluate_one(session, _review_config(), io.StringIO(), err)
+    assert session.api_calls == len(fake.calls)
+    return rc, err.getvalue()
+
+
+def _competing_push_status() -> dict:
+    return status_item(42, PUSH_CONTEXT.upper(), "failure")
+
+
+@pytest.mark.parametrize("conclusion", ["success", "failure"])
+def test_contested_post_at_cap_withdraws_only_success(conclusion: str) -> None:
+    fake = ReviewTransport()
+    fake.replies[STATUSES_URL] = iter([[], [], [_competing_push_status()]])
+    rc, err = _contested_status_write(fake, cap=7, conclusion=conclusion)
+    assert rc == 0 and "::warning::Sweep API call cap of 7" in err
+    states = ["success", "pending"] if conclusion == "success" else ["failure"]
+    assert fake.posts == [(REVIEW_POST_PATH, state) for state in states]
+    assert len(fake.calls) == 7
+    if conclusion == "success":
+        assert (
+            fake.answers[STATUSES_URL][0]["description"]
+            == "contested write; the next judgment decides"
+        )
+
+
+def test_second_contested_success_is_withdrawn() -> None:
+    fake = ReviewTransport()
+    contender = _competing_push_status()
+    fake.replies[STATUSES_URL] = iter([[], [], [contender], [contender], [contender], [contender]])
+    rc, err = _contested_status_write(fake)
+    assert rc == 0 and f"::warning::Status write contested again for {SHA}." in err
+    assert fake.posts == [(REVIEW_POST_PATH, state) for state in ("success", "success", "pending")]
+
+
+@pytest.mark.parametrize("withdrawal_fails", [False, True])
+def test_contested_success_with_retry_api_failure_withdraws_or_reports_risk(
+    withdrawal_fails: bool,
+) -> None:
+    fake = ReviewTransport()
+    fake.replies[STATUSES_URL] = iter([[], [], [_competing_push_status()], {}])
+    if withdrawal_fails:
+        fake.post_errors = iter([None, forge.ResponseError("blocked", status=403)])
+    rc, err = _contested_status_write(fake)
+    assert rc == 1
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    if withdrawal_fails:
+        assert SHA in err and "::error::" in err and "may rest on superseded evidence" in err
+    else:
+        assert "::error::" in err and "no list" in err
+
+
+def test_sweep_thirteen_deep_status_histories_still_evaluates_heads() -> None:
+    heads = [f"{i:040x}" for i in range(1, 14)]
+    fake = _review_sweep_transport(heads, app="scan-app")
+    for sha in heads:
+        for page in range(1, required_checks.STATUS_MAX_PAGES):
+            fake.answers[_status_page(page).replace(SHA, sha)] = _full_unrelated_status_page()
+    rc, err = _review_sweep(fake, apps_json='{"Build":"scan-app"}')
+    assert rc == 0, err
+    repo_read = fake.calls.index(("GET", f"repos/{REPO}"))
+    assert fake.calls[1:repo_read] == [("GET", STATUSES_URL.replace(SHA, sha)) for sha in heads]
+    assert fake.posts[0] == (REVIEW_POST_PATH, "success")
+    assert fake.posts[1] == (REVIEW_POST_PATH.replace(SHA, heads[0]), "success")
+    assert _review_evaluated_pulls(fake)
+
+
+def test_sweep_caps_triage_at_exact_retry_attempt_boundary() -> None:
+    heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
+    fake = _review_sweep_transport(heads)
+    paths = [STATUSES_URL.replace(SHA, sha) for sha in heads]
+    retry_once = set(paths[:22])
+    for path in paths:
+        fake.answers[path] = [status_item(1, "REQUIRED-CHECKS")]
+    calls: list[str] = []
+
+    def retrying(path: str, **kwargs: Any) -> tuple[int, dict[str, str], bytes]:
+        calls.append(path)
+        if path in retry_once:
+            retry_once.remove(path)
+            raise forge.ResponseError("rate limited", status=429, headers={"retry-after": "0"})
+        return fake(path, **kwargs)
+
+    err = io.StringIO()
+    rc = run_sweep(
+        _sweep_count_config(),
+        transport=retrying,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=io.StringIO(),
+        err=err,
+    )
+    assert rc == 0, err.getvalue()
+    repo_read = calls.index(f"repos/{REPO}")
+    assert repo_read - 1 == 120
+    assert calls[1:repo_read] == [
+        path for path in paths[:98] for _ in range(2 if path in paths[:22] else 1)
+    ]
+    evaluation_reads = [path for path in calls[repo_read:] if "/check-runs?" in path]
+    assert evaluation_reads[:2] == [CHECKS_URL, CHECKS_URL.replace(SHA, heads[98])]
+
+
+def test_sweep_rejudges_previous_success_after_fork_rerun() -> None:
+    fork_sha = "1" * 40
+    fake = _review_sweep_transport([fork_sha])
+    fake.answers[f"repos/{REPO}/pulls?state=open&per_page=100"] = [
+        {"head": {"sha": fork_sha, "repo": {"full_name": "fork/horistes"}}}
+    ]
+    checks = CHECKS_URL.replace(SHA, fork_sha)
+    fork_post = REVIEW_POST_PATH.replace(SHA, fork_sha)
+    assert _review_sweep(fake) == (0, "")
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (fork_post, "success")]
+    fake.calls.clear()
+    assert _review_sweep(fake, run_number=2) == (0, "")
+    assert ("GET", checks) in fake.calls
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (fork_post, "success")]
+    fake.answers[checks] = {"check_runs": [check_item(2, "Build", "failure")]}
+    assert _review_sweep(fake, run_number=3) == (0, "")
+    assert fake.posts[-1] == (fork_post, "failure")
+
+
+def test_sweep_rejudges_default_branch_success_after_rerun() -> None:
+    fake = _review_sweep_transport([])
+    assert _review_sweep(fake) == (0, "")
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(2, "Build", "failure")]}
+    assert _review_sweep(fake, run_number=2) == (0, "")
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_context", "expected_state"),
+    [("push", PUSH_CONTEXT, "success"), ("merge_group", "required-checks", "failure")],
+)
+def test_judge_does_not_reuse_other_event_policy_status(
+    event: str, expected_context: str, expected_state: str
+) -> None:
+    fake = _review_sweep_transport([])
+    other_context = PUSH_CONTEXT if event == "merge_group" else "required-checks"
+    fake.answers[STATUSES_URL] = [status_item(1, other_context, "success"), status_item(2, "Build")]
+    rc, _, err, _ = _review_judge(
+        fake,
+        event_name=event,
+        required_json='["Build","Sign-off"]',
+        pull_request_only_json='["Sign-off"]',
+        bound_minutes=1,
+        only_if_pending=True,
+    )
+    assert rc == 0, err
+    assert fake.posts == [(REVIEW_POST_PATH, expected_state)]
+    assert fake.answers[STATUSES_URL][0]["context"] == expected_context
+
+
+def test_sweep_posts_proposal_failure_when_same_sha_passes_push_policy() -> None:
+    fake = _review_sweep_transport([SHA])
+    fake.answers[STATUSES_URL] = [status_item(2, "Build")]
+    policy = {
+        "required_json": '["Build","Sign-off"]',
+        "pull_request_only_json": '["Sign-off"]',
+        "bound_minutes": 1,
+    }
+    rc, _, err, _ = _review_judge(fake, **policy)
+    assert rc == 0, err
+    assert fake.answers[STATUSES_URL][0]["context"] == PUSH_CONTEXT
+    rc, err = _review_sweep(fake, **policy)
+    assert rc == 0, err
+    statuses = required_checks._all_statuses(fake.answers[STATUSES_URL])
+    assert statuses[PUSH_CONTEXT]["state"] == "success"
+    assert statuses["required-checks"]["state"] == "failure"
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
 
 
 def _review_judge_function(name: str) -> ast.FunctionDef:

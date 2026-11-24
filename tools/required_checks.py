@@ -38,6 +38,7 @@ MAX_RUN_NUMBER = 10**9
 SESSION_DEADLINE_SECONDS = 8 * 60
 POST_FRESH_SECONDS = 10
 SWEEP_MAX_CALLS = 250
+TRIAGE_MAX_CALLS = 120
 MAX_RATE_LIMIT_SECONDS = 300
 API_BACKOFF_SECONDS = (30, 60, 120)
 MAX_RATE_LIMIT_WAITS_PER_CALL = 6
@@ -55,6 +56,7 @@ MAX_SELF_TESTS = 48
 STATUS_DESCRIPTION_MAX = 140
 DEFAULT_APP = "github-actions"
 DEFAULT_CONTEXT = "required-checks"
+PUSH_CONTEXT_SUFFIX = " (push)"
 DEFAULT_SELF_WORKFLOW = ".github/workflows/required-checks.yml"
 PR_EVENTS = frozenset({"pull_request", "pull_request_target"})
 PROPOSAL_EVENTS = PR_EVENTS | {"merge_group"}
@@ -133,6 +135,13 @@ class Config:
     run_number: int
     only_if_pending: bool
     target_url: str
+
+
+def status_context(config: Config) -> str:
+    """Return the status context for the event's check policy."""
+    if config.event_name in PROPOSAL_EVENTS:
+        return config.context
+    return f"{config.context}{PUSH_CONTEXT_SUFFIX}"
 
 
 @dataclass(frozen=True)
@@ -284,13 +293,16 @@ def _parse_required(raw: str) -> tuple[str, ...]:
         raise InputError("required: must not be empty")
     if len(data) > MAX_CONTEXTS:
         raise InputError(f"required: {len(data)} entries exceeds limit {MAX_CONTEXTS}")
-    seen: set[str] = set()
+    seen: dict[str, str] = {}
     names: list[str] = []
     for item in data[:MAX_CONTEXTS]:
         name = _validate_context_name("required", item)
-        if name in seen:
+        folded = name.casefold()
+        if seen.get(folded) == name:
             raise InputError(f"required: duplicate context name {name!r}")
-        seen.add(name)
+        if folded in seen:
+            raise InputError(f"required: {seen[folded]!r} and {name!r} differ only by case")
+        seen[folded] = name
         names.append(name)
     return tuple(names)
 
@@ -329,9 +341,15 @@ def _parse_apps(raw: str, allowed: frozenset[str]) -> dict[str, str]:
     return mapping
 
 
-def _reject_self_context(context: str, required: frozenset[str], label: str) -> None:
-    if context in required:
-        raise InputError(f"{label}: context {context!r} must not appear in required")
+def _judge_context_keys(context: str) -> tuple[str, str]:
+    return context.casefold(), f"{context}{PUSH_CONTEXT_SUFFIX}".casefold()
+
+
+def _reject_self_context(context: str, required: tuple[str, ...]) -> None:
+    own = _judge_context_keys(context)
+    for name in required[:MAX_CONTEXTS]:
+        if name.casefold() in own:
+            raise InputError(f"required: context {name!r} must not appear in required")
 
 
 def _parse_target_url(raw: str) -> str:
@@ -370,21 +388,33 @@ def _parse_run_number(raw: RawInputs) -> int:
     raise InputError(f"run-number: open-pulls requires a whole number from 1 to {MAX_RUN_NUMBER}")
 
 
+def parse_policy(
+    required_json: str,
+    pull_request_only_json: str,
+    not_owed_json: str,
+    apps_json: str,
+    context: str = DEFAULT_CONTEXT,
+) -> tuple[tuple[str, ...], frozenset[str], frozenset[str], dict[str, str]]:
+    """Parse required names, proposal-only names, exemptions, and app overrides."""
+    required = _parse_required(required_json)
+    allowed = frozenset(required)
+    pr_only = _parse_subset("pull-request-only", pull_request_only_json, allowed)
+    not_owed = _parse_subset("not-owed", not_owed_json, allowed)
+    apps = _parse_apps(apps_json, allowed)
+    _reject_self_context(context, required)
+    return required, pr_only, not_owed, apps
+
+
 def _parse_config_fields(raw: RawInputs) -> Config:
     """Validate check policy and build the normalized configuration."""
-    required = _parse_required(raw.required_json)
-    allowed = frozenset(required)
-    pr_only = _parse_subset("pull-request-only", raw.pull_request_only_json, allowed)
-    not_owed = _parse_subset("not-owed", raw.not_owed_json, allowed)
-    apps = _parse_apps(raw.apps_json, allowed)
+    ctx = _parse_context(raw.context)
+    required, pr_only, not_owed, apps = parse_policy(
+        raw.required_json, raw.pull_request_only_json, raw.not_owed_json, raw.apps_json, ctx
+    )
     bound = _parse_int_range(
         "bound-minutes", raw.bound_minutes, BOUND_MINUTES_MIN, BOUND_MINUTES_MAX
     )
-    ctx = _parse_context(raw.context)
     self_workflow = _parse_self_workflow(raw.self_workflow)
-    _reject_self_context(ctx, allowed, "required")
-    _reject_self_context(ctx, pr_only, "pull-request-only")
-    _reject_self_context(ctx, not_owed, "not-owed")
     return Config(
         repository=raw.repository,
         sha=raw.sha,
@@ -446,6 +476,7 @@ class ApiSession:
         self.out = out
         self.max_api_calls = max_api_calls
         self.api_calls = 0
+        self.withdrawal_reserved = False
         self.rate_limit_waited_seconds = 0.0
         self.rate_limit_wait_count = 0
 
@@ -499,15 +530,17 @@ class ApiSession:
         return min(forge.DEADLINE_SECONDS, remaining)
 
     def _check_api_cap(self, label: str, *, reserve: int = 0) -> None:
+        reserve = max(reserve, int(self.withdrawal_reserved))
         if self.max_api_calls is not None and self.api_calls + reserve >= self.max_api_calls:
             raise ApiCapReachedError(
                 f"Sweep API call cap of {self.max_api_calls} reached during {label}."
             )
 
-    def _request_once(self, label: str, path: str, method: str, **kw: object) -> object:
+    def _request_once(
+        self, label: str, path: str, method: str, *, reserve: int = 0, **kw: object
+    ) -> object:
         """Count every transport attempt, including failures and retries."""
-        # Keep a call available to verify a successful status write.
-        self._check_api_cap(label, reserve=int(method == "POST"))
+        self._check_api_cap(label, reserve=reserve)
         deadline = self._call_deadline(label)
         self.api_calls += 1
         try:
@@ -529,11 +562,15 @@ class ApiSession:
         else:
             raise failure
 
-    def request_json(self, label: str, path: str, *, method: str = "GET", **kw: object) -> object:
+    def request_json(
+        self, label: str, path: str, *, method: str = "GET", withdrawal: bool = False, **kw: object
+    ) -> object:
         """Decode one JSON endpoint. Only GET requests retry within the session."""
         if method != "GET":
             try:
-                return self._request_once(label, path, method, **kw)
+                # Verification and a possible withdrawal each need one call.
+                reserve = 0 if withdrawal else 2
+                return self._request_once(label, path, method, reserve=reserve, **kw)
             except forge.ResponseError as err:
                 raise PostFailureError(label, err) from err
         server_attempts = 0
@@ -662,9 +699,18 @@ def _check_run_admitted(
     return name, None
 
 
-def _check_run_rank(run: dict) -> tuple[float, int]:
-    stamp = run.get("started_at") or run.get("created_at") or run.get("completed_at")
-    return (_iso_epoch(stamp), _int_id(run.get("id")))
+def _check_run_stamp(run: dict) -> object:
+    return run.get("started_at") or run.get("created_at") or run.get("completed_at")
+
+
+def _newer_check_run(candidate: dict, current: dict) -> bool:
+    candidate_id = _int_id(candidate.get("id"))
+    current_id = _int_id(current.get("id"))
+    candidate_stamp = _check_run_stamp(candidate)
+    current_stamp = _check_run_stamp(current)
+    if not candidate_stamp or not current_stamp:
+        return candidate_id >= current_id
+    return (_iso_epoch(candidate_stamp), candidate_id) >= (_iso_epoch(current_stamp), current_id)
 
 
 def newest_check_runs(
@@ -676,7 +722,6 @@ def newest_check_runs(
 ) -> tuple[dict[str, dict], tuple[str, ...]]:
     """Select the newest check run per name from its expected app and, for Actions, own suite."""
     by_name: dict[str, dict] = {}
-    ranks: dict[str, tuple[float, int]] = {}
     ignored: list[str] = []
     seen_ignored: set[str] = set()
     for run in check_runs[:MAX_CHECK_RUNS]:
@@ -687,9 +732,8 @@ def newest_check_runs(
             ignored.append(foreign_note)
         if admitted_name is None:
             continue
-        rank = _check_run_rank(run)
-        if admitted_name not in ranks or rank >= ranks[admitted_name]:
-            ranks[admitted_name] = rank
+        current = by_name.get(admitted_name)
+        if current is None or _newer_check_run(run, current):
             by_name[admitted_name] = run
     return by_name, tuple(ignored)
 
@@ -699,13 +743,14 @@ def _status_timestamp(entry: Mapping[str, object]) -> float:
 
 
 def _all_statuses(statuses: list[dict]) -> dict[str, dict]:
-    """Newest commit status per context, including the self context."""
+    """Newest commit status per folded context, including both judge contexts."""
     by_context: dict[str, dict] = {}
     ranks: dict[str, tuple[float, int]] = {}
     for entry in statuses[:MAX_STATUSES]:
         context = entry.get("context")
         if not isinstance(context, str) or not context:
             continue
+        context = context.casefold()
         rank = (_status_timestamp(entry), _int_id(entry.get("id")))
         if context not in ranks or rank >= ranks[context]:
             ranks[context] = rank
@@ -713,10 +758,15 @@ def _all_statuses(statuses: list[dict]) -> dict[str, dict]:
     return by_context
 
 
+def _exclude_self_statuses(statuses: dict[str, dict], context: str) -> None:
+    for own in _judge_context_keys(context):
+        statuses.pop(own, None)
+
+
 def newest_statuses(statuses: list[dict], self_context: str) -> dict[str, dict]:
-    """Select the newest commit status per context except the self context."""
+    """Select the newest commit status per context except the judge's contexts."""
     recent = _all_statuses(statuses)
-    recent.pop(self_context, None)
+    _exclude_self_statuses(recent, self_context)
     return recent
 
 
@@ -760,7 +810,8 @@ def _read_workflow_runs(session: ApiSession, config: Config) -> list[dict]:
 def read_snapshot(session: ApiSession, config: Config) -> Snapshot | None:
     """Read current evidence. Skip a settled success when the caller requests it."""
     statuses = read_statuses(session, config.repository, config.sha)
-    self_status = statuses.pop(config.context, None)
+    self_status = statuses.get(status_context(config).casefold())
+    _exclude_self_statuses(statuses, config.context)
     if config.only_if_pending and self_status and self_status.get("state") == "success":
         return None
     checks_path = f"repos/{config.repository}/commits/{config.sha}/check-runs?filter=all"
@@ -810,7 +861,7 @@ def exempt_reason(name: str, config: Config) -> str:
 def _records_for(name: str, snapshot: Snapshot, config: Config) -> tuple[dict | None, dict | None]:
     """Return (check_run, commit_status) applicable to `name`."""
     run = snapshot.checks_by_name.get(name)
-    status = None if name in config.apps else snapshot.statuses_by_context.get(name)
+    status = None if name in config.apps else snapshot.statuses_by_context.get(name.casefold())
     return run, status
 
 
@@ -945,29 +996,34 @@ def judge_snapshot(snapshot: Snapshot, config: Config, out: TextIO) -> list[str]
 
 
 def _status_fields(config: Config, state: str, description: str) -> dict[str, str]:
-    fields = {"state": state, "context": config.context, "description": description}
+    fields = {"state": state, "context": status_context(config), "description": description}
     if config.target_url:
         fields["target_url"] = config.target_url
     return fields
 
 
 def _should_post(newest: Mapping[str, object] | None, state: str, description: str) -> bool:
-    if state == "pending" and (not newest or newest.get("state") != "success"):
-        return False
+    if state == "pending":
+        return newest is not None and newest.get("state") in ("success", "failure")
     if not newest:
         return True
     return newest.get("state") != state or newest.get("description") != description
 
 
-def post_commit_status(session: ApiSession, config: Config, state: str, description: str) -> int:
+def post_commit_status(
+    session: ApiSession, config: Config, state: str, description: str, *, withdrawal: bool = False
+) -> int:
     """Attempt a single status POST and return the created status ID."""
     path = f"repos/{config.repository}/statuses/{config.sha}"
     fields = _status_fields(config, state, description)
-    answer = session.request_json("post-status", path, method="POST", fields=fields)
+    answer = session.request_json(
+        "post-status", path, method="POST", withdrawal=withdrawal, fields=fields
+    )
+    session.withdrawal_reserved = state == "success"
     status_id = answer.get("id") if isinstance(answer, dict) else None
     if not isinstance(status_id, int) or isinstance(status_id, bool):
         raise ApiFailureError(f"GitHub API error (post-status): POST {path}: no integer id")
-    session.out.write(f"Posted {state} for {config.context} on {config.sha}\n")
+    session.out.write(f"Posted {state} for {status_context(config)} on {config.sha}\n")
     return status_id
 
 
@@ -981,7 +1037,7 @@ def _read_and_decide(session: ApiSession, config: Config, out: TextIO) -> Evalua
     read_started = session.now()
     snapshot = read_snapshot(session, config)
     if snapshot is None:
-        out.write(f"{config.sha}: {config.context} already settled\n")
+        out.write(f"{config.sha}: {status_context(config)} already settled\n")
         return None
     judge_snapshot(snapshot, config, out)
     state, description = decide(snapshot, config, session.now(), snapshot.anchor)
@@ -999,17 +1055,19 @@ def _owed_status_changed(
     config: Config, snapshot: Snapshot, recent: Mapping[str, dict], *, complete: bool
 ) -> bool:
     for name in config.required[:MAX_CONTEXTS]:
-        if name in config.apps or (name not in recent and not complete):
+        key = name.casefold()
+        if name in config.apps or (key not in recent and not complete):
             continue
-        if recent.get(name) != snapshot.statuses_by_context.get(name):
+        if recent.get(key) != snapshot.statuses_by_context.get(key):
             return True
     return False
 
 
-def _read_status_page_one(session: ApiSession, config: Config) -> tuple[list[dict], bool]:
-    """Return the newest commit-status page and whether it is complete."""
+def _read_status_page(session: ApiSession, config: Config, page: int) -> tuple[list[dict], bool]:
+    """Return a commit-status page and whether it exhausts the listing."""
     path = (
-        f"repos/{config.repository}/commits/{config.sha}/statuses?per_page={forge.PER_PAGE}&page=1"
+        f"repos/{config.repository}/commits/{config.sha}/statuses"
+        f"?per_page={forge.PER_PAGE}&page={page}"
     )
     data = session.request_json("statuses", path)
     if not isinstance(data, list):
@@ -1018,11 +1076,32 @@ def _read_status_page_one(session: ApiSession, config: Config) -> tuple[list[dic
     return [entry for entry in data[: forge.PER_PAGE] if isinstance(entry, dict)], complete
 
 
+def _read_status_page_one(session: ApiSession, config: Config) -> tuple[list[dict], bool]:
+    return _read_status_page(session, config, 1)
+
+
+def _status_in_context(entry: Mapping[str, object], key: str) -> bool:
+    context = entry.get("context")
+    return isinstance(context, str) and context.casefold() == key
+
+
+def _preflight_statuses(
+    session: ApiSession, config: Config, key: str
+) -> tuple[dict[str, dict], bool]:
+    statuses: list[dict] = []
+    for page in range(1, STATUS_MAX_PAGES + 1):
+        rows, complete = _read_status_page(session, config, page)
+        statuses.extend(rows)
+        if complete or any(_status_in_context(row, key) for row in rows[: forge.PER_PAGE]):
+            return _all_statuses(statuses), complete
+    return _all_statuses(statuses), False
+
+
 def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluation) -> str:
-    """Re-read the newest status page before a write to detect superseding evidence."""
-    statuses, complete = _read_status_page_one(session, config)
-    recent = _all_statuses(statuses)
-    newest = recent.get(config.context)
+    """Read through the first judge status or end of the listing before posting."""
+    key = status_context(config).casefold()
+    recent, complete = _preflight_statuses(session, config, key)
+    newest = recent.get(key)
     if newest is None and not complete:
         return "the newest judge status is outside the pre-post status page"
     if newest != evaluation.snapshot.self_status or (
@@ -1039,10 +1118,11 @@ def _post_is_contested(
 ) -> bool:
     """Detect judge writes made since the evidence read, including the same second."""
     statuses, complete = _read_status_page_one(session, config)
+    key = status_context(config).casefold()
     oldest_contender = floor(evaluation.read_started)
     own_status_seen = False
     for entry in statuses[: forge.PER_PAGE]:
-        if entry.get("context") != config.context:
+        if not _status_in_context(entry, key):
             continue
         if entry.get("id") == status_id:
             own_status_seen = True
@@ -1071,6 +1151,15 @@ def _attempt_post(
         return None
 
 
+def _report_no_post(config: Config, evaluation: Evaluation, out: TextIO) -> None:
+    newest = evaluation.snapshot.self_status
+    kept = (newest or {}).get("state") or "no status"
+    out.write(
+        f"No status post: {status_context(config)} on {config.sha} keeps {kept}; "
+        f"verdict {evaluation.state}\n"
+    )
+
+
 def _evaluate_attempt(
     session: ApiSession, config: Config, out: TextIO, *, can_retry_post: bool
 ) -> tuple[EvaluationRetry, str] | None:
@@ -1078,26 +1167,46 @@ def _evaluate_attempt(
     evaluation = _read_and_decide(session, config, out)
     if evaluation is None:
         return None
-    state, description = evaluation.state, evaluation.description
-    if not _should_post(evaluation.snapshot.self_status, state, description):
-        out.write(f"No status post: {config.context} on {config.sha} already has {state!r}\n")
+    should_post = _should_post(
+        evaluation.snapshot.self_status, evaluation.state, evaluation.description
+    )
+    if should_post or session.withdrawal_reserved:
+        stale_reason = _post_age_problem(session, evaluation) or _status_preflight(
+            session, config, evaluation
+        )
+        if stale_reason:
+            return EvaluationRetry.PREFLIGHT, f"Posting skipped for {config.sha}: {stale_reason}."
+    if not should_post:
+        session.withdrawal_reserved = False
+        _report_no_post(config, evaluation, out)
         _report_verdict(config, evaluation, out)
         return None
-    stale_reason = _post_age_problem(session, evaluation) or _status_preflight(
-        session, config, evaluation
-    )
-    if stale_reason:
-        return EvaluationRetry.PREFLIGHT, f"Posting skipped for {config.sha}: {stale_reason}."
     status_id = _attempt_post(session, config, evaluation, can_retry=can_retry_post)
     if status_id is None:
         return EvaluationRetry.POST, ""
     if _post_is_contested(session, config, evaluation, status_id):
         return EvaluationRetry.CONTESTED, f"Status write contested again for {config.sha}."
+    session.withdrawal_reserved = False
     _report_verdict(config, evaluation, out)
     return None
 
 
-def _evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> None:
+def _withdraw_unverified_success(session: ApiSession, config: Config) -> None:
+    """Spend the reserved call to replace an unresolved success with pending."""
+    if not session.withdrawal_reserved:
+        return
+    session.withdrawal_reserved = False
+    description = _truncate_description("contested write; the next judgment decides")
+    try:
+        post_commit_status(session, config, "pending", description, withdrawal=True)
+    except (ApiCapReachedError, ApiFailureError) as exc:
+        raise ApiFailureError(
+            f"Could not withdraw the status for {config.sha}; a success may rest on "
+            f"superseded evidence: {exc}"
+        ) from exc
+
+
+def _evaluate_retries(session: ApiSession, config: Config, out: TextIO) -> str:
     """Allow one re-evaluation per retry reason."""
     retried: set[EvaluationRetry] = set()
     for _ in range(1 + len(EvaluationRetry)):
@@ -1105,14 +1214,25 @@ def _evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO)
             session, config, out, can_retry_post=EvaluationRetry.POST not in retried
         )
         if retry is None:
-            return
+            return ""
         reason, warning = retry
         if reason in retried:
-            err.write(f"::warning::{warning}\n")
-            return
+            return warning
         retried.add(reason)
         if reason == EvaluationRetry.CONTESTED:
             config = replace(config, only_if_pending=False)
+    return ""
+
+
+def _evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> None:
+    try:
+        warning = _evaluate_retries(session, config, out)
+    except (ApiCapReachedError, ApiFailureError):
+        _withdraw_unverified_success(session, config)
+        raise
+    _withdraw_unverified_success(session, config)
+    if warning:
+        err.write(f"::warning::{warning}\n")
 
 
 def evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> int:
@@ -1146,23 +1266,44 @@ def _open_pull_head_shas(session: ApiSession, repository: str) -> list[str]:
     return heads
 
 
+def _read_triage_statuses(session: ApiSession, config: Config, heads: list[str]) -> dict[str, dict]:
+    """Read one status page per head until the triage attempt budget runs out."""
+    key = status_context(config).casefold()
+    judged: dict[str, dict] = {}
+    for sha in heads[:OPEN_PULLS_MAX]:
+        try:
+            statuses, _ = _read_status_page_one(session, replace(config, sha=sha))
+        except ApiCapReachedError:
+            break
+        newest = _all_statuses(statuses).get(key)
+        if newest is not None:
+            judged[sha] = newest
+    return judged
+
+
+def _sweep_triage(session: ApiSession, config: Config, heads: list[str]) -> dict[str, dict]:
+    """Cap triage independently so the same session can still judge targets."""
+    sweep_cap = session.max_api_calls
+    triage_cap = session.api_calls + TRIAGE_MAX_CALLS
+    session.max_api_calls = triage_cap if sweep_cap is None else min(sweep_cap, triage_cap)
+    try:
+        return _read_triage_statuses(session, config, heads)
+    finally:
+        session.max_api_calls = sweep_cap
+
+
+def _triage_priority(status: dict | None) -> tuple[int, float]:
+    if status is None:
+        return 0, 0.0
+    states = {"failure": 2, "success": 3}
+    return states.get(str(status.get("state")), 1), _status_timestamp(status)
+
+
 def _sweep_evaluation_order(session: ApiSession, config: Config, heads: list[str]) -> list[str]:
     """Build the priority list and select this run's block when over budget."""
-    never_judged: list[str] = []
-    judged: list[tuple[bool, float, str]] = []
-    for sha in heads[:OPEN_PULLS_MAX]:
-        statuses = read_statuses(session, config.repository, sha)
-        newest = statuses.get(config.context)
-        if newest is None:
-            never_judged.append(sha)
-            continue
-        state = newest.get("state")
-        if state == "success":
-            session.out.write(f"{sha}: {config.context} already settled\n")
-            continue
-        judged.append((state == "failure", _status_timestamp(newest), sha))
-    judged.sort(key=lambda row: (row[0], row[1]))
-    candidates = never_judged + [sha for _, _, sha in judged]
+    pr_config = replace(config, event_name="pull_request")
+    judged = _sweep_triage(session, pr_config, heads)
+    candidates = sorted(heads[:OPEN_PULLS_MAX], key=lambda sha: _triage_priority(judged.get(sha)))
     budget = config.max_targets
     if len(candidates) <= budget:
         return candidates
@@ -1205,12 +1346,12 @@ def _sweep_default_branch(
     out: TextIO,
     err: TextIO,
 ) -> int:
-    """Judge the default branch head last, with the sweep's shared session."""
+    """Judge the default branch head with its push policy in the sweep's session."""
     if _sweep_deadline_passed(session, err, "the default branch"):
         return 1
     sha, branch = default_head
     default_cfg = replace(
-        sweep_cfg, sha=sha, event_name="push", ref=f"refs/heads/{branch}", only_if_pending=True
+        sweep_cfg, sha=sha, event_name="push", ref=f"refs/heads/{branch}", only_if_pending=False
     )
     return evaluate_one(session, default_cfg, out, err)
 
@@ -1244,7 +1385,9 @@ def run_sweep(
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
         return 1
-    pending = len(to_eval) + 1
+    if _sweep_default_branch(session, sweep_cfg, default_head, out, err) != 0:
+        return 1
+    pending = len(to_eval)
     for sha in to_eval[:MAX_TARGETS_MAX]:
         pending -= 1
         if _sweep_deadline_passed(session, err, sha):
@@ -1258,7 +1401,7 @@ def run_sweep(
                 f"{pending} target(s) not judged.\n"
             )
             return 0
-    return _sweep_default_branch(session, sweep_cfg, default_head, out, err)
+    return 0
 
 
 def run_judge(
