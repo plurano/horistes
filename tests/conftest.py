@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import shlex
 import subprocess
@@ -22,11 +23,46 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import ciwf
+import pins
 
 ROOT = Path(__file__).resolve().parent.parent
+PIN_COMMENT = re.compile(r"^\s+# v\d+(?:\.\d+){0,2}$")
+MAX_WORKFLOW_STEPS = 100
+
+
+def assert_action_pin(uses: str, action: str, line: str | None = None) -> None:
+    """Assert `uses` pins `action` to a 40-hex commit, with `# v...` comment when `line` given."""
+    found_action, sep, sha = uses.partition("@")
+    assert sep == "@" and found_action == action, f"expected action {action!r}, got {uses!r}"
+    assert pins.COMMIT.fullmatch(sha) is not None, (
+        f"expected 40-hex commit pin for {action!r}, got {uses!r}"
+    )
+    if line is not None:
+        stripped = line.rstrip("\r\n")
+        prefix, found_uses, tail = stripped.partition(uses)
+        assert (
+            found_uses == uses
+            and not prefix.lstrip().startswith("#")
+            and PIN_COMMENT.fullmatch(tail) is not None
+        ), f"expected version comment for {action!r} after sha, got {line!r}"
+
+
+def uses_lines(path: Path, job_id: str) -> dict[int, str]:
+    """Raw workflow line for each step index declaring `uses` in `job_id`."""
+    raw = path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    top = pins._pairs(yaml.compose(raw, Loader=ciwf.StrictLoader))
+    steps = pins._steps(pins._below(pins._below(top, "jobs"), job_id))
+    return {
+        idx: lines[step["uses"][1].start_mark.line]
+        for idx, step in enumerate(steps[:MAX_WORKFLOW_STEPS])
+        if "uses" in step
+    }
+
 
 # The consumer path each template's header names.
 CALLER_TEMPLATES: dict[str, str] = {
