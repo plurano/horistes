@@ -72,11 +72,24 @@ At 100 open heads, the capped one-page fixture posts for the default head and 19
 - **a — `workflow_run` caller**: needs a dated dangerous-triggers exception against the ADR-0098 rendered-caller zizmor contract.
 - **c — sweep only**: ≈1,368 calls/hour at 10-minute interval with 100 open pulls (exceeds 1,000 budget).
 
+## Residual risk
+
+A contested or unacknowledged `success` is visible between its POST (`post_commit_status`) and the verification read (`_post_is_contested`) plus the `pending` withdrawal POST (`_withdraw_unverified_success` in [tools/required_checks.py](../../tools/required_checks.py)), and this decision accepts that window.
+
+- **Defence 1.** When the `pending` withdrawal POST in `_withdraw_unverified_success` fails, `evaluate_one` in [tools/required_checks.py](../../tools/required_checks.py) emits `::error::` naming the SHA (stating that a `success` `may rest on superseded evidence`) and exits 1, so the caller run in [required-checks.yml](../../.github/workflows/required-checks.yml) or [required-checks-sweep.yml](../../.github/workflows/required-checks-sweep.yml) is red (`test_contested_success_with_retry_api_failure_withdraws_or_reports_risk` with `withdrawal_fails=True` in [tests/test_required_checks.py](../../tests/test_required_checks.py)). The `success` status stays on the commit until the next judgment for the SHA replaces it (`_should_post`, `post_commit_status` in [tools/required_checks.py](../../tools/required_checks.py)).
+- **Defence 2.** The next judgment comes from a later event ([required-checks.yml](../../.github/workflows/required-checks.yml)) or the sweep (`17,47 * * * *` in [required-checks-caller.yml](../../.github/workflows/required-checks-caller.yml), calling [required-checks-sweep.yml](../../.github/workflows/required-checks-sweep.yml)), which judges the head within `ceil(len(candidates) / max_targets)` cron intervals (the `blocks` bound of Sweep ordering in `_sweep_evaluation_order` in [tools/required_checks.py](../../tools/required_checks.py)); that is one interval only when the candidate list fits `max_targets`, and the bound does not hold for a head whose evaluation keeps failing (`_sweep_pull_heads` in [tools/required_checks.py](../../tools/required_checks.py)).
+
+Inside that window, a ruleset that requires only the judge context (`status_context` in [tools/required_checks.py](../../tools/required_checks.py)) could merge on the stale `success`. Consumers that switch to the judge ([required-checks.yml.tmpl](../../templates/callers/required-checks.yml.tmpl), [tools/render.py](../../tools/render.py)) therefore keep every always-reporting check directly required beside `required-checks`, so a red check still blocks.
+
+The residual risk of [tools/required_checks.py](../../tools/required_checks.py) was accepted on 2026-11-24 with the revisit triggers below; the follow-up is tracked on #103.
+
 ## Revisit when
 
 - Pinned actionlint accepts `concurrency.queue`.
 - Measured evidence that a shared concurrency group leaves a PR `CLEAN` with a lone cancelled tail check run.
 - Measured token use near the repository budget cap.
+- Before any consumer ruleset drops a directly required always-reporting check in favour of the judge context (`status_context` in [tools/required_checks.py](../../tools/required_checks.py)).
+- GitHub offers a compare-and-set commit status write for `post_commit_status` in [tools/required_checks.py](../../tools/required_checks.py).
 
 ## Consequences
 
