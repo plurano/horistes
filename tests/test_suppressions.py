@@ -115,7 +115,7 @@ def test_tracked_tree_has_no_problems() -> None:
     The day is the one the engine-file exceptions in exceptions.yaml were entered on:
     before it, the BLE001 entry for the lefthook checkpoint script is not yet valid.
     """
-    assert tree_problems(ROOT, datetime.date(2026, 11, 13)) == []
+    assert tree_problems(ROOT, datetime.date(2026, 11, 23)) == []
 
 
 def test_tree_problems_ignores_untracked_copy(tree: Tree) -> None:
