@@ -18,6 +18,8 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum, auto
+from math import floor
 from pathlib import Path
 from typing import TextIO
 
@@ -32,6 +34,7 @@ BOUND_MINUTES_DEFAULT = 240
 MAX_TARGETS_MIN = 1
 MAX_TARGETS_MAX = 100
 MAX_TARGETS_DEFAULT = 30
+MAX_RUN_NUMBER = 10**9
 SESSION_DEADLINE_SECONDS = 8 * 60
 POST_FRESH_SECONDS = 10
 SWEEP_MAX_CALLS = 250
@@ -105,6 +108,7 @@ class RawInputs:
     self_workflow: str = DEFAULT_SELF_WORKFLOW
     targets: str = TARGETS_SHA
     max_targets: str | int = MAX_TARGETS_DEFAULT
+    run_number: str | int = ""
     only_if_pending: str | bool = False
     target_url: str = ""
 
@@ -126,6 +130,7 @@ class Config:
     self_workflow: str
     targets: str
     max_targets: int
+    run_number: int
     only_if_pending: bool
     target_url: str
 
@@ -143,13 +148,20 @@ class Snapshot:
 
 @dataclass(frozen=True)
 class Evaluation:
-    """A verdict and the timestamps bracketing its evidence read."""
+    """A verdict and the start time of its evidence read."""
 
     snapshot: Snapshot
     state: str
     description: str
     read_started: float
-    read_end: float
+
+
+class EvaluationRetry(Enum):
+    """Reasons an evaluation can start over once."""
+
+    PREFLIGHT = auto()
+    POST = auto()
+    CONTESTED = auto()
 
 
 def below_floor(version: tuple[int, ...]) -> str | None:
@@ -345,6 +357,19 @@ def _resolve_sha(event_name: str, explicit_sha: str, commit_sha: str, pr_head_sh
     return chosen
 
 
+def _parse_run_number(raw: RawInputs) -> int:
+    if raw.targets == TARGETS_SHA:
+        return 0
+    value = raw.run_number
+    if isinstance(value, str):
+        digits = value.strip().lstrip("0")
+        if re.fullmatch(r"[0-9]{1,10}", digits):
+            value = int(digits)
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_RUN_NUMBER:
+        return value
+    raise InputError(f"run-number: open-pulls requires a whole number from 1 to {MAX_RUN_NUMBER}")
+
+
 def _parse_config_fields(raw: RawInputs) -> Config:
     """Validate check policy and build the normalized configuration."""
     required = _parse_required(raw.required_json)
@@ -376,6 +401,7 @@ def _parse_config_fields(raw: RawInputs) -> Config:
         max_targets=_parse_int_range(
             "max-targets", raw.max_targets, MAX_TARGETS_MIN, MAX_TARGETS_MAX
         ),
+        run_number=_parse_run_number(raw),
         only_if_pending=_parse_bool("only-if-pending", raw.only_if_pending),
         target_url=_parse_target_url(raw.target_url),
     )
@@ -472,15 +498,16 @@ class ApiSession:
             )
         return min(forge.DEADLINE_SECONDS, remaining)
 
-    def _check_api_cap(self, label: str) -> None:
-        if self.max_api_calls is not None and self.api_calls >= self.max_api_calls:
+    def _check_api_cap(self, label: str, *, reserve: int = 0) -> None:
+        if self.max_api_calls is not None and self.api_calls + reserve >= self.max_api_calls:
             raise ApiCapReachedError(
                 f"Sweep API call cap of {self.max_api_calls} reached during {label}."
             )
 
     def _request_once(self, label: str, path: str, method: str, **kw: object) -> object:
         """Count every transport attempt, including failures and retries."""
-        self._check_api_cap(label)
+        # Keep a call available to verify a successful status write.
+        self._check_api_cap(label, reserve=int(method == "POST"))
         deadline = self._call_deadline(label)
         self.api_calls += 1
         try:
@@ -932,12 +959,16 @@ def _should_post(newest: Mapping[str, object] | None, state: str, description: s
     return newest.get("state") != state or newest.get("description") != description
 
 
-def post_commit_status(session: ApiSession, config: Config, state: str, description: str) -> None:
-    """Attempt a single status POST from a checked evaluation."""
+def post_commit_status(session: ApiSession, config: Config, state: str, description: str) -> int:
+    """Attempt a single status POST and return the created status ID."""
     path = f"repos/{config.repository}/statuses/{config.sha}"
     fields = _status_fields(config, state, description)
-    session.request_json("post-status", path, method="POST", fields=fields)
+    answer = session.request_json("post-status", path, method="POST", fields=fields)
+    status_id = answer.get("id") if isinstance(answer, dict) else None
+    if not isinstance(status_id, int) or isinstance(status_id, bool):
+        raise ApiFailureError(f"GitHub API error (post-status): POST {path}: no integer id")
     session.out.write(f"Posted {state} for {config.context} on {config.sha}\n")
+    return status_id
 
 
 def _warn_api_cap(err: TextIO, exc: ApiCapReachedError) -> int:
@@ -946,22 +977,21 @@ def _warn_api_cap(err: TextIO, exc: ApiCapReachedError) -> int:
 
 
 def _read_and_decide(session: ApiSession, config: Config, out: TextIO) -> Evaluation | None:
-    """Read evidence and record the start and end of the read used for a verdict."""
+    """Read evidence and record when the read used for the verdict began."""
     read_started = session.now()
     snapshot = read_snapshot(session, config)
     if snapshot is None:
         out.write(f"{config.sha}: {config.context} already settled\n")
         return None
-    read_end = session.now()
     judge_snapshot(snapshot, config, out)
     state, description = decide(snapshot, config, session.now(), snapshot.anchor)
-    return Evaluation(snapshot, state, description, read_started, read_end)
+    return Evaluation(snapshot, state, description, read_started)
 
 
 def _post_age_problem(session: ApiSession, evaluation: Evaluation) -> str:
-    age = session.now() - evaluation.read_end
+    age = session.now() - evaluation.read_started
     if age > POST_FRESH_SECONDS:
-        return f"snapshot read ended {age:.0f} s ago (limit {POST_FRESH_SECONDS} s)"
+        return f"snapshot read started {age:.0f} s ago (limit {POST_FRESH_SECONDS} s)"
     return ""
 
 
@@ -976,8 +1006,8 @@ def _owed_status_changed(
     return False
 
 
-def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluation) -> str:
-    """Re-read the newest status page before a write to detect superseding evidence."""
+def _read_status_page_one(session: ApiSession, config: Config) -> tuple[list[dict], bool]:
+    """Return the newest commit-status page and whether it is complete."""
     path = (
         f"repos/{config.repository}/commits/{config.sha}/statuses?per_page={forge.PER_PAGE}&page=1"
     )
@@ -985,7 +1015,13 @@ def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluatio
     if not isinstance(data, list):
         raise ApiFailureError(f"GitHub API error (statuses): GET {path}: no list in the answer")
     complete = len(data) < forge.PER_PAGE
-    recent = _all_statuses([entry for entry in data[: forge.PER_PAGE] if isinstance(entry, dict)])
+    return [entry for entry in data[: forge.PER_PAGE] if isinstance(entry, dict)], complete
+
+
+def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluation) -> str:
+    """Re-read the newest status page before a write to detect superseding evidence."""
+    statuses, complete = _read_status_page_one(session, config)
+    recent = _all_statuses(statuses)
     newest = recent.get(config.context)
     if newest is None and not complete:
         return "the newest judge status is outside the pre-post status page"
@@ -998,6 +1034,23 @@ def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluatio
     return _post_age_problem(session, evaluation)
 
 
+def _post_is_contested(
+    session: ApiSession, config: Config, evaluation: Evaluation, status_id: int
+) -> bool:
+    """Detect judge writes made since the evidence read, including the same second."""
+    statuses, complete = _read_status_page_one(session, config)
+    oldest_contender = floor(evaluation.read_started)
+    own_status_seen = False
+    for entry in statuses[: forge.PER_PAGE]:
+        if entry.get("context") != config.context:
+            continue
+        if entry.get("id") == status_id:
+            own_status_seen = True
+        elif _iso_epoch(entry.get("created_at")) >= oldest_contender:
+            return True
+    return not complete and not own_status_seen
+
+
 def _report_verdict(config: Config, evaluation: Evaluation, out: TextIO) -> None:
     if evaluation.state == "failure":
         out.write(f"{config.sha}: {evaluation.description}\n")
@@ -1007,44 +1060,59 @@ def _report_verdict(config: Config, evaluation: Evaluation, out: TextIO) -> None
 
 def _attempt_post(
     session: ApiSession, config: Config, evaluation: Evaluation, *, can_retry: bool
-) -> bool:
-    """Return false after waiting for a retry that needs a new judgment."""
+) -> int | None:
+    """Return the created status ID, or None after waiting to retry from fresh evidence."""
     try:
-        post_commit_status(session, config, evaluation.state, evaluation.description)
+        return post_commit_status(session, config, evaluation.state, evaluation.description)
     except PostFailureError as exc:
         if not can_retry:
             raise
         session.wait_to_retry_post(exc)
-        return False
-    return True
+        return None
+
+
+def _evaluate_attempt(
+    session: ApiSession, config: Config, out: TextIO, *, can_retry_post: bool
+) -> tuple[EvaluationRetry, str] | None:
+    """Judge once and return a retry reason if another evaluation is needed."""
+    evaluation = _read_and_decide(session, config, out)
+    if evaluation is None:
+        return None
+    state, description = evaluation.state, evaluation.description
+    if not _should_post(evaluation.snapshot.self_status, state, description):
+        out.write(f"No status post: {config.context} on {config.sha} already has {state!r}\n")
+        _report_verdict(config, evaluation, out)
+        return None
+    stale_reason = _post_age_problem(session, evaluation) or _status_preflight(
+        session, config, evaluation
+    )
+    if stale_reason:
+        return EvaluationRetry.PREFLIGHT, f"Posting skipped for {config.sha}: {stale_reason}."
+    status_id = _attempt_post(session, config, evaluation, can_retry=can_retry_post)
+    if status_id is None:
+        return EvaluationRetry.POST, ""
+    if _post_is_contested(session, config, evaluation, status_id):
+        return EvaluationRetry.CONTESTED, f"Status write contested again for {config.sha}."
+    _report_verdict(config, evaluation, out)
+    return None
 
 
 def _evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> None:
-    """Allow one preflight refresh and one retry of a transient status write."""
-    refreshed = False
-    retried_post = False
-    for _ in range(3):
-        evaluation = _read_and_decide(session, config, out)
-        if evaluation is None:
-            return
-        state, description = evaluation.state, evaluation.description
-        if not _should_post(evaluation.snapshot.self_status, state, description):
-            out.write(f"No status post: {config.context} on {config.sha} already has {state!r}\n")
-            _report_verdict(config, evaluation, out)
-            return
-        stale_reason = _post_age_problem(session, evaluation) or _status_preflight(
-            session, config, evaluation
+    """Allow one re-evaluation per retry reason."""
+    retried: set[EvaluationRetry] = set()
+    for _ in range(1 + len(EvaluationRetry)):
+        retry = _evaluate_attempt(
+            session, config, out, can_retry_post=EvaluationRetry.POST not in retried
         )
-        if stale_reason:
-            if refreshed:
-                err.write(f"::warning::Posting skipped for {config.sha}: {stale_reason}.\n")
-                return
-            refreshed = True
-            continue
-        if _attempt_post(session, config, evaluation, can_retry=not retried_post):
-            _report_verdict(config, evaluation, out)
+        if retry is None:
             return
-        retried_post = True
+        reason, warning = retry
+        if reason in retried:
+            err.write(f"::warning::{warning}\n")
+            return
+        retried.add(reason)
+        if reason == EvaluationRetry.CONTESTED:
+            config = replace(config, only_if_pending=False)
 
 
 def evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> int:
@@ -1078,10 +1146,8 @@ def _open_pull_head_shas(session: ApiSession, repository: str) -> list[str]:
     return heads
 
 
-def _sweep_evaluation_order(
-    session: ApiSession, config: Config, heads: list[str], start: float
-) -> list[str]:
-    """Rotate never-judged heads and order judged heads, with failures last."""
+def _sweep_evaluation_order(session: ApiSession, config: Config, heads: list[str]) -> list[str]:
+    """Build the priority list and select this run's block when over budget."""
     never_judged: list[str] = []
     judged: list[tuple[bool, float, str]] = []
     for sha in heads[:OPEN_PULLS_MAX]:
@@ -1095,11 +1161,13 @@ def _sweep_evaluation_order(
             session.out.write(f"{sha}: {config.context} already settled\n")
             continue
         judged.append((state == "failure", _status_timestamp(newest), sha))
-    if never_judged:
-        offset = int(start // 60) % len(never_judged)
-        never_judged = never_judged[offset:] + never_judged[:offset]
     judged.sort(key=lambda row: (row[0], row[1]))
-    return (never_judged + [sha for _, _, sha in judged])[: config.max_targets]
+    candidates = never_judged + [sha for _, _, sha in judged]
+    budget = config.max_targets
+    if len(candidates) <= budget:
+        return candidates
+    offset = ((config.run_number - 1) * budget) % len(candidates)
+    return (candidates[offset:] + candidates[:offset])[:budget]
 
 
 def _default_branch_head(session: ApiSession, repository: str) -> tuple[str, str]:
@@ -1169,7 +1237,7 @@ def run_sweep(
     sweep_cfg = replace(config, only_if_pending=False, targets=TARGETS_OPEN_PULLS)
     try:
         heads = _open_pull_head_shas(session, config.repository)
-        to_eval = _sweep_evaluation_order(session, config, heads, start)
+        to_eval = _sweep_evaluation_order(session, config, heads)
         default_head = _default_branch_head(session, config.repository)
     except ApiCapReachedError as exc:
         return _warn_api_cap(err, exc)
@@ -1262,7 +1330,7 @@ def _self_test_transport(
         if method == "POST":
             state = (fields or {}).get("state", "")
             posts.append(state)
-            return _ok_reply({"state": state})
+            return _ok_reply({"id": 1, "state": state})
         if pending_errors:
             raise pending_errors.pop(0)
         base = path.split("?", 1)[0]
@@ -1704,6 +1772,7 @@ def _build_parser() -> argparse.ArgumentParser:
     judge.add_argument("--self-workflow", default=None)
     judge.add_argument("--targets", default=None)
     judge.add_argument("--max-targets", default=None)
+    judge.add_argument("--run-number", default=None)
     judge.add_argument("--only-if-pending", default=None)
     judge.add_argument("--target-url", default=None)
     return parser
@@ -1774,6 +1843,7 @@ def main(
                 max_targets=_env_or(
                     args.max_targets, environ, f"{prefix}MAX_TARGETS", str(MAX_TARGETS_DEFAULT)
                 ),
+                run_number=_env_or(args.run_number, environ, f"{prefix}RUN_NUMBER", ""),
                 only_if_pending=_env_or(
                     args.only_if_pending, environ, f"{prefix}ONLY_IF_PENDING", "false"
                 ),

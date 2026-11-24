@@ -84,5 +84,6 @@ jobs:
           NOT_OWED_JSON: ${{ inputs.not-owed }}
           APPS_JSON: ${{ inputs.apps }}
           REQUIRED_CHECKS_TARGETS: open-pulls
+          REQUIRED_CHECKS_RUN_NUMBER: ${{ github.run_number }}
           GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: python3 -I -B required-checks-source/tools/required_checks.py judge

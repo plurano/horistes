@@ -111,13 +111,7 @@ def _gh_run(
     command = [*shlex.split(os.environ.get("GH", "gh")), "api", *args]
     env = {**os.environ, "GH_TOKEN": token} if token is not None else None
     # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args, dangerous-subprocess-use-audit expires 2027-03-09 category D: direct gh api argv with no shell and a binary override for test stand-ins  # noqa: E501
-    return subprocess.run(
-        command,
-        capture_output=True,
-        check=False,
-        timeout=deadline,
-        env=env,
-    )
+    return subprocess.run(command, capture_output=True, check=False, timeout=deadline, env=env)
 
 
 def download(path: str, *, token: str | None = None) -> bytes:
