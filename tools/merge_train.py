@@ -384,8 +384,8 @@ _SOURCERY_NO_ACCESS_LINE = re.compile(
     + LOGIN_PATTERN
     + r"(?:\[bot\])?! 👋|"
     + re.escape(_SOURCERY_ACCESS_SENTENCE)
-    + r"|Please \[upgrade\]\(https://app\.sourcery\.ai/dashboard/billing\?[^\s)]*\) "
-    r"to continue using Sourcery ✨"
+    + r"|Please \[upgrade\]\(https://app\.sourcery\.ai/dashboard/billing\?"
+    r"(?:[^\s()\\]|\([^\s()\\]*\))*\) to continue using Sourcery ✨"
 )
 _UNCHECKED_BOX = re.compile(r"^- \[ \] ", re.M)
 _BODY_REVIEW_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED", "APPROVED"})
@@ -413,6 +413,10 @@ class UnsignedBotError(RefusedError):
 
 class MergeInProgressError(RefusedError):
     """The forge answered that it is already merging the pull request."""
+
+
+class NotMergeableError(RefusedError):
+    """The forge answered in GraphQL errors that the pull request is not mergeable."""
 
 
 class UngrantedError(RefusedError):
@@ -819,6 +823,9 @@ def request_once(url, token, method, body, raw, redirect, shown=None):
             err.close()
     except (OSError, http.client.HTTPException) as err:
         # URLError, timeouts and dropped connections (RemoteDisconnected) refuse this call only.
+        if shown:
+            withheld = "(storage error text withheld)"
+            raise RefusedError(f"{method} {label}: {type(err).__name__} {withheld}") from err
         raise RefusedError(f"{method} {label}: {type(err).__name__}: {err}") from err
     return json.loads(text) if text else {}
 
@@ -838,6 +845,11 @@ def graphql(env, query, variables):
         for error in errors
     ):
         raise MergeInProgressError(f"GraphQL: {json.dumps(errors)[:500]}")
+    if errors and any(
+        isinstance(error, dict) and NOT_MERGEABLE in str(error.get("message") or "").lower()
+        for error in errors
+    ):
+        raise NotMergeableError(f"GraphQL: {json.dumps(errors)[:500]}")
     if errors or "data" not in answer:
         raise RefusedError(f"GraphQL: {json.dumps(errors)[:500]}")
     return answer["data"]
@@ -1048,15 +1060,15 @@ def commit_variables(env, conf, pull):
     return {**base, "headline": headline, "body": body}
 
 
-def moved_state(env, conf, pull, err):
+def moved_state(env, conf, pull):
     """The note for a merge or enqueue the forge refused as not mergeable after a move.
 
     Between the read and the merge another pull request can land and leave this one
     BEHIND. The live state is read once more: still at an accepted state, the refusal
-    stands; otherwise the next run serves it from its new state (record 0080).
+    stands; otherwise the next run serves it from its new state (record 0080). Callers
+    reach it only from NotMergeableError, which graphql raises from the answer's
+    errors list; an HTTP status, a cut body or a dropped connection never comes here.
     """
-    if NOT_MERGEABLE not in str(err).lower():
-        return None
     state = pull_merge_state(env, pull["number"])
     if state in conf["accept"]:
         return None
@@ -1068,8 +1080,8 @@ def enqueue(env, conf, pull):
     signed_message(env, conf, pull)
     try:
         data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
-    except RefusedError as err:
-        moved = moved_state(env, conf, pull, err)
+    except NotMergeableError:
+        moved = moved_state(env, conf, pull)
         if moved:
             return moved
         raise
@@ -1087,8 +1099,8 @@ def land(env, conf, pull, queue):
     except MergeInProgressError:
         # The forge is already merging it; the next run reads the result.
         return "merge in flight"
-    except RefusedError as err:
-        moved = moved_state(env, conf, pull, err)
+    except NotMergeableError:
+        moved = moved_state(env, conf, pull)
         if moved:
             return moved
         raise

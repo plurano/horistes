@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.request
 import zipfile
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -4120,6 +4121,99 @@ def test_call_with_shown_label_withholds_error_body(tmp_path, monkeypatch, code)
     assert "storage.test" not in message
     assert err.closed
     assert body.asked == []
+
+
+def _storage_bad_status_opener(inner, bad_line: str):
+    """Wrap an opener so only storage downloads raise BadStatusLine."""
+
+    class StorageBadStatusOpener:
+        def open(self, request, timeout=None):
+            if "/storage/" in request.full_url:
+                raise http.client.BadStatusLine(bad_line)
+            return inner.open(request, timeout=timeout)
+
+    return StorageBadStatusOpener()
+
+
+def test_storage_shown_bad_status_line_withholds_signed_url(tmp_path, monkeypatch, capsys):
+    """Labeled storage GET withholds BadStatusLine text from UnreadError, summary and warning."""
+    bad_line = "HTTP/1.1 999 https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"
+    real_build_opener = urllib.request.build_opener
+    monkeypatch.setattr(
+        urllib.request,
+        "build_opener",
+        lambda *handlers: _storage_bad_status_opener(real_build_opener(*handlers), bad_line),
+    )
+    unit_dir = tmp_path / "unit"
+    unit_dir.mkdir()
+    merge_train = load_train(unit_dir, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    with pytest.raises(merge_train.UnreadError) as caught:
+        merge_train.call(
+            "https://storage.invalid/storage/a?X-Amz-Signature=PLANTEDSECRET",
+            method="GET",
+            shown="artifact storage for https://api.github.test/zip",
+        )
+    unread_msg = str(caught.value)
+    assert "PLANTEDSECRET" not in unread_msg
+    assert "storage.invalid" not in unread_msg
+    assert unread_msg.endswith("BadStatusLine (storage error text withheld)")
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    forge = planted_storage_forge(cut=False)
+    done, summary, result = hold_read_train(sweep_dir, monkeypatch, capsys, forge)
+    assert_not_read(done, summary, "fleet/app")
+    assert len(result.unread) == 1
+    for text in (result.unread[0], summary, done.stdout):
+        assert "PLANTEDSECRET" not in text
+        assert "storage.invalid" not in text
+        assert "BadStatusLine" in text
+        assert "storage error text withheld" in text
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"),
+        urllib.error.URLError("https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"),
+    ],
+    ids=["oserror", "urlerror"],
+)
+def test_call_with_shown_label_withholds_oserror_text(tmp_path, monkeypatch, failure):
+    """Negative: a labeled call withholds OSError text that holds the signed URL."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    url = "https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"
+    monkeypatch.setattr(
+        merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(failure)
+    )
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.call(url, method="GET", shown="artifact storage for X")
+    message = str(caught.value)
+    expected_suffix = f"{type(failure).__name__} (storage error text withheld)"
+    assert message == f"GET artifact storage for X: {expected_suffix}"
+    assert "PLANTEDSECRET" not in message
+    assert "storage.invalid" not in message
+    assert caught.value.__cause__ is failure
+
+
+def test_call_without_shown_label_keeps_bad_status_line_text(tmp_path, monkeypatch):
+    """Boundary: an unlabeled call keeps BadStatusLine text."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    bad_line = "HTTP/1.1 999 https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"
+    failure = http.client.BadStatusLine(bad_line)
+    monkeypatch.setattr(
+        merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(failure)
+    )
+    with pytest.raises(merge_train.UnreadError) as caught:
+        merge_train.call("https://api.github.test/call", method="GET")
+    message = str(caught.value)
+    assert "BadStatusLine:" in message
+    assert bad_line in message
+    assert "storage error text withheld" not in message
+    assert caught.value.__cause__ is failure
 
 
 def test_without_the_length_check_the_cut_is_not_named(tmp_path):
@@ -8757,6 +8851,27 @@ def test_sourcery_no_access_notice_line_boundaries(tmp_path, monkeypatch, body):
 
 
 @pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("plan=(", True),
+        ("plan=(team)", False),
+        ("plan=team", False),
+        ("plan=((team))", True),
+    ],
+    ids=["unbalanced-open", "balanced-parens", "plain-query", "nested-parens"],
+)
+def test_sourcery_no_access_upgrade_query_parentheses(tmp_path, monkeypatch, query, expected):
+    """Sourcery upgrade destination allows one balanced parenthesis level and rejects nesting."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    body = sourcery_no_access_notice().replace(
+        "connection=github&owner=fixture&from_surface=github_bot&intent=private_repo_upsell",
+        query,
+    )
+    assert f"billing?{query}) to continue" in body
+    assert merge_train._bot_body_has_finding("sourcery-ai", body) is expected
+
+
+@pytest.mark.parametrize(
     "body",
     [
         sourcery_no_access_notice() + "\n## Overall Comments",
@@ -10738,15 +10853,89 @@ def test_enqueue_refused_as_not_mergeable_reads_the_state_again(tmp_path, state,
 def test_without_the_enqueue_handler_a_moved_pull_request_refuses(tmp_path):
     """Mutation: an enqueue refusal that skips moved_state turns the BEHIND case red."""
     old = """        data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
-    except RefusedError as err:"""
+    except NotMergeableError:"""
     assert script().count(old) == 1
-    flow = script().replace(old, old.replace("except RefusedError", "except ZeroDivisionError"))
+    flow = script().replace(
+        old, old.replace("except NotMergeableError", "except ZeroDivisionError")
+    )
     forge = Forge(repository(pull(1, "CLEAN"), queue=True))
     forge.enqueue_errors = [ENQUEUE_NOT_MERGEABLE]
     forge.merge_states[1] = "BEHIND"
     done, summary = train(tmp_path, forge, flow)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "not landed: the merge state moved" not in summary
+
+
+MERGE_MUTATION_MARKER = "mergePullRequest("
+ENQUEUE_MUTATION_MARKER = "enqueuePullRequest("
+
+
+def _merge_state_reads(forge: Forge) -> int:
+    """Count live MERGE_STATE reads: the only query naming mergeStateStatus on one pullRequest."""
+    return sum(
+        1 for query in forge.queries if "mergeStateStatus" in query and "pullRequest(" in query
+    )
+
+
+def test_merge_http_500_not_mergeable_text_stays_refused(tmp_path):
+    """Negative: HTTP 500 on MERGE with not-mergeable text refuses without a state read."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN")))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[MERGE_MUTATION_MARKER] = [500]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 500" in done.stdout
+    assert "HTTP 500" in summary
+    assert "not landed: the merge state moved" not in summary
+    assert _merge_state_reads(forge) == 0
+    assert forge.hold_faults[MERGE_MUTATION_MARKER] == []
+
+
+def test_enqueue_http_500_not_mergeable_text_stays_refused(tmp_path):
+    """Negative: HTTP 500 on ENQUEUE with not-mergeable text refuses without a state read."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN"), queue=True))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[ENQUEUE_MUTATION_MARKER] = [500]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 500" in done.stdout
+    assert "HTTP 500" in summary
+    assert "not landed: the merge state moved" not in summary
+    assert _merge_state_reads(forge) == 0
+    assert forge.hold_faults[ENQUEUE_MUTATION_MARKER] == []
+
+
+def test_merge_http_500_with_failing_state_read_stays_refused(tmp_path):
+    """Negative: HTTP 500 on MERGE never touches failing merge state reads or warns."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN")))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[MERGE_MUTATION_MARKER] = [500]
+    forge.merge_states[1] = "BEHIND"
+    forge.merge_state_statuses = [502] * 4
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 500" in done.stdout
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert "Not read after" not in summary
+    assert "not landed: the merge state moved" not in summary
+    assert forge.merge_state_statuses == [502] * 4
+    assert _merge_state_reads(forge) == 0
+
+
+def test_merge_not_mergeable_with_extra_graphql_error_moves(tmp_path):
+    """Boundary: GraphQL not-mergeable plus another error in the same answer still moves."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merge_errors = [
+        NOT_MERGEABLE,
+        {"type": "UNPROCESSABLE", "message": "Base branch was modified"},
+    ]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "### fleet/app: not landed: the merge state moved to BEHIND #1" in summary
+    assert _merge_state_reads(forge) == 1
 
 
 @pytest.mark.parametrize("fault", [502, 503, 504])
@@ -12711,18 +12900,53 @@ def test_two_exhausted_hold_reads_name_repository_once(tmp_path, monkeypatch, ca
     assert not any(forge.hold_faults.values())
 
 
-def test_no_status_text_match_in_merge_train():
+_STATUS_LITERAL = re.compile(r"HTTP \d{3} ?")
+
+
+def _is_status_text_match(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
+        return False
+    if not isinstance(node.ops[0], (ast.In, ast.NotIn)):
+        return False
+    left, right = node.left, node.comparators[0]
+    if not (
+        isinstance(left, ast.Constant)
+        and isinstance(left.value, str)
+        and _STATUS_LITERAL.fullmatch(left.value)
+    ):
+        return False
+    return (
+        isinstance(right, ast.Call) and isinstance(right.func, ast.Name) and right.func.id == "str"
+    )
+
+
+def _status_text_matches(source: str) -> list[int]:
+    tree = ast.parse(source)
+    return sorted(node.lineno for node in ast.walk(tree) if _is_status_text_match(node))
+
+
+@pytest.mark.parametrize(
+    "planted_guard",
+    [
+        '"HTTP 404" in str(err)',
+        "'HTTP 404' in str(err)",
+        '"HTTP 404" not in str(err)',
+    ],
+    ids=["double-quotes", "single-quotes", "not-in"],
+)
+def test_no_status_text_match_in_merge_train(planted_guard):
     """No HTTP status classification matches error text in tools/merge_train.py."""
-    pattern = re.compile(r'"HTTP \d{3} ?"\s+(not\s+)?in\s+str\(')
     source = (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8")
-    assert pattern.search(source) is None
+    assert "if http_status(err) == 404:" in source
+    assert _status_text_matches(source) == []
+    assert _status_text_matches("if http_status(err) == 404:\n    pass\n") == []
     planted = source.replace(
         "if http_status(err) == 404:\n            return False",
-        'if "HTTP 404" in str(err):\n            return False',
+        f"if {planted_guard}:\n            return False",
         1,
     )
     assert planted != source
-    assert pattern.search(planted) is not None
+    assert len(_status_text_matches(planted)) == 1
 
 
 REFUSED_CATCH_ALLOWED = {
@@ -12730,12 +12954,6 @@ REFUSED_CATCH_ALLOWED = {
     "read_graphql": (
         "retry loop: graphql sends one POST, which never raises UnreadError; "
         "the last try raises UnreadError"
-    ),
-    "enqueue": (
-        "wraps the ENQUEUE mutation, which never raises UnreadError; a moved pull request is a note"
-    ),
-    "land": (
-        "wraps the MERGE mutation, which never raises UnreadError; a moved pull request is a note"
     ),
     "update": "wraps the update-branch PUT, which never raises UnreadError",
     "_maintainer_unanswered": "recorded_right records an exhausted read before this conversion",
@@ -12765,6 +12983,35 @@ def _excepts_refused_or_unread(handler: ast.ExceptHandler) -> bool:
 
 _COVER, _ESCAPE, _PASS = "cover", "escape", "pass"
 _EXITS = (ast.Return, ast.Break, ast.Continue)
+_NON_SUPPRESSING_CONTEXTS = {
+    "open": "builtin file object, never suppresses",
+    "key_pipe": "contextmanager, yield in try/finally without except",
+}
+
+
+def _is_non_suppressing_item(item: ast.withitem) -> bool:
+    expr = item.context_expr
+    if not isinstance(expr, ast.Call):
+        return False
+    callee = expr.func
+    if isinstance(callee, ast.Name):
+        name = callee.id
+    elif isinstance(callee, ast.Attribute):
+        name = callee.attr
+    else:
+        return False
+    return name in _NON_SUPPRESSING_CONTEXTS
+
+
+def _with_outcome(stmt: ast.With, outcomes: dict[int, str]) -> str:
+    body = outcomes[id(stmt.body)]
+    if (
+        stmt.items
+        and len(stmt.items) <= 100
+        and all(_is_non_suppressing_item(item) for item in stmt.items[:100])
+    ):
+        return body
+    return _PASS if body == _COVER else body
 
 
 def _source_retry_codes(tree: ast.Module) -> frozenset[int] | None:
@@ -12891,7 +13138,7 @@ def _stmt_outcome(
     if isinstance(stmt, ast.If):
         return _if_outcome(stmt, outcomes, err_name, retry_codes)
     if isinstance(stmt, ast.With):
-        return outcomes[id(stmt.body)]
+        return _with_outcome(stmt, outcomes)
     return _ESCAPE if _has_exit(stmt) else _PASS
 
 
@@ -13105,6 +13352,46 @@ _PLANTED_EVERY_PATH_CASES = [
         "        raise UnreadError(str(err)) from err\n",
         [],
         id="raise-unread",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError:\n"
+        "        with contextlib.suppress(UnreadError):\n"
+        "            raise\n"
+        "        return None\n",
+        ["hold:4"],
+        id="suppress-then-return",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError:\n"
+        "        with suppress(RefusedError): raise\n",
+        ["hold:4"],
+        id="suppress-last-stmt",
+    ),
+    pytest.param(
+        "def hold(env, path):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError:\n"
+        "        with open(path) as handle:\n"
+        "            raise\n",
+        [],
+        id="with-open-reraise",
+    ),
+    pytest.param(
+        "def hold(env, key):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError:\n"
+        "        with key_pipe(key) as fd:\n"
+        "            raise\n",
+        [],
+        id="with-key-pipe-reraise",
     ),
 ]
 

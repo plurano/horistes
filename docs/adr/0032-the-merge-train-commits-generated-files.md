@@ -73,12 +73,16 @@ served by the app.
     header (using a redirect-disabled opener and performing a clean GET). The storage
     URL's scheme must match the scheme of `GITHUB_API_URL` (https in production, http in
     tests); an empty or scheme-mismatched redirect is refused. A refused or failed
-    storage read names the artifact API URL and the status code, never the storage URL,
-    and carries no text of the storage answer body, because a storage service can echo
-    the signed URL in its error body
+    storage read names the artifact API URL and the status code or exception type, never
+    the storage URL, and carries neither the storage answer body nor the error text of a
+    failed storage connection or status line, because a storage service can echo the
+    signed URL there
     (`test_storage_gateway_error_echoing_signed_url_keeps_signature_out`,
     `test_storage_refusal_echoing_signed_url_keeps_signature_out`,
-    `test_call_with_shown_label_withholds_error_body`).
+    `test_call_with_shown_label_withholds_error_body`,
+    `test_storage_shown_bad_status_line_withholds_signed_url`,
+    `test_call_with_shown_label_withholds_oserror_text`,
+    `test_call_without_shown_label_keeps_bad_status_line_text`).
   - Artifact download size is bounded at `MAX_ARTIFACT_BYTES = 16 MiB` (16,777,216 bytes).
     Before reading any member content, each member's declared `file_size` and the total
     uncompressed size sum across all members must not exceed `MAX_ARTIFACT_BYTES`. Duplicate
