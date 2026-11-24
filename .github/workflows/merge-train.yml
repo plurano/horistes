@@ -818,7 +818,7 @@ jobs:
               landerLease: label(name: "merge-train: lander lease") { description }
               releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
               releaseManifest: object(expression: "HEAD:.release-please-manifest.json") { oid }
-              pullRequests(states: OPEN, first: 25, after: $after,
+              pullRequests(states: OPEN, first: 10, after: $after,
                            orderBy: {field: CREATED_AT, direction: ASC}) {
                 pageInfo { hasNextPage endCursor }
                 nodes {

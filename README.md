@@ -246,14 +246,23 @@ To turn the hold off, clear `session_authors` and keep the train enabled until
 a run has removed every `merge-train: session hold` label; a train without the
 hold, such as an older pin, does not release those drafts.
 
-The train outlasts short forge faults (decision record 0080). A read (GET, and
-every GraphQL read) is tried up to three times when the forge answers 502, 503
-or 504, drops the connection or cuts the body short; a write runs once and a
-500 stays a refusal. A failed token revocation is a warning, since the token
-expires within the hour. A merge or enqueue refused as not mergeable after
-another merge moved the pull request is a note, and the next run serves its
-new state. A failed
-release pull request step gets one second attempt after 30 seconds.
+The train reads at most 100 open pull requests, in ten pages of ten. A Sourcery
+review containing only its no-access notice is not a finding; extra content
+keeps the existing review-body classification
+([ADR-0101](docs/adr/0101-a-failed-read-leaves-the-sweep-green.md)).
+
+The train outlasts short forge faults (decision records 0080 and 0101). A read
+(GET, and every GraphQL read) is tried up to three times when the forge answers
+502, 503 or 504, drops the connection or cuts the body short; a write runs once
+and a 500 stays a refusal. An exhausted transient read names the repository or
+account as not read, warns, and leaves the sweep green for the next run to read
+it again. A read exhausted inside a hold keeps the hold, and the repository
+stays served; a later refusal of that repository still fails the sweep.
+The initial installation-list read still fails the job. A failed token
+revocation is a warning, since the token expires within the hour. A merge or
+enqueue refused as not mergeable after another merge moved the pull request is a
+note, and the next run serves its new state. A failed release pull request step
+gets one second attempt after 30 seconds.
 
 When `required_status` names a commit status context, the train requires that
 context in state SUCCESS before it lands a pull request. Only then does the

@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.request
 import zipfile
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -382,9 +383,11 @@ class Forge:
         self.artifacts: dict[tuple[str, str], list[dict]] = {}
         self.storage: dict[int, bytes] = {}
         self.storage_cut: dict[int, int] = {}
+        self.storage_errors: dict[int, int] = {}
         # Downloads of an artifact still to cut; absent, every download is cut.
         self.storage_cuts_left: dict[int, int] = {}
         self.storage_reads: list[int] = []
+        self.storage_targets: list[str] = []
         self.storage_auth_seen: list[str] = []
         self.users_auth_seen: list[str] = []
         self.artifact_redirect_locations: dict[int, str | None] = {}
@@ -418,6 +421,8 @@ class Forge:
         self.review_body_calls: list[int] = []
         self.rights: dict[str, str] = {}
         self.right_refusals: dict[str, int] = {}
+        self.right_faults: dict[str, list[int]] = {}
+        self.right_message = "Permission read refused"
         self.right_calls: list[str] = []
         self.retry_histories: dict[int, dict] = {}
         self.retry_refusals: dict[int, str] = {}
@@ -809,8 +814,8 @@ class Forge:
         elif "pullRequests(" in query and "states: MERGED" not in query:
             self.read_calls.append((full, dict(variables)))
             size = int(re.search(r"pullRequests\(states: OPEN, first: (\d+)", query)[1])
-            if size > 25:
-                return 502, {"message": "stand-in forge: read page size exceeds 25"}
+            if size > 10:
+                return 502, {"message": "stand-in forge: read page size exceeds 10"}
             statuses = self.read_statuses.get(full, [])
             body = None
         elif "mergeStateStatus" in query and "pullRequest(" in query:
@@ -987,6 +992,8 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(404, {"message": "Not Found"})
 
     def _get_artifacts(self, path: str) -> None:
+        if self.fault("artifacts"):
+            return
         full_repo = path.removeprefix("/repos/").removesuffix("/actions/artifacts")
         query = parse_qs(urlsplit(self.path).query)
         name = query.get("name", [""])[0]
@@ -1018,6 +1025,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         art_id = int(path.removeprefix("/storage/"))
         self.server.forge.storage_reads.append(art_id)
+        self.server.forge.storage_targets.append(self.path)
+        if art_id in self.server.forge.storage_errors:
+            self.answer(
+                self.server.forge.storage_errors[art_id],
+                {"message": f"signature mismatch for {self.path}"},
+            )
+            return
         data = self.server.forge.storage.get(art_id)
         if data is None:
             self.answer(404, {"message": "Not Found"})
@@ -1054,11 +1068,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.answer(200, {"id": 123456, "login": path.removeprefix("/users/")})
             return True
         if path == "/app/installations":
-            if not self.app_call():
+            if not self.app_call() and not self.fault("installations"):
                 self.answer(200, self.server.forge.installation_list())
             return True
         if path == "/installation/repositories":
-            self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
+            if not self.fault("repositories"):
+                self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
             return True
         if re.fullmatch(r"/(repos/[^/]+/[^/]+|repositories/\d+)", path):
             self._get_repository(path)
@@ -1075,8 +1090,11 @@ class Handler(BaseHTTPRequestHandler):
         token = self.headers["Authorization"].removeprefix("Bearer ")
         if forge.tokens[token][3].get("metadata") != "read":
             self.answer(403, {"message": "Resource not accessible by integration"})
+        elif login in forge.right_faults and forge.right_faults[login]:
+            status = forge.right_faults[login].pop(0)
+            self.answer(status, {"message": forge.right_message})
         elif login in forge.right_refusals:
-            self.answer(forge.right_refusals[login], {"message": "Permission read refused"})
+            self.answer(forge.right_refusals[login], {"message": forge.right_message})
         elif login in forge.rights:
             permission = forge.rights[login]
             self.answer(200, {"permission": permission, "role_name": permission})
@@ -1358,6 +1376,42 @@ def test_call_http_error_message_closed(tmp_path, monkeypatch):
     assert err.closed
 
 
+def test_http_status_reads_the_cause_code(tmp_path, monkeypatch):
+    """Boundary: http_status reads only an HTTPError cause's code, never message text."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+
+    err_404 = urllib.error.HTTPError(
+        "https://api.github.test/call", 404, "Not Found", {}, io.BytesIO(b"")
+    )
+    err_404.close()
+    try:
+        raise merge_train.RefusedError("GET x: HTTP 404") from err_404
+    except merge_train.RefusedError as refused:
+        assert merge_train.http_status(refused) == 404
+
+    monkeypatch.setattr(
+        merge_train.urllib.request,
+        "build_opener",
+        lambda *h: _raising_opener(
+            urllib.error.HTTPError(
+                "https://api.github.test/call", 502, "Bad Gateway", {}, io.BytesIO(b"gw")
+            )
+        ),
+    )
+    with pytest.raises(merge_train.UnreadError) as unread:
+        merge_train.call("https://api.github.test/call", method="GET")
+    assert merge_train.http_status(unread.value) == 502
+
+    try:
+        raise merge_train.RefusedError("GET x: dropped") from urllib.error.URLError("dropped")
+    except merge_train.RefusedError as url_refused:
+        assert merge_train.http_status(url_refused) is None
+
+    assert merge_train.http_status(merge_train.RefusedError("plain failure")) is None
+    assert merge_train.http_status(merge_train.RefusedError("GET x: HTTP 404 Not Found")) is None
+
+
 class _UnreadableBody(io.BytesIO):
     """A response body whose read raises the error it is given."""
 
@@ -1545,7 +1599,7 @@ def test_clean_pull_request_on_second_page_lands(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(30)]
-    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25"]
+    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-10", "cursor-20"]
 
 
 @pytest.mark.parametrize("status", [502, 504])
@@ -1558,12 +1612,51 @@ def test_transient_read_error_is_retried(tmp_path, status):
     assert len(forge.read_calls) == 2
 
 
+def assert_not_read(done, summary, name):
+    """A failed read warns once, names its target, and leaves the sweep green."""
+    assert done.returncode == 0, done.stdout + done.stderr
+    section = summary.split("Not read after 3 tries, the next run reads them again:\n\n", 1)[1]
+    assert section.splitlines()[0].startswith(f"- {name}: ")
+    assert done.stdout.count("::warning title=Merge train not read::") == 1
+    assert f"::warning title=Merge train not read::{name}: " in done.stdout
+    assert "::error" not in done.stdout
+    assert "Refused:" not in summary
+
+
+@pytest.mark.parametrize("fault", ["502", "cut"])
+def test_planted_unread_repository_does_not_fail_the_fleet(tmp_path, fault):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.installations[0]["repos"].append("next")
+    forge.reads["fleet/next"] = [repository(pull(2, "CLEAN"))]
+    if fault == "502":
+        forge.read_statuses["fleet/app"] = [502] * 4
+    else:
+        forge.graphql_cuts["read"] = 3
+    done, summary = train(tmp_path, forge)
+    assert_not_read(done, summary, "fleet/app")
+    assert forge.where == [("fleet/next", landed(2))]
+    assert [full for full, _ in forge.read_calls].count("fleet/app") == 3
+    assert "### fleet/next: landed #2" in summary
+    assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_third_read_answer_lands_without_not_read_entry(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.read_statuses["fleet/app"] = [502, 502]
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert len(forge.read_calls) == 3
+    assert "Not read after" not in summary
+    assert "::warning title=Merge train not read::" not in done.stdout
+
+
 @pytest.mark.parametrize("status", [502, 504])
 def test_exhausted_read_retries_fail_closed(tmp_path, status):
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.read_statuses["fleet/app"] = [status] * 4
-    done, _ = train(tmp_path, forge)
-    assert done.returncode != 0
+    done, summary = train(tmp_path, forge)
+    assert_not_read(done, summary, "fleet/app")
     assert f"HTTP {status}" in done.stdout + done.stderr
     assert forge.writes == []
     assert [full for full, _ in forge.read_calls] == ["fleet/app"] * 3
@@ -1574,7 +1667,8 @@ def test_read_500_is_not_retried(tmp_path):
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.read_statuses["fleet/app"] = [500]
     done, _ = train(tmp_path, forge)
-    assert done.returncode != 0
+    assert done.returncode == 1
+    assert "::error title=Merge train refused::fleet/app:" in done.stdout
     assert "HTTP 500" in done.stdout + done.stderr
     assert forge.writes == []
     assert len(forge.read_calls) == 1
@@ -1595,7 +1689,7 @@ def test_mutation_502_is_not_retried(tmp_path, state, operation, write):
 
 
 @pytest.mark.parametrize(
-    "count, pages, truncated", [(25, 1, False), (100, 4, False), (120, 4, True)]
+    "count, pages, truncated", [(10, 1, False), (100, 10, False), (120, 10, True)]
 )
 def test_pull_pages_stop_at_cap(tmp_path, count, pages, truncated):
     forge = Forge(
@@ -1612,14 +1706,26 @@ def test_pull_pages_stop_at_cap(tmp_path, count, pages, truncated):
 
 def test_page_size_100_is_refused_by_forge(tmp_path):
     source = module()
-    mutant = source.replace("first: 25, after:", "first: 100, after:")
+    mutant = source.replace("first: 10, after:", "first: 100, after:")
     assert mutant != source
     forge = Forge(repository(pull(1, "CLEAN")))
-    done, _ = train(tmp_path, forge, helper=mutant)
-    assert done.returncode != 0
+    done, summary = train(tmp_path, forge, helper=mutant)
+    assert_not_read(done, summary, "fleet/app")
     assert "HTTP 502" in done.stdout + done.stderr
-    assert "read page size exceeds 25" in done.stdout + done.stderr
+    assert "read page size exceeds 10" in done.stdout + done.stderr
     assert forge.writes == []
+    assert len(forge.read_calls) == 3
+
+
+@pytest.mark.parametrize("required_status", ["", "quality"])
+def test_open_pull_query_uses_small_pages_and_lands(tmp_path, required_status):
+    p = pull(1, "CLEAN", status={"contexts": [{"context": "quality", "state": "SUCCESS"}]})
+    forge = Forge(repository(p))
+    done, summary = train(tmp_path, forge, required_status=required_status)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert len(forge.read_calls) == 1
+    assert "Not read after" not in summary
 
 
 def test_unknown_state_rereads_all_pull_pages(tmp_path):
@@ -1629,7 +1735,7 @@ def test_unknown_state_rereads_all_pull_pages(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(30)]
-    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25"] * 2
+    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-10", "cursor-20"] * 2
 
 
 def test_second_page_read_retry_keeps_cursor_and_earlier_nodes(tmp_path):
@@ -1638,7 +1744,12 @@ def test_second_page_read_retry_keeps_cursor_and_earlier_nodes(tmp_path):
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == [landed(30)]
-    assert [v.get("after") for _, v in forge.read_calls] == [None, "cursor-25", "cursor-25"]
+    assert [v.get("after") for _, v in forge.read_calls] == [
+        None,
+        "cursor-10",
+        "cursor-10",
+        "cursor-20",
+    ]
     assert "| #1 | DIRTY |" in summary
 
 
@@ -2231,6 +2342,37 @@ def test_installation_without_the_rights_is_skipped_and_the_others_run(tmp_path)
     assert refusal in done.stdout
     assert "| denied | 2 | 0 | 0 | 2 |" in summary
     assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_mint_checks_http_status_not_text(tmp_path, monkeypatch):
+    """Boundary: mint raises UngrantedError only when the HTTPError cause code is 422."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "app_jwt", lambda _env, _conf: "jwt")
+    env = {"GITHUB_API_URL": "https://api.github.test"}
+    conf = {"client_id": CLIENT_ID}
+
+    def raise_status(code: int, message: str):
+        def fake_call(url, *_args, **_kwargs):
+            http_err = urllib.error.HTTPError(url, code, "Error", {}, io.BytesIO(b""))
+            http_err.close()
+            raise merge_train.RefusedError(message) from http_err
+
+        return fake_call
+
+    monkeypatch.setattr(
+        merge_train, "call", raise_status(422, f"POST x: HTTP 422 {merge_train.UNGRANTED}")
+    )
+    with pytest.raises(merge_train.UngrantedError):
+        merge_train.mint(env, conf, {"id": 7}, {"metadata": "read"})
+
+    monkeypatch.setattr(
+        merge_train,
+        "call",
+        raise_status(500, f"POST x: HTTP 500 body says HTTP 422 {merge_train.UNGRANTED}"),
+    )
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.mint(env, conf, {"id": 7}, {"metadata": "read"})
+    assert not isinstance(caught.value, merge_train.UngrantedError)
 
 
 def test_without_the_installation_skip_each_repository_asks_again(tmp_path):
@@ -3611,6 +3753,35 @@ def test_dependency_pull_with_valid_artifact_commits_generated_files(tmp_path):
     assert "| fleet | 1 | 0 | 1 | 0 |" in summary
 
 
+def test_exhausted_head_file_read_echoing_404_is_not_read(tmp_path):
+    """An exhausted head-file read echoing HTTP 404 warns not read instead of committing."""
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt", "wasm/module.wasm"])
+    forge.contents[("fleet/app", "notices.txt", head)] = (
+        502,
+        {"message": "HTTP 404 Not Found"},
+    )
+    zip_bytes = make_artifact_zip(
+        head, {"notices.txt": b"licenses", "wasm/module.wasm": b"\x00asm\x01\x00\x00\x00"}
+    )
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+        workflow_run_id=456,
+        html_url="https://github.com/fleet/app/actions/runs/456",
+    )
+    done, summary = train(tmp_path, forge)
+    assert not any(w[0] == "commit" for w in forge.writes)
+    assert_not_read(done, summary, "fleet/app")
+    assert "| #1 | BLOCKED | generated files refused:" in summary
+
+
 def test_negative_no_allowlist_file(tmp_path):
     """Regeneration is refused when no allowlist file exists on the default branch."""
     head = f"{1:040x}"
@@ -3628,6 +3799,29 @@ def test_negative_no_allowlist_file(tmp_path):
     done, _ = train(tmp_path, forge)
     assert done.returncode == 0
     assert not any(w[0] == "commit" for w in forge.writes)
+
+
+def test_exhausted_allowlist_read_echoing_404_is_not_read(tmp_path):
+    """An exhausted allowlist read echoing HTTP 404 names the repository not read."""
+    head = f"{1:040x}"
+    dep_pull = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep_pull))
+    forge.contents[("fleet/app", ".github/generated-files", "main")] = (
+        502,
+        {"message": "HTTP 404 Not Found"},
+    )
+    zip_bytes = make_artifact_zip(head, {"notices.txt": b"licenses"})
+    forge.add_artifact(
+        "fleet/app",
+        101,
+        f"regenerated-{head}",
+        zip_bytes,
+        head_sha=head,
+        head_branch="renovate/demo-dep",
+    )
+    done, summary = train(tmp_path, forge)
+    assert forge.writes == []
+    assert_not_read(done, summary, "fleet/app")
 
 
 def test_negative_path_not_in_allowlist(tmp_path):
@@ -3780,6 +3974,26 @@ def test_negative_artifact_size_above_bound(tmp_path):
     assert "response exceeds" in summary
 
 
+PLANTED_STORAGE_QUERY = "sig=planted-storage-signature&se=2099-01-01"
+
+
+def _read_attempts() -> int:
+    match = re.search(r"^READ_ATTEMPTS = (\d+)", script(), re.M)
+    assert match, "READ_ATTEMPTS missing from merge train script"
+    return int(match.group(1))
+
+
+def planted_storage_forge(*, cut: bool = True, storage: bool = True) -> Forge:
+    """The cut-artifact pull with a signed storage Location; optionally whole or missing bytes."""
+    forge = cut_artifact_forge()
+    if not cut:
+        del forge.storage_cut[101]
+    forge.artifact_redirect_locations[101] = f"/storage/101?{PLANTED_STORAGE_QUERY}"
+    if not storage:
+        del forge.storage[101]
+    return forge
+
+
 def cut_artifact_forge():
     """A dependency pull whose artifact body the storage cuts in half under the full length."""
     head = f"{1:040x}"
@@ -3806,6 +4020,200 @@ def test_cut_artifact_body_fails_by_name(tmp_path):
     assert not any(w[0] == "commit" for w in forge.writes)
     assert "generated files refused:" in summary
     assert "body cut:" in summary
+
+
+def test_exhausted_storage_read_names_artifact_not_signed_url(tmp_path):
+    """Exhausted storage reads name the artifact API URL, not the signed storage query."""
+    forge = planted_storage_forge()
+    attempts = _read_attempts()
+    done, summary = train(tmp_path, forge)
+    secret = "planted-storage-signature"
+    assert secret not in done.stdout
+    assert secret not in done.stderr
+    assert secret not in summary
+    warn = "::warning title=Merge train not read::"
+    assert warn in done.stdout
+    warning = next(line for line in done.stdout.splitlines() if line.startswith(warn))
+    assert "fleet/app" in warning
+    assert "artifact storage for" in warning
+    assert "/actions/artifacts/101/zip" in warning
+    assert forge.storage_reads == [101] * attempts
+
+
+def test_refused_storage_read_names_artifact_not_signed_url(tmp_path):
+    """A non-transient missing storage body names the artifact, not the signed storage query."""
+    forge = planted_storage_forge(cut=False, storage=False)
+    done, summary = train(tmp_path, forge)
+    secret = "planted-storage-signature"
+    assert secret not in done.stdout
+    assert secret not in done.stderr
+    assert secret not in summary
+    assert "generated files refused:" in summary
+    assert "artifact storage for" in summary
+    assert forge.storage_reads == [101]
+
+
+def test_storage_download_still_reaches_signed_url(tmp_path):
+    """The storage GET still follows the signed Location when the body is whole."""
+    forge = planted_storage_forge(cut=False)
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert any(w[0] == "commit" for w in forge.writes)
+    assert "planted-storage-signature" not in summary
+    assert forge.storage_reads == [101]
+    assert forge.storage_targets == [f"/storage/101?{PLANTED_STORAGE_QUERY}"]
+
+
+@pytest.mark.parametrize("code", [502, 503, 504])
+def test_storage_gateway_error_echoing_signed_url_keeps_signature_out(tmp_path, code):
+    """Gateway storage errors echoing the signed URL withhold the body and keep it out."""
+    forge = planted_storage_forge(cut=False)
+    forge.storage_errors[101] = code
+    attempts = _read_attempts()
+    done, summary = train(tmp_path, forge)
+    secret = "planted-storage-signature"
+    assert secret not in done.stdout
+    assert secret not in done.stderr
+    assert secret not in summary
+    warn = "::warning title=Merge train not read::"
+    assert warn in done.stdout
+    warning = next(line for line in done.stdout.splitlines() if line.startswith(warn))
+    assert "fleet/app" in warning
+    assert "artifact storage for" in warning
+    assert "/actions/artifacts/101/zip" in warning
+    assert f"HTTP {code}" in warning
+    assert "storage answer body withheld" in warning
+    assert forge.storage_reads == [101] * attempts
+
+
+def test_storage_refusal_echoing_signed_url_keeps_signature_out(tmp_path):
+    """A refused storage read echoing the signed URL withholds the body and keeps it out."""
+    forge = planted_storage_forge(cut=False)
+    forge.storage_errors[101] = 403
+    done, summary = train(tmp_path, forge)
+    secret = "planted-storage-signature"
+    assert secret not in done.stdout
+    assert secret not in done.stderr
+    assert secret not in summary
+    assert "planted-storage" not in done.stdout
+    assert "planted-storage" not in summary
+    assert "generated files refused:" in summary
+    assert "artifact storage for" in summary
+    assert "HTTP 403" in summary
+    assert "storage answer body withheld" in summary
+    assert forge.storage_reads == [101]
+
+
+@pytest.mark.parametrize("code", [502, 404])
+def test_call_with_shown_label_withholds_error_body(tmp_path, monkeypatch, code):
+    """Boundary: call with shown withholds the HTTPError body without reading it and closes it."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    url = "https://storage.test/101?sig=planted-storage-signature"
+    body = _RecordingBody(b"echo https://storage.test/101?sig=planted-storage-signature")
+    err = urllib.error.HTTPError(url, code, "Error", {}, body)
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(err))
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.call(url, method="GET", shown="artifact storage for X")
+    message = str(caught.value)
+    assert message.endswith(f"HTTP {code} (storage answer body withheld)")
+    assert "planted-storage-signature" not in message
+    assert "storage.test" not in message
+    assert err.closed
+    assert body.asked == []
+
+
+def _storage_bad_status_opener(inner, bad_line: str):
+    """Wrap an opener so only storage downloads raise BadStatusLine."""
+
+    class StorageBadStatusOpener:
+        def open(self, request, timeout=None):
+            if "/storage/" in request.full_url:
+                raise http.client.BadStatusLine(bad_line)
+            return inner.open(request, timeout=timeout)
+
+    return StorageBadStatusOpener()
+
+
+def test_storage_shown_bad_status_line_withholds_signed_url(tmp_path, monkeypatch, capsys):
+    """Labeled storage GET withholds BadStatusLine text from UnreadError, summary and warning."""
+    bad_line = "HTTP/1.1 999 https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"
+    real_build_opener = urllib.request.build_opener
+    monkeypatch.setattr(
+        urllib.request,
+        "build_opener",
+        lambda *handlers: _storage_bad_status_opener(real_build_opener(*handlers), bad_line),
+    )
+    unit_dir = tmp_path / "unit"
+    unit_dir.mkdir()
+    merge_train = load_train(unit_dir, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    with pytest.raises(merge_train.UnreadError) as caught:
+        merge_train.call(
+            "https://storage.invalid/storage/a?X-Amz-Signature=PLANTEDSECRET",
+            method="GET",
+            shown="artifact storage for https://api.github.test/zip",
+        )
+    unread_msg = str(caught.value)
+    assert "PLANTEDSECRET" not in unread_msg
+    assert "storage.invalid" not in unread_msg
+    assert unread_msg.endswith("BadStatusLine (storage error text withheld)")
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    forge = planted_storage_forge(cut=False)
+    done, summary, result = hold_read_train(sweep_dir, monkeypatch, capsys, forge)
+    assert_not_read(done, summary, "fleet/app")
+    assert len(result.unread) == 1
+    for text in (result.unread[0], summary, done.stdout):
+        assert "PLANTEDSECRET" not in text
+        assert "storage.invalid" not in text
+        assert "BadStatusLine" in text
+        assert "storage error text withheld" in text
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"),
+        urllib.error.URLError("https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"),
+    ],
+    ids=["oserror", "urlerror"],
+)
+def test_call_with_shown_label_withholds_oserror_text(tmp_path, monkeypatch, failure):
+    """Negative: a labeled call withholds OSError text that holds the signed URL."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    url = "https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"
+    monkeypatch.setattr(
+        merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(failure)
+    )
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.call(url, method="GET", shown="artifact storage for X")
+    message = str(caught.value)
+    expected_suffix = f"{type(failure).__name__} (storage error text withheld)"
+    assert message == f"GET artifact storage for X: {expected_suffix}"
+    assert "PLANTEDSECRET" not in message
+    assert "storage.invalid" not in message
+    assert caught.value.__cause__ is failure
+
+
+def test_call_without_shown_label_keeps_bad_status_line_text(tmp_path, monkeypatch):
+    """Boundary: an unlabeled call keeps BadStatusLine text."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    bad_line = "HTTP/1.1 999 https://storage.invalid/a?X-Amz-Signature=PLANTEDSECRET"
+    failure = http.client.BadStatusLine(bad_line)
+    monkeypatch.setattr(
+        merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(failure)
+    )
+    with pytest.raises(merge_train.UnreadError) as caught:
+        merge_train.call("https://api.github.test/call", method="GET")
+    message = str(caught.value)
+    assert "BadStatusLine:" in message
+    assert bad_line in message
+    assert "storage error text withheld" not in message
+    assert caught.value.__cause__ is failure
 
 
 def test_without_the_length_check_the_cut_is_not_named(tmp_path):
@@ -5351,6 +5759,35 @@ def test_a_label_already_gone_still_counts_as_refreshed(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == refreshed(1)[:1]
     assert "### fleet/app: refreshed #1" in summary
+
+
+def test_toggle_refresh_checks_http_status_not_text(tmp_path, monkeypatch):
+    """Boundary: toggle_refresh ignores DELETE 404 by cause code, not error message text."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    env = {
+        "GITHUB_API_URL": "https://api.github.test",
+        "GITHUB_REPOSITORY": "fleet/app",
+        "TRAIN_TOKEN": "token",
+    }
+
+    def fake_delete(code: int, message: str):
+        def fake_call(url, _token=None, method="POST", *_args, **_kwargs):
+            if method == "POST":
+                return {}
+            http_err = urllib.error.HTTPError(url, code, "Error", {}, io.BytesIO(b""))
+            http_err.close()
+            raise merge_train.RefusedError(message) from http_err
+
+        return fake_call
+
+    monkeypatch.setattr(
+        merge_train, "call", fake_delete(500, "DELETE x: HTTP 500 body says HTTP 404")
+    )
+    with pytest.raises(merge_train.RefusedError):
+        merge_train.toggle_refresh(env, {"number": 1})
+
+    monkeypatch.setattr(merge_train, "call", fake_delete(404, "DELETE x: HTTP 404 Not Found"))
+    assert merge_train.toggle_refresh(env, {"number": 1}) is None
 
 
 @pytest.mark.parametrize(
@@ -8373,6 +8810,124 @@ def test_clean_coderabbit_codacy_and_sourcery_bodies_land(tmp_path):
     assert "### fleet/app: landed #1" in summary
 
 
+def sourcery_no_access_notice(login="person"):
+    """The no-access review body; fixture identities only."""
+    return (
+        f"Hi @{login}! 👋\n\n"
+        "Your private repo does not have access to Sourcery.\n\n"
+        "Please [upgrade](https://app.sourcery.ai/dashboard/billing?connection=github"
+        "&owner=fixture&from_surface=github_bot&intent=private_repo_upsell) "
+        "to continue using Sourcery ✨"
+    )
+
+
+@pytest.mark.parametrize("login", ["person-name", "some-app[bot]"])
+def test_planted_sourcery_no_access_notice_lands(tmp_path, login):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(601, "sourcery-ai[bot]", sourcery_no_access_notice(login))]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Your private repo does not have access to Sourcery.",
+        "  \n" + sourcery_no_access_notice() + "\n<!-- generated -->\n",
+        sourcery_no_access_notice().replace(
+            "?connection=github&owner=fixture&from_surface=github_bot&intent=private_repo_upsell",
+            "?",
+        ),
+    ],
+    ids=["access-only", "comments-and-whitespace", "empty-query"],
+)
+def test_sourcery_no_access_notice_line_boundaries(tmp_path, monkeypatch, body):
+    merge_train = load_train(tmp_path, monkeypatch)
+    assert merge_train._bot_body_has_finding("sourcery-ai", body) is False
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("plan=(", True),
+        ("plan=(team)", False),
+        ("plan=team", False),
+        ("plan=((team))", True),
+    ],
+    ids=["unbalanced-open", "balanced-parens", "plain-query", "nested-parens"],
+)
+def test_sourcery_no_access_upgrade_query_parentheses(tmp_path, monkeypatch, query, expected):
+    """Sourcery upgrade destination allows one balanced parenthesis level and rejects nesting."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    body = sourcery_no_access_notice().replace(
+        "connection=github&owner=fixture&from_surface=github_bot&intent=private_repo_upsell",
+        query,
+    )
+    assert f"billing?{query}) to continue" in body
+    assert merge_train._bot_body_has_finding("sourcery-ai", body) is expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        sourcery_no_access_notice() + "\n## Overall Comments",
+        sourcery_no_access_notice() + "\nCheck this edge case.",
+        sourcery_no_access_notice().replace("app.sourcery.ai", "other.example"),
+        sourcery_no_access_notice().replace(
+            "Your private repo does not have access to Sourcery.\n", ""
+        ),
+        sourcery_no_access_notice("person.name"),
+        sourcery_no_access_notice().replace("?connection=github", "?connection=git hub"),
+        sourcery_no_access_notice() + "\n### Sourcery assessment\nApproval pending",
+        sourcery_no_access_notice() + "\n### Sourcery assessment\n1 of 2 met",
+    ],
+    ids=["marker", "extra-line", "host", "no-access-line", "login", "space", "pending", "met"],
+)
+def test_planted_sourcery_no_access_with_other_content_holds(tmp_path, body):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    forge.review_details[1] = _detail(reviews=[_bot_review(601, "sourcery-ai", body)])
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review body: sourcery-ai review 601 has findings" in summary
+
+
+@pytest.mark.parametrize(
+    "login",
+    ["-", "-person", "a" * 40],
+    ids=["hyphen", "leading-hyphen", "too-long"],
+)
+def test_planted_malformed_greeting_login_holds(tmp_path, login):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(601, "sourcery-ai", sourcery_no_access_notice(login))]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == []
+    assert "review body: sourcery-ai review 601 has findings" in summary
+
+
+@pytest.mark.parametrize(
+    "login",
+    ["a" * 39, "a" * 39 + "[bot]"],
+    ids=["max-length", "max-length-bot"],
+)
+def test_greeting_login_boundary_lands(tmp_path, login):
+    forge = Forge(repository(pull(1, "CLEAN", author={"login": "person"})))
+    forge.review_details[1] = _detail(
+        reviews=[_bot_review(601, "sourcery-ai[bot]", sourcery_no_access_notice(login))]
+    )
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+
+
 @pytest.mark.parametrize(
     ("login", "body"),
     [
@@ -9269,6 +9824,94 @@ def test_maintainer_right_refusal_holds_bot_pull_request(tmp_path):
     assert forge.right_calls == ["maintainer"]
 
 
+def test_exhausted_permission_read_warns_and_holds(tmp_path, monkeypatch, capsys):
+    """An exhausted maintainer permission read names the repository and keeps the hold."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_refusals = {"maintainer": 502}
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert "| #1 | CLEAN | review body: cannot read the right of maintainer:" in summary
+    assert forge.writes == []
+    assert_not_read(done, summary, "fleet/app")
+    assert len(result.unread) == 1
+    assert result.refusals == []
+    assert forge.right_calls == ["maintainer"] * 3
+
+
+def test_exhausted_permission_read_echoing_404_warns_and_holds(tmp_path, monkeypatch, capsys):
+    """An exhausted permission read whose 502 body echoes HTTP 404 still warns and holds."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_refusals = {"maintainer": 502}
+    forge.right_message = "upstream said HTTP 404 Not Found"
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert "| #1 | CLEAN | review body: cannot read the right of maintainer:" in summary
+    assert forge.writes == []
+    assert_not_read(done, summary, "fleet/app")
+    assert len(result.unread) == 1
+    assert result.refusals == []
+    assert forge.right_calls == ["maintainer"] * 3
+
+
+def test_nontransient_permission_read_holds_without_warning(tmp_path, monkeypatch, capsys):
+    """A non-transient permission read refusal holds without a not-read warning."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_refusals = {"maintainer": 403}
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert done.returncode == 0, done.stdout
+    assert "| #1 | CLEAN | review body: cannot read the right of maintainer:" in summary
+    assert result.unread == []
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert forge.right_calls == ["maintainer"]
+
+
+def test_third_permission_read_answer_records_nothing(tmp_path, monkeypatch, capsys):
+    """A maintainer permission read that succeeds on the third try lands without a warning."""
+    forge = _maintainer_forge(comments=[_maintainer_answer()])
+    forge.right_faults = {"maintainer": [502, 502]}
+    forge.rights = {"maintainer": "write"}
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert done.returncode == 0, done.stdout
+    assert forge.writes == [landed(1)]
+    assert result.unread == []
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert forge.right_calls == ["maintainer"] * 4
+
+
+def test_exhausted_hold_read_survives_later_refusal(tmp_path, monkeypatch, capsys):
+    """A refused merge after an exhausted hold read lists both refusal and not-read."""
+    forge = hold_read_forge("review", [502] * 3)
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"].append(pull(2, "CLEAN"))
+    forge.mutation_statuses["mergePullRequest"] = [500]
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert len(result.refusals) == 1
+    assert result.refusals[0].startswith("fleet/app: ")
+    assert len(result.unread) == 1
+    assert "HTTP 502" in result.unread[0]
+    assert done.returncode == 1, done.stdout
+    assert "::warning title=Merge train not read::fleet/app: " in done.stdout
+    assert done.stdout.count("::warning title=Merge train not read::") == 1
+    section = summary.split("Not read after 3 tries, the next run reads them again:\n\n", 1)[1]
+    assert section.splitlines()[0].startswith("- fleet/app: ")
+    assert "::error title=Merge train refused::fleet/app:" in done.stdout
+
+
+def test_terminal_unread_after_hold_read_warns_once(tmp_path, monkeypatch, capsys):
+    """The terminal unread read is the sole warning after an exhausted hold-body read."""
+    forge = hold_read_forge("review", [502] * 3)
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"].append(pull(2, "CLEAN"))
+    forge.commits[2] = [("feat: two\n\nSigned-off-by: A <a@example.com>", 1)]
+    forge.merged_pulls["fleet/app"] = [merged_pull(2, (99, "OPEN"))]
+    forge.hold_faults["states: MERGED"] = [504, 504, 504]
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert len(result.unread) == 1
+    assert "HTTP 504" in result.unread[0]
+    assert "HTTP 502" not in result.unread[0]
+    assert done.stdout.count("::warning title=Merge train not read::") == 1
+    assert "::warning title=Merge train not read::fleet/app: " in done.stdout
+    assert assert_not_read(done, summary, "fleet/app") is None
+    assert forge.hold_faults["reviews(first: 100)"] == []
+    assert forge.hold_faults["states: MERGED"] == []
+
+
 def test_maintainer_answer_does_not_release_human_pull_request(tmp_path):
     """Human-authored pull requests still require the author's own review-body answer."""
     forge = _maintainer_forge(comments=[_maintainer_answer()], author={"login": "person"})
@@ -10003,12 +10646,88 @@ def test_transient_rest_read_is_tried_again(tmp_path, fault):
 def test_exhausted_rest_read_retries_refuse_the_repository(tmp_path, fault):
     forge = stopped_forge()
     forge.rest_faults["jobs"] = [fault] * 4
-    done, _ = train(tmp_path, forge)
-    assert done.returncode == 1, done.stdout + done.stderr
-    assert "::error title=Merge train refused::fleet/app: GET " in done.stdout
+    done, summary = train(tmp_path, forge)
+    assert_not_read(done, summary, "fleet/app")
+    assert "::warning title=Merge train not read::fleet/app: GET " in done.stdout
     assert "Traceback" not in done.stderr
     assert forge.rest_faults["jobs"] == [fault]
     assert forge.writes == []
+
+
+def test_exhausted_repositories_read_names_account_as_not_read(tmp_path):
+    forge = sweep_forge()
+    forge.rest_faults["repositories"] = [502] * 3
+    done, summary = train(tmp_path, forge)
+    assert_not_read(done, summary, "fleet")
+    assert "| fleet | not read | | | |" in summary
+    assert forge.where == [("other/b", armed(2)), ("other/b", updated(2))]
+    assert forge.rest_faults["repositories"] == []
+    assert sorted(forge.revoked) == sorted(forge.tokens)
+
+
+def test_exhausted_installations_read_still_fails_the_sweep(tmp_path):
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.rest_faults["installations"] = [502] * 4
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "::error title=Merge train refused::GET " in done.stdout
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert forge.rest_faults["installations"] == [502]
+    assert forge.where == []
+    assert summary == ""
+
+
+def test_unread_summary_keeps_only_first_error_line(tmp_path, monkeypatch):
+    merge_train = load_train(tmp_path, monkeypatch)
+    cause = http.client.IncompleteRead(b"", 10)
+    error = merge_train.UnreadError("HTTP 502 <html>\nsecond line</html>")
+    error.__cause__ = cause
+    error.unsigned_bots = ["fleet/app #1"]
+    monkeypatch.setattr(merge_train, "app_jwt", lambda *args: "fixture")
+    monkeypatch.setattr(
+        merge_train, "pages", lambda *args: [{"id": 7, "account": {"login": "fleet"}}]
+    )
+    monkeypatch.setattr(
+        merge_train,
+        "repositories",
+        lambda *args: ([{"full_name": "fleet/app", "name": "app", "id": 1}], frozenset(), []),
+    )
+
+    def unread(*args):
+        raise error
+
+    monkeypatch.setattr(merge_train, "one", unread)
+    env = {"GITHUB_STEP_SUMMARY": str(tmp_path / "summary"), "GITHUB_OUTPUT": str(tmp_path / "out")}
+    result = merge_train.sweep(env, {}, time.monotonic())
+    merge_train.summary(env, result)
+    assert result.unread == ["fleet/app: HTTP 502 <html>"]
+    assert result.unsigned_bots == ["fleet/app #1"]
+    summary = (tmp_path / "summary").read_text()
+    assert "second line" not in summary
+    assert "- fleet/app #1" in summary
+
+
+@pytest.mark.parametrize("method", ["GET", "GraphQL"])
+def test_unread_error_preserves_transient_cause(tmp_path, monkeypatch, method):
+    merge_train = load_train(tmp_path, monkeypatch)
+    cause = http.client.IncompleteRead(b"", 10)
+    calls = []
+
+    def refused(*args):
+        calls.append(args)
+        raise merge_train.RefusedError("body cut: 0 of 10 bytes") from cause
+
+    monkeypatch.setattr(merge_train, "request_once" if method == "GET" else "graphql", refused)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    with pytest.raises(merge_train.UnreadError) as caught:
+        if method == "GET":
+            merge_train.call("https://forge.test", method="GET")
+        else:
+            merge_train.read_graphql({}, "query", {})
+    assert str(caught.value) == "body cut: 0 of 10 bytes"
+    assert caught.value.__cause__ is cause
+    assert merge_train.transient(caught.value)
+    assert len(calls) == merge_train.READ_ATTEMPTS
 
 
 def test_rest_read_500_is_not_tried_again(tmp_path):
@@ -10021,15 +10740,16 @@ def test_rest_read_500_is_not_tried_again(tmp_path):
 
 
 def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
-    """Mutation: a GET that runs once turns the planted 502 on the jobs read red."""
+    """Mutation: skipping the GET retry leaves the repository unread without refreshing."""
     text = script()
     old = 'retries = READ_ATTEMPTS - 1 if method == "GET" else 0'
     assert text.count(old) == 1
     forge = stopped_forge()
     forge.rest_faults["jobs"] = [502]
-    done, _ = train(tmp_path, forge, text.replace(old, "retries = 0"))
-    assert done.returncode == 1, done.stdout + done.stderr
+    done, summary = train(tmp_path, forge, text.replace(old, "retries = 0"))
+    assert_not_read(done, summary, "fleet/app")
     assert forge.writes == []
+    assert forge.rest_faults["jobs"] == []
 
 
 @pytest.mark.parametrize("fault", [DROP, 502])
@@ -10133,15 +10853,89 @@ def test_enqueue_refused_as_not_mergeable_reads_the_state_again(tmp_path, state,
 def test_without_the_enqueue_handler_a_moved_pull_request_refuses(tmp_path):
     """Mutation: an enqueue refusal that skips moved_state turns the BEHIND case red."""
     old = """        data = graphql(env, ENQUEUE, {"id": pull["id"], "oid": pull["headRefOid"]})
-    except RefusedError as err:"""
+    except NotMergeableError:"""
     assert script().count(old) == 1
-    flow = script().replace(old, old.replace("except RefusedError", "except ZeroDivisionError"))
+    flow = script().replace(
+        old, old.replace("except NotMergeableError", "except ZeroDivisionError")
+    )
     forge = Forge(repository(pull(1, "CLEAN"), queue=True))
     forge.enqueue_errors = [ENQUEUE_NOT_MERGEABLE]
     forge.merge_states[1] = "BEHIND"
     done, summary = train(tmp_path, forge, flow)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "not landed: the merge state moved" not in summary
+
+
+MERGE_MUTATION_MARKER = "mergePullRequest("
+ENQUEUE_MUTATION_MARKER = "enqueuePullRequest("
+
+
+def _merge_state_reads(forge: Forge) -> int:
+    """Count live MERGE_STATE reads: the only query naming mergeStateStatus on one pullRequest."""
+    return sum(
+        1 for query in forge.queries if "mergeStateStatus" in query and "pullRequest(" in query
+    )
+
+
+def test_merge_http_500_not_mergeable_text_stays_refused(tmp_path):
+    """Negative: HTTP 500 on MERGE with not-mergeable text refuses without a state read."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN")))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[MERGE_MUTATION_MARKER] = [500]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 500" in done.stdout
+    assert "HTTP 500" in summary
+    assert "not landed: the merge state moved" not in summary
+    assert _merge_state_reads(forge) == 0
+    assert forge.hold_faults[MERGE_MUTATION_MARKER] == []
+
+
+def test_enqueue_http_500_not_mergeable_text_stays_refused(tmp_path):
+    """Negative: HTTP 500 on ENQUEUE with not-mergeable text refuses without a state read."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN"), queue=True))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[ENQUEUE_MUTATION_MARKER] = [500]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 500" in done.stdout
+    assert "HTTP 500" in summary
+    assert "not landed: the merge state moved" not in summary
+    assert _merge_state_reads(forge) == 0
+    assert forge.hold_faults[ENQUEUE_MUTATION_MARKER] == []
+
+
+def test_merge_http_500_with_failing_state_read_stays_refused(tmp_path):
+    """Negative: HTTP 500 on MERGE never touches failing merge state reads or warns."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN")))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[MERGE_MUTATION_MARKER] = [500]
+    forge.merge_states[1] = "BEHIND"
+    forge.merge_state_statuses = [502] * 4
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "HTTP 500" in done.stdout
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert "Not read after" not in summary
+    assert "not landed: the merge state moved" not in summary
+    assert forge.merge_state_statuses == [502] * 4
+    assert _merge_state_reads(forge) == 0
+
+
+def test_merge_not_mergeable_with_extra_graphql_error_moves(tmp_path):
+    """Boundary: GraphQL not-mergeable plus another error in the same answer still moves."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    forge.merge_errors = [
+        NOT_MERGEABLE,
+        {"type": "UNPROCESSABLE", "message": "Base branch was modified"},
+    ]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "### fleet/app: not landed: the merge state moved to BEHIND #1" in summary
+    assert _merge_state_reads(forge) == 1
 
 
 @pytest.mark.parametrize("fault", [502, 503, 504])
@@ -10158,16 +10952,17 @@ def test_moved_state_read_is_tried_again(tmp_path, fault):
 
 
 def test_exhausted_moved_state_reads_refuse_the_repository(tmp_path):
-    """Boundary: three failed state reads refuse the repository; the fourth is never sent."""
+    """Boundary: three failed state reads leave the repository unread; no fourth attempt."""
     forge = Forge(repository(pull(1, "CLEAN")))
     forge.merge_errors = [NOT_MERGEABLE]
     forge.merge_states[1] = "BEHIND"
     forge.merge_state_statuses = [502] * 4
     done, summary = train(tmp_path, forge)
-    assert done.returncode == 1, done.stdout + done.stderr
+    assert_not_read(done, summary, "fleet/app")
     assert "HTTP 502" in done.stdout
     assert forge.merge_state_statuses == [502]
     assert "not landed: the merge state moved" not in summary
+    assert forge.writes == [landed(1)]
 
 
 def test_without_the_read_wrapper_the_state_read_refuses(tmp_path):
@@ -10182,6 +10977,37 @@ def test_without_the_read_wrapper_the_state_read_refuses(tmp_path):
     done, _ = train(tmp_path, forge, flow)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "HTTP 502" in done.stdout
+
+
+COMMITS_QUERY_MARKER = "message parents { totalCount }"
+
+
+def test_exhausted_commits_read_in_land_is_not_a_moved_note(tmp_path):
+    """Negative: an exhausted COMMITS read in land warns as not read, never as moved."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN")))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[COMMITS_QUERY_MARKER] = [502] * 3
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert forge.hold_faults[COMMITS_QUERY_MARKER] == []
+    assert forge.writes == []
+    assert "not landed: the merge state moved" not in summary
+    assert_not_read(done, summary, "fleet/app")
+
+
+def test_transient_commits_read_in_land_lands_on_third_try(tmp_path):
+    """Boundary: two 502 COMMITS answers in land then success still land the pull request."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN")))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[COMMITS_QUERY_MARKER] = [502, 502]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.hold_faults[COMMITS_QUERY_MARKER] == []
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+    assert "Not read after" not in summary
+    assert "::warning title=Merge train not read::" not in done.stdout
 
 
 # Retry history is fresh relative to NOW, independent of the older head-suite fixtures.
@@ -10349,7 +11175,7 @@ def test_retry_hold_exact_seven_day_boundary(tmp_path, monkeypatch, seconds, hel
     stamp = NOW - timedelta(days=7)
     history = retry_history(1, retry_attempt(suites=[retry_suite(when=stamp)]))
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
-    hold = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW + timedelta(seconds=seconds))
+    hold = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW + timedelta(seconds=seconds), [])
     assert bool(hold) is held
     if held:
         assert hold.endswith("until " + NOW.strftime("%Y-%m-%dT%H:%M:%SZ"))
@@ -10615,14 +11441,14 @@ def test_retry_hold_malformed_history_is_held(tmp_path, monkeypatch, kind):
         monkeypatch.setattr(mod, "call", lambda *args: {"files": {"app.py": retry_file()}})
     else:
         monkeypatch.setattr(mod, "call", lambda *args: {"files": [retry_file(patch=123)]})
-    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, [])
     assert reason.startswith("held for retry: history unreadable:")
 
 
 def test_retry_hold_naive_attempt_stamp_is_unreadable(tmp_path, monkeypatch):
     history = retry_history(1, retry_attempt(suites=[retry_suite(when=NOW.replace(tzinfo=None))]))
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
-    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, [])
     assert "history unreadable: retry check timestamp has no timezone" in reason
 
 
@@ -10630,7 +11456,7 @@ def test_retry_hold_naive_attempt_stamp_is_unreadable(tmp_path, monkeypatch):
 def test_retry_hold_non_actions_suite_uses_app_name(tmp_path, monkeypatch, app, name):
     history = retry_history(1, retry_attempt(suites=[retry_suite(workflow=None, app=app)]))
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
-    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, [])
     assert f"failed {name}; until" in reason
 
 
@@ -10639,7 +11465,7 @@ def test_retry_hold_newer_pending_suite_does_not_extend_failed_stamp(tmp_path, m
     pending = retry_suite(None, workflow=2, when=NOW, number=2)
     history = retry_history(1, retry_attempt(suites=[failed, pending]))
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
-    assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW) is None
+    assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, []) is None
 
 
 def test_retry_hold_pending_app_suite_keeps_failure(tmp_path, monkeypatch):
@@ -10647,7 +11473,7 @@ def test_retry_hold_pending_app_suite_keeps_failure(tmp_path, monkeypatch):
     app = retry_attempt("d" * 40, [retry_suite(None, workflow=None, when=NOW)])
     history = retry_history(1, old, app)
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
-    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, [])
     assert reason and "diff unchanged since aaaaaaaaaaaa failed workflow-1; until" in reason
 
 
@@ -10656,7 +11482,7 @@ def test_retry_hold_latest_failure_names_all_failed_workflows(tmp_path, monkeypa
     second = retry_suite("TIMED_OUT", workflow=2, when=NOW, number=2)
     history = retry_history(1, retry_attempt(suites=[first, second]))
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
-    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, [])
     assert "failed workflow-1, workflow-2; until" in reason
     assert reason.endswith((NOW + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
@@ -10666,7 +11492,7 @@ def test_retry_hold_compare_file_page_below_limit_is_readable(tmp_path, monkeypa
     mod, conf, env = retry_reader(tmp_path, monkeypatch, history)
     files = [retry_file(filename=f"file-{n}.py") for n in range(299)]
     monkeypatch.setattr(mod, "call", lambda *args: {"files": files})
-    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, [])
     assert "diff unchanged since" in reason
 
 
@@ -10735,7 +11561,7 @@ def test_retry_hold_concluded_green_and_pending_app_releases(tmp_path, monkeypat
         [retry_suite("SUCCESS", when=NOW), retry_suite(None, workflow=None, when=NOW)],
     )
     mod, conf, env = retry_reader(tmp_path, monkeypatch, retry_history(1, old, green))
-    assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW) is None
+    assert mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, []) is None
 
 
 @pytest.mark.parametrize("mode,held", [(33188, True), (33261, False)], ids=["same", "changed"])
@@ -10784,7 +11610,7 @@ def test_retry_hold_missing_mode_is_unreadable(tmp_path, monkeypatch, node):
         return {"repository": node if "fragment M on Commit" in query else {"pullRequest": history}}
 
     monkeypatch.setattr(mod, "read_graphql", read)
-    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW)
+    reason = mod.retry_hold(env, conf, pull(1, "BEHIND"), NOW, [])
     assert reason.startswith("held for retry: history unreadable:")
 
 
@@ -11579,7 +12405,7 @@ def adr92_mutations():
         (
             "I",
             "merge_train",
-            "if arming and late_review_hold(env, conf, pull, notes, arming=True):",
+            "if arming and late_review_hold(env, conf, pull, notes, unread, arming=True):",
             "if arming and False:",
             "test_adr92_arming_rereads[I-hold]",
         ),
@@ -11649,7 +12475,7 @@ def adr92_followup_mutations():
         (
             "R3",
             "merge_train",
-            "if late_review_hold(env, conf, pull, notes, arming=True):",
+            "if late_review_hold(env, conf, pull, notes, unread, arming=True):",
             "if False:",
             "test_adr92_re_arm_rereads[R3-hold]",
         ),
@@ -11740,7 +12566,7 @@ def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
         "GITHUB_OUTPUT": str(tmp_path / "output"),
     }
-    mod.summary(env, {}, [], [], [], [], [], [])
+    mod.summary(env, mod.SweepResult({}, [], [], [], [], [], [], []))
     assert capsys.readouterr().out.count("review bots: none set, zero-review hold off") == 1
 
 
@@ -11898,6 +12724,684 @@ def test_adr93_mutations_reject_defects(tmp_path, section, module_name, old, new
     assert "1 failed" in mutated.stdout, mutated.stdout
 
 
+class HoldReadForge(Forge):
+    """Fail only selected hold reads, leaving the rest of the sweep live."""
+
+    def __init__(self, *reads: dict) -> None:
+        super().__init__(*reads)
+        self.hold_faults: dict[str, list[int]] = {}
+        self.hold_fault_message: str | None = None
+
+    def _hold_fault_body(self, status: int) -> dict[str, str]:
+        text = (
+            f"stand-in forge: queued HTTP {status}"
+            if self.hold_fault_message is None
+            else self.hold_fault_message
+        )
+        return {"message": text}
+
+    def graphql_response(self, header, query, variables):
+        for marker, statuses in self.hold_faults.items():
+            if not statuses:
+                continue
+            if marker == "states: MERGED" and "states: MERGED" in query:
+                status = statuses.pop(0)
+                return status, self._hold_fault_body(status)
+            if marker in query and "pullRequests(" not in query:
+                status = statuses.pop(0)
+                return status, self._hold_fault_body(status)
+        return super().graphql_response(header, query, variables)
+
+
+def hold_read_forge(handler, statuses):
+    first = pull(1, "CLEAN")
+    if handler == "artifact":
+        first = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    followers = []
+    if handler == "retry":
+        first = pull(1, "BLOCKED", autoMergeRequest={"enabledAt": OLD}, suites=[None])
+        followers = [pull(2, "BEHIND", autoMergeRequest={"enabledAt": OLD})]
+    forge = HoldReadForge(repository(first, *followers, release=(True, True)))
+    forge.hold_faults = {}
+    markers = {
+        "review": "reviews(first: 100)",
+        "lease": 'label(name: "merge-train: lander lease")',
+        "retry": "HEAD_REF_FORCE_PUSHED_EVENT",
+    }
+    if handler == "artifact":
+        forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+        forge.rest_faults["artifacts"] = list(statuses)
+    else:
+        forge.hold_faults[markers[handler]] = list(statuses)
+    return forge
+
+
+def hold_read_train(tmp_path, monkeypatch, capsys, forge):
+    """Run main against the fake forge and retain the actual sweep result."""
+    mod = load_train(tmp_path, monkeypatch)
+    mod.READ_BACKOFF_SECONDS = mod.SETTLE_SECONDS = 0
+    results = []
+    original = mod.sweep
+
+    def capture(*args):
+        result = original(*args)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(mod, "sweep", capture)
+    forge.workdir = tmp_path
+    server = serve(forge)
+    forge.api_url = f"http://127.0.0.1:{server.server_address[1]}"
+    env = TRAIN_DEFAULTS | {
+        "GITHUB_API_URL": forge.api_url,
+        "GITHUB_GRAPHQL_URL": f"{forge.api_url}/graphql",
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+        "GITHUB_OUTPUT": str(tmp_path / "output"),
+        "TRAIN_APP_KEY": app_key()[0],
+    }
+    try:
+        rc = mod.main(env)
+    finally:
+        server.shutdown()
+        server.server_close()
+    done = subprocess.CompletedProcess([], rc, capsys.readouterr().out, "")
+    return done, (tmp_path / "summary.md").read_text(), results[0]
+
+
+def hold_read_note(forge, handler, status):
+    """The unchanged hold or note, including its original truncation and error type."""
+    url = f"{forge.api_url}/graphql"
+    method = "POST"
+    if handler == "artifact":
+        url = (
+            f"{forge.api_url}/repos/fleet/app/actions/artifacts"
+            f"?name=regenerated-{1:040x}&per_page=10"
+        )
+        method = "GET"
+    error = f'{method} {url}: HTTP {status} {{"message": "stand-in forge: queued HTTP {status}"}}'
+    kind = "UnreadError" if status in (502, 504) else "RefusedError"
+    prefix = {
+        "review": "review body: cannot read: ",
+        "artifact": "generated files refused: ",
+        "lease": f"lander lease unreadable: {kind}: ",
+        "retry": "held for retry: history unreadable: ",
+    }[handler]
+    note = prefix + error
+    return note[:200] if handler in ("review", "artifact") else note
+
+
+@pytest.mark.parametrize("handler", ["review", "artifact", "lease", "retry"])
+def test_planted_exhausted_hold_read_warns(tmp_path, monkeypatch, capsys, handler):
+    forge = hold_read_forge(handler, [502] * 3)
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert hold_read_note(forge, handler, 502) in summary
+    assert_not_read(done, summary, "fleet/app")
+    assert len(result.unread) == 1
+    assert result.unread[0].startswith("fleet/app: ")
+    assert result.refusals == []
+    assert result.accounts["fleet"] == {
+        "repositories": 1,
+        "landed": 0,
+        "updated": int(handler == "retry"),
+        "refused": 0,
+    }
+    assert result.releases == [{"owner": "fleet", "name": "app"}]
+    assert forge.writes == ([updated(2)] if handler == "retry" else [])
+    assert not any(forge.hold_faults.values())
+    assert not any(forge.rest_faults.values())
+
+
+@pytest.mark.parametrize("handler", ["review", "artifact", "lease", "retry"])
+def test_nontransient_hold_read_keeps_hold_without_warning(tmp_path, monkeypatch, capsys, handler):
+    forge = hold_read_forge(handler, [403])
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert done.returncode == 0, done.stdout
+    assert hold_read_note(forge, handler, 403) in summary
+    assert result.unread == []
+    assert result.refusals == []
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert "Not read after" not in summary
+    assert forge.writes == ([updated(2)] if handler == "retry" else [])
+    assert not any(forge.hold_faults.values())
+    assert not any(forge.rest_faults.values())
+
+
+@pytest.mark.parametrize("handler", ["review", "artifact", "lease", "retry"])
+def test_third_hold_read_answer_records_nothing(tmp_path, monkeypatch, capsys, handler):
+    forge = hold_read_forge(handler, [502, 502])
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert done.returncode == 0, done.stdout
+    assert result.unread == []
+    assert result.refusals == []
+    assert "Not read after" not in summary
+    assert "::warning title=Merge train not read::" not in done.stdout
+    assert forge.writes == ([] if handler in ("artifact", "retry") else [landed(1)])
+    outcome = {
+        "artifact": "no pull request at a mergeable state",
+        "retry": "#1 is armed and in flight",
+    }.get(handler, "landed #1")
+    assert f"### fleet/app: {outcome}" in summary
+    assert not any(forge.hold_faults.values())
+    assert not any(forge.rest_faults.values())
+
+
+def test_two_exhausted_hold_reads_name_repository_once(tmp_path, monkeypatch, capsys):
+    forge = hold_read_forge("review", [502] * 3)
+    forge.reads["fleet/app"][0]["pullRequests"]["nodes"].append(pull(2, "BEHIND"))
+    forge.hold_faults["HEAD_REF_FORCE_PUSHED_EVENT"] = [504] * 3
+    done, summary, result = hold_read_train(tmp_path, monkeypatch, capsys, forge)
+    assert hold_read_note(forge, "review", 502) in summary
+    assert hold_read_note(forge, "retry", 504) in summary
+    assert_not_read(done, summary, "fleet/app")
+    assert len(result.unread) == 1
+    assert "HTTP 502" in result.unread[0]
+    assert "HTTP 504" not in result.unread[0]
+    assert result.refusals == []
+    assert not any(forge.hold_faults.values())
+
+
+_STATUS_LITERAL = re.compile(r"HTTP \d{3} ?")
+
+
+def _is_status_text_match(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
+        return False
+    if not isinstance(node.ops[0], (ast.In, ast.NotIn)):
+        return False
+    left, right = node.left, node.comparators[0]
+    if not (
+        isinstance(left, ast.Constant)
+        and isinstance(left.value, str)
+        and _STATUS_LITERAL.fullmatch(left.value)
+    ):
+        return False
+    return (
+        isinstance(right, ast.Call) and isinstance(right.func, ast.Name) and right.func.id == "str"
+    )
+
+
+def _status_text_matches(source: str) -> list[int]:
+    tree = ast.parse(source)
+    return sorted(node.lineno for node in ast.walk(tree) if _is_status_text_match(node))
+
+
+@pytest.mark.parametrize(
+    "planted_guard",
+    [
+        '"HTTP 404" in str(err)',
+        "'HTTP 404' in str(err)",
+        '"HTTP 404" not in str(err)',
+    ],
+    ids=["double-quotes", "single-quotes", "not-in"],
+)
+def test_no_status_text_match_in_merge_train(planted_guard):
+    """No HTTP status classification matches error text in tools/merge_train.py."""
+    source = (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8")
+    assert "if http_status(err) == 404:" in source
+    assert _status_text_matches(source) == []
+    assert _status_text_matches("if http_status(err) == 404:\n    pass\n") == []
+    planted = source.replace(
+        "if http_status(err) == 404:\n            return False",
+        f"if {planted_guard}:\n            return False",
+        1,
+    )
+    assert planted != source
+    assert len(_status_text_matches(planted)) == 1
+
+
+REFUSED_CATCH_ALLOWED = {
+    "call": "retry loop: request_once raises RefusedError only; the last try raises UnreadError",
+    "read_graphql": (
+        "retry loop: graphql sends one POST, which never raises UnreadError; "
+        "the last try raises UnreadError"
+    ),
+    "update": "wraps the update-branch PUT, which never raises UnreadError",
+    "_maintainer_unanswered": "recorded_right records an exhausted read before this conversion",
+    "_unanswered_body_hold": "recorded_right records an exhausted read before this hold",
+    "_ask_update_bot_recreate": "wraps a POST, which never raises UnreadError",
+    "close_issues": "wraps mint, a POST, which never raises UnreadError",
+    "release_off_get": "release_off_ids turns any failure, an unread too, into a warning",
+    "revoke": "a DELETE, which never raises UnreadError",
+    "sweep": "collects unread and refused repositories",
+    "main": "prints the sweep refusal",
+}
+
+
+def _excepts_refused_or_unread(handler: ast.ExceptHandler) -> bool:
+    kind = handler.type
+    if kind is None:
+        return False
+    if isinstance(kind, ast.Name):
+        return kind.id in ("RefusedError", "UnreadError")
+    if isinstance(kind, ast.Tuple):
+        return any(
+            isinstance(elt, ast.Name) and elt.id in ("RefusedError", "UnreadError")
+            for elt in kind.elts
+        )
+    return False
+
+
+_COVER, _ESCAPE, _PASS = "cover", "escape", "pass"
+_EXITS = (ast.Return, ast.Break, ast.Continue)
+_NON_SUPPRESSING_CONTEXTS = {
+    "open": "builtin file object, never suppresses",
+    "key_pipe": "contextmanager, yield in try/finally without except",
+}
+
+
+def _is_non_suppressing_item(item: ast.withitem) -> bool:
+    expr = item.context_expr
+    if not isinstance(expr, ast.Call):
+        return False
+    callee = expr.func
+    if isinstance(callee, ast.Name):
+        name = callee.id
+    elif isinstance(callee, ast.Attribute):
+        name = callee.attr
+    else:
+        return False
+    return name in _NON_SUPPRESSING_CONTEXTS
+
+
+def _with_outcome(stmt: ast.With, outcomes: dict[int, str]) -> str:
+    body = outcomes[id(stmt.body)]
+    if (
+        stmt.items
+        and len(stmt.items) <= 100
+        and all(_is_non_suppressing_item(item) for item in stmt.items[:100])
+    ):
+        return body
+    return _PASS if body == _COVER else body
+
+
+def _source_retry_codes(tree: ast.Module) -> frozenset[int] | None:
+    for stmt in tree.body[:500]:
+        if isinstance(stmt, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "RETRY_CODES" for target in stmt.targets
+        ):
+            return frozenset(ast.literal_eval(stmt.value))
+    return None
+
+
+def _retry_codes_for(tree: ast.Module) -> frozenset[int]:
+    found = _source_retry_codes(tree)
+    if found is not None:
+        return found
+    fallback = _source_retry_codes(ast.parse(script()))
+    assert fallback is not None
+    return fallback
+
+
+def _is_http_status_call(expr: ast.AST, err_name: str | None) -> bool:
+    return (
+        err_name is not None
+        and isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "http_status"
+        and len(expr.args) == 1
+        and not expr.keywords
+        and isinstance(expr.args[0], ast.Name)
+        and expr.args[0].id == err_name
+    )
+
+
+def _status_guard_op(
+    expr: ast.AST, err_name: str | None, retry_codes: frozenset[int]
+) -> ast.cmpop | None:
+    if not isinstance(expr, ast.Compare) or len(expr.ops) != 1 or len(expr.comparators) != 1:
+        return None
+    right = expr.comparators[0]
+    if not _is_http_status_call(expr.left, err_name):
+        return None
+    if (
+        isinstance(right, ast.Constant)
+        and type(right.value) is int
+        and right.value not in retry_codes
+    ):
+        return expr.ops[0]
+    return None
+
+
+def _status_guard(test: ast.AST, err_name: str | None, retry_codes: frozenset[int]) -> str | None:
+    op = _status_guard_op(test, err_name, retry_codes)
+    if isinstance(op, ast.Eq):
+        return "eq"
+    if isinstance(op, ast.NotEq):
+        return "ne"
+    if (
+        isinstance(test, ast.BoolOp)
+        and isinstance(test.op, ast.And)
+        and any(
+            isinstance(_status_guard_op(val, err_name, retry_codes), ast.Eq) for val in test.values
+        )
+    ):
+        return "eq"
+    return None
+
+
+def _has_exit(stmt: ast.stmt) -> bool:
+    return any(
+        isinstance(node, _EXITS) or (isinstance(node, ast.Raise) and node.exc is not None)
+        for node in ast.walk(stmt)
+    )
+
+
+def _raise_outcome(stmt: ast.Raise) -> str:
+    if stmt.exc is None:
+        return _COVER
+    exc = stmt.exc
+    if (
+        isinstance(exc, ast.Call)
+        and isinstance(exc.func, ast.Name)
+        and exc.func.id == "UnreadError"
+    ):
+        return _COVER
+    return _ESCAPE
+
+
+def _if_outcome(
+    stmt: ast.If,
+    outcomes: dict[int, str],
+    err_name: str | None,
+    retry_codes: frozenset[int],
+) -> str:
+    body, orelse = outcomes[id(stmt.body)], outcomes[id(stmt.orelse)]
+    guard = _status_guard(stmt.test, err_name, retry_codes)
+    if guard == "eq":
+        return orelse
+    if guard == "ne":
+        return body
+    if body == _COVER and orelse == _COVER:
+        return _COVER
+    if _ESCAPE in (body, orelse):
+        return _ESCAPE
+    return _PASS
+
+
+def _stmt_outcome(
+    stmt: ast.stmt,
+    outcomes: dict[int, str],
+    err_name: str | None,
+    retry_codes: frozenset[int],
+) -> str:
+    if isinstance(stmt, ast.Raise):
+        return _raise_outcome(stmt)
+    if isinstance(stmt, _EXITS):
+        return _ESCAPE
+    if (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id == "record_unread"
+    ):
+        return _COVER
+    if isinstance(stmt, ast.If):
+        return _if_outcome(stmt, outcomes, err_name, retry_codes)
+    if isinstance(stmt, ast.With):
+        return _with_outcome(stmt, outcomes)
+    return _ESCAPE if _has_exit(stmt) else _PASS
+
+
+def _list_outcome(
+    stmts: list[ast.stmt],
+    outcomes: dict[int, str],
+    err_name: str | None,
+    retry_codes: frozenset[int],
+) -> str:
+    for stmt in stmts[:1000]:
+        res = _stmt_outcome(stmt, outcomes, err_name, retry_codes)
+        if res != _PASS:
+            return res
+    return _PASS
+
+
+def _handler_records_or_reraises(
+    handler: ast.ExceptHandler, retry_codes: frozenset[int] | None = None
+) -> bool:
+    codes = _retry_codes_for(ast.parse(script())) if retry_codes is None else retry_codes
+    order: list[list[ast.stmt]] = []
+    stack: list[list[ast.stmt]] = [handler.body]
+    for _ in range(10000):
+        if not stack:
+            break
+        stmts = stack.pop()
+        order.append(stmts)
+        for stmt in stmts[:1000]:
+            if isinstance(stmt, ast.If):
+                stack.extend((stmt.body, stmt.orelse))
+            elif isinstance(stmt, ast.With):
+                stack.append(stmt.body)
+    if stack:
+        return False
+    outcomes: dict[int, str] = {}
+    for stmts in reversed(order):
+        outcomes[id(stmts)] = _list_outcome(stmts, outcomes, handler.name, codes)
+    return outcomes[id(handler.body)] == _COVER
+
+
+def refused_catch_offenders(source: str, allowed: dict[str, str]) -> list[str]:
+    """Handlers on RefusedError or UnreadError that neither record nor re-raise."""
+    tree = ast.parse(source)
+    retry_codes = _retry_codes_for(tree)
+    parent: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+    handlers_by_func: dict[str, list[ast.ExceptHandler]] = {}
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler) or not _excepts_refused_or_unread(node):
+            continue
+        func = None
+        current = node
+        for _ in range(200):
+            current = parent.get(current)
+            if current is None:
+                break
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func = current.name
+                break
+        if func is None:
+            continue
+        handlers_by_func.setdefault(func, []).append(node)
+        if func in allowed or _handler_records_or_reraises(node, retry_codes):
+            continue
+        offenders.append(f"{func}:{node.lineno}")
+    stale = [f"stale:{name}" for name in sorted(allowed) if name not in handlers_by_func]
+    return sorted(offenders) + stale
+
+
+def test_every_refused_catch_records_or_reraises():
+    """Every RefusedError or UnreadError handler records, re-raises, or is on the allow list."""
+    source = (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8")
+    assert refused_catch_offenders(source, REFUSED_CATCH_ALLOWED) == []
+
+
+_PLANTED_SWALLOW = (
+    "def hold(env):\n"
+    "    try:\n"
+    "        read(env)\n"
+    "    except RefusedError as err:\n"
+    "        return str(err)\n"
+)
+_PLANTED_TUPLE_SWALLOW = (
+    "def hold(env):\n"
+    "    try:\n"
+    "        read(env)\n"
+    "    except (KeyError, RefusedError) as err:\n"
+    "        return str(err)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "source, allowed, expected",
+    [
+        (_PLANTED_SWALLOW, {}, ["hold:4"]),
+        (_PLANTED_TUPLE_SWALLOW, {}, ["hold:4"]),
+    ],
+)
+def test_planted_swallowing_refused_catch_is_flagged(source, allowed, expected):
+    """Planted handlers that swallow refusals are named with their line number."""
+    assert refused_catch_offenders(source, allowed) == expected
+
+
+def test_planted_removed_review_hold_record_unread_is_flagged():
+    """Dropping record_unread from read_review_hold leaves that handler on the offender list."""
+    source = (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8")
+    pattern = (
+        r"(\n        record_unread\(unread, err\)\n"
+        r"        return f\"\{REVIEW_BODY\}cannot read: \{err\}\")"
+    )
+    replacement = r'\n        return f"{REVIEW_BODY}cannot read: {err}"'
+    stripped = re.sub(pattern, replacement, source, count=1)
+    assert stripped != source
+    offenders = refused_catch_offenders(stripped, REFUSED_CATCH_ALLOWED)
+    assert any(item.startswith("read_review_hold:") for item in offenders)
+
+
+def test_planted_stale_refused_catch_allow_key_is_reported():
+    """An allow-list key with no matching handler is reported as stale."""
+    allowed = {**REFUSED_CATCH_ALLOWED, "gone": "vanished handler"}
+    assert "stale:gone" in refused_catch_offenders(
+        (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8"), allowed
+    )
+
+
+_PLANTED_EVERY_PATH_CASES = [
+    pytest.param(
+        "def hold(env, unread, flag):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        if flag:\n"
+        "            record_unread(unread, err)\n"
+        "        else:\n"
+        "            return None\n",
+        ["hold:4"],
+        id="conditional-escape",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        '        raise RefusedError(f"x: {err}") from err\n',
+        ["hold:4"],
+        id="conversion-raise",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        '        if "HTTP 404" in str(err):\n'
+        "            return None\n"
+        "        raise\n",
+        ["hold:4"],
+        id="text-guard-404",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        if http_status(err) == 503:\n"
+        "            return None\n"
+        "        raise\n",
+        ["hold:4"],
+        id="retry-code-guard-503",
+    ),
+    pytest.param(
+        "def hold(env, unread, flag):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        if flag:\n"
+        "            record_unread(unread, err)\n"
+        "        else:\n"
+        "            raise\n",
+        [],
+        id="conditional-reraise",
+    ),
+    pytest.param(
+        "def hold(env, unread):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        record_unread(unread, err)\n"
+        "        return None\n",
+        [],
+        id="record-then-return",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        if http_status(err) == 404:\n"
+        "            return None\n"
+        "        raise\n",
+        [],
+        id="http-status-404",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        raise UnreadError(str(err)) from err\n",
+        [],
+        id="raise-unread",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError:\n"
+        "        with contextlib.suppress(UnreadError):\n"
+        "            raise\n"
+        "        return None\n",
+        ["hold:4"],
+        id="suppress-then-return",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError:\n"
+        "        with suppress(RefusedError): raise\n",
+        ["hold:4"],
+        id="suppress-last-stmt",
+    ),
+    pytest.param(
+        "def hold(env, path):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError:\n"
+        "        with open(path) as handle:\n"
+        "            raise\n",
+        [],
+        id="with-open-reraise",
+    ),
+    pytest.param(
+        "def hold(env, key):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError:\n"
+        "        with key_pipe(key) as fd:\n"
+        "            raise\n",
+        [],
+        id="with-key-pipe-reraise",
+    ),
+]
+
+
+@pytest.mark.parametrize(("source", "expected"), _PLANTED_EVERY_PATH_CASES)
+def test_planted_every_path_refused_catch_verdicts(source, expected):
+    """Every-path check flags escaping branches and accepts covered or 404-guarded paths."""
+    assert refused_catch_offenders(source, {}) == expected
+
+
 @pytest.mark.parametrize("write_file", [False, True])
 def test_summary_release_file_matches_output(tmp_path, monkeypatch, write_file):
     mod = load_train(tmp_path, monkeypatch)
@@ -11910,7 +13414,7 @@ def test_summary_release_file_matches_output(tmp_path, monkeypatch, write_file):
     if write_file:
         env["TRAIN_RELEASE_FILE"] = str(path)
     releases = [{"owner": "a", "name": f"r{i}"} for i in range(mod.MAX_RELEASES + 1)]
-    mod.summary(env, {}, [], [], [], releases, [], [])
+    mod.summary(env, mod.SweepResult({}, [], [], [], releases, [], [], []))
     assert path.exists() == write_file
     if write_file:
         assert json.loads(path.read_text()) == {
