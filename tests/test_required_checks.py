@@ -3044,7 +3044,9 @@ def test_review_prepost_owed_status_change_refreshes_verdict() -> None:
     fake = ReviewTransport()
     previously = status_item(1, "Build")
     latest = status_item(2, "Build", "failure", updated_at="2026-11-21T12:00:01Z")
-    fake.replies[STATUSES_URL] = iter([[previously], [latest], [latest], [latest]])
+    # GitHub keeps the status history append-only: the posted row lands beside latest.
+    fake.answers[STATUSES_URL] = [latest]
+    fake.replies[STATUSES_URL] = iter([[previously]])
     rc, _, err, _ = _review_judge(fake)
     assert rc == 0, err
     assert fake.posts == [(REVIEW_POST_PATH, "failure")]
@@ -3975,9 +3977,9 @@ def test_success_post_refused_before_send_posts_no_withdrawal() -> None:
     assert session.api_calls == 4
 
     fake_cut = ReviewTransport()
-    fake_cut.advance_on_reply[STATUSES_URL] = iter([0, required_checks.WORK_DEADLINE_SECONDS])
+    fake_cut.advance_on_reply[STATUSES_URL] = iter([0, 5])
     session_cut = ApiSession(
-        deadline=fake_cut.clock.now() + SESSION_DEADLINE_SECONDS,
+        deadline=fake_cut.clock.now() + required_checks.WITHDRAWAL_RESERVE_SECONDS + 5,
         now=fake_cut.clock.now,
         sleep=fake_cut.clock.sleep,
         transport=fake_cut,
@@ -3986,6 +3988,8 @@ def test_success_post_refused_before_send_posts_no_withdrawal() -> None:
     err_cut = io.StringIO()
     rc_cut = required_checks.evaluate_one(session_cut, _review_config(), io.StringIO(), err_cut)
     assert rc_cut == 1
+    assert "reached during post-status" in err_cut.getvalue()
+    assert not any(method == "POST" for method, _ in fake_cut.calls)
     assert fake_cut.posts == []
     assert session_cut.withdrawal_reserved is False
 
@@ -4217,9 +4221,15 @@ def test_success_post_502_twice_withdraws_after_retry_and_reports_error() -> Non
 
 
 def _stored_502_case(
-    *, only_if_pending: bool
+    *, only_if_pending: bool, retry_conclusion: str = "success"
 ) -> tuple[int, str, str, ReviewTransport, ApiSession, list[bool]]:
     fake = ReviewTransport()
+    fake.replies[CHECKS_URL] = iter(
+        [
+            {"check_runs": [check_item(1, "Build", "success")]},
+            {"check_runs": [check_item(2, "Build", retry_conclusion)]},
+        ]
+    )
     reserved_on_get: list[bool] = []
     session: ApiSession
 
@@ -4257,15 +4267,17 @@ def test_success_post_502_stored_by_github_clears_reservation_only_on_fresh_deci
     assert fake.answers[STATUSES_URL][0]["state"] == "success"
     assert session.api_calls == 9
 
-    rc_skip, _, err_skip, fake_skip, session_skip, skip_gets = _stored_502_case(
+    rc_skip, out_skip, err_skip, fake_skip, session_skip, skip_gets = _stored_502_case(
         only_if_pending=True
     )
     assert rc_skip == 0 and err_skip == ""
-    assert skip_gets == [True]
+    assert fake_skip.clock.sleeps == [30]
+    assert skip_gets == [True, True, True, True]
     assert session_skip.withdrawal_reserved is False
-    assert fake_skip.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
-    assert fake_skip.answers[STATUSES_URL][0]["state"] == "pending"
-    assert session_skip.api_calls == 7
+    assert fake_skip.posts == [(REVIEW_POST_PATH, "success")]
+    assert f"No status post: {PUSH_CONTEXT} on {SHA} keeps success; verdict success" in out_skip
+    assert fake_skip.answers[STATUSES_URL][0]["state"] == "success"
+    assert session_skip.api_calls == 9
 
 
 def test_failure_post_response_error_without_status_posts_no_withdrawal() -> None:
@@ -4396,3 +4408,158 @@ def test_check_run_unparsable_started_at_with_completed_at_counts_as_pending(
     assert "OK (success): Build" not in out
     snap = required_checks.Snapshot({"Build": run}, {}, (), REVIEW_EPOCH)
     assert decide(snap, _review_config(), REVIEW_EPOCH, REVIEW_EPOCH)[0] == "pending"
+
+
+def _prepend_external_failure(fake: ReviewTransport) -> None:
+    fake.before_post = None
+    existing = fake.answers[STATUSES_URL]
+    assert isinstance(existing, list)
+    failed = status_item(2, "External", "failure", updated_at="2026-11-21T12:00:00Z")
+    fake.answers[STATUSES_URL] = [failed, *existing]
+
+
+def test_post_verification_reevaluates_when_required_status_changes() -> None:
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = [status_item(1, "External", "success")]
+    fake.advance_on_reply[STATUSES_URL] = iter([0, 0, 1])
+    fake.before_post = lambda: _prepend_external_failure(fake)
+    rc, out, err, _ = _review_judge(fake, required_json='["Build", "External"]')
+    assert rc == 0 and err == ""
+    assert fake.calls.count(("GET", CHECKS_URL)) == 2
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
+    statuses = fake.answers[STATUSES_URL]
+    assert isinstance(statuses, list)
+    assert required_checks._all_statuses(statuses)[PUSH_CONTEXT]["state"] == "failure"
+    assert "External: status failure" in out
+
+
+def test_post_verification_keeps_success_when_required_status_unchanged() -> None:
+    baseline = ReviewTransport()
+    rc_base, _, err_base, _ = _review_judge(baseline)
+    assert rc_base == 0 and err_base == ""
+
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = [status_item(1, "External", "success")]
+    rc, _, err, _ = _review_judge(fake, required_json='["Build", "External"]')
+    assert rc == 0 and err == ""
+    assert fake.calls.count(("GET", CHECKS_URL)) == 1
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+    assert len(fake.calls) == len(baseline.calls) == 6
+
+
+@pytest.mark.parametrize("complete_page", [False, True], ids=["full-page", "short-page"])
+def test_post_verification_absent_required_status_depends_on_page_completeness(
+    complete_page: bool,
+) -> None:
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = [status_item(1, "External", "success")]
+    fake.advance_on_reply[STATUSES_URL] = iter([0, 0, 1])
+    other_count = 1 if complete_page else forge.PER_PAGE - 1
+
+    def drop_external_from_page_one() -> None:
+        fake.before_post = None
+        fake.answers[STATUSES_URL] = [status_item(10 + idx, "other") for idx in range(other_count)]
+
+    fake.before_post = drop_external_from_page_one
+    rc, _, err, _ = _review_judge(fake, required_json='["Build", "External"]')
+    assert rc == 0 and err == ""
+    statuses = fake.answers[STATUSES_URL]
+    assert isinstance(statuses, list)
+    standing = required_checks._all_statuses(statuses)[PUSH_CONTEXT]["state"]
+    if complete_page:
+        assert fake.calls.count(("GET", CHECKS_URL)) == 2
+        assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+        assert standing == "pending"
+    else:
+        assert len(statuses) == forge.PER_PAGE
+        assert fake.calls.count(("GET", CHECKS_URL)) == 1
+        assert fake.posts == [(REVIEW_POST_PATH, "success")]
+        assert standing == "success"
+
+
+def test_post_verification_required_status_change_withdraws_when_retry_fails() -> None:
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = [status_item(1, "External", "success")]
+    fake.advance_on_reply[STATUSES_URL] = iter([0, 0, required_checks.WORK_DEADLINE_SECONDS])
+    fake.before_post = lambda: _prepend_external_failure(fake)
+    rc, _, err, _ = _review_judge(fake, required_json='["Build", "External"]')
+    assert rc == 1
+    assert "Session deadline work cutoff" in err
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    statuses = fake.answers[STATUSES_URL]
+    assert isinstance(statuses, list)
+    assert required_checks._all_statuses(statuses)[PUSH_CONTEXT]["state"] == "pending"
+
+
+def test_reserved_withdrawal_bypasses_settled_shortcut_and_posts_failure() -> None:
+    rc, out, err, fake, session, reserved_on_get = _stored_502_case(
+        only_if_pending=True, retry_conclusion="failure"
+    )
+    assert rc == 0 and err == ""
+    assert fake.clock.sleeps == [30]
+    assert reserved_on_get == [True, True, True, True]
+    assert session.withdrawal_reserved is False
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
+    assert fake.answers[STATUSES_URL][0]["state"] == "failure"
+    assert "Build: failure" in out
+
+
+def test_settled_success_shortcut_skips_checks_when_unreserved() -> None:
+    fake = ReviewTransport()
+    fake.answers[STATUSES_URL] = [status_item(1, PUSH_CONTEXT, "success")]
+    out, err = io.StringIO(), io.StringIO()
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=fake,
+        out=out,
+    )
+    assert session.withdrawal_reserved is False
+    rc = required_checks.evaluate_one(session, _review_config(only_if_pending=True), out, err)
+    assert rc == 0 and err.getvalue() == ""
+    assert f"{SHA}: {PUSH_CONTEXT} already settled" in out.getvalue()
+    assert fake.calls == [("GET", STATUSES_URL)]
+    assert fake.posts == []
+    assert session.withdrawal_reserved is False
+
+
+def test_withdrawal_supersedes_concurrent_success_when_ownership_is_ambiguous() -> None:
+    fake = ReviewTransport()
+    post_count = 0
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        nonlocal post_count
+        if method == "POST" and post_count == 0:
+            post_count += 1
+            fake.calls.append((method, path))
+            fake.posts.append((path, kwargs["fields"]["state"]))
+            fake.answers[STATUSES_URL] = [status_item(42, PUSH_CONTEXT, "success")]
+            raise forge.ForgeError(f"POST {path}: timed out after send")
+        return fake(path, method=method, **kwargs)
+
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=transport,
+        out=io.StringIO(),
+    )
+    err = io.StringIO()
+    rc = required_checks.evaluate_one(session, _review_config(), io.StringIO(), err)
+    assert rc == 1
+    assert "timed out after send" in err.getvalue()
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    post_indices = [idx for idx, (method, _) in enumerate(fake.calls) if method == "POST"]
+    assert len(post_indices) == 2
+    between = fake.calls[post_indices[0] + 1 : post_indices[1]]
+    assert not any(method == "GET" and "/statuses" in path for method, path in between)
+    assert between == []
+    statuses = fake.answers[STATUSES_URL]
+    assert isinstance(statuses, list)
+    standing = required_checks._all_statuses(statuses)[PUSH_CONTEXT.casefold()]
+    assert standing["state"] == "pending"
+    assert standing["description"] == "contested write; the next judgment decides"
+    assert session.withdrawal_reserved is False

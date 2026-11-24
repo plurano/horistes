@@ -892,7 +892,12 @@ def read_snapshot(session: ApiSession, config: Config) -> Snapshot | None:
     statuses = read_statuses(session, config.repository, config.sha)
     self_status = statuses.get(status_context(config).casefold())
     _exclude_self_statuses(statuses, config.context)
-    if config.only_if_pending and self_status and self_status.get("state") == "success":
+    if (
+        config.only_if_pending
+        and not session.withdrawal_reserved
+        and self_status
+        and self_status.get("state") == "success"
+    ):
         return None
     checks_path = f"repos/{config.repository}/commits/{config.sha}/check-runs?filter=all"
     try:
@@ -1202,8 +1207,12 @@ def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluatio
 def _post_is_contested(
     session: ApiSession, config: Config, evaluation: Evaluation, status_id: int
 ) -> bool:
-    """Detect judge writes made since the evidence read, including the same second."""
-    statuses, _ = _read_status_page_one(session, config)
+    """Detect judge writes or required status changes since the evidence read."""
+    statuses, complete = _read_status_page_one(session, config)
+    if _owed_status_changed(
+        config, evaluation.snapshot, _all_statuses(statuses), complete=complete
+    ):
+        return True
     key = status_context(config).casefold()
     oldest_contender = floor(evaluation.read_started)
     own_status_seen = False
