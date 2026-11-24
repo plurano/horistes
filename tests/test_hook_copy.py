@@ -182,6 +182,9 @@ THIRD_PARTY_PIN = re.compile(
     r"(\s+# v)(\d+(?:\.\d+){0,2})$",
     re.MULTILINE,
 )
+APP_TOKEN_PIN = re.compile(
+    r"(actions/create-github-app-token@)([^\s#]+)(\s+# v)(\d+)(?:\.(\d+))?(?:\.\d+)?"
+)
 SAMPLE_SHA = "a" * 40
 SAMPLE_ACTION = "actions/create-github-app-token"
 
@@ -194,6 +197,14 @@ def _bump_pin_match(match: re.Match[str]) -> str:
     padded = ([int(part) for part in version.split(".")] + [0, 0])[:3]
     padded[2] += 1
     return f"{prefix}{new_sha}{comment_prefix}{padded[0]}.{padded[1]}.{padded[2]}"
+
+
+def _bump_app_token_match(match: re.Match[str]) -> str:
+    """Rewrite one create-github-app-token pin with a distinct sha and bumped minor."""
+    prefix, sha, comment_prefix, major, minor = match.groups()
+    new_sha = ("0" if sha[0] != "0" else "1") + sha[1:]
+    next_minor = (0 if minor is None else int(minor)) + 1
+    return f"{prefix}{new_sha}{comment_prefix}{major}.{next_minor}.0"
 
 
 def _check_merge_train_release(root: Path) -> None:
@@ -238,23 +249,33 @@ def test_renovate_pin_bump_replay_keeps_structure_checks_green(
     checker(tmp_path)
 
 
-def test_single_action_minor_bump_replay_keeps_checks_green(tmp_path: Path) -> None:
-    """A minor bump of create-github-app-token alone (the Renovate shape) keeps checks green."""
-    app_pin = re.compile(
-        r"(actions/create-github-app-token@)([^\s#]+)(\s+# v)(\d+)\.(\d+)(?:\.\d+)?"
-    )
+@pytest.mark.parametrize(
+    "version",
+    [
+        pytest.param("3", id="major-only"),
+        pytest.param("3.3", id="major-minor"),
+        pytest.param("3.3.0", id="semver"),
+    ],
+)
+def test_single_action_minor_bump_replay_keeps_checks_green(tmp_path: Path, version: str) -> None:
+    """A minor bump of create-github-app-token from a 1-to-3-part comment keeps checks green."""
+    expected_comment = "# v3.1.0" if version == "3" else "# v3.4.0"
     workflows_dir = tmp_path / ".github/workflows"
     workflows_dir.mkdir(parents=True)
     for name in ("release-please.yml", "merge-train-release.yml"):
         raw = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
-        rewritten, count = app_pin.subn(
-            lambda m: (
-                f"{m.group(1)}{'0' if m.group(2)[0] != '0' else '1'}{m.group(2)[1:]}"
-                f"{m.group(3)}{m.group(4)}.{int(m.group(5)) + 1}.0"
-            ),
-            raw,
-        )
+        seeded, seeded_count = APP_TOKEN_PIN.subn(rf"\g<1>\g<2>\g<3>{version}", raw)
+        assert seeded_count == 1
+        rewritten, count = APP_TOKEN_PIN.subn(_bump_app_token_match, seeded)
         assert count == 1
+        assert (
+            re.search(
+                rf"{re.escape(SAMPLE_ACTION)}@[0-9a-f]{{40}}\s+{re.escape(expected_comment)}$",
+                rewritten,
+                re.MULTILINE,
+            )
+            is not None
+        )
         (workflows_dir / name).write_text(rewritten, encoding="utf-8")
 
     check_release_please_workflow(tmp_path)
