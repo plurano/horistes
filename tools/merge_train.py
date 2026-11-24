@@ -804,6 +804,10 @@ def request_once(url, token, method, body, raw, redirect, shown=None):
             if not redirect and err.code in (301, 302, 303, 307, 308):
                 loc = err.headers.get("Location")
                 return {"location": urllib.parse.urljoin(url, loc) if loc else ""}
+            if shown:
+                # A storage service can echo the signed URL in its error body: keep the code only.
+                withheld = "(storage answer body withheld)"
+                raise RefusedError(f"{method} {label}: HTTP {err.code} {withheld}") from err
             raise RefusedError(f"{method} {label}: HTTP {err.code} {error_text(err)}") from err
         finally:
             err.close()

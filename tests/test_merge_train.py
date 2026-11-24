@@ -382,6 +382,7 @@ class Forge:
         self.artifacts: dict[tuple[str, str], list[dict]] = {}
         self.storage: dict[int, bytes] = {}
         self.storage_cut: dict[int, int] = {}
+        self.storage_errors: dict[int, int] = {}
         # Downloads of an artifact still to cut; absent, every download is cut.
         self.storage_cuts_left: dict[int, int] = {}
         self.storage_reads: list[int] = []
@@ -1021,6 +1022,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         art_id = int(path.removeprefix("/storage/"))
         self.server.forge.storage_reads.append(art_id)
+        if art_id in self.server.forge.storage_errors:
+            self.answer(
+                self.server.forge.storage_errors[art_id],
+                {"message": f"signature mismatch for {self.path}"},
+            )
+            return
         data = self.server.forge.storage.get(art_id)
         if data is None:
             self.answer(404, {"message": "Not Found"})
@@ -3931,6 +3938,65 @@ def test_storage_download_still_reaches_signed_url(tmp_path):
     assert any(w[0] == "commit" for w in forge.writes)
     assert "planted-storage-signature" not in summary
     assert forge.storage_reads == [101]
+
+
+@pytest.mark.parametrize("code", [502, 503, 504])
+def test_storage_gateway_error_echoing_signed_url_keeps_signature_out(tmp_path, code):
+    """Gateway storage errors echoing the signed URL withhold the body and keep it out."""
+    forge = planted_storage_forge(cut=False)
+    forge.storage_errors[101] = code
+    attempts = _read_attempts()
+    done, summary = train(tmp_path, forge)
+    secret = "planted-storage-signature"
+    assert secret not in done.stdout
+    assert secret not in done.stderr
+    assert secret not in summary
+    warn = "::warning title=Merge train not read::"
+    assert warn in done.stdout
+    warning = next(line for line in done.stdout.splitlines() if line.startswith(warn))
+    assert "fleet/app" in warning
+    assert "artifact storage for" in warning
+    assert "/actions/artifacts/101/zip" in warning
+    assert f"HTTP {code}" in warning
+    assert "storage answer body withheld" in warning
+    assert forge.storage_reads == [101] * attempts
+
+
+def test_storage_refusal_echoing_signed_url_keeps_signature_out(tmp_path):
+    """A refused storage read echoing the signed URL withholds the body and keeps it out."""
+    forge = planted_storage_forge(cut=False)
+    forge.storage_errors[101] = 403
+    done, summary = train(tmp_path, forge)
+    secret = "planted-storage-signature"
+    assert secret not in done.stdout
+    assert secret not in done.stderr
+    assert secret not in summary
+    assert "planted-storage" not in done.stdout
+    assert "planted-storage" not in summary
+    assert "generated files refused:" in summary
+    assert "artifact storage for" in summary
+    assert "HTTP 403" in summary
+    assert "storage answer body withheld" in summary
+    assert forge.storage_reads == [101]
+
+
+@pytest.mark.parametrize("code", [502, 404])
+def test_call_with_shown_label_withholds_error_body(tmp_path, monkeypatch, code):
+    """Boundary: call with shown withholds the HTTPError body without reading it and closes it."""
+    merge_train = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(merge_train, "READ_BACKOFF_SECONDS", 0)
+    url = "https://storage.test/101?sig=planted-storage-signature"
+    body = _RecordingBody(b"echo https://storage.test/101?sig=planted-storage-signature")
+    err = urllib.error.HTTPError(url, code, "Error", {}, body)
+    monkeypatch.setattr(merge_train.urllib.request, "build_opener", lambda *h: _raising_opener(err))
+    with pytest.raises(merge_train.RefusedError) as caught:
+        merge_train.call(url, method="GET", shown="artifact storage for X")
+    message = str(caught.value)
+    assert message.endswith(f"HTTP {code} (storage answer body withheld)")
+    assert "planted-storage-signature" not in message
+    assert "storage.test" not in message
+    assert err.closed
+    assert body.asked == []
 
 
 def test_without_the_length_check_the_cut_is_not_named(tmp_path):
