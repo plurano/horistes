@@ -2044,6 +2044,53 @@ def test_completed_head_second_range_declarations(extra_range, holds):
             False,
             id="fence-opener-below-item-column-is-top-level",
         ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ```\n  x\n  ```\nafter\n  ```\n"
+            "Actionable comments posted: 1",
+            False,
+            id="item-closes-after-nested-fence-closer",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n# Heading\n  ```\n"
+            "Actionable comments posted: 1",
+            False,
+            id="item-closes-on-atx-heading",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n***\n  ```\nActionable comments posted: 1",
+            False,
+            id="item-closes-on-thematic-break",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n> quote\n  ```\n"
+            "Actionable comments posted: 1",
+            False,
+            id="item-closes-on-block-quote",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\n- - -\n  ```\n"
+            "Actionable comments posted: 1",
+            False,
+            id="thematic-break-dash-is-no-list-item",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ***\n  ```\n  code\nafter\n"
+            "Actionable comments posted: 1",
+            True,
+            id="indented-thematic-break-inside-item-keeps-item",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\nlazy\n  ```\n  code\n"
+            "Actionable comments posted: 1",
+            True,
+            id="lazy-line-after-list-item-keeps-fence-nested",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  # Heading\n  ```\n  code\n\n"
+            "Actionable comments posted: 1",
+            True,
+            id="indented-heading-inside-item-keeps-item",
+        ),
     ],
 )
 def test_completed_head_summary_fenced_code(statement, holds):

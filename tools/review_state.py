@@ -78,6 +78,9 @@ REVIEWED_RANGE_LINE_RE = re.compile(
 )
 FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 LIST_ITEM_RE = re.compile(r"^( {0,3})([-+*]|[0-9]{1,9}[.)])( {1,4})\S")
+ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+THEMATIC_BREAK_RE = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+BLOCK_QUOTE_RE = re.compile(r"^ {0,3}>")
 MAX_HEAD_CHECK_SUITES = 5
 MAX_HEAD_CHECK_RUNS = 5
 CODERABBIT_APP_ID = 347564
@@ -300,14 +303,21 @@ def _fence_closer(line: str, char: str, length: int) -> bool:
     )
 
 
-def _next_item_col(line: str, item_col: int, prev_blank: bool, opens_fence: bool) -> int:
+def _starts_block(line: str, opens_fence: bool) -> bool:
+    """Return True when line opens a fence, an ATX heading, or a block quote."""
+    return bool(opens_fence or ATX_HEADING_RE.match(line) or BLOCK_QUOTE_RE.match(line))
+
+
+def _next_item_col(line: str, item_col: int, prev_para: bool, starts_block: bool) -> int:
     """Return the active list-item content column after an outside Markdown line."""
     if not line.strip(" \t"):
         return item_col
+    indent = len(line) - len(line.lstrip(" "))
+    if THEMATIC_BREAK_RE.match(line):
+        return item_col if indent >= item_col else 0
     if item := LIST_ITEM_RE.match(line):
         return item.end(3)
-    indent = len(line) - len(line.lstrip(" "))
-    if item_col and indent < item_col and (prev_blank or opens_fence):
+    if item_col and indent < item_col and (not prev_para or starts_block):
         return 0
     return item_col
 
@@ -315,12 +325,13 @@ def _next_item_col(line: str, item_col: int, prev_blank: bool, opens_fence: bool
 def _without_fenced_code(body: str) -> str:
     """Return bounded summary text with fenced Markdown blocks removed.
 
-    A fence opened inside a list item closes when a less-indented non-blank line closes that item.
+    A fence nested in a list item closes when a non-blank line below its column is not lazy
+    paragraph continuation text and closes that item.
     """
     kept: list[str] = []
     fence_char, fence_len, fence_col = "", 0, 0
     item_col = 0
-    prev_blank = False
+    prev_para = False
     for line in body.splitlines()[:MAX_LINES]:
         blank = not line.strip(" \t")
         indent = len(line) - len(line.lstrip(" "))
@@ -329,11 +340,12 @@ def _without_fenced_code(body: str) -> str:
         if fence_len:
             if _fence_closer(line, fence_char, fence_len):
                 fence_char, fence_len, fence_col = "", 0, 0
-            prev_blank = blank
+            prev_para = False
             continue
         opener = _fence_opener(line)
-        item_col = _next_item_col(line, item_col, prev_blank, opener is not None)
-        prev_blank = blank
+        starts_block = _starts_block(line, opener is not None)
+        item_col = _next_item_col(line, item_col, prev_para, starts_block)
+        prev_para = not (blank or starts_block or THEMATIC_BREAK_RE.match(line))
         if opener is not None:
             fence_char, fence_len = opener
             fence_col = item_col
