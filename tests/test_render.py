@@ -440,6 +440,37 @@ def test_tail_accepts_sample_policy():
     assert render._tail_problems(tail, doc, ROOT) == []
 
 
+def test_tail_runner_input_requires_string(tree):
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    files = {
+        name: (ROOT / name).read_text(encoding="utf-8")
+        for name in (CALLED, render.TAIL_WORKFLOW, "hosts.toml")
+    }
+    tree.write({**files, "exceptions.yaml": EXCEPTIONS, REAL: source})
+    assert tree.tool("render.py", "check").returncode == 0
+
+    target = "      runner: <% .RunnerTag %>\n      required:"
+    rendered_target = "      runner: ubuntu-26.04\n      required:"
+
+    empty_tail, empty_doc = _tail_documents(
+        RENDERED.replace(rendered_target, '      runner: ""\n      required:')
+    )
+    assert render._tail_problems(empty_tail, empty_doc, ROOT) == []
+    tree.write({REAL: source.replace(target, '      runner: ""\n      required:')})
+    assert tree.tool("render.py", "check").returncode == 0
+
+    seq_tail, seq_doc = _tail_documents(
+        RENDERED.replace(rendered_target, "      runner: [ubuntu-26.04]\n      required:")
+    )
+    assert render._tail_problems(seq_tail, seq_doc, ROOT) == [
+        "job required-checks passes `runner` as a non-string value"
+    ]
+    tree.write({REAL: source.replace(target, "      runner: [ubuntu-26.04]\n      required:")})
+    done = tree.tool("render.py", "check")
+    assert done.returncode == 1, done.stdout
+    assert "passes `runner` as a non-string value" in done.stderr
+
+
 def test_scorecard_template_renders_into_the_recorded_caller():
     assert rendered_real_template(REAL_SCORECARD) == RENDERED_SCORECARD
 

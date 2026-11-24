@@ -503,14 +503,19 @@ def _tail_workflow_problems(tail: dict, doc: dict, root: Path, *, check_inputs: 
     return problems
 
 
+def _tail_non_string_message(key: str) -> str:
+    kind = "value" if key == "runner" else "policy value"
+    return f"job {TAIL} passes `{key}` as a non-string {kind}"
+
+
 def _tail_policy_problems(passed: dict) -> list[str]:
-    fields = TAIL_WITH[1:]
+    policy_fields = TAIL_WITH[1:]
     problems = [
-        f"job {TAIL} passes `{key}` as a non-string policy value"
-        for key in fields
+        _tail_non_string_message(key)
+        for key in TAIL_WITH
         if key in passed and not isinstance(passed[key], str)
     ]
-    if problems or any(key not in passed for key in fields):
+    if any(key not in passed or not isinstance(passed[key], str) for key in policy_fields):
         return problems
     try:
         required_checks.parse_policy(

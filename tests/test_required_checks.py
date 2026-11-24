@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import io
+import itertools
 import json
 import os
 import re
@@ -1573,7 +1574,11 @@ def test_api_session_call_deadline_matches_remaining_budget() -> None:
             captured.append(float(deadline))
         return 200, {}, b'{"check_runs": []}'
 
-    session = ApiSession(deadline=start + 20.0, now=lambda: start, transport=transport)
+    session = ApiSession(
+        deadline=start + required_checks.WITHDRAWAL_RESERVE_SECONDS + 20.0,
+        now=lambda: start,
+        transport=transport,
+    )
     session.request_json("check-runs", f"repos/{REPO}/commits/{SHA}/check-runs")
     assert captured == [20.0]
 
@@ -1832,7 +1837,7 @@ def test_sweep_priority_rotates_successes_after_pending_and_failures() -> None:
         for m, p in record
         if m == "GET" and "/check-runs" in p
     ]
-    assert check_shas == ["d" * 40, heads[1], heads[0], heads[4], heads[5]]
+    assert check_shas == ["d" * 40, heads[2], heads[1], heads[0], heads[4]]
 
 
 def test_sweep_pending_priority_orders_never_judged_before_oldest_judged() -> None:
@@ -2625,7 +2630,7 @@ def test_sweep_api_cap_preserves_evaluation_error(monkeypatch: pytest.MonkeyPatc
 
     assert rc == 1
     assert err.count("::error::") == 1 and SHA in err
-    assert f"::warning::Sweep API call cap of {cap} reached; 1 target(s) not judged." in err
+    assert f"::warning::Sweep API call cap of {cap} reached; 2 target(s) not judged." in err
     assert fake.posts == []
 
 
@@ -2677,7 +2682,7 @@ def _review_evaluated_pulls(fake: ReviewTransport) -> list[str]:
 def test_review_sweep_rotates_thirty_one_waiting_heads() -> None:
     heads = [f"{i:040x}" for i in range(1, 32)]
     fake = _review_sweep_transport(heads, app="external", conclusion=None)
-    for run_number, expected in [(1, heads[:30]), (2, heads[30:] + heads[:29])]:
+    for run_number, expected in [(1, heads[:30]), (2, heads[15:] + heads[:14])]:
         fake.calls.clear()
         rc, err = _review_sweep(fake, run_number=run_number, apps_json='{"Build":"external"}')
         assert rc == 0, err
@@ -3387,10 +3392,7 @@ def test_sweep_block_rotation_boundaries_and_max_run_number() -> None:
         fake, run_number=required_checks.MAX_RUN_NUMBER, apps_json='{"Build":"external"}'
     )
     assert rc == 0 and err == ""
-    blocks = (heads[: len(heads) // 2], heads[len(heads) // 2 :])
-    assert any(
-        len(max_run_judged) == len(block) and set(max_run_judged) == set(block) for block in blocks
-    )
+    assert max_run_judged == [heads[30], *heads[15:30], *heads[:14]]
 
 
 def test_sweep_block_tail_unjudged_in_pass_zero_and_judged_by_pass_s_minus_k() -> None:
@@ -3455,3 +3457,343 @@ def test_contested_failure_then_contested_success_is_withdrawn() -> None:
     standing = required_checks._all_statuses(statuses)[PUSH_CONTEXT]
     assert standing["state"] == "pending"
     assert standing["description"] == "contested write; the next judgment decides"
+
+
+def test_sweep_fills_over_budget_blocks_to_max_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads31 = [f"{i:040x}" for i in range(1, 32)]
+    fake31 = _review_sweep_transport(heads31, app="external", conclusion=None)
+    expected31 = (
+        (1, heads31[:30]),
+        (2, heads31[15:] + heads31[:14]),
+        (3, [*heads31[1:15], heads31[0], *heads31[15:30]]),
+    )
+    for run_number, expected in expected31:
+        rc, judged, err = _sweep_judged_pulls(
+            fake31, run_number=run_number, apps_json='{"Build":"external"}'
+        )
+        assert rc == 0 and err == ""
+        assert judged == expected
+
+    heads60 = [f"{i:040x}" for i in range(1, 61)]
+    fake60 = _review_sweep_transport(heads60, app="external", conclusion=None)
+    for run_number, expected in ((1, heads60[:30]), (2, heads60[30:])):
+        rc, judged, err = _sweep_judged_pulls(
+            fake60, run_number=run_number, apps_json='{"Build":"external"}'
+        )
+        assert rc == 0 and err == ""
+        assert judged == expected
+
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", 10_000)
+    heads100 = [f"{i:040x}" for i in range(1, 101)]
+    fake100 = _review_sweep_transport(heads100, app="external", conclusion=None)
+    expected100 = (
+        (1, heads100[0:25] + heads100[25:30]),
+        (2, heads100[25:50] + heads100[50:55]),
+        (3, heads100[50:75] + heads100[75:80]),
+        (4, heads100[75:100] + heads100[0:5]),
+    )
+    for run_number, expected in expected100:
+        rc, judged, err = _sweep_judged_pulls(
+            fake100, run_number=run_number, apps_json='{"Build":"external"}'
+        )
+        assert rc == 0 and err == ""
+        assert judged == expected
+
+
+def test_sweep_cap_cuts_fill_before_block_members() -> None:
+    fake, heads = _deep_failure_sweep_transport(31, check_pages=6)
+    rc1, judged1, err1 = _sweep_judged_pulls(fake, run_number=1)
+    assert rc1 == 0 and "4 target(s) not judged." in err1
+    assert judged1 == [*heads[:15], *heads[15:26]]
+
+    rc2, judged2, err2 = _sweep_judged_pulls(fake, run_number=2)
+    assert rc2 == 0 and "4 target(s) not judged." in err2
+    assert judged2 == [*heads[15:31], *heads[:10]]
+
+
+def test_withdrawal_uses_reserved_deadline_window_after_work_cutoff() -> None:
+    fake = ReviewTransport()
+    post_deadlines: list[float] = []
+    reserve = getattr(required_checks, "WITHDRAWAL_RESERVE_SECONDS", 30)
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        if method == "POST":
+            deadline = kwargs.get("deadline")
+            if isinstance(deadline, (int, float)):
+                post_deadlines.append(float(deadline))
+            reply = fake(path, method=method, **kwargs)
+            if len(post_deadlines) == 1:
+                fake.clock.current = REVIEW_EPOCH + SESSION_DEADLINE_SECONDS - reserve + 10
+            return reply
+        return fake(path, method=method, **kwargs)
+
+    out, err = io.StringIO(), io.StringIO()
+    rc = run_judge(
+        _review_config(),
+        transport=transport,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=out,
+        err=err,
+    )
+    assert getattr(required_checks, "WITHDRAWAL_RESERVE_SECONDS", None) == 30
+    assert rc == 1
+    assert f"{SESSION_DEADLINE_SECONDS - reserve} s" in err.getvalue()
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    assert len(post_deadlines) == 2
+    assert 0 < post_deadlines[1] <= reserve
+    assert post_deadlines[1] == 20.0
+
+
+def test_withdrawal_refused_past_session_deadline_reports_risk() -> None:
+    fake = ReviewTransport()
+
+    def advance_past_session_deadline() -> None:
+        fake.before_post = None
+        fake.clock.current = REVIEW_EPOCH + SESSION_DEADLINE_SECONDS + 1
+
+    fake.before_post = advance_past_session_deadline
+    out, err = io.StringIO(), io.StringIO()
+    rc = run_judge(
+        _review_config(),
+        transport=fake,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=out,
+        err=err,
+    )
+    assert getattr(required_checks, "WITHDRAWAL_RESERVE_SECONDS", None) == 30
+    assert rc == 1
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+    assert "a success may rest on superseded evidence" in err.getvalue()
+
+
+def test_work_cutoff_boundary_allows_one_second_before_and_refuses_at_cutoff() -> None:
+    reserve = getattr(required_checks, "WITHDRAWAL_RESERVE_SECONDS", 30)
+    cutoff = REVIEW_EPOCH + SESSION_DEADLINE_SECONDS - reserve
+    captured: list[float] = []
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: object
+    ) -> tuple[int, dict[str, str], bytes]:
+        deadline = kwargs.get("deadline")
+        if isinstance(deadline, (int, float)):
+            captured.append(float(deadline))
+        return 200, {}, b"[]"
+
+    before = ApiSession(
+        deadline=REVIEW_EPOCH + SESSION_DEADLINE_SECONDS,
+        now=lambda: cutoff - 1,
+        transport=transport,
+    )
+    assert before.request_json("statuses", STATUSES_URL) == []
+    assert captured == [1.0]
+
+    at_cutoff = ApiSession(
+        deadline=REVIEW_EPOCH + SESSION_DEADLINE_SECONDS,
+        now=lambda: cutoff,
+        transport=transport,
+    )
+    with pytest.raises(ApiFailureError, match=rf"{SESSION_DEADLINE_SECONDS - reserve} s"):
+        at_cutoff.request_json("statuses", STATUSES_URL)
+    assert captured == [1.0]
+
+    pull = "1" * 40
+    sweep_fake = _review_sweep_transport([pull])
+    sweep_fake.advance_on_reply[STATUSES_URL] = iter([0, 0, SESSION_DEADLINE_SECONDS - reserve])
+    rc, err = _review_sweep(sweep_fake)
+    assert rc == 1
+    assert f"{SESSION_DEADLINE_SECONDS - reserve} s" in err
+    assert f"reached before judging {pull}" in err
+
+
+def test_check_run_total_order_selects_unstamped_across_permutations() -> None:
+    run_5 = check_item(5, "Build", "success", started_at="2026-11-21T12:00:02Z")
+    run_6 = check_item(6, "Build", None, status="queued", started_at=None)
+    run_9 = check_item(9, "Build", "failure", started_at="2026-11-21T12:00:01Z")
+    config = _review_config()
+    orders = list(itertools.permutations((run_5, run_6, run_9)))
+    for order in orders[:6]:
+        selected, ignored = required_checks.newest_check_runs(
+            list(order), {1}, {}, frozenset({"Build"}), "required-checks"
+        )
+        assert selected["Build"]["id"] == 6
+        snapshot = required_checks.Snapshot(selected, {}, ignored, REVIEW_EPOCH)
+        assert decide(snapshot, config, REVIEW_EPOCH, REVIEW_EPOCH)[0] == "pending"
+
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [run_6, run_9, run_5]}
+    fake.answers[STATUSES_URL] = [status_item(1, PUSH_CONTEXT, "success")]
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0 and err == ""
+    assert fake.posts == [(REVIEW_POST_PATH, "pending")]
+
+
+def test_unstamped_completed_check_run_counts_as_pending() -> None:
+    unstamped_ok = check_item(7, "Build", "success", status="completed", started_at=None)
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [unstamped_ok]}
+    fake.answers[STATUSES_URL] = [status_item(1, PUSH_CONTEXT, "success")]
+    rc, out, err, _ = _review_judge(fake)
+    assert rc == 0 and err == ""
+    assert fake.posts == [(REVIEW_POST_PATH, "pending")]
+    assert "OK (success): Build" not in out
+
+    unstamped_fail = check_item(8, "Build", "failure", status="completed", started_at=None)
+    snap = required_checks.Snapshot({"Build": unstamped_fail}, {}, (), REVIEW_EPOCH)
+    assert decide(snap, _review_config(), REVIEW_EPOCH, REVIEW_EPOCH)[0] == "pending"
+
+
+def test_check_run_equal_stamps_compare_by_id() -> None:
+    stamp = "2026-11-21T12:00:05Z"
+    older = check_item(4, "Build", "failure", started_at=stamp)
+    newer = check_item(8, "Build", "success", started_at=stamp)
+    config = _review_config()
+    for runs in ([older, newer], [newer, older]):
+        selected, ignored = required_checks.newest_check_runs(
+            runs, {1}, {}, frozenset({"Build"}), "required-checks"
+        )
+        assert selected["Build"]["id"] == 8
+        snap = required_checks.Snapshot(selected, {}, ignored, REVIEW_EPOCH)
+        assert decide(snap, config, REVIEW_EPOCH, REVIEW_EPOCH)[0] == "success"
+
+    unstamped_older = check_item(4, "Build", "failure", status="completed", started_at=None)
+    unstamped_newer = check_item(8, "Build", "success", status="completed", started_at=None)
+    for runs in ([unstamped_older, unstamped_newer], [unstamped_newer, unstamped_older]):
+        selected, ignored = required_checks.newest_check_runs(
+            runs, {1}, {}, frozenset({"Build"}), "required-checks"
+        )
+        assert selected["Build"]["id"] == 8
+        snap = required_checks.Snapshot(selected, {}, ignored, REVIEW_EPOCH)
+        assert decide(snap, config, REVIEW_EPOCH, REVIEW_EPOCH)[0] == "pending"
+
+
+def _run_non_json_post_case(
+    conclusion: str,
+) -> tuple[int, str, ReviewTransport, ApiSession]:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", conclusion)]}
+    post_count = 0
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        nonlocal post_count
+        if method == "POST":
+            post_count += 1
+            if post_count == 1:
+                fake.posts.append((path, kwargs["fields"]["state"]))
+                return 201, {}, b"<html>201 Created</html>"
+        return fake(path, method=method, **kwargs)
+
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=transport,
+        out=io.StringIO(),
+    )
+    err = io.StringIO()
+    rc = required_checks.evaluate_one(session, _review_config(), io.StringIO(), err)
+    return rc, err.getvalue(), fake, session
+
+
+def test_success_post_non_json_body_withdraws_and_reports_decode_error() -> None:
+    rc, err, fake, session = _run_non_json_post_case("success")
+    assert rc == 1
+    assert "post-status" in err and "Expecting value" in err
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    assert session.withdrawal_reserved is False
+    assert session.api_calls == 6
+
+
+def test_success_post_422_sets_no_reservation_and_posts_no_withdrawal() -> None:
+    fake = ReviewTransport()
+    fake.post_errors = iter(
+        [forge.ResponseError("POST failed: HTTP 422", status=422, message="Unprocessable Entity")]
+    )
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=fake,
+        out=io.StringIO(),
+    )
+    err = io.StringIO()
+    rc = required_checks.evaluate_one(session, _review_config(), io.StringIO(), err)
+    assert rc == 1
+    assert "422" in err.getvalue()
+    assert session.withdrawal_reserved is False
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
+def test_failure_post_non_json_body_posts_no_withdrawal() -> None:
+    rc, err, fake, session = _run_non_json_post_case("failure")
+    assert rc == 1
+    assert "post-status" in err and "Expecting value" in err
+    assert session.withdrawal_reserved is False
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+
+
+def test_sweep_cap_counts_unjudged_when_exhausted_by_default_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = ["1" * 40, "2" * 40, "3" * 40]
+    fake = _review_sweep_transport(heads)
+    fake.answers[CHECKS_URL] = {}
+    cap = 6 + 2
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+    rc, err = _review_sweep(fake)
+    assert rc == 1
+    assert f"::warning::Sweep API call cap of {cap} reached; 3 target(s) not judged." in err
+    assert fake.posts == []
+    assert len(fake.calls) == cap
+
+
+def test_sweep_cap_counts_interrupted_head_as_unjudged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = ["1" * 40, "2" * 40, "3" * 40]
+    fake = _review_sweep_transport(heads)
+    cap = 6 + 6 + 6 + 2
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+    rc, err = _review_sweep(fake)
+    assert rc == 0
+    assert f"::warning::Sweep API call cap of {cap} reached; 2 target(s) not judged." in err
+    assert fake.posts == [
+        (REVIEW_POST_PATH, "success"),
+        (REVIEW_POST_PATH.replace(SHA, heads[0]), "success"),
+    ]
+
+
+def test_sweep_cap_excludes_head_finishing_at_exact_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = ["1" * 40, "2" * 40, "3" * 40]
+    settled_desc = "All owed required checks reported success."
+    fake = _review_sweep_transport(heads)
+    for idx, sha in enumerate(heads):
+        row = status_item(
+            idx + 1, "required-checks", "success", updated_at=f"2026-11-21T10:00:0{idx}Z"
+        )
+        fake.answers[STATUSES_URL.replace(SHA, sha)] = [{**row, "description": settled_desc}]
+    cap = 6 + 6 + 3 + 3
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+    rc, err = _review_sweep(fake)
+    assert rc == 0
+    assert f"::warning::Sweep API call cap of {cap} reached; 1 target(s) not judged." in err
+    assert len(fake.calls) == cap
+
+    fake_all = _review_sweep_transport(heads)
+    for idx, sha in enumerate(heads):
+        row = status_item(
+            idx + 1, "required-checks", "success", updated_at=f"2026-11-21T10:00:0{idx}Z"
+        )
+        fake_all.answers[STATUSES_URL.replace(SHA, sha)] = [{**row, "description": settled_desc}]
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap + 3)
+    rc_all, err_all = _review_sweep(fake_all)
+    assert rc_all == 0 and err_all == ""

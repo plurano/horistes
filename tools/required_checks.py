@@ -36,6 +36,8 @@ MAX_TARGETS_MAX = 100
 MAX_TARGETS_DEFAULT = 30
 MAX_RUN_NUMBER = 10**9
 SESSION_DEADLINE_SECONDS = 8 * 60
+WITHDRAWAL_RESERVE_SECONDS = 30
+WORK_DEADLINE_SECONDS = SESSION_DEADLINE_SECONDS - WITHDRAWAL_RESERVE_SECONDS
 POST_FRESH_SECONDS = 10
 SWEEP_MAX_CALLS = 250
 TRIAGE_MAX_CALLS = 120
@@ -456,6 +458,13 @@ def parse_config(raw: RawInputs) -> Config:
     )
 
 
+def _decode_json(label: str, body: bytes) -> object:
+    try:
+        return json.loads(body)
+    except ValueError as err:
+        raise ApiFailureError(f"GitHub API error ({label}): {err}") from err
+
+
 class ApiSession:
     """Bounded forge client with 5xx outage backoff and rate-limit budget tracking."""
 
@@ -470,12 +479,14 @@ class ApiSession:
         max_api_calls: int | None = None,
     ) -> None:
         self.deadline = deadline
+        self.work_deadline = deadline - WITHDRAWAL_RESERVE_SECONDS
         self.now = now
         self.sleep = sleep
         self.transport = transport
         self.out = out
         self.max_api_calls = max_api_calls
         self.api_calls = 0
+        self.cap_reached = False
         self.withdrawal_reserved = False
         self.rate_limit_waited_seconds = 0.0
         self.rate_limit_wait_count = 0
@@ -485,7 +496,7 @@ class ApiSession:
             return False
         if self.rate_limit_waited_seconds + delay > MAX_RATE_LIMIT_SECONDS:
             return False
-        return self.now() + delay <= self.deadline
+        return self.now() + delay < self.work_deadline
 
     def _wait_rate_limit(
         self, label: str, err: forge.ResponseError, delay: int | float, waits: int
@@ -508,10 +519,11 @@ class ApiSession:
                 "after backoff budget. No check result was judged; rerun this job."
             ) from err
         seconds = API_BACKOFF_SECONDS[attempt]
-        if self.now() + seconds > self.deadline:
+        if self.now() + seconds >= self.work_deadline:
             raise ApiFailureError(
                 f"Transient GitHub API failure: {label} still answers HTTP {err.status} "
-                "at the session deadline. No check result was judged; rerun this job."
+                f"at the {WORK_DEADLINE_SECONDS} s session work cutoff. "
+                "No check result was judged; rerun this job."
             ) from err
         self._check_api_cap(label)
         self.out.write(
@@ -519,36 +531,49 @@ class ApiSession:
         )
         self.sleep(seconds)
 
-    def _call_deadline(self, label: str) -> float:
-        """Per-call transport deadline capped by the remaining session budget."""
-        remaining = self.deadline - self.now()
+    def _call_deadline(self, label: str, *, withdrawal: bool = False) -> float:
+        """Per-call transport deadline capped by the remaining work or withdrawal budget."""
+        limit = self.deadline if withdrawal else self.work_deadline
+        remaining = limit - self.now()
         if remaining <= 0:
+            bound = (
+                f"Session deadline of {SESSION_DEADLINE_SECONDS} s"
+                if withdrawal
+                else f"Session deadline work cutoff of {WORK_DEADLINE_SECONDS} s"
+            )
             raise ApiFailureError(
-                f"Session deadline of {SESSION_DEADLINE_SECONDS} s reached during {label}. "
-                "No check result was judged; rerun this job."
+                f"{bound} reached during {label}. No check result was judged; rerun this job."
             )
         return min(forge.DEADLINE_SECONDS, remaining)
 
     def _check_api_cap(self, label: str, *, reserve: int = 0) -> None:
         reserve = max(reserve, int(self.withdrawal_reserved))
         if self.max_api_calls is not None and self.api_calls + reserve >= self.max_api_calls:
+            self.cap_reached = True
             raise ApiCapReachedError(
                 f"Sweep API call cap of {self.max_api_calls} reached during {label}."
             )
 
-    def _request_once(
-        self, label: str, path: str, method: str, *, reserve: int = 0, **kw: object
-    ) -> object:
+    def _request_bytes(
+        self,
+        label: str,
+        path: str,
+        method: str,
+        *,
+        reserve: int = 0,
+        withdrawal: bool = False,
+        **kw: object,
+    ) -> bytes:
         """Count every transport attempt, including failures and retries."""
         self._check_api_cap(label, reserve=reserve)
-        deadline = self._call_deadline(label)
+        deadline = self._call_deadline(label, withdrawal=withdrawal)
         self.api_calls += 1
         try:
             _, _, body = self.transport(path, method=method, deadline=deadline, **kw)
-            return json.loads(body)
+            return body
         except forge.ResponseError:
             raise
-        except (forge.ForgeError, ValueError) as err:
+        except forge.ForgeError as err:
             raise ApiFailureError(f"GitHub API error ({label}): {err}") from err
 
     def wait_to_retry_post(self, failure: PostFailureError) -> None:
@@ -562,22 +587,54 @@ class ApiSession:
         else:
             raise failure
 
+    def _post_json(
+        self,
+        label: str,
+        path: str,
+        method: str,
+        *,
+        withdrawal: bool = False,
+        reserve_withdrawal: bool | None = None,
+        **kw: object,
+    ) -> object:
+        """Send one non-GET request and update withdrawal reservation before decoding."""
+        try:
+            # Verification and a possible withdrawal each need one call.
+            reserve = 0 if withdrawal else 2
+            body = self._request_bytes(
+                label, path, method, reserve=reserve, withdrawal=withdrawal, **kw
+            )
+        except forge.ResponseError as err:
+            raise PostFailureError(label, err) from err
+        if reserve_withdrawal is not None:
+            self.withdrawal_reserved = reserve_withdrawal
+        return _decode_json(label, body)
+
     def request_json(
-        self, label: str, path: str, *, method: str = "GET", withdrawal: bool = False, **kw: object
+        self,
+        label: str,
+        path: str,
+        *,
+        method: str = "GET",
+        withdrawal: bool = False,
+        reserve_withdrawal: bool | None = None,
+        **kw: object,
     ) -> object:
         """Decode one JSON endpoint. Only GET requests retry within the session."""
         if method != "GET":
-            try:
-                # Verification and a possible withdrawal each need one call.
-                reserve = 0 if withdrawal else 2
-                return self._request_once(label, path, method, reserve=reserve, **kw)
-            except forge.ResponseError as err:
-                raise PostFailureError(label, err) from err
+            return self._post_json(
+                label,
+                path,
+                method,
+                withdrawal=withdrawal,
+                reserve_withdrawal=reserve_withdrawal,
+                **kw,
+            )
         server_attempts = 0
         rate_limit_waits = 0
         for _ in range(MAX_CALL_ATTEMPTS):
             try:
-                return self._request_once(label, path, method, **kw)
+                return _decode_json(label, self._request_bytes(label, path, method, **kw))
             except forge.ResponseError as err:
                 delay = forge.rate_limit_delay(
                     err.status, err.headers, err.message, rate_limit_waits, self.now()
@@ -699,18 +756,26 @@ def _check_run_admitted(
     return name, None
 
 
-def _check_run_stamp(run: dict) -> object:
-    return run.get("started_at") or run.get("created_at") or run.get("completed_at")
+def _check_run_epoch(run: dict) -> float:
+    return (
+        _iso_epoch(run.get("started_at"))
+        or _iso_epoch(run.get("created_at"))
+        or _iso_epoch(run.get("completed_at"))
+    )
+
+
+def _check_run_key(run: dict) -> tuple[int, float, int]:
+    epoch = _check_run_epoch(run)
+    run_id = _int_id(run.get("id"))
+    return (0, epoch, run_id) if epoch > 0 else (1, 0.0, run_id)
 
 
 def _newer_check_run(candidate: dict, current: dict) -> bool:
-    candidate_id = _int_id(candidate.get("id"))
-    current_id = _int_id(current.get("id"))
-    candidate_stamp = _check_run_stamp(candidate)
-    current_stamp = _check_run_stamp(current)
-    if not candidate_stamp or not current_stamp:
-        return candidate_id >= current_id
-    return (_iso_epoch(candidate_stamp), candidate_id) >= (_iso_epoch(current_stamp), current_id)
+    return _check_run_key(candidate) >= _check_run_key(current)
+
+
+def _check_run_completed(run: dict) -> bool:
+    return run.get("status") == "completed" and _check_run_epoch(run) > 0
 
 
 def newest_check_runs(
@@ -866,14 +931,14 @@ def _records_for(name: str, snapshot: Snapshot, config: Config) -> tuple[dict | 
 
 
 def _is_context_pending(run: dict | None, status: dict | None) -> bool:
-    run_pending = run is not None and run.get("status") != "completed"
+    run_pending = run is not None and not _check_run_completed(run)
     status_pending = status is not None and status.get("state") == "pending"
     return run_pending or status_pending
 
 
 def _terminal_failure(run: dict | None, status: dict | None) -> bool:
     check_failed = (
-        run is not None and run.get("status") == "completed" and run.get("conclusion") != "success"
+        run is not None and _check_run_completed(run) and run.get("conclusion") != "success"
     )
     status_failed = status is not None and status.get("state") not in ("pending", "success")
     return check_failed or status_failed
@@ -937,7 +1002,7 @@ def _judge_exempt(
     name: str, reason: str, run: dict | None, status: dict | None
 ) -> tuple[bool, str]:
     """Judge an exempt context: absent, skipped, pending or success pass; failures fail."""
-    if run is not None and run.get("status") == "completed":
+    if run is not None and _check_run_completed(run):
         conclusion = str(run.get("conclusion") or "completed")
         if conclusion not in {"success", "skipped"}:
             return False, f"{name}: {conclusion} (ran although {reason})"
@@ -951,8 +1016,10 @@ def _judge_exempt(
 def _owed_run_problem(run: dict | None) -> str:
     if run is None:
         return ""
-    if run.get("status") != "completed":
-        return f"still {run.get('status') or 'pending'}"
+    if not _check_run_completed(run):
+        status = run.get("status")
+        state = "pending" if status == "completed" else (status or "pending")
+        return f"still {state}"
     if run.get("conclusion") != "success":
         return str(run.get("conclusion") or "completed")
     return ""
@@ -1017,9 +1084,13 @@ def post_commit_status(
     path = f"repos/{config.repository}/statuses/{config.sha}"
     fields = _status_fields(config, state, description)
     answer = session.request_json(
-        "post-status", path, method="POST", withdrawal=withdrawal, fields=fields
+        "post-status",
+        path,
+        method="POST",
+        withdrawal=withdrawal,
+        reserve_withdrawal=state == "success",
+        fields=fields,
     )
-    session.withdrawal_reserved = state == "success"
     status_id = answer.get("id") if isinstance(answer, dict) else None
     if not isinstance(status_id, int) or isinstance(status_id, bool):
         raise ApiFailureError(f"GitHub API error (post-status): POST {path}: no integer id")
@@ -1290,6 +1361,7 @@ def _sweep_triage(session: ApiSession, config: Config, heads: list[str]) -> dict
         return _read_triage_statuses(session, config, heads)
     finally:
         session.max_api_calls = sweep_cap
+        session.cap_reached = False
 
 
 def _triage_priority(status: dict | None) -> tuple[int, float]:
@@ -1300,7 +1372,7 @@ def _triage_priority(status: dict | None) -> tuple[int, float]:
 
 
 def _sweep_evaluation_order(session: ApiSession, config: Config, heads: list[str]) -> list[str]:
-    """Build the priority list and rotate within this run's balanced block when over budget."""
+    """Build the priority list, rotating this run's balanced block and filling to max_targets."""
     pr_config = replace(config, event_name="pull_request")
     judged = _sweep_triage(session, pr_config, heads)
     candidates = sorted(heads[:OPEN_PULLS_MAX], key=lambda sha: _triage_priority(judged.get(sha)))
@@ -1312,9 +1384,12 @@ def _sweep_evaluation_order(session: ApiSession, config: Config, heads: list[str
     index = config.run_number - 1
     block = index % blocks
     cycle = index // blocks
-    members = candidates[block * n // blocks : (block + 1) * n // blocks]
+    lo = block * n // blocks
+    hi = (block + 1) * n // blocks
+    members = candidates[lo:hi]
     start = cycle % len(members)
-    return members[start:] + members[:start]
+    fill = (candidates[hi:] + candidates[:lo])[: budget - len(members)]
+    return members[start:] + members[:start] + fill
 
 
 def _default_branch_head(session: ApiSession, repository: str) -> tuple[str, str]:
@@ -1335,14 +1410,21 @@ def _default_branch_head(session: ApiSession, repository: str) -> tuple[str, str
 
 
 def _sweep_deadline_passed(session: ApiSession, err: TextIO, what: str) -> bool:
-    """Refuse the next sweep target once the session deadline has passed."""
-    if session.now() < session.deadline:
+    """Refuse the next sweep target once the session work cutoff has passed."""
+    if session.now() < session.work_deadline:
         return False
     err.write(
-        f"::error::Session deadline of {SESSION_DEADLINE_SECONDS} s reached before "
+        f"::error::Session deadline work cutoff of {WORK_DEADLINE_SECONDS} s reached before "
         f"judging {what}. No check result was judged; rerun this job.\n"
     )
     return True
+
+
+def _warn_unjudged_targets(err: TextIO, count: int) -> None:
+    err.write(
+        f"::warning::Sweep API call cap of {SWEEP_MAX_CALLS} reached; "
+        f"{count} target(s) not judged.\n"
+    )
 
 
 def _sweep_default_branch(
@@ -1358,6 +1440,33 @@ def _sweep_default_branch(
         sweep_cfg, sha=sha, event_name="push", ref=f"refs/heads/{branch}", only_if_pending=False
     )
     return evaluate_one(session, default_cfg, out, err)
+
+
+def _sweep_pull_heads(
+    session: ApiSession,
+    sweep_cfg: Config,
+    to_eval: list[str],
+    result: int,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """Judge selected pull heads until the cap or work cutoff stops the sweep."""
+    unjudged = len(to_eval[:MAX_TARGETS_MAX])
+    for sha in to_eval[:MAX_TARGETS_MAX]:
+        if session.api_calls >= SWEEP_MAX_CALLS:
+            _warn_unjudged_targets(err, unjudged)
+            return result
+        if _sweep_deadline_passed(session, err, sha):
+            return 1
+        session.cap_reached = False
+        one = replace(sweep_cfg, sha=sha, event_name="pull_request")
+        if evaluate_one(session, one, out, err) != 0:
+            result = 1
+        if not session.cap_reached:
+            unjudged -= 1
+    if unjudged > 0 and session.cap_reached:
+        _warn_unjudged_targets(err, unjudged)
+    return result
 
 
 def run_sweep(
@@ -1392,21 +1501,7 @@ def run_sweep(
     if _sweep_deadline_passed(session, err, "the default branch"):
         return 1
     result = _sweep_default_branch(session, sweep_cfg, default_head, out, err)
-    pending = len(to_eval)
-    for sha in to_eval[:MAX_TARGETS_MAX]:
-        pending -= 1
-        if _sweep_deadline_passed(session, err, sha):
-            return 1
-        one = replace(sweep_cfg, sha=sha, event_name="pull_request")
-        if evaluate_one(session, one, out, err) != 0:
-            result = 1
-        if session.api_calls >= SWEEP_MAX_CALLS:
-            err.write(
-                f"::warning::Sweep API call cap of {SWEEP_MAX_CALLS} reached; "
-                f"{pending} target(s) not judged.\n"
-            )
-            break
-    return result
+    return _sweep_pull_heads(session, sweep_cfg, to_eval, result, out, err)
 
 
 def run_judge(
