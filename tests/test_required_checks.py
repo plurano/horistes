@@ -2633,6 +2633,8 @@ def test_review_post_retry_rereads_before_next_attempt(
     expected_posts = [(REVIEW_POST_PATH, "success")]
     if wait:
         expected_posts.append((REVIEW_POST_PATH, "failure"))
+    if error_status == 502 and repeat:
+        expected_posts.append((REVIEW_POST_PATH, "pending"))
     assert fake.posts == expected_posts
     assert rc == expected_rc, err
     assert ("::error::" in err) == (expected_rc == 1)
@@ -4150,3 +4152,159 @@ def test_short_verification_page_with_own_id_accepts_without_reread() -> None:
     assert fake.posts == [(REVIEW_POST_PATH, "success")]
     assert fake.calls.count(("GET", CHECKS_URL)) == 1
     assert _statuses_get_count([path for _, path in fake.calls]) == 3
+
+
+def _run_post_response_error_case(
+    errors: list[forge.ResponseError], *, conclusion: str = "success"
+) -> tuple[int, str, str, ReviewTransport, ApiSession]:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", conclusion)]}
+    fake.post_errors = iter(errors)
+    out, err = io.StringIO(), io.StringIO()
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=fake,
+        out=out,
+    )
+    rc = required_checks.evaluate_one(session, _review_config(), out, err)
+    return rc, out.getvalue(), err.getvalue(), fake, session
+
+
+def test_success_post_response_error_without_status_withdraws_and_reports_error() -> None:
+    error = forge.ResponseError(
+        f"POST {REVIEW_POST_PATH}: TLS connection reset",
+        status=None,
+        message="TLS connection reset",
+    )
+    rc, _, err, fake, session = _run_post_response_error_case([error])
+    assert rc == 1
+    assert "::error::GitHub API error (post-status):" in err
+    assert "TLS connection reset" in err
+    assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    assert fake.answers[STATUSES_URL][0]["state"] == "pending"
+    assert (
+        fake.answers[STATUSES_URL][0]["description"] == "contested write; the next judgment decides"
+    )
+    assert session.withdrawal_reserved is False
+    assert session.api_calls == 6
+    assert required_checks.TransportFailureError.__doc__ == (
+        "A transport attempt ended without an HTTP answer; the request may have reached GitHub."
+    )
+
+
+def test_success_post_502_twice_withdraws_after_retry_and_reports_error() -> None:
+    err_502 = forge.ResponseError(
+        "POST failed: HTTP 502: Bad Gateway", status=502, message="Bad Gateway"
+    )
+    rc, _, err, fake, session = _run_post_response_error_case([err_502, err_502])
+    assert rc == 1
+    assert fake.clock.sleeps == [30]
+    assert "::error::GitHub API error (post-status):" in err
+    assert "HTTP 502" in err and "Bad Gateway" in err
+    assert fake.posts == [
+        (REVIEW_POST_PATH, "success"),
+        (REVIEW_POST_PATH, "success"),
+        (REVIEW_POST_PATH, "pending"),
+    ]
+    assert fake.answers[STATUSES_URL][0]["state"] == "pending"
+    assert (
+        fake.answers[STATUSES_URL][0]["description"] == "contested write; the next judgment decides"
+    )
+    assert session.withdrawal_reserved is False
+    assert session.api_calls == 11
+
+
+def _stored_502_case(
+    *, only_if_pending: bool
+) -> tuple[int, str, str, ReviewTransport, ApiSession, list[bool]]:
+    fake = ReviewTransport()
+    reserved_on_get: list[bool] = []
+    session: ApiSession
+
+    def store_then_502(
+        path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        if method == "GET" and len(fake.posts) == 1:
+            reserved_on_get.append(session.withdrawal_reserved)
+        reply = fake(path, method=method, **kwargs)
+        if method == "POST" and len(fake.posts) == 1:
+            raise forge.ResponseError("POST failed: HTTP 502", status=502, message="Bad Gateway")
+        return reply
+
+    out, err = io.StringIO(), io.StringIO()
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=store_then_502,
+        out=out,
+    )
+    cfg = _review_config(only_if_pending=only_if_pending)
+    rc = required_checks.evaluate_one(session, cfg, out, err)
+    return rc, out.getvalue(), err.getvalue(), fake, session, reserved_on_get
+
+
+def test_success_post_502_stored_by_github_clears_reservation_only_on_fresh_decision() -> None:
+    rc, out, err, fake, session, reserved_on_get = _stored_502_case(only_if_pending=False)
+    assert rc == 0 and err == ""
+    assert fake.clock.sleeps == [30]
+    assert reserved_on_get == [True, True, True, True]
+    assert session.withdrawal_reserved is False
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+    assert f"No status post: {PUSH_CONTEXT} on {SHA} keeps success; verdict success" in out
+    assert fake.answers[STATUSES_URL][0]["state"] == "success"
+    assert session.api_calls == 9
+
+    rc_skip, _, err_skip, fake_skip, session_skip, skip_gets = _stored_502_case(
+        only_if_pending=True
+    )
+    assert rc_skip == 0 and err_skip == ""
+    assert skip_gets == [True]
+    assert session_skip.withdrawal_reserved is False
+    assert fake_skip.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    assert fake_skip.answers[STATUSES_URL][0]["state"] == "pending"
+    assert session_skip.api_calls == 7
+
+
+def test_failure_post_response_error_without_status_posts_no_withdrawal() -> None:
+    error = forge.ResponseError(
+        f"POST {REVIEW_POST_PATH}: TLS connection reset",
+        status=None,
+        message="TLS connection reset",
+    )
+    rc, _, err, fake, session = _run_post_response_error_case([error], conclusion="failure")
+    assert rc == 1
+    assert "TLS connection reset" in err
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+    assert session.withdrawal_reserved is False
+    assert session.api_calls == 5
+
+
+@pytest.mark.parametrize(
+    ("status", "repeats", "expected_sleeps", "expected_states", "expected_calls"),
+    [
+        (399, 1, [], ["success", "pending"], 6),
+        (400, 1, [], ["success"], 5),
+        (499, 1, [], ["success"], 5),
+        (500, 2, [30], ["success", "success", "pending"], 11),
+    ],
+)
+def test_success_post_definitive_rejection_status_boundaries(
+    status: int,
+    repeats: int,
+    expected_sleeps: list[float],
+    expected_states: list[str],
+    expected_calls: int,
+) -> None:
+    err_item = forge.ResponseError(
+        f"POST failed: HTTP {status}", status=status, message=f"status {status}"
+    )
+    rc, _, err, fake, session = _run_post_response_error_case([err_item] * repeats)
+    assert rc == 1
+    assert f"HTTP {status}" in err
+    assert fake.clock.sleeps == expected_sleeps
+    assert fake.posts == [(REVIEW_POST_PATH, state) for state in expected_states]
+    assert session.withdrawal_reserved is False
+    assert session.api_calls == expected_calls

@@ -82,7 +82,7 @@ class ApiFailureError(Exception):
 
 
 class TransportFailureError(ApiFailureError):
-    """A transport attempt failed after sending without an HTTP response."""
+    """A transport attempt ended without an HTTP answer; the request may have reached GitHub."""
 
 
 class ApiCapReachedError(Exception):
@@ -469,6 +469,12 @@ def _decode_json(label: str, body: bytes) -> object:
         raise ApiFailureError(f"GitHub API error ({label}): {err}") from err
 
 
+def _is_definitive_rejection(err: forge.ResponseError) -> bool:
+    """Whether an HTTP response error guarantees GitHub stored no commit status."""
+    status = err.status
+    return isinstance(status, int) and not isinstance(status, bool) and 400 <= status < 500
+
+
 class ApiSession:
     """Bounded forge client with 5xx outage backoff and rate-limit budget tracking."""
 
@@ -609,6 +615,8 @@ class ApiSession:
                 label, path, method, reserve=reserve, withdrawal=withdrawal, **kw
             )
         except forge.ResponseError as err:
+            if reserve_withdrawal and not _is_definitive_rejection(err):
+                self.withdrawal_reserved = True
             raise PostFailureError(label, err) from err
         except TransportFailureError:
             if reserve_withdrawal:
