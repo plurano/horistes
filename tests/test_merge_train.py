@@ -2654,17 +2654,15 @@ def derive_patching_helpers(module: ast.Module) -> set[str]:
 
 
 def key_builds_after_shared_module_patch(source: str) -> list[str]:
-    """Find test functions with a key build later in the source than a shared patch."""
+    """Find functions with a key build later in the source than a shared patch."""
     module = ast.parse(source)
     builders = derive_key_builders(module)
     patching_helpers = derive_patching_helpers(module)
     offenders = []
-    for test in ast.walk(module):
-        if not isinstance(test, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    for function in ast.walk(module):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not test.name.startswith("test_"):
-            continue
-        calls = [node for node in ast.walk(test) if isinstance(node, ast.Call)]
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
         patched_at = min(
             (
                 (call.end_lineno, call.end_col_offset)
@@ -2680,7 +2678,7 @@ def key_builds_after_shared_module_patch(source: str) -> list[str]:
             and (call.lineno, call.col_offset) >= patched_at
             for call in calls
         ):
-            offenders.append(test.name)
+            offenders.append(function.name)
     return offenders
 
 
@@ -2805,6 +2803,53 @@ def test_key_build_order_check(first, second, expected):
         "def shrink_indirectly(monkeypatch):\n    shrink(monkeypatch)\n"
         'def patch_train_module(monkeypatch):\n    monkeypatch.setattr(train_mod, "call", fake)\n'
         f"def test_example(monkeypatch):\n    {first}\n    {second}\n"
+    )
+    assert key_builds_after_shared_module_patch(source) == expected
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        pytest.param(
+            'monkeypatch.setattr(train_mod.os, "pipe", small)',
+            "app_key()",
+            ["case_helper"],
+            id="helper-patch-before-key",
+        ),
+        pytest.param(
+            "app_key()",
+            'monkeypatch.setattr(train_mod.os, "pipe", small)',
+            [],
+            id="helper-key-before-patch",
+        ),
+        pytest.param(
+            "shrink(monkeypatch)",
+            'non_rsa_app_key("ec")',
+            ["case_helper"],
+            id="helper-transitive-patch-before-builder-helper",
+        ),
+        pytest.param(
+            'monkeypatch.setattr(train_mod.os, "pipe", small); app_key()',
+            "pass",
+            ["case_helper"],
+            id="helper-patch-before-key-same-line",
+        ),
+        pytest.param(
+            'monkeypatch.setattr(train_mod, "call", fake)',
+            "app_key()",
+            [],
+            id="helper-safe-target-before-key",
+        ),
+    ],
+)
+def test_key_build_order_inside_helpers(first, second, expected):
+    """Check key-build ordering inside helpers that both patch and build a key."""
+    source = (
+        "def non_rsa_app_key(kind):\n    return app_key()\n"
+        'def app_key():\n    return openssl("genpkey")\n'
+        'def shrink(monkeypatch):\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+        f"def case_helper(monkeypatch):\n    {first}\n    {second}\n"
+        "def test_example(monkeypatch):\n    case_helper(monkeypatch)\n"
     )
     assert key_builds_after_shared_module_patch(source) == expected
 
