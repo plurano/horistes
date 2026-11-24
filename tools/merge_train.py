@@ -1081,8 +1081,9 @@ def enqueue(env, conf, pull):
 def land(env, conf, pull, queue):
     if queue:
         return enqueue(env, conf, pull)
+    variables = commit_variables(env, conf, pull)
     try:
-        data = graphql(env, MERGE, commit_variables(env, conf, pull))
+        data = graphql(env, MERGE, variables)
     except MergeInProgressError:
         # The forge is already merging it; the next run reads the result.
         return "merge in flight"

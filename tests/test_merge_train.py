@@ -10790,6 +10790,37 @@ def test_without_the_read_wrapper_the_state_read_refuses(tmp_path):
     assert "HTTP 502" in done.stdout
 
 
+COMMITS_QUERY_MARKER = "message parents { totalCount }"
+
+
+def test_exhausted_commits_read_in_land_is_not_a_moved_note(tmp_path):
+    """Negative: an exhausted COMMITS read in land warns as not read, never as moved."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN")))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[COMMITS_QUERY_MARKER] = [502] * 3
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert forge.hold_faults[COMMITS_QUERY_MARKER] == []
+    assert forge.writes == []
+    assert "not landed: the merge state moved" not in summary
+    assert_not_read(done, summary, "fleet/app")
+
+
+def test_transient_commits_read_in_land_lands_on_third_try(tmp_path):
+    """Boundary: two 502 COMMITS answers in land then success still land the pull request."""
+    forge = HoldReadForge(repository(pull(1, "CLEAN")))
+    forge.hold_fault_message = "Pull request is not mergeable"
+    forge.hold_faults[COMMITS_QUERY_MARKER] = [502, 502]
+    forge.merge_states[1] = "BEHIND"
+    done, summary = train(tmp_path, forge)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.hold_faults[COMMITS_QUERY_MARKER] == []
+    assert forge.writes == [landed(1)]
+    assert "### fleet/app: landed #1" in summary
+    assert "Not read after" not in summary
+    assert "::warning title=Merge train not read::" not in done.stdout
+
+
 # Retry history is fresh relative to NOW, independent of the older head-suite fixtures.
 def retry_suite(conclusion="FAILURE", *, when=None, workflow=1, number=1, app="github-actions"):
     node = suite(number, conclusion, 0, workflow=workflow, app=app)
@@ -12507,16 +12538,29 @@ def test_adr93_mutations_reject_defects(tmp_path, section, module_name, old, new
 class HoldReadForge(Forge):
     """Fail only selected hold reads, leaving the rest of the sweep live."""
 
+    def __init__(self, *reads: dict) -> None:
+        super().__init__(*reads)
+        self.hold_faults: dict[str, list[int]] = {}
+        self.hold_fault_message: str | None = None
+
+    def _hold_fault_body(self, status: int) -> dict[str, str]:
+        text = (
+            f"stand-in forge: queued HTTP {status}"
+            if self.hold_fault_message is None
+            else self.hold_fault_message
+        )
+        return {"message": text}
+
     def graphql_response(self, header, query, variables):
         for marker, statuses in self.hold_faults.items():
             if not statuses:
                 continue
             if marker == "states: MERGED" and "states: MERGED" in query:
                 status = statuses.pop(0)
-                return status, {"message": f"stand-in forge: queued HTTP {status}"}
+                return status, self._hold_fault_body(status)
             if marker in query and "pullRequests(" not in query:
                 status = statuses.pop(0)
-                return status, {"message": f"stand-in forge: queued HTTP {status}"}
+                return status, self._hold_fault_body(status)
         return super().graphql_response(header, query, variables)
 
 
@@ -12682,6 +12726,18 @@ def test_no_status_text_match_in_merge_train():
 
 
 REFUSED_CATCH_ALLOWED = {
+    "call": "retry loop: request_once raises RefusedError only; the last try raises UnreadError",
+    "read_graphql": (
+        "retry loop: graphql sends one POST, which never raises UnreadError; "
+        "the last try raises UnreadError"
+    ),
+    "enqueue": (
+        "wraps the ENQUEUE mutation, which never raises UnreadError; a moved pull request is a note"
+    ),
+    "land": (
+        "wraps the MERGE mutation, which never raises UnreadError; a moved pull request is a note"
+    ),
+    "update": "wraps the update-branch PUT, which never raises UnreadError",
     "_maintainer_unanswered": "recorded_right records an exhausted read before this conversion",
     "_unanswered_body_hold": "recorded_right records an exhausted read before this hold",
     "_ask_update_bot_recreate": "wraps a POST, which never raises UnreadError",
@@ -12707,22 +12763,179 @@ def _excepts_refused_or_unread(handler: ast.ExceptHandler) -> bool:
     return False
 
 
-def _handler_records_or_reraises(handler: ast.ExceptHandler) -> bool:
-    for node in ast.walk(ast.Module(body=handler.body, type_ignores=[])):
-        if isinstance(node, ast.Raise) and node.exc is None:
-            return True
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "record_unread"
+_COVER, _ESCAPE, _PASS = "cover", "escape", "pass"
+_EXITS = (ast.Return, ast.Break, ast.Continue)
+
+
+def _source_retry_codes(tree: ast.Module) -> frozenset[int] | None:
+    for stmt in tree.body[:500]:
+        if isinstance(stmt, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "RETRY_CODES" for target in stmt.targets
         ):
-            return True
-    return False
+            return frozenset(ast.literal_eval(stmt.value))
+    return None
+
+
+def _retry_codes_for(tree: ast.Module) -> frozenset[int]:
+    found = _source_retry_codes(tree)
+    if found is not None:
+        return found
+    fallback = _source_retry_codes(ast.parse(script()))
+    assert fallback is not None
+    return fallback
+
+
+def _is_http_status_call(expr: ast.AST, err_name: str | None) -> bool:
+    return (
+        err_name is not None
+        and isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "http_status"
+        and len(expr.args) == 1
+        and not expr.keywords
+        and isinstance(expr.args[0], ast.Name)
+        and expr.args[0].id == err_name
+    )
+
+
+def _status_guard_op(
+    expr: ast.AST, err_name: str | None, retry_codes: frozenset[int]
+) -> ast.cmpop | None:
+    if not isinstance(expr, ast.Compare) or len(expr.ops) != 1 or len(expr.comparators) != 1:
+        return None
+    right = expr.comparators[0]
+    if not _is_http_status_call(expr.left, err_name):
+        return None
+    if (
+        isinstance(right, ast.Constant)
+        and type(right.value) is int
+        and right.value not in retry_codes
+    ):
+        return expr.ops[0]
+    return None
+
+
+def _status_guard(test: ast.AST, err_name: str | None, retry_codes: frozenset[int]) -> str | None:
+    op = _status_guard_op(test, err_name, retry_codes)
+    if isinstance(op, ast.Eq):
+        return "eq"
+    if isinstance(op, ast.NotEq):
+        return "ne"
+    if (
+        isinstance(test, ast.BoolOp)
+        and isinstance(test.op, ast.And)
+        and any(
+            isinstance(_status_guard_op(val, err_name, retry_codes), ast.Eq) for val in test.values
+        )
+    ):
+        return "eq"
+    return None
+
+
+def _has_exit(stmt: ast.stmt) -> bool:
+    return any(
+        isinstance(node, _EXITS) or (isinstance(node, ast.Raise) and node.exc is not None)
+        for node in ast.walk(stmt)
+    )
+
+
+def _raise_outcome(stmt: ast.Raise) -> str:
+    if stmt.exc is None:
+        return _COVER
+    exc = stmt.exc
+    if (
+        isinstance(exc, ast.Call)
+        and isinstance(exc.func, ast.Name)
+        and exc.func.id == "UnreadError"
+    ):
+        return _COVER
+    return _ESCAPE
+
+
+def _if_outcome(
+    stmt: ast.If,
+    outcomes: dict[int, str],
+    err_name: str | None,
+    retry_codes: frozenset[int],
+) -> str:
+    body, orelse = outcomes[id(stmt.body)], outcomes[id(stmt.orelse)]
+    guard = _status_guard(stmt.test, err_name, retry_codes)
+    if guard == "eq":
+        return orelse
+    if guard == "ne":
+        return body
+    if body == _COVER and orelse == _COVER:
+        return _COVER
+    if _ESCAPE in (body, orelse):
+        return _ESCAPE
+    return _PASS
+
+
+def _stmt_outcome(
+    stmt: ast.stmt,
+    outcomes: dict[int, str],
+    err_name: str | None,
+    retry_codes: frozenset[int],
+) -> str:
+    if isinstance(stmt, ast.Raise):
+        return _raise_outcome(stmt)
+    if isinstance(stmt, _EXITS):
+        return _ESCAPE
+    if (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Name)
+        and stmt.value.func.id == "record_unread"
+    ):
+        return _COVER
+    if isinstance(stmt, ast.If):
+        return _if_outcome(stmt, outcomes, err_name, retry_codes)
+    if isinstance(stmt, ast.With):
+        return outcomes[id(stmt.body)]
+    return _ESCAPE if _has_exit(stmt) else _PASS
+
+
+def _list_outcome(
+    stmts: list[ast.stmt],
+    outcomes: dict[int, str],
+    err_name: str | None,
+    retry_codes: frozenset[int],
+) -> str:
+    for stmt in stmts[:1000]:
+        res = _stmt_outcome(stmt, outcomes, err_name, retry_codes)
+        if res != _PASS:
+            return res
+    return _PASS
+
+
+def _handler_records_or_reraises(
+    handler: ast.ExceptHandler, retry_codes: frozenset[int] | None = None
+) -> bool:
+    codes = _retry_codes_for(ast.parse(script())) if retry_codes is None else retry_codes
+    order: list[list[ast.stmt]] = []
+    stack: list[list[ast.stmt]] = [handler.body]
+    for _ in range(10000):
+        if not stack:
+            break
+        stmts = stack.pop()
+        order.append(stmts)
+        for stmt in stmts[:1000]:
+            if isinstance(stmt, ast.If):
+                stack.extend((stmt.body, stmt.orelse))
+            elif isinstance(stmt, ast.With):
+                stack.append(stmt.body)
+    if stack:
+        return False
+    outcomes: dict[int, str] = {}
+    for stmts in reversed(order):
+        outcomes[id(stmts)] = _list_outcome(stmts, outcomes, handler.name, codes)
+    return outcomes[id(handler.body)] == _COVER
 
 
 def refused_catch_offenders(source: str, allowed: dict[str, str]) -> list[str]:
     """Handlers on RefusedError or UnreadError that neither record nor re-raise."""
     tree = ast.parse(source)
+    retry_codes = _retry_codes_for(tree)
     parent: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
@@ -12744,7 +12957,7 @@ def refused_catch_offenders(source: str, allowed: dict[str, str]) -> list[str]:
         if func is None:
             continue
         handlers_by_func.setdefault(func, []).append(node)
-        if func in allowed or _handler_records_or_reraises(node):
+        if func in allowed or _handler_records_or_reraises(node, retry_codes):
             continue
         offenders.append(f"{func}:{node.lineno}")
     stale = [f"stale:{name}" for name in sorted(allowed) if name not in handlers_by_func]
@@ -12805,6 +13018,101 @@ def test_planted_stale_refused_catch_allow_key_is_reported():
     assert "stale:gone" in refused_catch_offenders(
         (ROOT / "tools" / "merge_train.py").read_text(encoding="utf-8"), allowed
     )
+
+
+_PLANTED_EVERY_PATH_CASES = [
+    pytest.param(
+        "def hold(env, unread, flag):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        if flag:\n"
+        "            record_unread(unread, err)\n"
+        "        else:\n"
+        "            return None\n",
+        ["hold:4"],
+        id="conditional-escape",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        '        raise RefusedError(f"x: {err}") from err\n',
+        ["hold:4"],
+        id="conversion-raise",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        '        if "HTTP 404" in str(err):\n'
+        "            return None\n"
+        "        raise\n",
+        ["hold:4"],
+        id="text-guard-404",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        if http_status(err) == 503:\n"
+        "            return None\n"
+        "        raise\n",
+        ["hold:4"],
+        id="retry-code-guard-503",
+    ),
+    pytest.param(
+        "def hold(env, unread, flag):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        if flag:\n"
+        "            record_unread(unread, err)\n"
+        "        else:\n"
+        "            raise\n",
+        [],
+        id="conditional-reraise",
+    ),
+    pytest.param(
+        "def hold(env, unread):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        record_unread(unread, err)\n"
+        "        return None\n",
+        [],
+        id="record-then-return",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        if http_status(err) == 404:\n"
+        "            return None\n"
+        "        raise\n",
+        [],
+        id="http-status-404",
+    ),
+    pytest.param(
+        "def hold(env):\n"
+        "    try:\n"
+        "        read(env)\n"
+        "    except RefusedError as err:\n"
+        "        raise UnreadError(str(err)) from err\n",
+        [],
+        id="raise-unread",
+    ),
+]
+
+
+@pytest.mark.parametrize(("source", "expected"), _PLANTED_EVERY_PATH_CASES)
+def test_planted_every_path_refused_catch_verdicts(source, expected):
+    """Every-path check flags escaping branches and accepts covered or 404-guarded paths."""
+    assert refused_catch_offenders(source, {}) == expected
 
 
 @pytest.mark.parametrize("write_file", [False, True])
