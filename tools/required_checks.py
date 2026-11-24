@@ -1347,8 +1347,6 @@ def _sweep_default_branch(
     err: TextIO,
 ) -> int:
     """Judge the default branch head with its push policy in the sweep's session."""
-    if _sweep_deadline_passed(session, err, "the default branch"):
-        return 1
     sha, branch = default_head
     default_cfg = replace(
         sweep_cfg, sha=sha, event_name="push", ref=f"refs/heads/{branch}", only_if_pending=False
@@ -1365,7 +1363,7 @@ def run_sweep(
     out: TextIO = sys.stdout,
     err: TextIO = sys.stderr,
 ) -> int:
-    """Judge open pull heads and the default branch head in one session."""
+    """Judge the default head and selected pull heads, retaining evaluation errors."""
     start = now()
     session = ApiSession(
         deadline=start + SESSION_DEADLINE_SECONDS,
@@ -1385,8 +1383,9 @@ def run_sweep(
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
         return 1
-    if _sweep_default_branch(session, sweep_cfg, default_head, out, err) != 0:
+    if _sweep_deadline_passed(session, err, "the default branch"):
         return 1
+    result = _sweep_default_branch(session, sweep_cfg, default_head, out, err)
     pending = len(to_eval)
     for sha in to_eval[:MAX_TARGETS_MAX]:
         pending -= 1
@@ -1394,14 +1393,14 @@ def run_sweep(
             return 1
         one = replace(sweep_cfg, sha=sha, event_name="pull_request")
         if evaluate_one(session, one, out, err) != 0:
-            return 1
+            result = 1
         if session.api_calls >= SWEEP_MAX_CALLS:
             err.write(
                 f"::warning::Sweep API call cap of {SWEEP_MAX_CALLS} reached; "
                 f"{pending} target(s) not judged.\n"
             )
-            return 0
-    return 0
+            break
+    return result
 
 
 def run_judge(

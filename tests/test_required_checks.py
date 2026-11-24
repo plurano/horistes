@@ -2597,6 +2597,51 @@ def _review_sweep(
     return rc, err.getvalue()
 
 
+@pytest.mark.parametrize("failed_index", [0, 1], ids=["default-branch", "first-pull"])
+def test_sweep_continues_after_check_run_listing_error(failed_index: int) -> None:
+    heads = [SHA, "1" * 40, "2" * 40]
+    failed = heads[failed_index]
+    fake = _review_sweep_transport(heads[1:])
+    fake.answers[CHECKS_URL.replace(SHA, failed)] = {}
+
+    rc, err = _review_sweep(fake)
+
+    assert rc == 1
+    assert err.count("::error::") == 1 and failed in err and "no list check_runs" in err
+    assert fake.posts == [
+        (REVIEW_POST_PATH.replace(SHA, sha), "success") for sha in heads if sha != failed
+    ]
+
+
+def test_sweep_api_cap_preserves_evaluation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    heads = ["1" * 40, "2" * 40]
+    fake = _review_sweep_transport(heads)
+    fake.answers[CHECKS_URL] = {}
+    # Setup, triage, then the default head's status and malformed check-run listing.
+    cap = 3 + len(heads) + 2
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+
+    rc, err = _review_sweep(fake)
+
+    assert rc == 1
+    assert err.count("::error::") == 1 and SHA in err
+    assert f"::warning::Sweep API call cap of {cap} reached; 1 target(s) not judged." in err
+    assert fake.posts == []
+
+
+def test_sweep_deadline_after_default_branch_stops_before_pulls() -> None:
+    pull = "1" * 40
+    fake = _review_sweep_transport([pull])
+    fake.advance_on_reply[STATUSES_URL] = iter([0, 0, SESSION_DEADLINE_SECONDS])
+
+    rc, err = _review_sweep(fake)
+
+    assert rc == 1
+    assert f"reached before judging {pull}" in err
+    assert ("GET", CHECKS_URL.replace(SHA, pull)) not in fake.calls
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
 def test_review_sweep_reads_statuses_after_triage() -> None:
     pull = "1" * 40
     fake = _review_sweep_transport([pull])

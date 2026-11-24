@@ -513,7 +513,12 @@ def _tail_policy_problems(passed: dict) -> list[str]:
     if problems or any(key not in passed for key in fields):
         return problems
     try:
-        required_checks.parse_policy(*(passed[key] for key in fields))
+        required_checks.parse_policy(
+            required_json=passed["required"],
+            pull_request_only_json=passed["pull-request-only"],
+            not_owed_json=passed["not-owed"],
+            apps_json=passed["apps"],
+        )
     except required_checks.InputError as err:
         problems.append(f"job {TAIL} passes a policy the judge refuses: {err}")
     return problems
