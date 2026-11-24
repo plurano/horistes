@@ -3316,3 +3316,142 @@ def test_review_bool_parser_does_not_assign_token() -> None:
         for node in ast.walk(function)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
     )
+
+
+def _deep_failure_sweep_transport(
+    count: int, *, check_pages: int = 5
+) -> tuple[ReviewTransport, list[str]]:
+    heads = [f"{i:040x}" for i in range(1, count + 1)]
+    fake = _review_sweep_transport(heads, conclusion="failure")
+    fake.answers[STATUSES_URL] = [
+        {**status_item(999, PUSH_CONTEXT, "failure"), "description": "Build: failure"}
+    ]
+    full_checks = [check_item(i, "Build", "failure") for i in range(1, forge.PER_PAGE + 1)]
+    tail_checks = [check_item(forge.PER_PAGE * check_pages + 1, "Build", "failure")]
+    for index, sha in enumerate(heads[:OPEN_PULLS_MAX]):
+        stamp = f"2026-11-21T11:{index // 60:02d}:{index % 60:02d}Z"
+        row = status_item(index + 1, "required-checks", "failure", updated_at=stamp)
+        fake.answers[STATUSES_URL.replace(SHA, sha)] = [{**row, "description": "Build: failure"}]
+        base = CHECKS_URL.replace(SHA, sha).removesuffix("1")
+        for page in range(1, check_pages):
+            fake.answers[f"{base}{page}"] = {"check_runs": full_checks}
+        fake.answers[f"{base}{check_pages}"] = {"check_runs": tail_checks}
+    return fake, heads
+
+
+def _sweep_judged_pulls(
+    fake: ReviewTransport, *, run_number: int, **overrides: Any
+) -> tuple[int, list[str], str]:
+    out, err = io.StringIO(), io.StringIO()
+    cfg = _review_config(targets="open-pulls", run_number=run_number, **overrides)
+    rc = run_sweep(
+        cfg, transport=fake, now=fake.clock.now, sleep=fake.clock.sleep, out=out, err=err
+    )
+    judged = re.findall(r"No status post: required-checks on ([0-9a-f]{40}) keeps ", out.getvalue())
+    return rc, judged, err.getvalue()
+
+
+def test_sweep_capped_blocks_reach_all_sixty_unchanged_failures() -> None:
+    fake, heads = _deep_failure_sweep_transport(60)
+    blocks = 2
+    block_size = len(heads) // blocks
+    judged_counts: list[int] = []
+    seen: set[str] = set()
+    min_judged = 26
+    bound = (block_size - min_judged + 1) * blocks
+    for run_number in range(1, bound + 1):
+        rc, judged, err = _sweep_judged_pulls(fake, run_number=run_number)
+        assert rc == 0
+        assert "Sweep API call cap of 250 reached" in err
+        assert min_judged <= len(judged) < block_size
+        judged_counts.append(len(judged))
+        seen.update(judged)
+    assert min(judged_counts) == min_judged
+    assert seen == set(heads)
+    assert fake.posts == []
+
+
+def test_sweep_block_rotation_boundaries_and_max_run_number() -> None:
+    heads = [f"{i:040x}" for i in range(1, MAX_TARGETS_DEFAULT + 2)]
+    fake = _review_sweep_transport(heads, app="external", conclusion=None)
+    seen: list[str] = []
+    for run_number in (1, 2):
+        rc, judged, err = _sweep_judged_pulls(
+            fake, run_number=run_number, apps_json='{"Build":"external"}'
+        )
+        assert rc == 0 and err == ""
+        seen.extend(judged)
+    assert set(seen) == set(heads)
+
+    rc, max_run_judged, err = _sweep_judged_pulls(
+        fake, run_number=required_checks.MAX_RUN_NUMBER, apps_json='{"Build":"external"}'
+    )
+    assert rc == 0 and err == ""
+    blocks = (heads[: len(heads) // 2], heads[len(heads) // 2 :])
+    assert any(
+        len(max_run_judged) == len(block) and set(max_run_judged) == set(block) for block in blocks
+    )
+
+
+def test_sweep_block_tail_unjudged_in_pass_zero_and_judged_by_pass_s_minus_k() -> None:
+    fake, heads = _deep_failure_sweep_transport(60)
+    blocks = 2
+    s = len(heads) // blocks
+    tails = {heads[s - 1], heads[-1]}
+    pass_zero_seen: set[str] = set()
+    k = s
+    for run_number in range(1, blocks + 1):
+        rc, judged, err = _sweep_judged_pulls(fake, run_number=run_number)
+        assert rc == 0 and "Sweep API call cap of 250 reached" in err
+        k = min(k, len(judged))
+        pass_zero_seen.update(judged)
+    assert k < s
+    assert tails.isdisjoint(pass_zero_seen)
+
+    later_seen = set(pass_zero_seen)
+    target_pass = s - k
+    for run_number in range(blocks + 1, (target_pass + 1) * blocks + 1):
+        rc, judged, err = _sweep_judged_pulls(fake, run_number=run_number)
+        assert rc == 0 and "Sweep API call cap of 250 reached" in err
+        later_seen.update(judged)
+    assert tails <= later_seen
+
+
+def test_contested_failure_then_contested_success_is_withdrawn() -> None:
+    fake = ReviewTransport()
+    fake.answers[CHECKS_URL] = {
+        "check_runs": [check_item(1, "Build", "failure"), check_item(2, "Lint", "success")]
+    }
+    fake.advance_on_reply[STATUSES_URL] = iter([0, 0, 1])
+
+    def interleave_posts() -> None:
+        if not fake.posts:
+            first = status_item(41, PUSH_CONTEXT, "failure", updated_at="2026-11-21T12:00:00Z")
+            fake.answers[STATUSES_URL] = [first]
+            fake.answers[CHECKS_URL] = {
+                "check_runs": [check_item(3, "Build", "success"), check_item(2, "Lint", "success")]
+            }
+            return
+        fake.before_post = None
+        second = status_item(42, PUSH_CONTEXT, "failure", updated_at="2026-11-21T12:00:01Z")
+        existing = fake.answers[STATUSES_URL]
+        assert isinstance(existing, list)
+        fake.answers[STATUSES_URL] = [second, *existing]
+        fake.answers[CHECKS_URL] = {
+            "check_runs": [check_item(3, "Build", "success"), check_item(4, "Lint", "failure")]
+        }
+
+    fake.before_post = interleave_posts
+    rc, _, err, _ = _review_judge(fake, required_json='["Build","Lint"]')
+    assert rc == 0
+    assert f"::warning::Status write contested again for {SHA}." in err
+    assert fake.posts == [
+        (REVIEW_POST_PATH, "failure"),
+        (REVIEW_POST_PATH, "success"),
+        (REVIEW_POST_PATH, "pending"),
+    ]
+    statuses = fake.answers[STATUSES_URL]
+    assert isinstance(statuses, list)
+    standing = required_checks._all_statuses(statuses)[PUSH_CONTEXT]
+    assert standing["state"] == "pending"
+    assert standing["description"] == "contested write; the next judgment decides"

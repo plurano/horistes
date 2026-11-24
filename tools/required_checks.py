@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum, auto
-from math import floor
+from math import ceil, floor
 from pathlib import Path
 from typing import TextIO
 
@@ -1300,15 +1300,21 @@ def _triage_priority(status: dict | None) -> tuple[int, float]:
 
 
 def _sweep_evaluation_order(session: ApiSession, config: Config, heads: list[str]) -> list[str]:
-    """Build the priority list and select this run's block when over budget."""
+    """Build the priority list and rotate within this run's balanced block when over budget."""
     pr_config = replace(config, event_name="pull_request")
     judged = _sweep_triage(session, pr_config, heads)
     candidates = sorted(heads[:OPEN_PULLS_MAX], key=lambda sha: _triage_priority(judged.get(sha)))
+    n = len(candidates)
     budget = config.max_targets
-    if len(candidates) <= budget:
+    if n <= budget:
         return candidates
-    offset = ((config.run_number - 1) * budget) % len(candidates)
-    return (candidates[offset:] + candidates[:offset])[:budget]
+    blocks = ceil(n / budget)
+    index = config.run_number - 1
+    block = index % blocks
+    cycle = index // blocks
+    members = candidates[block * n // blocks : (block + 1) * n // blocks]
+    start = cycle % len(members)
+    return members[start:] + members[:start]
 
 
 def _default_branch_head(session: ApiSession, repository: str) -> tuple[str, str]:
