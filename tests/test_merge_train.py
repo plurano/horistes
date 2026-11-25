@@ -138,10 +138,12 @@ def module() -> str:
     return "\n".join(lines[1:-1]) + "\n"
 
 
+_REAL_RUN = subprocess.run
+
+
 def openssl(*args: str, data: bytes = b"") -> bytes:
-    done = subprocess.run(
-        ["openssl", *args], input=data, capture_output=True, check=True, timeout=60
-    )
+    # Cached key helpers must not route through a test's patched subprocess.run.
+    done = _REAL_RUN(["openssl", *args], input=data, capture_output=True, check=True, timeout=60)
     return done.stdout
 
 
@@ -2686,6 +2688,43 @@ def test_app_jwt_passes_literal_openssl_and_executable_path(tmp_path, monkeypatc
     which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
     assert len(run_app_jwt(train_mod).split(".")) == 3
     assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param("positive-cold-cache", id="positive-cold-cache"),
+        pytest.param("negative-train-call", id="negative-train-call"),
+        pytest.param("boundary-warm-cache", id="boundary-warm-cache"),
+    ],
+)
+def test_key_helpers_bypass_a_patched_subprocess_run(case, tmp_path, monkeypatch):
+    """Cached openssl() keeps using the real subprocess.run under test patches."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls: list[tuple[list[str], object]] = []
+
+    def recording_run(cmd, *args, **kwargs):
+        calls.append((cmd, kwargs.get("executable")))
+        return _REAL_RUN(cmd, *args, **kwargs)
+
+    if case == "negative-train-call":
+        pem = app_key(2048)[0]
+        monkeypatch.setattr(subprocess, "run", recording_run)
+        assert train_mod.key_bits(pem) == 2048
+        assert len(calls) == 1
+        assert calls[0][0][0] == "openssl"
+        return
+
+    if case == "boundary-warm-cache":
+        app_key(2048)
+        monkeypatch.setattr(subprocess, "run", recording_run)
+        app_key(2048)
+        assert calls == []
+        return
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    app_key(2048, which="bypass-cold-cache-probe")
+    assert calls == []
 
 
 def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):

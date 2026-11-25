@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, three days of waiting after a release except for a fix of a known vulnerability, which carries the label security for the merge train and is rebased as soon as it falls behind, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, go mod tidy after a Go module update, and no proposal for the machine a job runs on; own releases of the family's organisations wait for no release age; digest updates of container images wait for no release age; forks of outside projects keep three days.",
+    "Defaults for every repository of the family: the recommended base, a sign-off line on the commits of the bot, non-major updates in one weekly batch per manager (pin updates on the same batch branch), major updates in their own proposals, vulnerability fixes and own releases in their own immediate proposals, three days of waiting after a release except for a fix of a known vulnerability, which carries the label security for the merge train and is rebased as soon as it falls behind, no edit mark for the generated-file commits of the merge-train app, no merge by the bot, go mod tidy after a Go module update, and no proposal for the machine a job runs on; own releases of the family's organisations wait for no release age; digest updates of container images wait for no release age; forks of outside projects keep three days; an open batch branch changes only inside the Monday window or on a requested rebase.",
     "The PR header carries the repository template's description and verification checklist, with every box unticked; CI runs the required checks."
   ],
   "extends": [
@@ -37,7 +37,23 @@
       "enabled": false
     },
     {
-      "description": "Own GitHub releases wait for no release age.",
+      "description": "Non-major updates wait for one weekly batch per manager; a major update stays its own proposal; pin updates share their manager's batch branch; a repository rule that names its own group keeps its own branch; an open batch branch changes only inside the window or on a requested rebase.",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "{{manager}} non-major",
+      "groupSlug": "{{{groupName}}}",
+      "schedule": [
+        "* 0-3 * * 1"
+      ],
+      "updateNotScheduled": false
+    },
+    {
+      "description": "Own GitHub releases wait for no release age and stay their own proposals at any time.",
       "matchDatasources": [
         "github-tags",
         "github-releases",
@@ -47,37 +63,45 @@
       "matchPackageNames": [
         "/^(lusoris|cordanallm|golusoris|vmafx|tekmora|plurano|vidiko|jellysin|goph-arr)\\//i"
       ],
-      "minimumReleaseAge": null
+      "minimumReleaseAge": null,
+      "groupName": null,
+      "schedule": []
     },
     {
-      "description": "Own Go modules wait for no release age.",
+      "description": "Own Go modules wait for no release age and stay their own proposals at any time.",
       "matchDatasources": [
         "go"
       ],
       "matchPackageNames": [
         "/^github\\.com\\/(lusoris|cordanallm|golusoris|vmafx|tekmora|plurano|vidiko|jellysin|goph-arr)\\//i"
       ],
-      "minimumReleaseAge": null
+      "minimumReleaseAge": null,
+      "groupName": null,
+      "schedule": []
     },
     {
-      "description": "Own container images wait for no release age.",
+      "description": "Own container images wait for no release age and stay their own proposals at any time.",
       "matchDatasources": [
         "docker"
       ],
       "matchPackageNames": [
         "/^ghcr\\.io\\/(lusoris|cordanallm|golusoris|vmafx|tekmora|plurano|vidiko|jellysin|goph-arr)\\//i"
       ],
-      "minimumReleaseAge": null
+      "minimumReleaseAge": null,
+      "groupName": null,
+      "schedule": []
     },
     {
-      "description": "Own npm packages wait for no release age.",
+      "description": "Own npm packages wait for no release age and stay their own proposals at any time.",
       "matchDatasources": [
         "npm"
       ],
       "matchPackageNames": [
         "/^@(lusoris|cordanallm|golusoris|vmafx|tekmora|plurano|vidiko|jellysin|goph-arr)\\//i"
       ],
-      "minimumReleaseAge": null
+      "minimumReleaseAge": null,
+      "groupName": null,
+      "schedule": []
     },
     {
       "description": "Digest updates of container images wait for no release age, since a re-pushed tag restarts the age.",
