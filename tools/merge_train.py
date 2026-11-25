@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 
@@ -72,7 +73,9 @@ TIMEOUT = 30
 ERROR_TEXT = 500
 SETTLE_ROUNDS = 3
 SETTLE_SECONDS = 5
-PULL_PAGES = 4
+PULL_PAGE = 25
+PULL_PAGE_MIN = 6
+PULL_LIMIT = 100
 # Page sizes of the pull query's check suites and label events; a full page may hide more.
 SUITE_PAGE = 30
 RETRY_HOLD_DAYS = 7
@@ -120,7 +123,7 @@ LIST_RIGHTS = {"metadata": "read"}
 METHODS = ("SQUASH", "MERGE")
 # The sweep's GraphQL documents; the rules module keeps only the pull query (ADR-0082).
 MERGE_STATE = """
-query($owner: String!, $name: String!, $number: Int!) {
+query MergeState($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       mergeStateStatus
@@ -129,14 +132,14 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 """
 LANDER_LEASE = """
-query($owner: String!, $name: String!) {
+query LanderLease($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     landerLease: label(name: "merge-train: lander lease") { description }
   }
 }
 """
 RETRY_HISTORY = """
-query($owner: String!, $name: String!, $number: Int!) {
+query RetryHistory($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       headRefOid baseRefOid
@@ -158,7 +161,7 @@ fragment Attempt on Commit {
 }
 """
 COMMITS = """
-query($owner: String!, $name: String!, $number: Int!) {
+query Commits($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       headRefOid
@@ -172,7 +175,7 @@ query($owner: String!, $name: String!, $number: Int!) {
 """
 # The newest merged pull requests and the issues each one closes, for the close step.
 MERGED = """
-query($owner: String!, $name: String!) {
+query Merged($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: MERGED, first: 10, orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes {
@@ -194,7 +197,7 @@ query($owner: String!, $name: String!) {
 }
 """
 MERGE = """
-mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
+mutation Merge($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
          $headline: String, $body: String) {
   mergePullRequest(
     input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
@@ -206,7 +209,7 @@ mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
 """
 # A default branch with a merge queue refuses a direct merge; the queue lands it.
 ENQUEUE = """
-mutation($id: ID!, $oid: GitObjectID!) {
+mutation Enqueue($id: ID!, $oid: GitObjectID!) {
   enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
     mergeQueueEntry { state }
   }
@@ -214,14 +217,14 @@ mutation($id: ID!, $oid: GitObjectID!) {
 """
 # Dequeue a pull request from the merge queue.
 DEQUEUE = """
-mutation($id: ID!) {
+mutation Dequeue($id: ID!) {
   dequeuePullRequest(input: {id: $id}) {
     mergeQueueEntry { id }
   }
 }
 """
 ARM = """
-mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
+mutation Arm($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
          $headline: String, $body: String) {
   enablePullRequestAutoMerge(
     input: {pullRequestId: $id, expectedHeadOid: $oid, mergeMethod: $method,
@@ -232,28 +235,28 @@ mutation($id: ID!, $oid: GitObjectID!, $method: PullRequestMergeMethod!,
 }
 """
 DISARM = """
-mutation($id: ID!) {
+mutation Disarm($id: ID!) {
   disablePullRequestAutoMerge(input: {pullRequestId: $id}) {
     pullRequest { autoMergeRequest { enabledAt } }
   }
 }
 """
 DRAFT = """
-mutation($id: ID!) {
+mutation Draft($id: ID!) {
   convertPullRequestToDraft(input: {pullRequestId: $id}) {
     pullRequest { isDraft }
   }
 }
 """
 READY = """
-mutation($id: ID!) {
+mutation Ready($id: ID!) {
   markPullRequestReadyForReview(input: {pullRequestId: $id}) {
     pullRequest { isDraft }
   }
 }
 """
 COMMIT_MUTATION = """
-mutation($input: CreateCommitOnBranchInput!) {
+mutation CreateCommit($input: CreateCommitOnBranchInput!) {
   createCommitOnBranch(input: $input) {
     commit { oid }
   }
@@ -307,7 +310,7 @@ ANSWER_ASSOCIATION_RANK = {
 # Any other or missing association ranks after every listed one.
 ANSWER_UNRANKED = max(ANSWER_ASSOCIATION_RANK.values()) + 1
 REVIEW_BODIES = """
-query($owner: String!, $name: String!, $number: Int!) {
+query ReviewBodies($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       headRefOid
@@ -789,23 +792,32 @@ def request_once(url, token, method, body, raw, redirect):
     return json.loads(text) if text else {}
 
 
+def graphql_name(query):
+    """Every train document declares its operation before the variables or selection."""
+    operation = re.match(r"\s*(?:query|mutation)\s+([A-Za-z_]\w*)\b", query)
+    assert operation, "anonymous GraphQL operation"
+    return operation[1]
+
+
 def graphql(env, query, variables):
-    answer = call(
-        env["GITHUB_GRAPHQL_URL"],
-        env["TRAIN_TOKEN"],
-        body={
-            "query": query,
-            "variables": variables,
-        },
-    )
+    prefix = f"graphql {graphql_name(query)}: "
+    try:
+        answer = call(
+            env["GITHUB_GRAPHQL_URL"],
+            env["TRAIN_TOKEN"],
+            body={"query": query, "variables": variables},
+        )
+    except RefusedError as err:
+        err.args = (prefix + str(err),)
+        raise
     errors = answer.get("errors")
     if errors and all(
         error.get("type") == "UNPROCESSABLE" and error.get("message") == MERGE_IN_PROGRESS
         for error in errors
     ):
-        raise MergeInProgressError(f"GraphQL: {json.dumps(errors)[:500]}")
+        raise MergeInProgressError(f"{prefix}GraphQL: {json.dumps(errors)[:500]}")
     if errors or "data" not in answer:
-        raise RefusedError(f"GraphQL: {json.dumps(errors)[:500]}")
+        raise RefusedError(f"{prefix}GraphQL: {json.dumps(errors)[:500]}")
     return answer["data"]
 
 
@@ -821,25 +833,57 @@ def read_graphql(env, query, variables):
             time.sleep(READ_BACKOFF_SECONDS)
 
 
-def read_page(env, variables, query):
-    """One page of the read."""
-    return read_graphql(env, query, variables)["repository"]
+@dataclass
+class PullPageReader:
+    """Page size and first split reason for one repository, including settle reads."""
+
+    size: int = PULL_PAGE
+    split_reason: str = ""
+
+    def read(self, env, query, variables, remaining):
+        size = min(self.size, remaining)
+        for _ in range(size.bit_length()):
+            variables["first"] = size
+            reader = read_graphql if size <= PULL_PAGE_MIN else graphql
+            try:
+                return reader(env, query, variables)["repository"]
+            except RefusedError as err:
+                if size <= PULL_PAGE_MIN:
+                    err.args = (
+                        f"{err} (page size {size}, cursor {variables['after'] or 'start'})",
+                    )
+                    raise
+                if not transient(err):
+                    raise
+                if not self.split_reason:
+                    self.split_reason = str(err).splitlines()[0]
+                size = self.size = max(PULL_PAGE_MIN, size // 2)
+        raise AssertionError("halving must reach the minimum page size")
 
 
-def pull_pages(env, conf):
-    """The oldest open pull requests, at most PULL_PAGES pages."""
+def pull_pages(env, conf, reader):
+    """Read at most the oldest PULL_LIMIT open pull requests."""
     owner, name = env["GITHUB_REPOSITORY"].split("/", 1)
     variables = {"owner": owner, "name": name, "after": None}
     if conf.get("required_status"):
         variables["status"] = conf["required_status"]
     query = pull_query(conf)
-    pulls, repo = [], {}
-    for _ in range(PULL_PAGES):
-        repo = read_page(env, variables, query)
-        pulls += repo["pullRequests"]["nodes"]
-        page = repo["pullRequests"]["pageInfo"]
-        if not page["hasNextPage"]:
+    pulls = []
+    for _ in range(PULL_LIMIT):
+        repo = reader.read(env, query, variables, PULL_LIMIT - len(pulls))
+        connection = repo["pullRequests"]
+        pulls.extend(connection["nodes"])
+        page = connection["pageInfo"]
+        if not page["hasNextPage"] or len(pulls) == PULL_LIMIT:
             break
+        if (
+            not connection["nodes"]
+            or not page["endCursor"]
+            or page["endCursor"] == variables["after"]
+        ):
+            raise RefusedError(
+                f"graphql {graphql_name(query)}: open pull request page did not advance"
+            )
         variables["after"] = page["endCursor"]
     repo["pullRequests"]["nodes"] = pulls
     return repo
@@ -847,15 +891,17 @@ def pull_pages(env, conf):
 
 def fetch(env, conf):
     """The repository and its open pull requests, re-read while a merge state is UNKNOWN."""
-    repo = {}
+    reader = PullPageReader()
     for attempt in range(SETTLE_ROUNDS):
-        repo = pull_pages(env, conf)
+        repo = pull_pages(env, conf, reader)
         pulls = repo["pullRequests"]["nodes"]
         if all(pull["mergeStateStatus"] != "UNKNOWN" or pull["isDraft"] for pull in pulls):
             break
         if attempt + 1 < SETTLE_ROUNDS:
             time.sleep(SETTLE_SECONDS)
-    return repo
+    if reader.split_reason:
+        return repo, f"Split open pull request page to {reader.size} after {reader.split_reason}"
+    return repo, ""
 
 
 def pull_commits(env, number):
@@ -979,7 +1025,7 @@ def dry_note_unsigned_dependencies(env, conf, repo, rows, notes):
         for pull, reason in rows
         if reason == "behind" and pull["headRefName"].startswith(conf["dependency"])
     ]
-    for pull, arming in updatable(repo, behind, notes, conf)[: PULL_PAGES * 100]:
+    for pull, arming in updatable(repo, behind, notes, conf)[:PULL_LIMIT]:
         if not arming:
             continue
         note = dependency_unsigned_note(env, conf, pull)
@@ -1111,7 +1157,7 @@ def advance(env, conf, repo, rows, notes, check_retry=None):
     before its update: auto-merge would otherwise land the new head before the train
     reads its status or listed review (decision records 0076 and 0092).
     """
-    for pull, arming in updatable(repo, rows, notes, conf)[: PULL_PAGES * 100]:
+    for pull, arming in updatable(repo, rows, notes, conf)[:PULL_LIMIT]:
         if arming and has_red_code_scanning(pull):
             notes[pull["number"]] = "not armed: code-scanning check failed"
             continue
@@ -1559,7 +1605,7 @@ def re_arm_drifted(env, conf, served, held, notes):
     Otherwise read reviews again before disarming and re-arming; a held review or
     lack of sign-off ends the run disarmed, so later steps do not read it as armed.
     """
-    for pull, reason in served[: PULL_PAGES * 100]:
+    for pull, reason in served[:PULL_LIMIT]:
         if reason.startswith(REVIEW_BODY) or required_status_hold(pull, conf):
             continue
         if pull["number"] in held or not drifted(pull, conf):
@@ -1908,7 +1954,7 @@ def hold_review_bodies(env, conf, rows):
     """
     eligible = [
         pull
-        for pull, reason in serving_order(rows, conf)[: PULL_PAGES * 100]
+        for pull, reason in serving_order(rows, conf)[:PULL_LIMIT]
         if review_body_eligible(pull, reason, conf)
     ]
     holds = {
@@ -1916,10 +1962,10 @@ def hold_review_bodies(env, conf, rows):
         for pull in eligible[:REVIEW_READS]
     }
     conf["review_reads"] = len(holds)
-    unread = frozenset(pull["number"] for pull in eligible[REVIEW_READS : PULL_PAGES * 100])
+    unread = frozenset(pull["number"] for pull in eligible[REVIEW_READS:PULL_LIMIT])
     over = f"{REVIEW_BODY}not read: more than {REVIEW_READS} pull requests to read in one run"
     updated = []
-    for pull, reason in rows[: PULL_PAGES * 100]:
+    for pull, reason in rows[:PULL_LIMIT]:
         number = pull["number"]
         updated.append((pull, over if number in unread else holds.get(number) or reason))
     return updated
@@ -2042,7 +2088,7 @@ def same_retry_change(env, base, before, after):
     declarations = ", ".join(f"$p{index}: String!" for index in range(len(paths)))
     fields = " ".join(f"f{index}: file(path: $p{index}) {{ mode }}" for index in range(len(paths)))
     query = (
-        "query($owner: String!, $name: String!, $before: GitObjectID!, "
+        "query FileModes($owner: String!, $name: String!, $before: GitObjectID!, "
         f"$after: GitObjectID!, {declarations}) {{ "
         "repository(owner: $owner, name: $name) { "
         "before: object(oid: $before) { ...M } after: object(oid: $after) { ...M } } } "
@@ -2473,13 +2519,15 @@ def one(env, conf, installation, target, now):
         rights = {**rights, **STATUS_RIGHTS}
     token = mint(env, conf, installation, rights, [target["name"]])
     local = {**env, "GITHUB_REPOSITORY": target["full_name"], "TRAIN_TOKEN": token}
-    closed = []
+    section_notes = []
     notes = {}
     try:
-        repo = fetch(local, conf)
+        repo, split_note = fetch(local, conf)
+        if split_note:
+            section_notes.append(split_note)
         rows, notes, outcome = run(local, conf, repo, now, notes)
         if conf["switch"] == "on":
-            closed = close_issues(local, conf, installation, target, now)
+            section_notes.extend(close_issues(local, conf, installation, target, now))
     except RefusedError as err:
         err.unsigned_bots = unsigned_bot_entries(target, notes)
         raise
@@ -2502,9 +2550,9 @@ def one(env, conf, installation, target, now):
         for note in notes.values()
     )
     section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""
-    if closed:
+    if section_notes:
         section = section or f"### {target['full_name']}: {outcome}\n"
-        section += "\n" + "\n".join(closed) + "\n"
+        section += "\n" + "\n".join(section_notes) + "\n"
     unsigned_bots = unsigned_bot_entries(target, notes)
     return (
         outcome,
