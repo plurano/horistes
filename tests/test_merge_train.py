@@ -465,6 +465,7 @@ class Forge:
         self.read_calls: list[tuple[str, dict]] = []
         self.pull_page_timeout_above: int | None = None
         self.read_statuses: dict[str, list[int]] = {}
+        self.read_error_bodies: dict[int, bytes] = {}
         self.mutation_statuses: dict[str, list[int]] = {}
         self.merge_state_statuses: list[int] = []
         # GraphQL answers to cut under their full length, per kind ("read" or a mutation name).
@@ -894,7 +895,9 @@ class Forge:
         }
         return {"data": {"repository": {**read, "pullRequests": page}}}
 
-    def graphql_response(self, header: str, query: str, variables: dict) -> tuple[int, dict]:
+    def graphql_response(
+        self, header: str, query: str, variables: dict
+    ) -> tuple[int, dict | bytes]:
         """HTTP status and body of one GraphQL call; a status read without the right fails."""
         if not re.match(r"\s*(?:query|mutation)\s+[_A-Za-z]\w*\s*[(\{]", query):
             return 400, {"message": "stand-in forge: anonymous operation"}
@@ -916,7 +919,9 @@ class Forge:
             if size > 25:
                 return 502, {"message": "stand-in forge: read page size exceeds 25"}
             if self.pull_page_timeout_above is not None and size > self.pull_page_timeout_above:
-                return 504, {"message": "stand-in forge: pull page timed out"}
+                return 504, self.read_error_bodies.get(
+                    504, {"message": "stand-in forge: pull page timed out"}
+                )
             statuses = self.read_statuses.get(full, [])
             body = None
         elif "mergeStateStatus" in query and "pullRequest(" in query:
@@ -927,6 +932,8 @@ class Forge:
             body = None
         status = statuses.pop(0) if statuses else 200
         if status != 200:
+            if statuses is self.read_statuses.get(full) and status in self.read_error_bodies:
+                return status, self.read_error_bodies[status]
             return status, {"message": f"stand-in forge: queued HTTP {status}"}
         return status, body or self.graphql(header, query, variables)
 
@@ -1041,8 +1048,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         pass
 
-    def answer(self, code: int, body: dict | list | None) -> None:
-        data = b"" if body is None else json.dumps(body).encode()
+    def answer(self, code: int, body: dict | list | bytes | None) -> None:
+        data = body
+        if not isinstance(body, bytes):
+            data = b"" if body is None else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -1652,12 +1661,27 @@ def test_missing_queue_entry_fails(tmp_path):
 def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
     train_mod = load_train(tmp_path, monkeypatch)
     rules = load_rules(tmp_path)
-    documents = [
-        doc
-        for key, doc in vars(train_mod).items()
-        if key.isupper() and isinstance(doc, str) and re.match(r"\s*(query\b|mutation\b|\{)", doc)
-    ]
-    documents.extend([rules.QUERY, rules.STATUS_QUERY])
+    generated = []
+
+    def read_file_modes(_env, query, _variables):
+        generated.append(query)
+        commit = {"f0": {"mode": 33188}}
+        return {"repository": {"before": commit, "after": commit}}
+
+    monkeypatch.setattr(train_mod, "own_diff", lambda *_: [("path", "patch", "modified")])
+    monkeypatch.setattr(train_mod, "read_graphql", read_file_modes)
+    assert train_mod.same_retry_change({"GITHUB_REPOSITORY": "fleet/app"}, "base", "old", "new")
+    assert [train_mod.graphql_name(doc) for doc in generated] == ["FileModes"]
+
+    def documents():
+        constants = [
+            doc
+            for key, doc in vars(train_mod).items()
+            if key.isupper()
+            and isinstance(doc, str)
+            and re.match(r"\s*(query\b|mutation\b|\{)", doc)
+        ]
+        return [*constants, rules.QUERY, rules.STATUS_QUERY, *generated]
 
     def check(docs):
         names = []
@@ -1667,11 +1691,13 @@ def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
             names.append(match[1])
         assert len(set(names)) == len(names), "duplicate operation name"
 
-    check(documents)
-    with pytest.raises(AssertionError, match="duplicate"):
-        check([*documents, rules.QUERY])
+    check(documents())
     with pytest.raises(AssertionError, match="missing"):
-        check([*documents, "query { viewer { login } }"])
+        check([*documents(), "query { viewer { login } }"])
+    duplicate = train_mod.MERGE_STATE.replace("query MergeState(", "query FileModes(", 1)
+    monkeypatch.setattr(train_mod, "MERGE_STATE", duplicate)
+    with pytest.raises(AssertionError, match="duplicate"):
+        check(documents())
 
 
 def test_anonymous_graphql_document_raises_document_error(tmp_path, monkeypatch):
@@ -1714,9 +1740,9 @@ def test_oversized_pull_page_times_out(tmp_path, split):
     flow = None
     if not split:
         source = script()
-        split_guard = "\n                if not transient(err):"
+        split_guard = "if size <= PULL_PAGE_MIN or not transient(err):"
         assert source.count(split_guard) == 1
-        flow = source.replace(split_guard, "\n                if True:")
+        flow = source.replace(split_guard, "if True:")
         assert flow != source
     done, summary = train(tmp_path, forge, flow)
     sizes = [v["first"] for _, v in forge.read_calls]
@@ -1740,18 +1766,35 @@ def test_oversized_pull_page_times_out(tmp_path, split):
         )
 
 
+MULTILINE_READ_ERROR = b"stand-in forge: first error line\r\nstand-in forge: second error line"
+FLATTENED_READ_ERROR = " ".join(MULTILINE_READ_ERROR.decode().splitlines())
+
+
+def pull_refusal_line(stdout, summary):
+    prefix = "::error title=Merge train refused::"
+    annotations = [
+        line.removeprefix(prefix) for line in stdout.splitlines() if line.startswith(prefix)
+    ]
+    assert len(annotations) == 1
+    assert [line for line in summary.splitlines() if line.startswith("- fleet/app: ")] == [
+        f"- {annotations[0]}"
+    ]
+    return annotations[0]
+
+
 @pytest.mark.parametrize("status", [502, 504])
 def test_exhausted_read_retries_fail_closed(tmp_path, status):
     forge = Forge(repository(pull(1, "CLEAN")))
+    forge.read_error_bodies[status] = MULTILINE_READ_ERROR
     if status == 504:
         forge.pull_page_timeout_above = 0
     else:
         forge.read_statuses["fleet/app"] = [status] * 6
     done, summary = train(tmp_path, forge)
     assert done.returncode == 1, done.stdout + done.stderr
-    refusal = rf"fleet/app: graphql PullPage: .*HTTP {status} .*page size 6, cursor start"
-    assert re.search(r"::error title=Merge train refused::" + refusal, done.stdout)
-    assert re.search(refusal, summary)
+    refusal = pull_refusal_line(done.stdout, summary)
+    assert re.match(r"fleet/app: graphql PullPage: .*page size 6, cursor start:", refusal)
+    assert refusal.endswith(f"HTTP {status} {FLATTENED_READ_ERROR}")
     assert forge.writes == []
     assert [v["first"] for _, v in forge.read_calls] == [25, 12, 6, 6, 6]
     if status == 502:
@@ -1765,7 +1808,7 @@ def test_short_final_page_refusal_names_cursor(tmp_path):
     done, summary = train(tmp_path, forge, required_status="lanes/booked")
     assert done.returncode == 1, done.stdout + done.stderr
     assert re.search(
-        r"fleet/app: graphql PullPageWithStatus: .*HTTP 504 .*page size 4, cursor cursor-96",
+        r"fleet/app: graphql PullPageWithStatus: .*page size 4, cursor cursor-96: .*HTTP 504",
         summary,
     )
     assert [(v["after"], v["first"]) for _, v in forge.read_calls[-3:]] == [("cursor-96", 4)] * 3
@@ -1843,9 +1886,13 @@ def test_split_within_sweep_budget_finishes_and_next_page_refuses(tmp_path, monk
 def test_minimum_pull_page_does_not_retry_past_sweep_budget(tmp_path, guard):
     forge = Forge(repository(*(pull(n, "CLEAN" if n == 26 else "DIRTY") for n in range(1, 27))))
     forge.read_statuses["fleet/app"] = [200, 504, 504, 504]
+    forge.read_error_bodies[504] = MULTILINE_READ_ERROR
     setup = """
+from types import SimpleNamespace
+
 tick = 0.0
 request = graphql
+READ_BACKOFF_SECONDS = 2
 
 def timed_graphql(env, query, variables):
     global tick
@@ -1854,10 +1901,14 @@ def timed_graphql(env, query, variables):
     finally:
         if variables.get("first") == PULL_PAGE // 2:
             tick = SWEEP_SECONDS - 1
-        elif variables.get("first") == PULL_PAGE_MIN:
-            tick = SWEEP_SECONDS + 1
 
-time.monotonic = lambda: tick
+def advance_backoff(seconds):
+    global tick
+    assert seconds == READ_BACKOFF_SECONDS
+    assert tick == SWEEP_SECONDS - 1
+    tick += seconds
+
+time = SimpleNamespace(time=time.time, monotonic=lambda: tick, sleep=advance_backoff)
 graphql = timed_graphql
 """
     entry = 'if __name__ == "__main__":'
@@ -1873,12 +1924,13 @@ graphql = timed_graphql
         assert done.returncode == 1, done.stdout + done.stderr
         assert calls == before_retry
         assert forge.writes == []
-        refusal = (
-            r"fleet/app: graphql PullPage: sweep budget of 1500 s spent "
-            r".*HTTP 504 .*page size 6, cursor cursor-25"
+        refusal = pull_refusal_line(done.stdout, summary)
+        assert re.match(
+            r"fleet/app: graphql PullPage: .*page size 6, cursor cursor-25: "
+            r"sweep budget of 1500 s spent before the read after graphql PullPage: .*HTTP 504",
+            refusal,
         )
-        assert re.search(r"::error title=Merge train refused::" + refusal, done.stdout)
-        assert re.search(refusal, summary)
+        assert refusal.endswith(f"HTTP 504 {FLATTENED_READ_ERROR}")
     else:
         assert done.returncode == 0, done.stdout + done.stderr
         assert calls == [*before_retry, (6, "cursor-25")]
@@ -1889,10 +1941,11 @@ graphql = timed_graphql
 def test_recovered_pull_page_split_is_reported_on_later_refusal(tmp_path, keep_split):
     forge = Forge(repository(*(pull(n, "DIRTY") for n in range(1, 14))))
     forge.read_statuses["fleet/app"] = [504, 200, 500]
+    forge.read_error_bodies[500] = MULTILINE_READ_ERROR
     source = None
     if not keep_split:
         source = script()
-        note = '            err.args = (f"{err} ({split_note})",)'
+        note = "            add_refusal_context(err, split_note)"
         assert source.count(note) == 1
         source = source.replace(note, "            pass")
     done, summary = train(tmp_path, forge, text=source)
@@ -1903,11 +1956,12 @@ def test_recovered_pull_page_split_is_reported_on_later_refusal(tmp_path, keep_s
         (12, "cursor-12"),
     ]
     assert forge.writes == []
-    refusal = r"fleet/app: graphql PullPage: .*HTTP 500[^\n]*"
-    annotation = re.search(r"::error title=Merge train refused::(" + refusal + ")", done.stdout)
-    assert annotation and re.search(r"^- " + re.escape(annotation[1]) + "$", summary, re.M)
+    refusal = pull_refusal_line(done.stdout, summary)
+    assert refusal.startswith("fleet/app: graphql PullPage: ")
+    assert "page size 12, cursor cursor-12:" in refusal
+    assert refusal.endswith(f"HTTP 500 {FLATTENED_READ_ERROR}")
     split = r"Split open pull request page to 12 after graphql PullPage: .*HTTP 504"
-    assert bool(re.search(split, annotation[1])) is keep_split
+    assert bool(re.search(split, refusal)) is keep_split
 
 
 def test_read_500_is_not_retried(tmp_path):

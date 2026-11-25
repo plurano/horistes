@@ -830,6 +830,15 @@ def pull_page_budget_message(query):
     return f"graphql {graphql_name(query)}: sweep budget of {SWEEP_SECONDS} s spent before the read"
 
 
+def add_refusal_context(err, context):
+    message = str(err)
+    if message.startswith("graphql "):
+        operation, _, reason = message.partition(": ")
+        err.args = (f"{operation}: {context}: {reason}",)
+    else:
+        err.args = (f"{context}: {message}",)
+
+
 def read_graphql(env, query, variables, *, started=None):
     """A GraphQL read; a gateway error, a dropped connection or a cut body is tried again,
     at most READ_ATTEMPTS times (record 0080). Mutations go through graphql and run once."""
@@ -841,8 +850,7 @@ def read_graphql(env, query, variables, *, started=None):
                 raise
             time.sleep(READ_BACKOFF_SECONDS)
             if started is not None and over_budget(started):
-                reason = str(err).splitlines()[0]
-                raise RefusedError(f"{pull_page_budget_message(query)} after {reason}") from err
+                raise RefusedError(f"{pull_page_budget_message(query)} after {err}") from err
 
 
 @dataclass
@@ -871,10 +879,8 @@ class PullPageReader:
                     return read_graphql(env, query, variables, started=self.started)["repository"]
                 return graphql(env, query, variables)["repository"]
             except RefusedError as err:
-                if size <= PULL_PAGE_MIN:
-                    err.args = (f"{err} ({where})",)
-                    raise
-                if not transient(err):
+                if size <= PULL_PAGE_MIN or not transient(err):
+                    add_refusal_context(err, where)
                     raise
                 if not self.split_reason:
                     self.split_reason = str(err).splitlines()[0]
@@ -2547,7 +2553,7 @@ def one(env, conf, installation, target, now, started):
             section_notes.extend(close_issues(local, conf, installation, target, now))
     except RefusedError as err:
         if split_note := reader.split_note():
-            err.args = (f"{err} ({split_note})",)
+            add_refusal_context(err, split_note)
         err.unsigned_bots = unsigned_bot_entries(target, notes)
         raise
     finally:
@@ -2623,12 +2629,12 @@ def sweep(env, conf, started):
                 tally["refused"] += rest
                 refusals.append(
                     f"{account}: installation {installation['id']} has not accepted the rights "
-                    f"the train asks for; {rest} repositories skipped: {err}"
+                    f"the train asks for; {rest} repositories skipped: {refusal_line(err)}"
                 )
                 break
             except RefusedError as err:
                 tally["refused"] += 1
-                refusals.append(f"{target['full_name']}: {err}")
+                refusals.append(f"{target['full_name']}: {refusal_line(err)}")
                 unsigned_bots.extend(err.unsigned_bots)
                 continue
             tally["landed"] += outcome.startswith("landed")
@@ -2712,6 +2718,10 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
             json.dump(payload, output, separators=(",", ":"))
 
 
+def refusal_line(err):
+    return " ".join(str(err).splitlines())
+
+
 def main(env):
     """Run one full train sweep across all installed repositories and report."""
     try:
@@ -2724,7 +2734,7 @@ def main(env):
             env, conf, time.monotonic()
         )
     except RefusedError as err:
-        sys.stdout.write(f"::error title=Merge train refused::{err}\n")
+        sys.stdout.write(f"::error title=Merge train refused::{refusal_line(err)}\n")
         return 1
     summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots)
     for line in refusals:

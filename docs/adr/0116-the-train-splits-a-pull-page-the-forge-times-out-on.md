@@ -38,10 +38,11 @@ and the first line of the original refusal. If the repository is later refused,
 include the split in its refusal line. If the smallest request fails, report
 its size and cursor and fail the sweep. Mutations still run once.
 
-Check the sweep budget before every pull-page attempt, including splits and
-retries after a backoff. A budget refusal names the document, page size and
-cursor. When the budget stops a retry, it also names the last refusal. A
-request already in flight can finish after the budget is spent.
+Start the 1,500-second sweep budget after settings validation, including the
+app-key check. Check the budget before every pull-page attempt, including
+splits and retries after a backoff. A budget refusal names the document,
+page size and cursor. When the budget stops a retry, it also names the last
+refusal. A request already in flight can finish after the budget is spent.
 
 ## Consequences
 
@@ -56,9 +57,9 @@ request already in flight can finish after the budget is spent.
   cost 5,170 seconds, and a single pass 1,760 seconds. The budget stops it:
   the sweep checks it before each repository and before every pull-page
   attempt. Only one pull-page request can be in flight when the budget is
-  spent. The budget clock starts with the train step. A fleet run spent
-  5 seconds before that step and 4 seconds after it (run 45675358659), inside
-  the 30-minute job limit. Later repositories are listed as unreached.
+  spent. Settings validation uses time from the 30-minute job limit. A fleet
+  run spent 5 seconds before the train step and 4 seconds after it (run
+  45675358659). Later repositories are listed as unreached.
 - If the forge returns short nonfinal pages, each must advance the cursor and
   contribute at least one pull. The absolute bound is 100 pages per pass, or
   902 pull-page calls across three rounds including both splits. The same
