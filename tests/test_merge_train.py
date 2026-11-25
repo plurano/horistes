@@ -31,8 +31,12 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.error
+import urllib.request
+import weakref
 import zipfile
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -138,14 +142,113 @@ def module() -> str:
     return "\n".join(lines[1:-1]) + "\n"
 
 
+KEY_BUILD_SAFE_MODULES = frozenset({"urllib.request", __name__})
+
+
+def key_build_safe_target(target: object) -> bool:
+    """Return whether an attribute patch target is safe for test key builds (issue 260).
+
+    Covers setattr and delattr; item and environment patches are not covered.
+    """
+    if isinstance(target, types.ModuleType):
+        return (
+            sys.modules.get(target.__name__) is not target
+            or target.__name__ in KEY_BUILD_SAFE_MODULES
+        )
+    if isinstance(target, str):
+        return target.rpartition(".")[0] in KEY_BUILD_SAFE_MODULES
+    return False
+
+
+KEY_BUILD_PATCHES: weakref.WeakSet[KeyBuildGuardPatch] = weakref.WeakSet()
+
+
+class KeyBuildGuardPatch(pytest.MonkeyPatch):
+    """Record shared-target attribute patches for the issue 260 key-build guard.
+
+    Covers setattr and delattr; item and environment patches are not covered.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.key_build_hazards: list[str] = []
+        KEY_BUILD_PATCHES.add(self)
+
+    def _record_hazard(
+        self, target: object, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> None:
+        if key_build_safe_target(target):
+            return
+        if isinstance(target, str):
+            self.key_build_hazards.append(target)
+            return
+        name = args[0] if args else kwargs["name"]
+        owner = getattr(target, "__name__", type(target).__name__)
+        self.key_build_hazards.append(f"{owner}.{name}")
+
+    def setattr(self, target: object, *args: object, **kwargs: object) -> None:
+        super().setattr(target, *args, **kwargs)
+        self._record_hazard(target, args, kwargs)
+
+    def delattr(self, target: object, *args: object, **kwargs: object) -> None:
+        super().delattr(target, *args, **kwargs)
+        self._record_hazard(target, args, kwargs)
+
+    def undo(self) -> None:
+        self.key_build_hazards.clear()
+        super().undo()
+
+
+@pytest.fixture
+def monkeypatch() -> Iterator[KeyBuildGuardPatch]:
+    """Yield a KeyBuildGuardPatch for issue 260 (setattr and delattr; not item or env)."""
+    patch = KeyBuildGuardPatch()
+    yield patch
+    patch.undo()
+
+
+class KeyBuildUnderPatchError(AssertionError):
+    """Raised when a key build runs under an active setattr or delattr patch (issue 260).
+
+    Item and environment patches are not covered.
+    """
+
+
+def refuse_key_build_under_patch() -> None:
+    """Raise KeyBuildUnderPatchError when any live patch holds hazards (issue 260).
+
+    Covers setattr and delattr; item and environment patches are not covered.
+    """
+    hazards = [hazard for patch in KEY_BUILD_PATCHES for hazard in patch.key_build_hazards]
+    if hazards:
+        raise KeyBuildUnderPatchError(f"build the test key before patching: {', '.join(hazards)}")
+
+
+def guarded_key_cache(build):
+    """Wrap functools.cache(build) and refuse active patches on every call (issue 260).
+
+    Covers setattr and delattr; item and environment patches are not covered.
+    """
+    cached = functools.cache(build)
+
+    @functools.wraps(build)
+    def wrapped(*args, **kwargs):
+        refuse_key_build_under_patch()
+        return cached(*args, **kwargs)
+
+    wrapped.cache_clear = cached.cache_clear
+    return wrapped
+
+
 def openssl(*args: str, data: bytes = b"") -> bytes:
+    refuse_key_build_under_patch()
     done = subprocess.run(
         ["openssl", *args], input=data, capture_output=True, check=True, timeout=60
     )
     return done.stdout
 
 
-@functools.cache
+@guarded_key_cache
 def app_key(bits: int = 2048, which: str = "app") -> tuple[str, bytes]:
     """A key made for this test run: the private PEM text and the public PEM."""
     del which
@@ -153,7 +256,7 @@ def app_key(bits: int = 2048, which: str = "app") -> tuple[str, bytes]:
     return private.decode(), openssl("pkey", "-pubout", data=private)
 
 
-@functools.cache
+@guarded_key_cache
 def non_rsa_app_key(kind: str) -> str:
     """A non-RSA private key PEM text generated for test refusal."""
     if kind == "DSA":
@@ -2495,8 +2598,8 @@ def shrink_pipes(train_mod, monkeypatch):
 def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
     """key_bits reads an RSA key longer than the 4096-byte pipe buffer without hanging."""
     train_mod = load_train(tmp_path, monkeypatch)
-    shrink_pipes(train_mod, monkeypatch)
     key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
+    shrink_pipes(train_mod, monkeypatch)
     result = {}
 
     def worker():
@@ -2517,8 +2620,8 @@ def test_key_longer_than_pipe_capacity_key_bits(tmp_path, monkeypatch):
 def test_key_longer_than_pipe_capacity_app_jwt(tmp_path, monkeypatch):
     """app_jwt signs a JWT using a key longer than the 4096-byte pipe buffer without hanging."""
     train_mod = load_train(tmp_path, monkeypatch)
-    shrink_pipes(train_mod, monkeypatch)
     key = ("x" * 63 + "\n") * 100 + app_key(2048)[0]
+    shrink_pipes(train_mod, monkeypatch)
     env = {"TRAIN_APP_KEY": key}
     conf = {"client_id": "test-client-id"}
     result = {}
@@ -2547,9 +2650,10 @@ def test_key_bits_pipe_oserror_raises_invalid_setting_error(tmp_path, monkeypatc
     def mock_pipe():
         raise OSError(errno.EMFILE, "Too many open files")
 
+    key = app_key(2048)[0]
     monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
     with pytest.raises(train_mod.InvalidSettingError) as exc_info:
-        train_mod.key_bits(app_key(2048)[0])
+        train_mod.key_bits(key)
     msg = str(exc_info.value)
     assert "Too many open files" in msg or "EMFILE" in msg
     assert f"at least {train_mod.MIN_KEY_BITS} bits are required" in msg
@@ -2562,13 +2666,172 @@ def test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch):
     def mock_pipe():
         raise OSError(errno.EMFILE, "Too many open files")
 
-    monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
     env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)
     conf = {"client_id": "test-client-id"}
     with pytest.raises(train_mod.RefusedError) as exc_info:
         train_mod.app_jwt(env, conf)
     msg = str(exc_info.value)
     assert "Too many open files" in msg or "EMFILE" in msg
+
+
+def test_app_jwt_pipe_oserror_on_cold_key_cache(tmp_path, monkeypatch):
+    """Exercise the pipe failure when this worker has no cached app keys."""
+    app_key.cache_clear()
+    test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch)
+
+
+def test_key_build_guard_refused_cold(monkeypatch):
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        app_key(2048, "guard-cold")
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
+
+
+def test_key_build_guard_refused_warm(monkeypatch):
+    app_key(2048)
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        app_key(2048)
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
+
+
+def test_key_build_guard_refused_openssl(monkeypatch):
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        openssl("version")
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
+
+
+def test_key_build_guard_refused_non_rsa(monkeypatch):
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        non_rsa_app_key("EC")
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
+
+
+def test_key_build_guard_refused_string_target(monkeypatch):
+    monkeypatch.setattr("os.pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        app_key(2048)
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
+
+
+def test_key_build_guard_refused_delattr(monkeypatch):
+    monkeypatch.delattr(errno, "EMFILE")
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        app_key(2048)
+    assert str(exc_info.value) == "build the test key before patching: errno.EMFILE"
+
+
+def test_key_build_guard_refused_argument_order(monkeypatch):
+    with pytest.raises(KeyBuildUnderPatchError):
+        app_key(2048, (monkeypatch.setattr(os, "pipe", os.pipe), "guard-argument")[1])
+
+
+def test_key_build_guard_refused_loop_back_edge(monkeypatch):
+    built = []
+    with pytest.raises(KeyBuildUnderPatchError):
+        for bits in (2048, 3072):
+            built.append(app_key(bits))
+            monkeypatch.setattr(os, "pipe", os.pipe)
+    assert len(built) == 1
+
+
+def test_key_build_guard_allowed_single_iteration(monkeypatch):
+    built = []
+    for bits in (2048,):
+        built.append(app_key(bits))
+        monkeypatch.setattr(os, "pipe", os.pipe)
+    assert len(built) == 1
+
+
+def test_key_build_guard_refused_redefinition(monkeypatch):
+    def setup():
+        monkeypatch.setattr(os, "pipe", os.pipe)
+
+    setup()
+
+    def noop():
+        pass
+
+    setup = noop
+    assert setup is noop
+    with pytest.raises(KeyBuildUnderPatchError):
+        app_key(2048)
+
+
+def test_key_build_guard_allowed_call_after_redefinition(monkeypatch):
+    def setup():
+        monkeypatch.setattr(os, "pipe", os.pipe)
+
+    def noop():
+        pass
+
+    assert setup is not noop
+    setup = noop
+    setup()
+    app_key(2048)
+
+
+def test_key_build_guard_refused_parameter(monkeypatch):
+    def inner(build):
+        build()
+        return app_key(2048)
+
+    def patch():
+        monkeypatch.setattr(os, "pipe", os.pipe)
+
+    with pytest.raises(KeyBuildUnderPatchError):
+        inner(patch)
+
+
+def test_key_build_guard_allowed_parameter(monkeypatch):
+    def inner(build):
+        build()
+        return app_key(2048)
+
+    def noop():
+        pass
+
+    assert inner(noop) == app_key(2048)
+
+
+def test_key_build_guard_allowed_build_before_patch(monkeypatch):
+    app_key(2048)
+    monkeypatch.setattr(os, "pipe", os.pipe)
+
+
+def test_key_build_guard_allowed_module_copy(tmp_path, monkeypatch):
+    train_mod = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(train_mod, "app_jwt", train_mod.app_jwt)
+    app_key(2048)
+
+
+def test_key_build_guard_allowed_urllib_request(monkeypatch):
+    monkeypatch.setattr(urllib.request, "urlopen", urllib.request.urlopen)
+    app_key(2048)
+
+
+def test_key_build_guard_allowed_own_module(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "KEY_BUILD_SAFE_MODULES", KEY_BUILD_SAFE_MODULES)
+    app_key(2048)
+    monkeypatch.setattr(f"{__name__}.KEY_BUILD_SAFE_MODULES", KEY_BUILD_SAFE_MODULES)
+    app_key(2048)
+
+
+def test_key_build_guard_allowed_after_undo(monkeypatch):
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    monkeypatch.undo()
+    app_key(2048)
+
+
+def test_key_build_guard_context(monkeypatch):
+    with monkeypatch.context() as inner_patch:
+        inner_patch.setattr(os, "pipe", os.pipe)
+        with pytest.raises(KeyBuildUnderPatchError):
+            app_key(2048)
+    app_key(2048)
 
 
 def test_os_failure_names_the_type_and_description_only(tmp_path, monkeypatch):
@@ -2590,10 +2853,11 @@ def test_key_bits_thread_runtime_error_raises_invalid_setting_error_and_leaks_no
         def start(self):
             raise RuntimeError("thread creation failed")
 
+    key = app_key(2048)[0]
     monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
     fds_before = len(os.listdir(FD_DIR))
     with pytest.raises(train_mod.InvalidSettingError) as exc_info:
-        train_mod.key_bits(app_key(2048)[0])
+        train_mod.key_bits(key)
     fds_after = len(os.listdir(FD_DIR))
     assert fds_after == fds_before
     msg = str(exc_info.value)
@@ -2610,8 +2874,8 @@ def test_app_jwt_thread_runtime_error_raises_refused_error_and_leaks_no_fds(tmp_
         def start(self):
             raise RuntimeError("thread creation failed")
 
-    monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
     env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+    monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)
     conf = {"client_id": "test-client-id"}
     fds_before = len(os.listdir(FD_DIR))
     with pytest.raises(train_mod.RefusedError) as exc_info:
@@ -2647,9 +2911,9 @@ def patch_openssl_which(tmp_path, monkeypatch, train_mod, marker):
     return str(wrapper), calls
 
 
-def run_app_jwt(train_mod):
-    """Sign a token with a fresh 2048-bit key and return it."""
-    env = {"TRAIN_APP_KEY": app_key(2048)[0]}
+def run_app_jwt(train_mod, key: str):
+    """Sign a token with the supplied key and return it."""
+    env = {"TRAIN_APP_KEY": key}
     conf = {"client_id": "test-client-id"}
     return train_mod.app_jwt(env, conf)
 
@@ -2658,8 +2922,9 @@ def test_key_bits_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
     """key_bits runs the openssl that shutil.which found."""
     train_mod = load_train(tmp_path, monkeypatch)
     marker = tmp_path / "marker_key_bits"
+    key = app_key(2048)[0]
     patch_openssl_which(tmp_path, monkeypatch, train_mod, marker)
-    assert train_mod.key_bits(app_key(2048)[0]) == 2048
+    assert train_mod.key_bits(key) == 2048
     assert marker.is_file()
 
 
@@ -2667,24 +2932,27 @@ def test_app_jwt_uses_openssl_path_from_shutil_which(tmp_path, monkeypatch):
     """app_jwt runs the openssl that shutil.which found."""
     train_mod = load_train(tmp_path, monkeypatch)
     marker = tmp_path / "marker_app_jwt"
+    key = app_key(2048)[0]
     patch_openssl_which(tmp_path, monkeypatch, train_mod, marker)
-    assert len(run_app_jwt(train_mod).split(".")) == 3
+    assert len(run_app_jwt(train_mod, key).split(".")) == 3
     assert marker.is_file()
 
 
 def test_key_bits_passes_literal_openssl_and_executable_path(tmp_path, monkeypatch):
     """key_bits passes the literal "openssl" first and the which path as executable."""
     train_mod = load_train(tmp_path, monkeypatch)
+    key = app_key(2048)[0]
     which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
-    assert train_mod.key_bits(app_key(2048)[0]) == 2048
+    assert train_mod.key_bits(key) == 2048
     assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
 
 
 def test_app_jwt_passes_literal_openssl_and_executable_path(tmp_path, monkeypatch):
     """app_jwt passes the literal "openssl" first and the which path as executable."""
     train_mod = load_train(tmp_path, monkeypatch)
+    key = app_key(2048)[0]
     which_path, calls = patch_openssl_which(tmp_path, monkeypatch, train_mod, tmp_path / "m")
-    assert len(run_app_jwt(train_mod).split(".")) == 3
+    assert len(run_app_jwt(train_mod, key).split(".")) == 3
     assert [(cmd[0], executable) for cmd, executable in calls] == [("openssl", which_path)]
 
 
@@ -2695,6 +2963,7 @@ def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):
     script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     script.chmod(0o755)
 
+    key = app_key(2048)[0]
     monkeypatch.setattr(
         train_mod.shutil,
         "which",
@@ -2711,7 +2980,7 @@ def test_key_pipe_joins_the_writer_before_returning(tmp_path, monkeypatch):
         event.set()
 
     monkeypatch.setattr(train_mod, "write_key", wrapped_write_key)
-    assert train_mod.key_bits(app_key(2048)[0]) is None
+    assert train_mod.key_bits(key) is None
     assert event.is_set()
 
 

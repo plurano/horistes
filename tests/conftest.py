@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import shlex
 import subprocess
@@ -22,11 +23,58 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import ciwf
+import pins
 
 ROOT = Path(__file__).resolve().parent.parent
+PIN_COMMENT = re.compile(r" v\d+(?:\.\d+){0,2}")
+MAX_WORKFLOW_STEPS = 100
+
+
+def _line_call(line: str) -> pins.Call | None:
+    """Read a uses call and its trailing comment from a single YAML line."""
+    try:
+        node = yaml.compose(line, Loader=ciwf.StrictLoader)
+    except yaml.YAMLError:
+        return None
+    if isinstance(node, yaml.SequenceNode) and len(node.value) == 1:
+        node = node.value[0]
+    return pins._call(pins._pairs(node), False, [line])
+
+
+def assert_action_pin(uses: str, action: str, line: str | None = None) -> None:
+    """Check a 40-hex pin and, given a line, read the version comment where the YAML scalar ends."""
+    found_action, sep, sha = uses.partition("@")
+    assert sep == "@" and found_action == action, f"expected action {action!r}, got {uses!r}"
+    assert pins.COMMIT.fullmatch(sha) is not None, (
+        f"expected 40-hex commit pin for {action!r}, got {uses!r}"
+    )
+    if line is not None:
+        stripped = line.rstrip("\r\n")
+        call = _line_call(stripped)
+        assert (
+            call is not None
+            and call.uses == uses
+            and call.comment is not None
+            and PIN_COMMENT.fullmatch(call.comment) is not None
+        ), f"expected version comment for {action!r} after sha, got {line!r}"
+
+
+def uses_lines(path: Path, job_id: str) -> dict[int, str]:
+    """Raw workflow line for each step index declaring `uses` in `job_id`."""
+    raw = path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    top = pins._pairs(yaml.compose(raw, Loader=ciwf.StrictLoader))
+    steps = pins._steps(pins._below(pins._below(top, "jobs"), job_id))
+    return {
+        idx: lines[step["uses"][1].start_mark.line]
+        for idx, step in enumerate(steps[:MAX_WORKFLOW_STEPS])
+        if "uses" in step
+    }
+
 
 # The consumer path each template's header names.
 CALLER_TEMPLATES: dict[str, str] = {
