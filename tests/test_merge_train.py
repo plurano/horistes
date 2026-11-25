@@ -31,12 +31,15 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.error
+import urllib.request
+import weakref
 import zipfile
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import NamedTuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
@@ -139,14 +142,113 @@ def module() -> str:
     return "\n".join(lines[1:-1]) + "\n"
 
 
+KEY_BUILD_SAFE_MODULES = frozenset({"urllib.request", __name__})
+
+
+def key_build_safe_target(target: object) -> bool:
+    """Return whether an attribute patch target is safe for test key builds (issue 260).
+
+    Covers setattr and delattr; item and environment patches are not covered.
+    """
+    if isinstance(target, types.ModuleType):
+        return (
+            sys.modules.get(target.__name__) is not target
+            or target.__name__ in KEY_BUILD_SAFE_MODULES
+        )
+    if isinstance(target, str):
+        return target.rpartition(".")[0] in KEY_BUILD_SAFE_MODULES
+    return False
+
+
+KEY_BUILD_PATCHES: weakref.WeakSet[KeyBuildGuardPatch] = weakref.WeakSet()
+
+
+class KeyBuildGuardPatch(pytest.MonkeyPatch):
+    """Record shared-target attribute patches for the issue 260 key-build guard.
+
+    Covers setattr and delattr; item and environment patches are not covered.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.key_build_hazards: list[str] = []
+        KEY_BUILD_PATCHES.add(self)
+
+    def _record_hazard(
+        self, target: object, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> None:
+        if key_build_safe_target(target):
+            return
+        if isinstance(target, str):
+            self.key_build_hazards.append(target)
+            return
+        name = args[0] if args else kwargs["name"]
+        owner = getattr(target, "__name__", type(target).__name__)
+        self.key_build_hazards.append(f"{owner}.{name}")
+
+    def setattr(self, target: object, *args: object, **kwargs: object) -> None:
+        super().setattr(target, *args, **kwargs)
+        self._record_hazard(target, args, kwargs)
+
+    def delattr(self, target: object, *args: object, **kwargs: object) -> None:
+        super().delattr(target, *args, **kwargs)
+        self._record_hazard(target, args, kwargs)
+
+    def undo(self) -> None:
+        self.key_build_hazards.clear()
+        super().undo()
+
+
+@pytest.fixture
+def monkeypatch() -> Iterator[KeyBuildGuardPatch]:
+    """Yield a KeyBuildGuardPatch for issue 260 (setattr and delattr; not item or env)."""
+    patch = KeyBuildGuardPatch()
+    yield patch
+    patch.undo()
+
+
+class KeyBuildUnderPatchError(AssertionError):
+    """Raised when a key build runs under an active setattr or delattr patch (issue 260).
+
+    Item and environment patches are not covered.
+    """
+
+
+def refuse_key_build_under_patch() -> None:
+    """Raise KeyBuildUnderPatchError when any live patch holds hazards (issue 260).
+
+    Covers setattr and delattr; item and environment patches are not covered.
+    """
+    hazards = [hazard for patch in KEY_BUILD_PATCHES for hazard in patch.key_build_hazards]
+    if hazards:
+        raise KeyBuildUnderPatchError(f"build the test key before patching: {', '.join(hazards)}")
+
+
+def guarded_key_cache(build):
+    """Wrap functools.cache(build) and refuse active patches on every call (issue 260).
+
+    Covers setattr and delattr; item and environment patches are not covered.
+    """
+    cached = functools.cache(build)
+
+    @functools.wraps(build)
+    def wrapped(*args, **kwargs):
+        refuse_key_build_under_patch()
+        return cached(*args, **kwargs)
+
+    wrapped.cache_clear = cached.cache_clear
+    return wrapped
+
+
 def openssl(*args: str, data: bytes = b"") -> bytes:
+    refuse_key_build_under_patch()
     done = subprocess.run(
         ["openssl", *args], input=data, capture_output=True, check=True, timeout=60
     )
     return done.stdout
 
 
-@functools.cache
+@guarded_key_cache
 def app_key(bits: int = 2048, which: str = "app") -> tuple[str, bytes]:
     """A key made for this test run: the private PEM text and the public PEM."""
     del which
@@ -154,7 +256,7 @@ def app_key(bits: int = 2048, which: str = "app") -> tuple[str, bytes]:
     return private.decode(), openssl("pkey", "-pubout", data=private)
 
 
-@functools.cache
+@guarded_key_cache
 def non_rsa_app_key(kind: str) -> str:
     """A non-RSA private key PEM text generated for test refusal."""
     if kind == "DSA":
@@ -2579,542 +2681,157 @@ def test_app_jwt_pipe_oserror_on_cold_key_cache(tmp_path, monkeypatch):
     test_app_jwt_pipe_oserror_raises_refused_error(tmp_path, monkeypatch)
 
 
-KEY_BUILD_SAFE_TARGETS = frozenset(
-    {"train_mod", "mod", "merge_train.urllib.request", "sys.modules[__name__]"}
-)
+def test_key_build_guard_refused_cold(monkeypatch):
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        app_key(2048, "guard-cold")
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
 
 
-def patches_key_build_module(call: ast.Call) -> bool:
-    """Identify monkeypatch.setattr calls outside the known safe targets."""
-    if ast.unparse(call.func) != "monkeypatch.setattr":
-        return False
-    target = (
-        call.args[0]
-        if call.args
-        else next((keyword.value for keyword in call.keywords if keyword.arg == "target"), None)
-    )
-    if target is None:
-        return True
-    if isinstance(target, ast.Constant) and isinstance(target.value, str):
-        module_name = target.value.rpartition(".")[0]
-    else:
-        module_name = ast.unparse(target)
-    return module_name not in KEY_BUILD_SAFE_TARGETS
+def test_key_build_guard_refused_warm(monkeypatch):
+    app_key(2048)
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        app_key(2048)
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
 
 
-def own_scope_calls(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> tuple[list[ast.Call], list[ast.FunctionDef | ast.AsyncFunctionDef]]:
-    """Collect calls in the function's own scope and its direct nested definitions."""
-    calls: list[ast.Call] = []
-    nested: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
-    stack: list[ast.AST] = list(reversed(function.body))
-    for _ in range(len(list(ast.walk(function)))):
-        if not stack:
-            break
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            nested.append(node)
-            body_ids = {id(statement) for statement in node.body}
-            children = [child for child in ast.iter_child_nodes(node) if id(child) not in body_ids]
-        else:
-            if isinstance(node, ast.Call):
-                calls.append(node)
-            children = list(ast.iter_child_nodes(node))
-        stack.extend(reversed(children))
-    return calls, nested
+def test_key_build_guard_refused_openssl(monkeypatch):
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        openssl("version")
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
 
 
-class FunctionScope(NamedTuple):
-    """One function scope with its enclosing index, own-scope calls, and local definitions."""
-
-    function: ast.FunctionDef | ast.AsyncFunctionDef
-    enclosing: int | None
-    calls: list[ast.Call]
-    local_defs: dict[str, int]
+def test_key_build_guard_refused_non_rsa(monkeypatch):
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        non_rsa_app_key("EC")
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
 
 
-def function_scopes(module: ast.Module) -> tuple[list[FunctionScope], dict[str, int]]:
-    """List every function scope in ast.walk order and map module-level function names."""
-    functions = [
-        node
-        for node in ast.walk(module)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-    index_by_id = {id(function): index for index, function in enumerate(functions)}
-    enclosing: list[int | None] = [None] * len(functions)
-    entries: list[
-        tuple[ast.FunctionDef | ast.AsyncFunctionDef, list[ast.Call], dict[str, int]]
-    ] = []
-    for index, function in enumerate(functions):
-        calls, nested = own_scope_calls(function)
-        local_defs: dict[str, int] = {}
-        for child in nested:
-            child_index = index_by_id[id(child)]
-            enclosing[child_index] = index
-            local_defs[child.name] = child_index
-        entries.append((function, calls, local_defs))
-    scopes = [
-        FunctionScope(function, enclosing[index], calls, local_defs)
-        for index, (function, calls, local_defs) in enumerate(entries)
-    ]
-    module_names = {
-        statement.name: index_by_id[id(statement)]
-        for statement in module.body
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    return scopes, module_names
+def test_key_build_guard_refused_string_target(monkeypatch):
+    monkeypatch.setattr("os.pipe", os.pipe)
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        app_key(2048)
+    assert str(exc_info.value) == "build the test key before patching: os.pipe"
 
 
-def resolve_callee(
-    scopes: list[FunctionScope],
-    module_names: dict[str, int],
-    index: int,
-    name: str,
-) -> int | None:
-    """Resolve a bare-name call from scope index through enclosing scopes to module names."""
-    current: int | None = index
-    for _ in range(len(scopes) + 1):
-        if current is None:
-            return module_names.get(name)
-        scope = scopes[current]
-        if name in scope.local_defs:
-            return scope.local_defs[name]
-        current = scope.enclosing
-    return module_names.get(name)
+def test_key_build_guard_refused_delattr(monkeypatch):
+    monkeypatch.delattr(errno, "EMFILE")
+    with pytest.raises(KeyBuildUnderPatchError) as exc_info:
+        app_key(2048)
+    assert str(exc_info.value) == "build the test key before patching: errno.EMFILE"
 
 
-def call_builds_key(
-    scopes: list[FunctionScope],
-    module_names: dict[str, int],
-    builders: set[int],
-    index: int,
-    call: ast.Call,
-) -> bool:
-    """Check whether a call in scope index invokes openssl or a resolved key-builder scope."""
-    if not isinstance(call.func, ast.Name):
-        return False
-    target = resolve_callee(scopes, module_names, index, call.func.id)
-    return (call.func.id == "openssl" and target is None) or target in builders
+def test_key_build_guard_refused_argument_order(monkeypatch):
+    with pytest.raises(KeyBuildUnderPatchError):
+        app_key(2048, (monkeypatch.setattr(os, "pipe", os.pipe), "guard-argument")[1])
 
 
-def call_patches(
-    scopes: list[FunctionScope],
-    module_names: dict[str, int],
-    patchers: set[int],
-    index: int,
-    call: ast.Call,
-) -> bool:
-    """Check whether a call in scope index patches a shared module directly or via a patcher."""
-    if patches_key_build_module(call):
-        return True
-    if not isinstance(call.func, ast.Name):
-        return False
-    return resolve_callee(scopes, module_names, index, call.func.id) in patchers
+def test_key_build_guard_refused_loop_back_edge(monkeypatch):
+    built = []
+    with pytest.raises(KeyBuildUnderPatchError):
+        for bits in (2048, 3072):
+            built.append(app_key(bits))
+            monkeypatch.setattr(os, "pipe", os.pipe)
+    assert len(built) == 1
 
 
-def scope_builds_key(
-    scopes: list[FunctionScope],
-    module_names: dict[str, int],
-    builders: set[int],
-    index: int,
-) -> bool:
-    """Check whether scope index has an own-scope call that builds a key."""
-    return any(
-        call_builds_key(scopes, module_names, builders, index, call) for call in scopes[index].calls
-    )
+def test_key_build_guard_allowed_single_iteration(monkeypatch):
+    built = []
+    for bits in (2048,):
+        built.append(app_key(bits))
+        monkeypatch.setattr(os, "pipe", os.pipe)
+    assert len(built) == 1
 
 
-def scope_patches(
-    scopes: list[FunctionScope],
-    module_names: dict[str, int],
-    patchers: set[int],
-    index: int,
-) -> bool:
-    """Check whether scope index has an own-scope call that patches a shared module."""
-    return any(
-        call_patches(scopes, module_names, patchers, index, call) for call in scopes[index].calls
-    )
+def test_key_build_guard_refused_redefinition(monkeypatch):
+    def setup():
+        monkeypatch.setattr(os, "pipe", os.pipe)
+
+    setup()
+
+    def noop():
+        pass
+
+    setup = noop
+    assert setup is noop
+    with pytest.raises(KeyBuildUnderPatchError):
+        app_key(2048)
 
 
-def scope_roles(
-    scopes: list[FunctionScope], module_names: dict[str, int]
-) -> tuple[set[int], set[int]]:
-    """Derive builder and patcher scope indexes from own-scope calls to a fixpoint."""
-    builders = {module_names["openssl"]} if "openssl" in module_names else set()
-    non_test_scopes = set(range(len(scopes))) - {
-        index for name, index in module_names.items() if name.startswith("test_")
-    }
-    patchers: set[int] = set()
-    for _ in range(len(scopes) + 1):
-        next_builders = builders | {
-            index
-            for index in range(len(scopes))
-            if scope_builds_key(scopes, module_names, builders, index)
-        }
-        next_patchers = patchers | {
-            index
-            for index in non_test_scopes
-            if scope_patches(scopes, module_names, patchers, index)
-        }
-        if next_builders == builders and next_patchers == patchers:
-            break
-        builders, patchers = next_builders, next_patchers
-    return builders, patchers
+def test_key_build_guard_allowed_call_after_redefinition(monkeypatch):
+    def setup():
+        monkeypatch.setattr(os, "pipe", os.pipe)
+
+    def noop():
+        pass
+
+    assert setup is not noop
+    setup = noop
+    setup()
+    app_key(2048)
 
 
-def derive_key_builders(module: ast.Module) -> set[str]:
-    """Find module-level functions whose own scope builds a key directly or through a call."""
-    scopes, module_names = function_scopes(module)
-    builders, _ = scope_roles(scopes, module_names)
-    return {"openssl"} | {name for name, index in module_names.items() if index in builders}
+def test_key_build_guard_refused_parameter(monkeypatch):
+    def inner(build):
+        build()
+        return app_key(2048)
+
+    def patch():
+        monkeypatch.setattr(os, "pipe", os.pipe)
+
+    with pytest.raises(KeyBuildUnderPatchError):
+        inner(patch)
 
 
-def derive_patching_helpers(module: ast.Module) -> set[str]:
-    """Find module-level helpers whose own scope patches shared modules directly or via a call."""
-    scopes, module_names = function_scopes(module)
-    _, patchers = scope_roles(scopes, module_names)
-    return {name for name, index in module_names.items() if index in patchers}
+def test_key_build_guard_allowed_parameter(monkeypatch):
+    def inner(build):
+        build()
+        return app_key(2048)
+
+    def noop():
+        pass
+
+    assert inner(noop) == app_key(2048)
 
 
-def key_builds_after_shared_module_patch(source: str) -> list[str]:
-    """Find functions whose own scope builds a key at or after a shared patch."""
-    module = ast.parse(source)
-    scopes, module_names = function_scopes(module)
-    builders, patchers = scope_roles(scopes, module_names)
-    offenders: list[str] = []
-    for index, scope in enumerate(scopes):
-        patched_at = min(
-            (
-                (call.end_lineno, call.end_col_offset)
-                for call in scope.calls
-                if call_patches(scopes, module_names, patchers, index, call)
-            ),
-            default=None,
-        )
-        if patched_at is not None and any(
-            call_builds_key(scopes, module_names, builders, index, call)
-            and (call.lineno, call.col_offset) >= patched_at
-            for call in scope.calls
-        ):
-            offenders.append(scope.function.name)
-    return offenders
+def test_key_build_guard_allowed_build_before_patch(monkeypatch):
+    app_key(2048)
+    monkeypatch.setattr(os, "pipe", os.pipe)
 
 
-def test_no_key_build_after_shared_module_patch():
-    offenders = key_builds_after_shared_module_patch(Path(__file__).read_text(encoding="utf-8"))
-    assert not offenders, (
-        "Build the test key before monkeypatching a target outside the allow-list in: "
-        f"{', '.join(offenders)}"
-    )
+def test_key_build_guard_allowed_module_copy(tmp_path, monkeypatch):
+    train_mod = load_train(tmp_path, monkeypatch)
+    monkeypatch.setattr(train_mod, "app_jwt", train_mod.app_jwt)
+    app_key(2048)
 
 
-def test_derived_builders_include_key_helpers():
-    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    assert {"openssl", "app_key", "non_rsa_app_key"} <= derive_key_builders(module)
+def test_key_build_guard_allowed_urllib_request(monkeypatch):
+    monkeypatch.setattr(urllib.request, "urlopen", urllib.request.urlopen)
+    app_key(2048)
 
 
-def test_derived_patching_helpers_include_shared_module_helpers():
-    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    assert {"patch_openssl_which", "shrink_pipes"} <= derive_patching_helpers(module)
+def test_key_build_guard_allowed_own_module(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "KEY_BUILD_SAFE_MODULES", KEY_BUILD_SAFE_MODULES)
+    app_key(2048)
+    monkeypatch.setattr(f"{__name__}.KEY_BUILD_SAFE_MODULES", KEY_BUILD_SAFE_MODULES)
+    app_key(2048)
 
 
-@pytest.mark.parametrize(
-    ("first", "second", "expected"),
-    [
-        pytest.param(
-            'monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)',
-            'env = {"TRAIN_APP_KEY": app_key(2048)[0]}',
-            ["test_example"],
-            id="patch-before-key",
-        ),
-        pytest.param(
-            'env = {"TRAIN_APP_KEY": app_key(2048)[0]}',
-            'monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)',
-            [],
-            id="key-before-patch",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(train_mod.shutil, "which", mock_which)',
-            "app_key(2048)",
-            ["test_example"],
-            id="unrelated-patch",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(os, "pipe", mock_pipe)',
-            "app_key()",
-            ["test_example"],
-            id="direct-os",
-        ),
-        pytest.param(
-            'monkeypatch.setattr("subprocess.run", mock_run)',
-            'openssl("genpkey")',
-            ["test_example"],
-            id="direct-subprocess-dotted-path",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(target=train_mod.subprocess, name="run", value=mock_run)',
-            'openssl("genpkey")',
-            ["test_example"],
-            id="shared-subprocess-keyword-target",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(train_mod.time, "monotonic", lambda: 1.0)',
-            "app_key()",
-            ["test_example"],
-            id="time-patch-before-key",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(train_mod.threading, "Thread", FailingThread)',
-            "app_key()",
-            ["test_example"],
-            id="threading-patch-before-key",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)',
-            'non_rsa_app_key("ec")',
-            ["test_example"],
-            id="non-rsa-after-os-patch",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(train_mod, "call", fake)',
-            "app_key()",
-            [],
-            id="train-module-attribute-patch",
-        ),
-        pytest.param(
-            'app_key(); monkeypatch.setattr(train_mod.os, "pipe", mock_pipe)',
-            "pass",
-            [],
-            id="key-at-same-line-boundary",
-        ),
-        pytest.param(
-            "shrink(monkeypatch)",
-            "app_key()",
-            ["test_example"],
-            id="patching-helper-before-key",
-        ),
-        pytest.param(
-            "shrink_indirectly(monkeypatch)",
-            "app_key()",
-            ["test_example"],
-            id="transitive-patching-helper-before-key",
-        ),
-        pytest.param(
-            "app_key()",
-            "shrink(monkeypatch)",
-            [],
-            id="key-before-patching-helper",
-        ),
-        pytest.param(
-            "patch_train_module(monkeypatch)",
-            "app_key()",
-            [],
-            id="safe-patching-helper-before-key",
-        ),
-    ],
-)
-def test_key_build_order_check(first, second, expected):
-    source = (
-        "def non_rsa_app_key(kind):\n    return app_key()\n"
-        'def app_key():\n    return openssl("genpkey")\n'
-        'def shrink(monkeypatch):\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-        "def shrink_indirectly(monkeypatch):\n    shrink(monkeypatch)\n"
-        'def patch_train_module(monkeypatch):\n    monkeypatch.setattr(train_mod, "call", fake)\n'
-        f"def test_example(monkeypatch):\n    {first}\n    {second}\n"
-    )
-    assert key_builds_after_shared_module_patch(source) == expected
+def test_key_build_guard_allowed_after_undo(monkeypatch):
+    monkeypatch.setattr(os, "pipe", os.pipe)
+    monkeypatch.undo()
+    app_key(2048)
 
 
-@pytest.mark.parametrize(
-    ("first", "second", "expected"),
-    [
-        pytest.param(
-            'monkeypatch.setattr(train_mod.os, "pipe", small)',
-            "app_key()",
-            ["case_helper"],
-            id="helper-patch-before-key",
-        ),
-        pytest.param(
-            "app_key()",
-            'monkeypatch.setattr(train_mod.os, "pipe", small)',
-            [],
-            id="helper-key-before-patch",
-        ),
-        pytest.param(
-            "shrink(monkeypatch)",
-            'non_rsa_app_key("ec")',
-            ["case_helper"],
-            id="helper-transitive-patch-before-builder-helper",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(train_mod.os, "pipe", small); app_key()',
-            "pass",
-            ["case_helper"],
-            id="helper-patch-before-key-same-line",
-        ),
-        pytest.param(
-            'monkeypatch.setattr(train_mod, "call", fake)',
-            "app_key()",
-            [],
-            id="helper-safe-target-before-key",
-        ),
-    ],
-)
-def test_key_build_order_inside_helpers(first, second, expected):
-    """Check key-build ordering inside helpers that both patch and build a key."""
-    source = (
-        "def non_rsa_app_key(kind):\n    return app_key()\n"
-        'def app_key():\n    return openssl("genpkey")\n'
-        'def shrink(monkeypatch):\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-        f"def case_helper(monkeypatch):\n    {first}\n    {second}\n"
-        "def test_example(monkeypatch):\n    case_helper(monkeypatch)\n"
-    )
-    assert key_builds_after_shared_module_patch(source) == expected
-
-
-NESTED_KEY_BUILD_CASES = [
-    pytest.param(
-        'def inner():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\napp_key()\ninner()',
-        [],
-        id="review-case",
-    ),
-    pytest.param(
-        'def inner():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\napp_key()',
-        [],
-        id="never-called",
-    ),
-    pytest.param(
-        'def inner():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\ninner()\napp_key()',
-        ["test_example"],
-        id="called-before",
-    ),
-    pytest.param(
-        "def make():\n    return app_key()\nshrink(monkeypatch)\nmake()",
-        ["test_example"],
-        id="nested-key-builder",
-    ),
-    pytest.param(
-        "def inner():\n    shrink(monkeypatch)\ninner()\napp_key()",
-        ["test_example"],
-        id="nested-through-module-helper",
-    ),
-    pytest.param(
-        (
-            'def a():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-            "def b():\n    a()\nb()\napp_key()"
-        ),
-        ["test_example"],
-        id="transitive-nested",
-    ),
-    pytest.param(
-        (
-            'def inner():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-            "    app_key()\ninner()"
-        ),
-        ["inner"],
-        id="nested-own-order",
-    ),
-    pytest.param(
-        "shrink(monkeypatch)\n@app_key()\ndef inner():\n    pass",
-        ["test_example"],
-        id="decorator-boundary",
-    ),
-    pytest.param(
-        "shrink(monkeypatch)\ndef inner(key=app_key()):\n    pass",
-        ["test_example"],
-        id="default-arg-boundary",
-    ),
-    pytest.param(
-        (
-            "def outer():\n    def unused():\n"
-            '        monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-            "outer()\napp_key()"
-        ),
-        [],
-        id="defined-not-called",
-    ),
-    pytest.param(
-        (
-            "def outer():\n    def unused():\n"
-            '        monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-            "    unused()\nouter()\napp_key()"
-        ),
-        ["test_example"],
-        id="called-through-outer",
-    ),
-    pytest.param(
-        "shrink(monkeypatch)\ndef outer():\n    def unused():\n        app_key()\nouter()",
-        [],
-        id="builder-defined-not-called",
-    ),
-    pytest.param(
-        (
-            "shrink(monkeypatch)\ndef outer():\n    def unused():\n"
-            "        app_key()\n    unused()\nouter()"
-        ),
-        ["test_example"],
-        id="builder-called-through-outer",
-    ),
-    pytest.param(
-        (
-            "def make():\n    return app_key()\ndef inner():\n"
-            '    monkeypatch.setattr(train_mod.os, "pipe", small)\n    make()\ninner()'
-        ),
-        ["inner"],
-        id="enclosing-builder-after-patch",
-    ),
-    pytest.param(
-        (
-            "def make():\n    return app_key()\ndef inner():\n    make()\n"
-            '    monkeypatch.setattr(train_mod.os, "pipe", small)\ninner()'
-        ),
-        [],
-        id="enclosing-builder-before-patch",
-    ),
-    pytest.param(
-        (
-            'def patch():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-            "def inner():\n    patch()\n    app_key()\ninner()"
-        ),
-        ["inner"],
-        id="enclosing-patcher-before-key",
-    ),
-    pytest.param(
-        (
-            "def make():\n    return app_key()\ndef inner():\n    def make():\n        pass\n"
-            '    monkeypatch.setattr(train_mod.os, "pipe", small)\n    make()\ninner()'
-        ),
-        [],
-        id="local-def-shadows-enclosing",
-    ),
-    pytest.param(
-        "define_only(monkeypatch)\napp_key()",
-        [],
-        id="module-helper-defines-only",
-    ),
-    pytest.param(
-        "define_and_call(monkeypatch)\napp_key()",
-        ["test_example"],
-        id="module-helper-calls-nested",
-    ),
-]
-
-
-@pytest.mark.parametrize(("body", "expected"), NESTED_KEY_BUILD_CASES)
-def test_key_build_order_nested_functions(body, expected):
-    """Attribute nested patches and key builds to the parent at each call, not at definition."""
-    indented = body.replace("\n", "\n    ")
-    source = (
-        'def app_key():\n    return openssl("genpkey")\n'
-        'def shrink(monkeypatch):\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-        "def define_only(monkeypatch):\n    def unused():\n"
-        '        monkeypatch.setattr(train_mod.os, "pipe", small)\n'
-        "def define_and_call(monkeypatch):\n    def used():\n"
-        '        monkeypatch.setattr(train_mod.os, "pipe", small)\n    used()\n'
-        f"def test_example(monkeypatch):\n    {indented}\n"
-    )
-    assert key_builds_after_shared_module_patch(source) == expected
+def test_key_build_guard_context(monkeypatch):
+    with monkeypatch.context() as inner_patch:
+        inner_patch.setattr(os, "pipe", os.pipe)
+        with pytest.raises(KeyBuildUnderPatchError):
+            app_key(2048)
+    app_key(2048)
 
 
 def test_os_failure_names_the_type_and_description_only(tmp_path, monkeypatch):
