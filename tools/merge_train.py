@@ -2325,7 +2325,7 @@ def serve_pending(env, conf, repo, served, notes, now, lease):
 def report(name, repo, rows, notes, outcome):
     """The section of one repository with open pull requests."""
     lines = [
-        f"### {name}: {outcome}",
+        f"### {name}: {refusal_line(outcome)}",
         "",
         "| Pull request | Merge state | Train |",
         "|---|---|---|",

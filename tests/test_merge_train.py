@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import email.message
 import errno
 import functools
 import hashlib
 import http.client
 import importlib.util
+import inspect
 import io
 import itertools
 import json
@@ -29,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -501,7 +504,7 @@ class Forge:
         self.ungranted: set[int] = set()
         self.jobs: dict[int, list[dict]] = {}
         self.jobs_calls: list[int] = []
-        # Queued HTTP faults by REST route or GraphQL query name.
+        # Queued HTTP faults by REST route or GraphQL operation name.
         self.rest_faults: dict[str, list[int | str | tuple[int, bytes]]] = {}
         self.label_missing = False
         self.unlabel_status: int | None = None
@@ -1261,7 +1264,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/graphql":
             request = self.body()
             query = request["query"]
-            operation = re.match(r"\s*query\s+(\w+)", query)
+            operation = re.match(r"\s*(?:query|mutation)\s+(\w+)", query)
             if operation and self.fault(operation[1]):
                 return
             forge = self.server.forge
@@ -1335,6 +1338,31 @@ TRAIN_DEFAULTS = {
 }
 
 
+@contextlib.contextmanager
+def train_environment(tmp_path, forge, settings):
+    """Yield the train step's environment with the stand-in forge running."""
+    forge.workdir = tmp_path
+    private = app_key()[0]
+    server = serve(forge)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield measured(
+            TRAIN_DEFAULTS
+            | {
+                "GITHUB_API_URL": url,
+                "GITHUB_GRAPHQL_URL": f"{url}/graphql",
+                "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+                "GITHUB_OUTPUT": str(tmp_path / "output"),
+                "RUNNER_TEMP": str(tmp_path),
+                "TRAIN_APP_KEY": private,
+                **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
+            }
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def train(
     tmp_path: Path,
     forge: Forge,
@@ -1358,23 +1386,7 @@ def train(
         shutil.copyfile(ROOT / "tools/review_state.py", tmp_path / "review_state.py")
         shutil.copyfile(ROOT / "tools/release_workflows.py", tmp_path / "release_workflows.py")
         command = [sys.executable, *flags, str(path)]
-    summary, output = tmp_path / "summary.md", tmp_path / "output"
-    forge.workdir = tmp_path
-    server = serve(forge)
-    url = f"http://127.0.0.1:{server.server_address[1]}"
-    env = measured(
-        TRAIN_DEFAULTS
-        | {
-            "GITHUB_API_URL": url,
-            "GITHUB_GRAPHQL_URL": f"{url}/graphql",
-            "GITHUB_STEP_SUMMARY": str(summary),
-            "GITHUB_OUTPUT": str(output),
-            "RUNNER_TEMP": str(tmp_path),
-            "TRAIN_APP_KEY": app_key()[0],
-            **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
-        }
-    )
-    try:
+    with train_environment(tmp_path, forge, settings) as env:
         done = subprocess.run(
             command,
             capture_output=True,
@@ -1383,9 +1395,7 @@ def train(
             env=env,
             timeout=120,
         )
-    finally:
-        server.shutdown()
-        server.server_close()
+    summary = tmp_path / "summary.md"
     written = summary.read_text(encoding="utf-8") if summary.exists() else ""
     return done, written
 
@@ -1666,30 +1676,40 @@ def test_missing_queue_entry_fails(tmp_path):
     assert "no merge queue entry" in done.stdout
 
 
-def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
-    train_mod = load_train(tmp_path, monkeypatch)
-    rules = load_rules(tmp_path)
+def file_modes_document(train_mod, monkeypatch):
+    """Capture the document generated for a retry diff with one surviving file."""
     generated = []
 
     def read_file_modes(_env, query, _variables):
+        """Capture the document and return equal file modes."""
         generated.append(query)
         commit = {"f0": {"mode": 33188}}
         return {"repository": {"before": commit, "after": commit}}
 
-    monkeypatch.setattr(train_mod, "own_diff", lambda *_: [("path", "patch", "modified")])
-    monkeypatch.setattr(train_mod, "read_graphql", read_file_modes)
-    assert train_mod.same_retry_change({"GITHUB_REPOSITORY": "fleet/app"}, "base", "old", "new")
-    assert [train_mod.graphql_name(doc) for doc in generated] == ["FileModes"]
+    with monkeypatch.context() as patch:
+        patch.setattr(train_mod, "own_diff", lambda *_: [("path", "patch", "modified")])
+        patch.setattr(train_mod, "read_graphql", read_file_modes)
+        assert train_mod.same_retry_change({"GITHUB_REPOSITORY": "fleet/app"}, "base", "old", "new")
+    (document,) = generated
+    return document
 
-    def documents():
-        constants = [
-            doc
-            for key, doc in vars(train_mod).items()
-            if key.isupper()
-            and isinstance(doc, str)
-            and re.match(r"\s*(query\b|mutation\b|\{)", doc)
-        ]
-        return [*constants, rules.QUERY, rules.STATUS_QUERY, *generated]
+
+def train_graphql_documents(train_mod, rules, generated):
+    """Collect the train's static, rules-module and generated GraphQL documents."""
+    constants = [
+        doc
+        for key, doc in vars(train_mod).items()
+        if key.isupper() and isinstance(doc, str) and re.match(r"\s*(query\b|mutation\b|\{)", doc)
+    ]
+    return [*constants, rules.QUERY, rules.STATUS_QUERY, generated]
+
+
+def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
+    train_mod = load_train(tmp_path, monkeypatch)
+    rules = load_rules(tmp_path)
+    generated = file_modes_document(train_mod, monkeypatch)
+    assert train_mod.graphql_name(generated) == "FileModes"
+    documents = functools.partial(train_graphql_documents, train_mod, rules, generated)
 
     def check(docs):
         names = []
@@ -11119,6 +11139,152 @@ def test_retry_read_refusal_stays_in_one_notes_cell(tmp_path):
         assert note.endswith(f"HTTP 502 {FLATTENED_READ_ERROR}")
 
 
+FORGE_FAULT_BODY = b"first line\r\nsecond line"
+UNREACHED_FORGE_FAULTS: dict[str, str] = {}
+NONFATAL_FORGE_REFUSALS = frozenset(
+    {"LanderLease", "ReviewBodies", "RetryHistory", "FileModes", "artifacts", "revoke"}
+)
+
+
+def rest_fault_routes():
+    """Find the literal REST route keys served by the stand-in forge's fault queue."""
+    keys = [
+        node.args[0]
+        for node in ast.walk(ast.parse(inspect.getsource(Handler)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fault"
+    ]
+    assert sum(not isinstance(key, ast.Constant) for key in keys) == 1  # The GraphQL dispatcher.
+    return {key.value for key in keys if isinstance(key, ast.Constant)}
+
+
+def pytest_generate_tests(metafunc):
+    """Parametrize the fault sweep from the shared document and forge route inventories."""
+    if "forge_fault" not in metafunc.fixturenames:
+        return
+    with tempfile.TemporaryDirectory() as temporary, pytest.MonkeyPatch.context() as patch:
+        path = Path(temporary)
+        rules = load_rules(path)
+        patch.setitem(sys.modules, "train_rules", rules)
+        train_mod = load_train(path, patch)
+        documents = train_graphql_documents(train_mod, rules, file_modes_document(train_mod, patch))
+        operations = {
+            train_mod.graphql_name(doc): doc.lstrip().startswith("mutation") for doc in documents
+        }
+    routes = rest_fault_routes()
+    assert operations.keys().isdisjoint(routes)
+    assert UNREACHED_FORGE_FAULTS.keys() <= operations.keys() | routes
+    assert all(
+        reason.strip() and len(reason.splitlines()) == 1
+        for reason in UNREACHED_FORGE_FAULTS.values()
+    )
+    single_attempt = {**operations, **{route: route == "revoke" for route in routes}}
+    cases = [pytest.param((key, once), id=key) for key, once in sorted(single_attempt.items())]
+    metafunc.parametrize("forge_fault", cases)
+
+
+def artifact_fault_forge():
+    """A dependency update with a changed artifact and a live merge-state recheck."""
+    dep = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep))
+    regenerable(forge, dep)
+    return forge
+
+
+def fault_scenario(key):
+    """Choose a whole-sweep scenario that reaches the requested forge operation."""
+    settings = {}
+    if key in {"FileModes", "RetryHistory"}:
+        return retry_forge("BEHIND"), settings
+    if key in {"artifacts", "CreateCommit", "MergeState"}:
+        return artifact_fault_forge(), settings
+    if key == "jobs":
+        return stopped_forge(), settings
+    if key == "Draft":
+        return Forge(repository(*held_pair(), rules=LINEAR)), settings
+    if key == "Ready":
+        held = pull(1, "CLEAN", headRefName="renovate/go-snaps", isDraft=True, labels=(HOLD,))
+        return Forge(repository(held)), settings
+    if key in {"Dequeue", "Disarm", "PullPageWithStatus"}:
+        settings["required_status"] = "lanes/booked"
+        if key == "Dequeue":
+            return Forge(repository(pull(1, "CLEAN", isInMergeQueue=True), queue=True)), settings
+        if key == "Disarm":
+            armed_pull = pull(1, "BLOCKED", autoMergeRequest=armed_squash("change 1 (#1)"))
+            return Forge(repository(armed_pull)), settings
+    p = pull(1, "BEHIND" if key == "Arm" else "CLEAN")
+    return Forge(repository(p, queue=key == "Enqueue")), settings
+
+
+def observe_sweep_refusals(train_mod, patch):
+    """Capture the sweep's refusals before the summary and annotation render them."""
+    sweep = train_mod.sweep
+    refusals = []
+
+    def observed(*args):
+        """Forward the sweep result and record the entries it passes to the renderer."""
+        result = sweep(*args)
+        refusals.extend(result[2])
+        return result
+
+    patch.setattr(train_mod, "sweep", observed)
+    return refusals
+
+
+def assert_one_line_fault_output(text):
+    """Reject a traceback, orphaned response line or multiple commands on one line."""
+    assert "Traceback" not in text
+    for line in text.splitlines():
+        assert not re.match(r"^[\s#>|*+`_~-]*second line", line), line
+        if line.startswith("::"):
+            assert line.count("::") == 2, line
+
+
+def test_forge_fault_sweep(tmp_path, monkeypatch, capsys, record_property, forge_fault):
+    """Spend a forge operation's HTTP 502 retries and inspect the full sweep's output."""
+    key, once = forge_fault
+    forge, settings = fault_scenario(key)
+    train_mod = load_train(tmp_path, monkeypatch)
+    attempts = 1 if once else train_mod.READ_ATTEMPTS
+    if key in {"PullPage", "PullPageWithStatus"}:
+        attempts += 2  # The two splits precede the retries at the minimum page size.
+    faults = [(502, FORGE_FAULT_BODY)] * attempts
+    forge.rest_faults[key] = faults
+    with train_environment(tmp_path, forge, settings) as env:
+        clock = types.SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None, time=time.time)
+        monkeypatch.setattr(train_mod, "time", clock)
+        opener = urllib.request.build_opener
+        monkeypatch.setattr(
+            urllib.request,
+            "build_opener",
+            lambda *handlers: opener(urllib.request.ProxyHandler({}), *handlers),
+        )
+        refusals = observe_sweep_refusals(train_mod, monkeypatch)
+        code = train_mod.main(env)
+
+    out, err = capsys.readouterr()
+    summary_path = tmp_path / "summary.md"
+    summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
+    body_visible = any("first line second line" in text for text in (out, err, summary))
+    consumed = attempts - len(faults)
+    record_property("faults_consumed", consumed)
+    record_property("body_visible", body_visible)
+    assert_one_line_fault_output(out)
+    assert_one_line_fault_output(err)
+    assert_one_line_fault_output(summary)
+    if key in UNREACHED_FORGE_FAULTS:
+        assert consumed == 0, f"{key} is now reached"
+        return
+    assert consumed == attempts, f"{key}: consumed {consumed} of {attempts} faults"
+    assert all(refusal.splitlines() == [refusal] for refusal in refusals), refusals
+    expected = 0 if key in NONFATAL_FORGE_REFUSALS else 1
+    assert code == expected, out + err
+    if expected == 1:
+        assert "::error title=Merge train refused::" in out, out
+    assert body_visible, out + err
+
+
 def test_report_escapes_pipe_in_notes_cell(tmp_path, monkeypatch):
     """A literal pipe in the train's note preserves the three table cells."""
     mod = load_train(tmp_path, monkeypatch)
@@ -11476,17 +11642,32 @@ def test_lander_lease_unchanged_lands_after_one_read(tmp_path, lease):
         ({"errors": [{"message": "lease read refused"}]}, "lease read refused"),
         ({"data": {"repository": {}}}, "landerLease"),
         ({"data": {"repository": None}}, "NoneType"),
+        pytest.param(None, "HTTP 502 first line second line", id="multiline-502"),
     ],
 )
 def test_lander_lease_unreadable_lands_nothing(tmp_path, answer, cause):
     forge = Forge(repository(pull(1, "CLEAN"), pull(2, "CLEAN")))
-    forge.lease_read = answer
+    if answer is None:
+        forge.rest_faults["LanderLease"] = [(502, FORGE_FAULT_BODY)] * 3
+    else:
+        forge.lease_read = answer
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
-    assert "lander lease unreadable" in summary
-    assert cause in summary
-    assert forge.lease_calls == 1
+    for output in (done.stdout, summary):
+        (heading,) = [line for line in output.splitlines() if line.startswith("### fleet/app: ")]
+        assert heading.startswith("### fleet/app: lander lease unreadable: ")
+        assert cause in heading
+        if answer is None:
+            assert re.fullmatch(
+                r"### fleet/app: lander lease unreadable: RefusedError: graphql LanderLease: "
+                r"POST http://127\.0\.0\.1:\d+/graphql: HTTP 502 first line second line",
+                heading,
+            )
+    if answer is None:
+        assert forge.rest_faults["LanderLease"] == []
+    else:
+        assert forge.lease_calls == 1
 
 
 def test_retry_hold_concluded_green_and_pending_app_releases(tmp_path, monkeypatch):
