@@ -72,9 +72,19 @@ A Dependency Dashboard request (`unpend`) overrides that gate
 ([`branch/index.ts`](https://github.com/renovatebot/renovate/blob/44.257.9/lib/workers/repository/update/branch/index.ts#L81-L86),
 [`branch/index.ts`](https://github.com/renovatebot/renovate/blob/44.257.9/lib/workers/repository/update/branch/index.ts#L156-L163)).
 
+The dashboard stores the request by branch name, without recording a version
+([`branch/index.ts`](https://github.com/renovatebot/renovate/blob/44.257.9/lib/workers/repository/update/branch/index.ts#L81-L86)).
+When every candidate is pending, lookup selects the highest pending release
+([`filter-checks.ts`](https://github.com/renovatebot/renovate/blob/44.257.9/lib/workers/repository/process/lookup/filter-checks.ts#L251-L262)).
+The requested branch can therefore contain a newer release published after the
+person checked the age. Before merging, the reviewer checks the release age of
+the version in the pull request outside Renovate and merges only once that
+version is at least three days old.
+
 With `internalChecksFilter: strict`, undated outside images therefore get neither
 a branch nor a pull request until a person judges release age elsewhere and
-requests the update on the dashboard.
+requests the update on the dashboard. The reviewer then checks the age of the
+version in the pull request before merging.
 
 ### Time-based pull request creation (refuted)
 
@@ -139,7 +149,9 @@ preset; per-package `timestamp-optional` is out of scope for this record.
 
 The wait-keeping path for undated outside images is section **Status quo
 (works)** above: no branch and no pull request until a person checks release age
-outside Renovate and requests the update on the Dependency Dashboard.
+outside Renovate and requests the update on the Dependency Dashboard, and no
+merge until the reviewer checks outside Renovate that the version in the pull
+request is at least three days old.
 
 Per-image **overridePackageName** toward a Docker Hub twin is allowed only when
 all three proofs in **Dated twin per image** hold; when any is missing, the
