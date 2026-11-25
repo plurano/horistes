@@ -4563,6 +4563,7 @@ def test_post_verification_absent_required_status_depends_on_page_completeness(
         assert rc == 0 and err == "", err
         assert fake.posts == [(REVIEW_POST_PATH, "success")]
         assert standing == "success"
+        assert fake.calls.count(("GET", CHECKS_URL)) == 1
         post_index = fake.calls.index(("POST", REVIEW_POST_PATH))
         assert ("GET", _status_page(2)) in fake.calls[post_index + 1 :]
     elif mode == "full-page-external-failed-on-page-two":
@@ -4599,6 +4600,74 @@ def test_post_verification_reads_contender_displaced_to_page_two() -> None:
     )
     assert rc == 0 and err == "", err
     assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
+
+
+@dataclass(frozen=True)
+class _SnapshotJudgeStatusCase:
+    prior_state: str
+    keep_id: bool = True
+    competitor: str = ""
+    expected_states: tuple[str, ...] = ("success",)
+    expected_checks_gets: int = 1
+    expect_clean_err: bool = True
+
+
+def _interleave_idless_sweep_failure(fake: ReviewTransport, created_at: str) -> None:
+    fake.before_post = None
+    assert fake.calls[-2] == ("GET", STATUSES_URL)
+    fake.clock.current = max(fake.clock.now(), required_checks._iso_epoch(created_at))
+    failed = status_item(41, PUSH_CONTEXT, "failure", updated_at=created_at)
+    failed.pop("id")
+    existing = fake.answers[STATUSES_URL]
+    assert isinstance(existing, list)
+    fake.answers[STATUSES_URL] = [failed, *existing]
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(2, "Build", "failure")]}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _SnapshotJudgeStatusCase("failure"),
+        _SnapshotJudgeStatusCase("pending"),
+        _SnapshotJudgeStatusCase(
+            "failure",
+            competitor="id",
+            expected_states=("success", "failure"),
+            expected_checks_gets=2,
+            expect_clean_err=False,
+        ),
+        _SnapshotJudgeStatusCase(
+            "failure",
+            keep_id=False,
+            competitor="idless",
+            expected_states=("success", "failure"),
+            expected_checks_gets=2,
+            expect_clean_err=False,
+        ),
+    ],
+    ids=[
+        "prior-failure-in-read-second",
+        "prior-pending-in-read-second",
+        "prior-plus-competitor",
+        "id-less-prior-and-competitor",
+    ],
+)
+def test_post_verification_ignores_snapshot_judge_status(case: _SnapshotJudgeStatusCase) -> None:
+    fake = ReviewTransport()
+    prior = status_item(40, PUSH_CONTEXT, case.prior_state)
+    if not case.keep_id:
+        prior.pop("id")
+    fake.answers[STATUSES_URL] = [prior]
+    if case.competitor == "id":
+        fake.before_post = lambda: _interleave_sweep_failure(fake, "2026-11-21T12:00:00Z")
+    elif case.competitor == "idless":
+        fake.before_post = lambda: _interleave_idless_sweep_failure(fake, "2026-11-21T12:00:00Z")
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0
+    if case.expect_clean_err:
+        assert err == ""
+    assert fake.posts == [(REVIEW_POST_PATH, state) for state in case.expected_states]
+    assert fake.calls.count(("GET", CHECKS_URL)) == case.expected_checks_gets
 
 
 def test_post_verification_required_status_change_withdraws_when_retry_fails() -> None:

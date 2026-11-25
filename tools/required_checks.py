@@ -1256,11 +1256,25 @@ def _statuses_covered(rows: list[dict], owed_keys: frozenset[str], oldest_conten
     return owed_keys <= seen
 
 
-def _has_contender(rows: list[dict], key: str, status_id: int, oldest_contender: int) -> bool:
+def _excluded_status_ids(
+    status_id: int, self_status: Mapping[str, object] | None
+) -> frozenset[int]:
+    """Exclude the created status and the judge status the snapshot read, because preflight
+    confirmed it was the newest before the POST.
+    """
+    prior_id = self_status.get("id") if self_status is not None else None
+    if isinstance(prior_id, int) and not isinstance(prior_id, bool):
+        return frozenset({status_id, prior_id})
+    return frozenset({status_id})
+
+
+def _has_contender(
+    rows: list[dict], key: str, excluded_ids: frozenset[int], oldest_contender: int
+) -> bool:
     for entry in rows[:MAX_STATUSES]:
         if (
             _status_in_context(entry, key)
-            and entry.get("id") != status_id
+            and entry.get("id") not in excluded_ids
             and _iso_epoch(entry.get("created_at")) >= oldest_contender
         ):
             return True
@@ -1292,7 +1306,8 @@ def _post_is_contested(
             return True
     if _owed_status_changed(config, evaluation.snapshot, _all_statuses(rows), complete=complete):
         return True
-    return _has_contender(rows, key, status_id, oldest_contender)
+    excluded_ids = _excluded_status_ids(status_id, evaluation.snapshot.self_status)
+    return _has_contender(rows, key, excluded_ids, oldest_contender)
 
 
 def _report_verdict(config: Config, evaluation: Evaluation, out: TextIO) -> None:
