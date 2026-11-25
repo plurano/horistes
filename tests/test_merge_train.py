@@ -1786,8 +1786,52 @@ def test_nonadvancing_pull_page_refuses(tmp_path, monkeypatch, empty):
     with pytest.raises(
         train_mod.RefusedError, match="graphql PullPage: open pull request page did not advance"
     ):
-        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {})
+        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, train_mod.time.monotonic())
     assert calls == [25]
+
+
+def test_spent_sweep_budget_refuses_before_the_first_pull_page(tmp_path, monkeypatch):
+    """No pull page request starts once the sweep budget is spent; the refusal names the read."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(train_mod, "graphql", lambda _env, _query, variables: calls.append(1))
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: float(train_mod.SWEEP_SECONDS + 1))
+    with pytest.raises(
+        train_mod.RefusedError,
+        match=rf"graphql PullPage: sweep budget of {train_mod.SWEEP_SECONDS} s spent "
+        r"before the read \(page size 25, cursor start\)",
+    ):
+        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, 0.0)
+    assert calls == []
+
+
+def test_split_within_sweep_budget_finishes_and_next_page_refuses(tmp_path, monkeypatch):
+    """A split begun inside the budget reads its page; the page after the budget is refused."""
+    train_mod = load_train(tmp_path, monkeypatch)
+    calls = []
+
+    def page(_env, _query, variables):
+        calls.append((variables["first"], variables["after"]))
+        if variables["first"] == 25:
+            raise train_mod.RefusedError("graphql PullPage: timed out") from TimeoutError()
+        connection = {
+            "nodes": [pull(1, "CLEAN")],
+            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+        }
+        return {"repository": {"pullRequests": connection}}
+
+    ticks = itertools.chain(
+        [float(train_mod.SWEEP_SECONDS)] * 2, itertools.repeat(float(train_mod.SWEEP_SECONDS + 1))
+    )
+    monkeypatch.setattr(train_mod, "graphql", page)
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(
+        train_mod.RefusedError,
+        match=rf"graphql PullPage: sweep budget of {train_mod.SWEEP_SECONDS} s spent "
+        r"before the read \(page size 12, cursor cursor-1\)",
+    ):
+        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, 0.0)
+    assert calls == [(25, None), (12, None)]
 
 
 def test_read_500_is_not_retried(tmp_path):

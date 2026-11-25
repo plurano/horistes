@@ -36,6 +36,12 @@ Report a recovered split once in the repository section with the reduced size
 and the first line of the original refusal. If the smallest request fails,
 report its size and cursor and fail the sweep. Mutations still run once.
 
+No page or split request starts once the sweep budget is spent. The refusal
+names the document, the page size and the cursor, and the repository is
+reported refused. A request already in flight is not cut short; its socket
+timeout and read attempts bound it, and a split that started inside the budget
+still finishes its page.
+
 ## Consequences
 
 - A repository with 100 or more open pulls normally takes four page calls per
@@ -45,16 +51,19 @@ report its size and cursor and fail the sweep. Mutations still run once.
   floor, including the final four pulls. If each succeeds on its third
   attempt, three settle rounds cost at most `2 + 3 × 17 × 3 = 155` pull-page
   calls per repository. The two larger failed calls occur only once.
-- At 30 seconds per call plus retry and settle sleeps, that scenario costs
-  5,170 seconds. Even a single such pass could take 1,760 seconds. These
-  estimates exceed the 1,500-second sweep budget. The sweep checks its budget
-  before starting each repository. An in-progress page read can finish after
-  the budget expires, leaving later repositories listed as unreached.
+- At 30 seconds per call plus retry and settle sleeps, that scenario would
+  cost 5,170 seconds, and a single pass 1,760 seconds. The budget stops it:
+  the sweep checks it before each repository and before each pull-page
+  request, so only the request in flight runs past it. The budget clock starts
+  with the train step; a fleet run spent 5 seconds before that step and 4
+  seconds after it (run 45675358659), inside the 30-minute job limit. Later
+  repositories are listed as unreached.
 - If the forge returns short nonfinal pages, each must advance the cursor and
   contribute at least one pull. The absolute bound is 100 pages per pass, or
   902 pull-page calls across three rounds including both splits. The same
-  timeout-and-sleep calculation gives 30,070 seconds. These figures cover
-  pull pagination only. The socket timeout applies to individual I/O operations.
+  timeout-and-sleep calculation gives 30,070 seconds before the budget ends
+  the read. These figures cover pull pagination only. The socket timeout
+  applies to individual I/O operations.
 
 ## References
 

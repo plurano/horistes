@@ -836,8 +836,10 @@ def read_graphql(env, query, variables):
 
 @dataclass
 class PullPageReader:
-    """Page size and first split reason for one repository, including settle reads."""
+    """Page size and first split reason for one repository, including settle reads; no page
+    or split request starts once the sweep budget from started is spent."""
 
+    started: float
     size: int = PULL_PAGE
     split_reason: str = ""
 
@@ -845,14 +847,18 @@ class PullPageReader:
         size = min(self.size, remaining)
         for _ in range(size.bit_length()):
             variables["first"] = size
+            where = f"page size {size}, cursor {variables['after'] or 'start'}"
+            if over_budget(self.started):
+                raise RefusedError(
+                    f"graphql {graphql_name(query)}: sweep budget of {SWEEP_SECONDS} s spent "
+                    f"before the read ({where})"
+                )
             reader = read_graphql if size <= PULL_PAGE_MIN else graphql
             try:
                 return reader(env, query, variables)["repository"]
             except RefusedError as err:
                 if size <= PULL_PAGE_MIN:
-                    err.args = (
-                        f"{err} (page size {size}, cursor {variables['after'] or 'start'})",
-                    )
+                    err.args = (f"{err} ({where})",)
                     raise
                 if not transient(err):
                     raise
@@ -890,9 +896,9 @@ def pull_pages(env, conf, reader):
     return repo
 
 
-def fetch(env, conf):
+def fetch(env, conf, started):
     """The repository and its open pull requests, re-read while a merge state is UNKNOWN."""
-    reader = PullPageReader()
+    reader = PullPageReader(started)
     for attempt in range(SETTLE_ROUNDS):
         repo = pull_pages(env, conf, reader)
         pulls = repo["pullRequests"]["nodes"]
@@ -2513,7 +2519,7 @@ def unsigned_bot_entries(target, notes):
     ]
 
 
-def one(env, conf, installation, target, now):
+def one(env, conf, installation, target, now, started):
     """The train in one repository, with a token for that repository alone."""
     rights = WRITE_RIGHTS if conf["switch"] == "on" else READ_RIGHTS
     if conf["required_status"]:
@@ -2523,7 +2529,7 @@ def one(env, conf, installation, target, now):
     section_notes = []
     notes = {}
     try:
-        repo, split_note = fetch(local, conf)
+        repo, split_note = fetch(local, conf, started)
         if split_note:
             section_notes.append(split_note)
         rows, notes, outcome = run(local, conf, repo, now, notes)
@@ -2595,7 +2601,7 @@ def sweep(env, conf, started):
             try:
                 now = datetime.now(UTC)
                 outcome, section, moved, release, unsigned = one(
-                    env, {**conf, **identity}, installation, target, now
+                    env, {**conf, **identity}, installation, target, now, started
                 )
             except UngrantedError as err:
                 rest = len(targets) - index
