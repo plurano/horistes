@@ -408,6 +408,10 @@ class InvalidSettingError(Exception):
     """A setting outside its allowed values."""
 
 
+class GraphQLDocumentError(Exception):
+    """A train GraphQL document is invalid."""
+
+
 def check_session_hold_hours(raw, error_cls=ValueError):
     """Maximum hold per update, whole hours from 1 to 48."""
     if not re.fullmatch(r"[0-9]{1,2}", raw) or not 1 <= int(raw) <= 48:
@@ -796,7 +800,7 @@ def graphql_name(query):
     """Every train document declares its operation before the variables or selection."""
     operation = re.match(r"\s*(?:query|mutation)\s+([A-Za-z_]\w*)\b", query)
     if operation is None:
-        raise ValueError("anonymous GraphQL operation")
+        raise GraphQLDocumentError("anonymous GraphQL operation")
     return operation[1]
 
 
@@ -822,7 +826,11 @@ def graphql(env, query, variables):
     return answer["data"]
 
 
-def read_graphql(env, query, variables):
+def pull_page_budget_message(query):
+    return f"graphql {graphql_name(query)}: sweep budget of {SWEEP_SECONDS} s spent before the read"
+
+
+def read_graphql(env, query, variables, *, started=None):
     """A GraphQL read; a gateway error, a dropped connection or a cut body is tried again,
     at most READ_ATTEMPTS times (record 0080). Mutations go through graphql and run once."""
     for attempt in range(1, READ_ATTEMPTS + 1):
@@ -832,6 +840,9 @@ def read_graphql(env, query, variables):
             if not transient(err) or attempt == READ_ATTEMPTS:
                 raise
             time.sleep(READ_BACKOFF_SECONDS)
+            if started is not None and over_budget(started):
+                reason = str(err).splitlines()[0]
+                raise RefusedError(f"{pull_page_budget_message(query)} after {reason}") from err
 
 
 @dataclass
@@ -843,19 +854,22 @@ class PullPageReader:
     size: int = PULL_PAGE
     split_reason: str = ""
 
+    def split_note(self):
+        if self.split_reason:
+            return f"Split open pull request page to {self.size} after {self.split_reason}"
+        return ""
+
     def read(self, env, query, variables, remaining):
         size = min(self.size, remaining)
         for _ in range(size.bit_length()):
             variables["first"] = size
             where = f"page size {size}, cursor {variables['after'] or 'start'}"
             if over_budget(self.started):
-                raise RefusedError(
-                    f"graphql {graphql_name(query)}: sweep budget of {SWEEP_SECONDS} s spent "
-                    f"before the read ({where})"
-                )
-            reader = read_graphql if size <= PULL_PAGE_MIN else graphql
+                raise RefusedError(f"{pull_page_budget_message(query)} ({where})")
             try:
-                return reader(env, query, variables)["repository"]
+                if size <= PULL_PAGE_MIN:
+                    return read_graphql(env, query, variables, started=self.started)["repository"]
+                return graphql(env, query, variables)["repository"]
             except RefusedError as err:
                 if size <= PULL_PAGE_MIN:
                     err.args = (f"{err} ({where})",)
@@ -896,9 +910,8 @@ def pull_pages(env, conf, reader):
     return repo
 
 
-def fetch(env, conf, started):
+def fetch(env, conf, reader):
     """The repository and its open pull requests, re-read while a merge state is UNKNOWN."""
-    reader = PullPageReader(started)
     for attempt in range(SETTLE_ROUNDS):
         repo = pull_pages(env, conf, reader)
         pulls = repo["pullRequests"]["nodes"]
@@ -906,9 +919,7 @@ def fetch(env, conf, started):
             break
         if attempt + 1 < SETTLE_ROUNDS:
             time.sleep(SETTLE_SECONDS)
-    if reader.split_reason:
-        return repo, f"Split open pull request page to {reader.size} after {reader.split_reason}"
-    return repo, ""
+    return repo
 
 
 def pull_commits(env, number):
@@ -2528,14 +2539,15 @@ def one(env, conf, installation, target, now, started):
     local = {**env, "GITHUB_REPOSITORY": target["full_name"], "TRAIN_TOKEN": token}
     section_notes = []
     notes = {}
+    reader = PullPageReader(started)
     try:
-        repo, split_note = fetch(local, conf, started)
-        if split_note:
-            section_notes.append(split_note)
+        repo = fetch(local, conf, reader)
         rows, notes, outcome = run(local, conf, repo, now, notes)
         if conf["switch"] == "on":
             section_notes.extend(close_issues(local, conf, installation, target, now))
     except RefusedError as err:
+        if split_note := reader.split_note():
+            err.args = (f"{err} ({split_note})",)
         err.unsigned_bots = unsigned_bot_entries(target, notes)
         raise
     finally:
@@ -2557,6 +2569,8 @@ def one(env, conf, installation, target, now, started):
         for note in notes.values()
     )
     section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""
+    if split_note := reader.split_note():
+        section_notes.insert(0, split_note)
     if section_notes:
         section = section or f"### {target['full_name']}: {outcome}\n"
         section += "\n" + "\n".join(section_notes) + "\n"

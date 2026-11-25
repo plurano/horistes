@@ -23,7 +23,8 @@ bytes). Retrying the same 25 pulls could repeatedly hit the forge's time limit.
 
 Give every GraphQL document a unique operation name and prefix its refusals
 with that name. Preserve the exception type and transport cause used by the
-retry and merge-in-progress handlers.
+retry and merge-in-progress handlers. An anonymous document stops the sweep
+with a programming error.
 
 Request 25 open pulls initially. On a transient refusal, keep the cursor and
 halve the requested size, down to six. Keep the reduced size for later pages
@@ -33,14 +34,14 @@ The last request asks for at most the remainder of the 100-pull allowance.
 The forge's final `hasNextPage` determines whether the summary reports truncation.
 
 Report a recovered split once in the repository section with the reduced size
-and the first line of the original refusal. If the smallest request fails,
-report its size and cursor and fail the sweep. Mutations still run once.
+and the first line of the original refusal. If the repository is later refused,
+include the split in its refusal line. If the smallest request fails, report
+its size and cursor and fail the sweep. Mutations still run once.
 
-No page or split request starts once the sweep budget is spent. The refusal
-names the document, the page size and the cursor, and the repository is
-reported refused. A request already in flight is not cut short; its socket
-timeout and read attempts bound it, and a split that started inside the budget
-still finishes its page.
+Check the sweep budget before every pull-page attempt, including splits and
+retries after a backoff. A budget refusal names the document, page size and
+cursor. When the budget stops a retry, it also names the last refusal. A
+request already in flight can finish after the budget is spent.
 
 ## Consequences
 
@@ -53,11 +54,11 @@ still finishes its page.
   calls per repository. The two larger failed calls occur only once.
 - At 30 seconds per call plus retry and settle sleeps, that scenario would
   cost 5,170 seconds, and a single pass 1,760 seconds. The budget stops it:
-  the sweep checks it before each repository and before each pull-page
-  request, so only the request in flight runs past it. The budget clock starts
-  with the train step; a fleet run spent 5 seconds before that step and 4
-  seconds after it (run 45675358659), inside the 30-minute job limit. Later
-  repositories are listed as unreached.
+  the sweep checks it before each repository and before every pull-page
+  attempt. Only one pull-page request can be in flight when the budget is
+  spent. The budget clock starts with the train step. A fleet run spent
+  5 seconds before that step and 4 seconds after it (run 45675358659), inside
+  the 30-minute job limit. Later repositories are listed as unreached.
 - If the forge returns short nonfinal pages, each must advance the cursor and
   contribute at least one pull. The absolute bound is 100 pages per pass, or
   902 pull-page calls across three rounds including both splits. The same

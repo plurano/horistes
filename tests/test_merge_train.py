@@ -1323,13 +1323,16 @@ def train(
     forge: Forge,
     text: str | None = None,
     helper: str | None = None,
+    *,
+    optimize: bool = False,
     **settings: str,
 ):
     """Run the step's script against the stand-in forge; the result and the summary written."""
     (tmp_path / "train_rules.py").write_text(helper or module(), encoding="utf-8")
+    flags = ["-I", "-B", *(["-O"] if optimize else [])]
     if text is None:
         # The genuine script runs from tools/, so coverage counts it; LAUNCH zeroes the waits.
-        command = [sys.executable, "-I", "-B", "-c", LAUNCH, str(SCRIPT)]
+        command = [sys.executable, *flags, "-c", LAUNCH, str(SCRIPT)]
     else:
         source = text.replace("SETTLE_SECONDS = 5", "SETTLE_SECONDS = 0")
         source = source.replace("READ_BACKOFF_SECONDS = 5", "READ_BACKOFF_SECONDS = 0")
@@ -1337,7 +1340,7 @@ def train(
         path.write_text(source, encoding="utf-8")
         shutil.copyfile(ROOT / "tools/review_state.py", tmp_path / "review_state.py")
         shutil.copyfile(ROOT / "tools/release_workflows.py", tmp_path / "release_workflows.py")
-        command = [sys.executable, "-I", "-B", str(path)]
+        command = [sys.executable, *flags, str(path)]
     summary, output = tmp_path / "summary.md", tmp_path / "output"
     forge.workdir = tmp_path
     server = serve(forge)
@@ -1671,10 +1674,10 @@ def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
         check([*documents, "query { viewer { login } }"])
 
 
-def test_anonymous_graphql_document_raises_value_error(tmp_path, monkeypatch):
+def test_anonymous_graphql_document_raises_document_error(tmp_path, monkeypatch):
     train_mod = load_train(tmp_path, monkeypatch)
     assert train_mod.graphql_name("query PullPage($n: Int!) { viewer { login } }") == "PullPage"
-    with pytest.raises(ValueError, match="anonymous GraphQL operation"):
+    with pytest.raises(train_mod.GraphQLDocumentError, match="anonymous GraphQL operation"):
         train_mod.graphql_name("query { viewer { login } }")
 
 
@@ -1786,7 +1789,8 @@ def test_nonadvancing_pull_page_refuses(tmp_path, monkeypatch, empty):
     with pytest.raises(
         train_mod.RefusedError, match="graphql PullPage: open pull request page did not advance"
     ):
-        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, train_mod.time.monotonic())
+        reader = train_mod.PullPageReader(train_mod.time.monotonic())
+        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, reader)
     assert calls == [25]
 
 
@@ -1801,7 +1805,7 @@ def test_spent_sweep_budget_refuses_before_the_first_pull_page(tmp_path, monkeyp
         match=rf"graphql PullPage: sweep budget of {train_mod.SWEEP_SECONDS} s spent "
         r"before the read \(page size 25, cursor start\)",
     ):
-        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, 0.0)
+        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, train_mod.PullPageReader(0.0))
     assert calls == []
 
 
@@ -1809,29 +1813,101 @@ def test_split_within_sweep_budget_finishes_and_next_page_refuses(tmp_path, monk
     """A split begun inside the budget reads its page; the page after the budget is refused."""
     train_mod = load_train(tmp_path, monkeypatch)
     calls = []
+    tick = 0.0
 
     def page(_env, _query, variables):
+        nonlocal tick
         calls.append((variables["first"], variables["after"]))
         if variables["first"] == 25:
+            tick = train_mod.SWEEP_SECONDS - 1
             raise train_mod.RefusedError("graphql PullPage: timed out") from TimeoutError()
+        tick = train_mod.SWEEP_SECONDS + 1
         connection = {
             "nodes": [pull(1, "CLEAN")],
             "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
         }
         return {"repository": {"pullRequests": connection}}
 
-    ticks = itertools.chain(
-        [float(train_mod.SWEEP_SECONDS)] * 2, itertools.repeat(float(train_mod.SWEEP_SECONDS + 1))
-    )
     monkeypatch.setattr(train_mod, "graphql", page)
-    monkeypatch.setattr(train_mod.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(train_mod.time, "monotonic", lambda: tick)
     with pytest.raises(
         train_mod.RefusedError,
         match=rf"graphql PullPage: sweep budget of {train_mod.SWEEP_SECONDS} s spent "
         r"before the read \(page size 12, cursor cursor-1\)",
     ):
-        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, 0.0)
+        train_mod.fetch({"GITHUB_REPOSITORY": "fleet/app"}, {}, train_mod.PullPageReader(0.0))
     assert calls == [(25, None), (12, None)]
+
+
+@pytest.mark.parametrize("guard", [True, False], ids=["budget-guard", "guard-removed"])
+def test_minimum_pull_page_does_not_retry_past_sweep_budget(tmp_path, guard):
+    forge = Forge(repository(*(pull(n, "CLEAN" if n == 26 else "DIRTY") for n in range(1, 27))))
+    forge.read_statuses["fleet/app"] = [200, 504, 504, 504]
+    setup = """
+tick = 0.0
+request = graphql
+
+def timed_graphql(env, query, variables):
+    global tick
+    try:
+        return request(env, query, variables)
+    finally:
+        if variables.get("first") == PULL_PAGE // 2:
+            tick = SWEEP_SECONDS - 1
+        elif variables.get("first") == PULL_PAGE_MIN:
+            tick = SWEEP_SECONDS + 1
+
+time.monotonic = lambda: tick
+graphql = timed_graphql
+"""
+    entry = 'if __name__ == "__main__":'
+    source = script().replace(entry, setup + "\n" + entry)
+    if not guard:
+        check = "if started is not None and over_budget(started):"
+        assert source.count(check) == 1
+        source = source.replace(check, "if False:")
+    done, summary = train(tmp_path, forge, source)
+    calls = [(v["first"], v["after"]) for _, v in forge.read_calls]
+    before_retry = [(25, None), (25, "cursor-25"), (12, "cursor-25"), (6, "cursor-25")]
+    if guard:
+        assert done.returncode == 1, done.stdout + done.stderr
+        assert calls == before_retry
+        assert forge.writes == []
+        refusal = (
+            r"fleet/app: graphql PullPage: sweep budget of 1500 s spent "
+            r".*HTTP 504 .*page size 6, cursor cursor-25"
+        )
+        assert re.search(r"::error title=Merge train refused::" + refusal, done.stdout)
+        assert re.search(refusal, summary)
+    else:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert calls == [*before_retry, (6, "cursor-25")]
+        assert forge.writes == [landed(26)]
+
+
+@pytest.mark.parametrize("keep_split", [True, False], ids=["split-note", "note-removed"])
+def test_recovered_pull_page_split_is_reported_on_later_refusal(tmp_path, keep_split):
+    forge = Forge(repository(*(pull(n, "DIRTY") for n in range(1, 14))))
+    forge.read_statuses["fleet/app"] = [504, 200, 500]
+    source = None
+    if not keep_split:
+        source = script()
+        note = '            err.args = (f"{err} ({split_note})",)'
+        assert source.count(note) == 1
+        source = source.replace(note, "            pass")
+    done, summary = train(tmp_path, forge, text=source)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert [(v["first"], v["after"]) for _, v in forge.read_calls] == [
+        (25, None),
+        (12, None),
+        (12, "cursor-12"),
+    ]
+    assert forge.writes == []
+    refusal = r"fleet/app: graphql PullPage: .*HTTP 500[^\n]*"
+    annotation = re.search(r"::error title=Merge train refused::(" + refusal + ")", done.stdout)
+    assert annotation and re.search(r"^- " + re.escape(annotation[1]) + "$", summary, re.M)
+    split = r"Split open pull request page to 12 after graphql PullPage: .*HTTP 504"
+    assert bool(re.search(split, annotation[1])) is keep_split
 
 
 def test_read_500_is_not_retried(tmp_path):
@@ -10893,6 +10969,36 @@ def test_retry_hold_unreadable_holds_or_retries_alone(tmp_path, kind, cause, fol
     assert "held for retry: history unreadable:" in summary
     assert cause in summary
     assert ("retry hold released:" in summary) is not follower
+
+
+@pytest.mark.parametrize("operation", ["RetryHistory", "FileModes"])
+@pytest.mark.parametrize("fatal", [True, False], ids=["document-error", "value-error"])
+def test_anonymous_retry_document_stops_the_run(tmp_path, operation, fatal):
+    forge = retry_forge("BEHIND")
+    source = script()
+    named = f"query {operation}("
+    assert source.count(named) == 1
+    source = source.replace(named, "query(")
+    if not fatal:
+        error = 'raise GraphQLDocumentError("anonymous GraphQL operation")'
+        assert source.count(error) == 1
+        source = source.replace(error, 'raise ValueError("anonymous GraphQL operation")')
+    done, summary = train(tmp_path, forge, source, optimize=True)
+    hold = "held for retry: history unreadable: anonymous GraphQL operation"
+    expected_calls = []
+    if operation == "FileModes":
+        expected_calls = [1] if fatal else [1, 2]
+    assert forge.retry_calls == expected_calls
+    assert forge.mode_calls == []
+    if fatal:
+        assert done.returncode != 0, done.stdout + done.stderr
+        assert "GraphQLDocumentError: anonymous GraphQL operation" in done.stderr
+        assert "held for retry: history unreadable" not in done.stdout + done.stderr + summary
+        assert forge.writes == []
+    else:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert hold in summary
+        assert forge.writes == [updated(2 if operation == "FileModes" else 1)]
 
 
 @pytest.mark.parametrize("count", [2, 6])
