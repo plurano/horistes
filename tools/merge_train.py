@@ -2331,7 +2331,7 @@ def report(name, repo, rows, notes, outcome):
         "|---|---|---|",
     ]
     lines += [
-        f"| #{pull['number']} | {pull['mergeStateStatus']} | {notes[pull['number']]} |"
+        f"| #{pull['number']} | {pull['mergeStateStatus']} | {note_cell(notes[pull['number']])} |"
         for pull, _ in rows
     ]
     if repo["pullRequests"]["pageInfo"]["hasNextPage"]:
@@ -2411,7 +2411,8 @@ def revoke(env, token):
         call(f"{env['GITHUB_API_URL']}/installation/token", token, "DELETE")
     except RefusedError as err:
         sys.stdout.write(
-            f"::warning title=Merge train::token not revoked, it expires within the hour: {err}\n"
+            "::warning title=Merge train::token not revoked, it expires within the hour: "
+            f"{refusal_line(err)}\n"
         )
 
 
@@ -2456,10 +2457,11 @@ def over_budget(started):
 
 def release_off_fallback(installation, listed, entry, reason):
     """All listed repository IDs and the summary warning when release_off resolution stops."""
-    warning = (
-        f"::warning title=Merge train::release_off entry {entry}: {reason}; "
+    message = (
+        f"release_off entry {entry}: {reason}; "
         f"release train off for installation {installation['id']}"
     )
+    warning = f"::warning title=Merge train::{refusal_line(message)}"
     return frozenset(target["id"] for target in listed), [warning]
 
 
@@ -2697,7 +2699,7 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
                 f"| {tally['updated']} | {tally['refused']} |"
             )
     if refusals:
-        lines += ["", "Refused:", ""] + [f"- {line}" for line in refusals]
+        lines += ["", "Refused:", ""] + [f"- {refusal_line(line)}" for line in refusals]
     if unsigned_bots:
         lines += [
             "",
@@ -2723,12 +2725,17 @@ def refusal_line(err):
     return " ".join(str(err).splitlines())
 
 
+def note_cell(note):
+    """Render a diagnostic as one Markdown table cell."""
+    return refusal_line(note).replace("|", r"\|")
+
+
 def main(env):
     """Run one full train sweep across all installed repositories and report."""
     try:
         conf = settings(env)
     except InvalidSettingError as err:
-        sys.stdout.write(f"::error title=Merge train setting::{err}\n")
+        sys.stdout.write(f"::error title=Merge train setting::{refusal_line(err)}\n")
         return 3
     try:
         accounts, sections, refusals, skipped, releases, off, unsigned_bots = sweep(
@@ -2739,7 +2746,7 @@ def main(env):
         return 1
     summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots)
     for line in refusals:
-        sys.stdout.write(f"::error title=Merge train refused::{line}\n")
+        sys.stdout.write(f"::error title=Merge train refused::{refusal_line(line)}\n")
     if skipped:
         sys.stdout.write(f"::warning title=Merge train::{len(skipped)} repositories not reached\n")
     return 1 if refusals else 0

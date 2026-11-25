@@ -501,7 +501,7 @@ class Forge:
         self.ungranted: set[int] = set()
         self.jobs: dict[int, list[dict]] = {}
         self.jobs_calls: list[int] = []
-        # Queued REST faults by route: a status, a status with a raw body, or DROP.
+        # Queued HTTP faults by REST route or GraphQL query name.
         self.rest_faults: dict[str, list[int | str | tuple[int, bytes]]] = {}
         self.label_missing = False
         self.unlabel_status: int | None = None
@@ -1231,7 +1231,8 @@ class Handler(BaseHTTPRequestHandler):
         elif "/contents/" in path and path.startswith("/repos/"):
             self._get_contents(path)
         elif path.startswith("/repos/") and path.endswith("/actions/artifacts"):
-            self._get_artifacts(path)
+            if not self.fault("artifacts"):
+                self._get_artifacts(path)
         elif "/actions/artifacts/" in path and path.endswith("/zip"):
             self._get_artifact_zip(path)
         elif path.startswith("/storage/"):
@@ -1259,10 +1260,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/graphql":
             request = self.body()
+            query = request["query"]
+            operation = re.match(r"\s*query\s+(\w+)", query)
+            if operation and self.fault(operation[1]):
+                return
             forge = self.server.forge
             header = self.headers["Authorization"]
-            code, body = forge.graphql_response(header, request["query"], request["variables"])
-            if forge.graphql_cut(request["query"]):
+            code, body = forge.graphql_response(header, query, request["variables"])
+            if forge.graphql_cut(query):
                 self.cut_answer(code, body)
             else:
                 self.answer(code, body)
@@ -10639,7 +10644,9 @@ def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
     assert forge.writes == []
 
 
-@pytest.mark.parametrize("fault", [DROP, 502])
+@pytest.mark.parametrize(
+    "fault", [DROP, 502, pytest.param((502, MULTILINE_READ_ERROR), id="multiline-502")]
+)
 def test_failed_revocation_warns_and_the_sweep_goes_on(tmp_path, fault):
     """Planted: the first revocation drops or fails; every repository is still served."""
     forge = sweep_forge()
@@ -10652,7 +10659,9 @@ def test_failed_revocation_warns_and_the_sweep_goes_on(tmp_path, fault):
         ("other/b", updated(2)),
     ]
     warning = "::warning title=Merge train::token not revoked, it expires within the hour: DELETE "
-    assert warning in done.stdout
+    (line,) = [line for line in done.stdout.splitlines() if line.startswith(warning)]
+    if isinstance(fault, tuple):
+        assert line.endswith(f"HTTP 502 {FLATTENED_READ_ERROR}")
     assert "### fleet/app: landed #1" in summary
     # A revocation is a write: it runs once, so exactly one token stays unrevoked.
     assert len(forge.revoked) == len(forge.tokens) - 1
@@ -11049,6 +11058,121 @@ def test_retry_hold_unreadable_holds_or_retries_alone(tmp_path, kind, cause, fol
     assert "held for retry: history unreadable:" in summary
     assert cause in summary
     assert ("retry hold released:" in summary) is not follower
+
+
+def pull_note_cell(text, number, state):
+    """Read the notes cell of one physical row with three Markdown cells."""
+    (row,) = [line for line in text.splitlines() if line.startswith(f"| #{number} |")]
+    cells = re.split(r"(?<!\\)\|", row)
+    assert len(cells) == 5, row
+    assert cells[:3] == ["", f" #{number} ", f" {state} "], row
+    assert cells[-1] == "", row
+    return cells[3].strip()
+
+
+def test_artifact_list_refusal_stays_in_one_notes_cell(tmp_path):
+    """All three artifact-list reads return a short two-line gateway failure."""
+    dep = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    forge.rest_faults["artifacts"] = [(502, b"first line\r\nsecond line")] * 3
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.rest_faults["artifacts"] == []
+    assert forge.writes == []
+    for text in (summary, done.stdout):
+        note = pull_note_cell(text, 1, "BLOCKED")
+        assert note.startswith("generated files refused: GET ")
+        assert note.endswith("HTTP 502 first line second line")
+
+
+def test_review_read_refusal_stays_in_one_notes_cell(tmp_path):
+    """A multiline gateway failure holds the reviewed pull and serves its follower."""
+    first = pull(1, "CLEAN", author={"login": "person"})
+    second = pull(2, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(first, second))
+    forge.rest_faults["ReviewBodies"] = [(502, MULTILINE_READ_ERROR)] * 3
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.rest_faults["ReviewBodies"] == []
+    assert forge.writes == [landed(2)]
+    for text in (summary, done.stdout):
+        note = pull_note_cell(text, 1, "CLEAN")
+        assert note.startswith("review body: cannot read: graphql ReviewBodies: POST ")
+        assert note.endswith(f"HTTP 502 {FLATTENED_READ_ERROR}")
+
+
+def test_retry_read_refusal_stays_in_one_notes_cell(tmp_path):
+    """A multiline history failure holds the retry and lets the follower update."""
+    forge = retry_forge("BEHIND")
+    forge.rest_faults["RetryHistory"] = [(502, MULTILINE_READ_ERROR)] * 3
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.rest_faults["RetryHistory"] == []
+    assert forge.writes == [updated(2)]
+    for text in (summary, done.stdout):
+        note = pull_note_cell(text, 1, "BEHIND")
+        assert note.startswith("held for retry: history unreadable: graphql RetryHistory: POST ")
+        assert note.endswith(f"HTTP 502 {FLATTENED_READ_ERROR}")
+
+
+def test_report_escapes_pipe_in_notes_cell(tmp_path, monkeypatch):
+    """A literal pipe in the train's note preserves the three table cells."""
+    mod = load_train(tmp_path, monkeypatch)
+    p = pull(1, "CLEAN")
+    report = mod.report("fleet/app", repository(p), [(p, "land")], {1: "left | right"}, "done")
+    assert pull_note_cell(report, 1, "CLEAN") == r"left \| right"
+
+
+def fstrings_starting_with(tree, prefixes):
+    """Find f-strings by the prefix of their first literal segment."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.JoinedStr)
+        and node.values
+        and isinstance(node.values[0], ast.Constant)
+        and node.values[0].value.startswith(prefixes)
+    ]
+
+
+def calls_name(value, names):
+    """Whether the expression directly calls one of the named functions."""
+    return (
+        isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in names
+    )
+
+
+def test_annotation_fstrings_flatten_runtime_text():
+    """Guard annotation text written directly or through summary sections."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    annotations = fstrings_starting_with(tree, ("::error", "::warning", "::notice"))
+    assert annotations
+    unsafe = [
+        f"line {node.lineno}: {ast.unparse(part.value)}"
+        for node in annotations
+        for part in node.values
+        if isinstance(part, ast.FormattedValue)
+        and not isinstance(part.value, ast.Constant)
+        and not calls_name(part.value, ("refusal_line", "len", "int"))
+    ]
+    assert unsafe == []
+
+
+def test_report_fstrings_render_notes_through_note_cell():
+    """Guard the notes cell of every f-string that renders a pull request row."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    report = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "report"
+    )
+    rows = fstrings_starting_with(report, "| #")
+    assert rows
+    for row in rows:
+        cells = [part.value for part in row.values if isinstance(part, ast.FormattedValue)]
+        assert len(cells) == 3 and calls_name(cells[2], ("note_cell",)), ast.unparse(row)
 
 
 @pytest.mark.parametrize("operation", ["RetryHistory", "FileModes"])
