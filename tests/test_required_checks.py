@@ -332,6 +332,31 @@ def test_python_floor_3d(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "::error::the required-checks judge needs Python" in err.getvalue()
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            f"{REPO}/.github/workflows/licence-check.yml@refs/heads/release@2",
+            ".github/workflows/licence-check.yml",
+        ),
+        (
+            f"{REPO}/.github/workflows/licence-check.yml@refs/pull/1/head",
+            ".github/workflows/licence-check.yml",
+        ),
+        (f"{REPO}/.github/workflows/licence-check.yml", ".github/workflows/licence-check.yml"),
+        ("  ", ""),
+    ],
+    ids=["branch-with-at", "pull-ref", "no-ref", "unset"],
+)
+def test_workflow_ref_path_splits_at_first_at_sign(raw: str, expected: str) -> None:
+    assert required_checks._path_from_workflow_ref(raw) == expected
+
+
+def test_workflow_ref_without_path_is_rejected() -> None:
+    with pytest.raises(InputError, match="has no workflow path"):
+        required_checks._path_from_workflow_ref(f"{REPO}@refs/heads/main")
+
+
 def test_workflow_inputs_and_permissions_contract() -> None:
     doc = ciwf.load(WORKFLOW_PATH)
     assert doc["permissions"] == {}
@@ -420,6 +445,11 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
     )
     assert done_judge.returncode == 0, done_judge.stdout + done_judge.stderr
     assert "OK (success): Gate" in done_judge.stdout
+    posts = _forge_post_records(fixture_tree)
+    assert len(posts) == 1
+    method = posts[0].index("-X")
+    assert posts[0][method + 1 : method + 3] == ["POST", f"repos/{REPO}/statuses/{SHA}"]
+    assert "state=success" in posts[0]
 
     (isolated / "tools/results.py").unlink()
     # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed self-test argv
@@ -3318,6 +3348,52 @@ def test_sweep_thirteen_deep_status_histories_still_evaluates_heads() -> None:
     assert fake.posts[0] == (REVIEW_POST_PATH, "success")
     assert fake.posts[1] == (REVIEW_POST_PATH.replace(SHA, heads[0]), "success")
     assert _review_evaluated_pulls(fake)
+
+
+@pytest.mark.parametrize("case", ["head-error-continues", "error-at-work-cutoff-stops"])
+def test_sweep_triage_read_error_ranks_head_unknown(case: str) -> None:
+    first, second = "1" * 40, "2" * 40
+    fake = _review_sweep_transport([first, second])
+    first_statuses = STATUSES_URL.replace(SHA, first)
+    second_statuses = STATUSES_URL.replace(SHA, second)
+    fake.answers[second_statuses] = [status_item(1, "required-checks")]
+    failures_left = len(API_BACKOFF_SECONDS) + 1
+
+    def transport(path: str, **kwargs: Any) -> tuple[int, dict[str, str], bytes]:
+        nonlocal failures_left
+        if path == first_statuses and failures_left:
+            failures_left -= 1
+            if case == "error-at-work-cutoff-stops":
+                fake.clock.sleep(required_checks.WORK_DEADLINE_SECONDS + 1)
+            raise forge.ResponseError("bad gateway", status=502)
+        return fake(path, **kwargs)
+
+    err = io.StringIO()
+    rc = run_sweep(
+        _review_config(targets="open-pulls", run_number=1),
+        transport=transport,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=io.StringIO(),
+        err=err,
+    )
+    assert rc == 1
+    message = err.getvalue()
+    assert message.count("::error::") == 1
+    if case == "error-at-work-cutoff-stops":
+        assert "::error::Transient GitHub API failure: statuses still answers HTTP 502" in message
+        assert "session work cutoff" in message
+        assert "ranks as unknown" not in message
+        assert fake.posts == []
+    else:
+        assert f"Triage status read for {first} failed; it ranks as unknown" in message
+        assert fake.calls.index(("GET", second_statuses)) < fake.calls.index(
+            ("GET", f"repos/{REPO}")
+        )
+        assert _review_evaluated_pulls(fake) == [first, second]
+        assert fake.posts == [
+            (REVIEW_POST_PATH.replace(SHA, sha), "success") for sha in (SHA, first, second)
+        ]
 
 
 def test_sweep_caps_triage_at_exact_retry_attempt_boundary() -> None:

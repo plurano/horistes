@@ -139,9 +139,9 @@ def _default_pull_request_only(fields: dict, where: str) -> str:
     if not isinstance(required, str):
         raise ciwf.ReadError(f"{where}: .RequiredChecks.Required must be a JSON list")
     try:
-        names = json.loads(required)
-    except json.JSONDecodeError as err:
-        raise ciwf.ReadError(f"{where}: invalid .RequiredChecks.Required JSON: {err}") from err
+        names = required_checks._load_json(".RequiredChecks.Required", required)
+    except required_checks.InputError as err:
+        raise ciwf.ReadError(f"{where}: {err}") from err
     if not isinstance(names, list):
         raise ciwf.ReadError(f"{where}: .RequiredChecks.Required must be a JSON list")
     return '["Sign-off"]' if "Sign-off" in names else "[]"

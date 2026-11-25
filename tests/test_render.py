@@ -370,6 +370,21 @@ def test_rendered_sign_off_defaults_to_proposals(required, override, expected):
     assert render._tail_problems(doc["jobs"]["required-checks"], doc, ROOT) == []
 
 
+@pytest.mark.parametrize(
+    "required",
+    ["[" + "9" * 5000 + "]", "[" * 100000 + "]" * 100000, '["Sign-off", NaN]'],
+    ids=["huge-int", "deep-nesting", "nan-constant"],
+)
+def test_policy_default_reports_json_conversion_errors(required):
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {"Required": required, "NotOwed": "[]", "Apps": "{}"},
+    }
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    with pytest.raises(ciwf.ReadError, match=r"\.RequiredChecks\.Required"):
+        render.render(source, context, REAL)
+
+
 def _tail_documents(source=RENDERED):
     doc = ciwf.loads(source, REAL)
     return doc["jobs"]["required-checks"], doc
