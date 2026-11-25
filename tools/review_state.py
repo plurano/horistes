@@ -147,6 +147,14 @@ def _last_commit_at(pr: dict) -> datetime | None:
     return max(times) if times else None
 
 
+def _notice_lines(body: str) -> list[str]:
+    """Split at every str.splitlines() boundary so no separator hides a notice.
+
+    These boundaries include all GFM line endings. Evidence readers use _lines.
+    """
+    return body.splitlines()
+
+
 def _lines(body: str) -> list[str]:
     """Split only at GFM line endings and retain an overflow item above the bound."""
     if not body:
@@ -234,7 +242,7 @@ def _paused_block(lines: list[str], notice_idx: int) -> list[str]:
 
 def _pause_allowance_notices(body: str) -> tuple[list, bool, bool]:
     """Limit notices in body and whether the body is mixed pause plus allowance only."""
-    lines = _lines(body)
+    lines = _notice_lines(body)
     if len(lines) > MAX_LINES:
         return [], False, False
     notices = [
@@ -258,13 +266,15 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
     """Exempt only pause notices with unambiguous, block-local evidence for the full head."""
     if not re.fullmatch(r"[0-9a-f]{40}", head):
         return False
+    lines = _lines(body)
+    if _notice_lines(body) != lines:
+        return False
     notices, mixed, foreign = _pause_allowance_notices(body)
     if not notices or foreign:
         return False
     pause_notices = [(idx, match) for idx, match in notices[:MAX_LINES] if match.group("paused")]
     if not pause_notices:
         return False
-    lines = _lines(body)
     reviewed = {
         match.group(1).lower()
         for line in lines[:MAX_LINES]
@@ -545,9 +555,8 @@ def _non_allowance_notice(body: str) -> bool:
     """A skipped review cannot also prove completed review evidence."""
     if len(body) > MAX_SUMMARY_CHARS:
         return True
-    return any(
-        not match.group("allowance") for match in list(LIMIT_NOTICE_RE.finditer(body))[:MAX_LINES]
-    )
+    notices = list(LIMIT_NOTICE_RE.finditer("\n".join(_notice_lines(body))))
+    return any(not match.group("allowance") for match in notices[:MAX_LINES])
 
 
 def _head_evidence(
@@ -614,7 +623,7 @@ def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
 
 def _notice_read(body: str) -> tuple[str, bool]:
     """Read at most 65536 characters and 2000 lines; retain whether any tail is unread."""
-    lines = _lines(body[:MAX_SUMMARY_CHARS])
+    lines = _notice_lines(body[:MAX_SUMMARY_CHARS])
     return "\n".join(lines[:MAX_LINES]), len(body) > MAX_SUMMARY_CHARS or len(lines) > MAX_LINES
 
 
@@ -632,7 +641,7 @@ def _unread_notice_holds(comment: dict, head: str, last_commit) -> bool:
     body = str(comment.get("body") or "")
     if len(body) > MAX_SUMMARY_CHARS:
         return True
-    notices = list(LIMIT_NOTICE_RE.finditer(body))
+    notices = list(LIMIT_NOTICE_RE.finditer("\n".join(_notice_lines(body))))
     if not notices:
         return False
     when = _body_at(comment)

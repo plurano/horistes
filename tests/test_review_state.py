@@ -920,6 +920,65 @@ ADR114_BUDGET = (
 ADR114_CR_SUCCESS = "Result: Success - Review completed\n"
 ADR114_SOURCERY_LOGIN = "sourcery-ai[bot]"
 
+NON_GFM_SEPARATORS = {
+    "vt": "\x0b",
+    "ff": "\x0c",
+    "fs": "\x1c",
+    "gs": "\x1d",
+    "rs": "\x1e",
+    "nel": "\x85",
+    "ls": "\u2028",
+    "ps": "\u2029",
+}
+NOTICE_SEPARATORS = {**NON_GFM_SEPARATORS, "cr": "\r"}
+
+
+@pytest.mark.parametrize("separator", NOTICE_SEPARATORS.values(), ids=NOTICE_SEPARATORS)
+def test_notice_after_line_separator(separator):
+    reader = adr92_reader()
+    node = _fixture("pr3507-review-state.json")["data"]["repository"]["pullRequest"]
+    comment = node["comments"]["nodes"][1]
+    node["comments"] = {"nodes": [comment], "totalCount": 1}
+    assert reader.review_incomplete(node)
+    body = comment["body"]
+    notice = reader.LIMIT_NOTICE_RE.search(body)
+    assert notice and notice.start() > 0 and body[notice.start() - 1] == "\n"
+    comment["body"] = body[: notice.start() - 1] + separator + body[notice.start() :]
+    assert reader.review_incomplete(node)
+
+
+@pytest.mark.parametrize("separator", NOTICE_SEPARATORS.values(), ids=NOTICE_SEPARATORS)
+def test_non_allowance_notice_after_separator(separator):
+    reader = adr92_reader()
+    assert reader._non_allowance_notice("Review prose.\n" + ADR114_BUDGET) is True
+    assert reader._non_allowance_notice("Review prose." + separator + ADR114_BUDGET) is True
+
+
+@pytest.mark.parametrize("separator", NOTICE_SEPARATORS.values(), ids=NOTICE_SEPARATORS)
+def test_unread_notice_after_separator(separator):
+    body = "x\n" * MAX_LINES + "Review prose." + separator + ADR114_BUDGET
+    assert review_incomplete(adr92_pull(adr92_comment(body))).endswith(
+        "notice body exceeds the read bound"
+    )
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [pytest.param(sep, id=f"sep-{tag}") for tag, sep in NON_GFM_SEPARATORS.items()]
+    + [pytest.param(None, id="hidden-other-commit")],
+)
+def test_paused_head_separator_proves_nothing(separator):
+    reader = adr92_reader()
+    body, head, _, _ = _mixed_pause_allowance_body_parts()
+    assert reader._paused_head_reviewed(body, head) is True
+    if separator is None:
+        body += "\u2028Last reviewed commit: " + "d" * 40
+    else:
+        heading = "> ## Reviews paused"
+        assert "\n" + heading in body
+        body = body.replace("\n" + heading, separator + heading, 1)
+    assert reader._paused_head_reviewed(body, head) is False
+
 
 def adr114_check_run(name, conclusion, summary, *, status="COMPLETED"):
     return {"name": name, "status": status, "conclusion": conclusion, "summary": summary}
@@ -2341,7 +2400,61 @@ def _shape_controls():
     ]
 
 
-@pytest.mark.parametrize(("body", "expected", "names"), _planted_shape_cases() + _shape_controls())
+def _misplaced_shape_cases():
+    count = ("count line position",)
+    layout = ("status block layout",)
+    markers = ("status block markers",)
+    start, _, sentence, _, end = REVIEW_STATUS.split("\n")
+    counted = _shape_body(REVIEW_COUNT_ZERO)
+    bad_range = ("range block layout",)
+    return [
+        pytest.param(
+            _shape_body("Intro\n" + REVIEW_COUNT_ZERO),
+            False,
+            count,
+            id="hold-bold-count-off-line-2",
+        ),
+        pytest.param(
+            _shape_body(tail=f"```\n{REVIEW_COUNT_ZERO}\n```"),
+            False,
+            count,
+            id="hold-bold-count-fenced",
+        ),
+        pytest.param(
+            _shape_body(tail=f"{start}\n{sentence}\n{end}"),
+            False,
+            layout,
+            id="hold-status-no-blanks",
+        ),
+        pytest.param(
+            _shape_body(tail=f"> {start}\n>\n> {sentence}\n>\n> {end}"),
+            False,
+            layout,
+            id="hold-status-quoted",
+        ),
+        pytest.param(
+            _shape_body(tail=start + "\n" + REVIEW_STATUS),
+            False,
+            markers,
+            id="hold-status-two-starts",
+        ),
+        pytest.param(
+            _shape_body(tail=REVIEW_STATUS + "\n" + end), False, markers, id="hold-status-two-ends"
+        ),
+        pytest.param(
+            counted.replace("<details>", "<div>"), False, bad_range, id="hold-range-no-details"
+        ),
+        pytest.param(counted.replace("<br>\n", ""), False, bad_range, id="hold-range-lead"),
+        pytest.param(
+            counted.replace("</details>", "</div>"), False, bad_range, id="hold-range-tail"
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "names"),
+    _planted_shape_cases() + _shape_controls() + _misplaced_shape_cases(),
+)
 def test_completed_head_summary_shapes(body, expected, names):
     reader = adr92_reader()
     actual = reader._zero_action_summary(body, SHAPE_HEAD)
@@ -2349,6 +2462,41 @@ def test_completed_head_summary_shapes(body, expected, names):
     shape = reader._summary_shape(body)
     assert shape.unmatched == names
     assert shape.range_end == ("" if "range block layout" in names else SHAPE_HEAD)
+
+
+@pytest.mark.parametrize("size", [65536, 65537])
+def test_summary_shape_character_bound(size):
+    reader = adr92_reader()
+    summary = _shape_body(REVIEW_COUNT_ZERO)
+    body = summary + "\n" + "x" * (size - len(summary) - 1)
+    assert len(body) == size
+    expected = (
+        reader.SummaryShape(True, SHAPE_HEAD, ())
+        if size == 65536
+        else reader.SummaryShape(False, "", ())
+    )
+    assert reader._summary_shape(body) == expected
+
+
+@pytest.mark.parametrize(
+    ("comment", "formal_only", "paused_head", "expected"),
+    [
+        pytest.param({"body": "x"}, False, True, True, id="ordinary-paused"),
+        pytest.param({"body": "x"}, True, True, False, id="formal-only-paused"),
+        pytest.param(
+            {"state": "COMMENTED", "commit": {"oid": SHAPE_HEAD}},
+            True,
+            False,
+            True,
+            id="formal-only-formal-on-head",
+        ),
+    ],
+)
+def test_head_evidence_paused_scope(comment, formal_only, paused_head, expected):
+    reader = adr92_reader()
+    assert (
+        reader._head_evidence(comment, SHAPE_HEAD, formal_only, paused_head=paused_head) is expected
+    )
 
 
 def test_summary_shape_hold_names():

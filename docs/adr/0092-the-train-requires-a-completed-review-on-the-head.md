@@ -85,7 +85,11 @@ line. It reads the no-action sentence only inside its five-line status block
 and the reviewed range only inside the Commits details block. Each phrase
 used as evidence must occur exactly once. Lines end only at LF, CR or CRLF
 (GitHub Flavored Markdown 0.29 section 2.1). Any other layout for a phrase
-proves nothing for that evidence family.
+proves nothing for that evidence family. As `test_notice_after_line_separator`
+and `test_paused_head_separator_proves_nothing` check, limit notices are found
+at every line start Python's `str.splitlines()` reports, a superset of GFM line
+ends, so a notice never hides behind a separator and a body containing a
+non-GFM line separator proves no paused head.
 
 The ADR-0090 hold line ends with `; summary shape unmatched: <names>` when
 the body carrying the limit notice contains an unmatched phrase or marker.
