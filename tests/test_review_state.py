@@ -708,6 +708,37 @@ def adr92_pull(*comments, commits=None, reviews=()):
     }
 
 
+@pytest.mark.parametrize(
+    "later_review",
+    [
+        pytest.param(False, id="edited-earlier-review-holds"),
+        pytest.param(True, id="later-empty-review-clears"),
+    ],
+)
+def test_formal_evidence_submission_time(later_review):
+    notice = adr92_comment("0 remain after this review")
+    earlier = {
+        "author": {"login": "coderabbitai"},
+        "state": "COMMENTED",
+        "commit": {"oid": ADR92_HEAD},
+        "body": "Edited review.",
+        "submittedAt": ADR92_COMMIT,
+        "updatedAt": "2026-11-16T17:00:00Z",
+    }
+    reviews = [earlier]
+    if later_review:
+        reviews.append(
+            {
+                "author": earlier["author"],
+                "state": "COMMENTED",
+                "commit": {"oid": ADR92_HEAD},
+                "body": "",
+                "submittedAt": "2026-11-16T18:00:00Z",
+            }
+        )
+    assert bool(review_incomplete(adr92_pull(notice, reviews=reviews))) is (not later_review)
+
+
 def adr92_reader_cases():
     notice = adr92_comment("Review limit reached.")
     cases = []

@@ -607,7 +607,8 @@ def review_evidence(
         # A paused block proving the head clears a pause notice (ADR-0093), never an allowance.
         on_head = (paused_head and not formal_only) or _head_evidence(comment, head, formal_only)
         if comment.get("state") in COMPLETED_STATES or pre_merge_rows(body) or on_head:
-            evidence.append((login, _body_at(comment), on_head))
+            when = _instant(comment.get("submittedAt")) if formal_only else _body_at(comment)
+            evidence.append((login, when, on_head))
     return evidence
 
 
