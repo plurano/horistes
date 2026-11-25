@@ -2607,7 +2607,7 @@ def sweep(env, conf, started):
         try:
             targets, resolved, warnings = repositories(env, conf, installation, identity, started)
         except RefusedError as err:
-            refusals.append(f"{account}: {err}")
+            refusals.append(f"{account}: {refusal_line(err)}")
             accounts[account] = "refused"
             continue
         sections.extend(warnings)
@@ -2719,6 +2719,7 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
 
 
 def refusal_line(err):
+    """Render a refusal on one line for annotations and the summary."""
     return " ".join(str(err).splitlines())
 
 

@@ -501,8 +501,8 @@ class Forge:
         self.ungranted: set[int] = set()
         self.jobs: dict[int, list[dict]] = {}
         self.jobs_calls: list[int] = []
-        # Faults the REST stand-in answers first, per kind ("jobs", "revoke"): a status or DROP.
-        self.rest_faults: dict[str, list[int | str]] = {}
+        # Queued REST faults by route: a status, a status with a raw body, or DROP.
+        self.rest_faults: dict[str, list[int | str | tuple[int, bytes]]] = {}
         self.label_missing = False
         self.unlabel_status: int | None = None
         self.repository_moves: dict[str, str] = {}
@@ -1072,13 +1072,15 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
 
     def fault(self, kind: str) -> bool:
-        """Answer the next queued fault of kind: a status, or DROP closes without an answer."""
+        """Serve the next queued fault, or close without an answer for DROP."""
         queued = self.server.forge.rest_faults.get(kind, [])
         if not queued:
             return False
         fault = queued.pop(0)
         if fault == DROP:
             self.close_connection = True
+        elif isinstance(fault, tuple):
+            self.answer(*fault)
         else:
             self.answer(int(fault), {"message": f"stand-in forge: queued HTTP {fault}"})
         return True
@@ -1173,7 +1175,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.answer(200, self.server.forge.installation_list())
             return True
         if path == "/installation/repositories":
-            self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
+            if not self.fault("installation/repositories"):
+                self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
             return True
         if re.fullmatch(r"/(repos/[^/]+/[^/]+|repositories/\d+)", path):
             self._get_repository(path)
@@ -10590,6 +10593,29 @@ def test_exhausted_rest_read_retries_refuse_the_repository(tmp_path, fault):
     assert "Traceback" not in done.stderr
     assert forge.rest_faults["jobs"] == [fault]
     assert forge.writes == []
+
+
+def test_exhausted_installation_read_refusal_stays_on_one_line(tmp_path):
+    """Three gateway failures refuse the installation and keep both body lines in each report."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    failure = (502, MULTILINE_READ_ERROR)
+    forge.rest_faults["installation/repositories"] = [failure] * 4
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.rest_faults["installation/repositories"] == [failure]
+    assert forge.writes == []
+    prefix = "::error title=Merge train refused::"
+    (annotation,) = [line for line in done.stdout.splitlines() if line.startswith(prefix)]
+    refusal = annotation.removeprefix(prefix)
+    assert re.fullmatch(
+        r"fleet: GET \S+/installation/repositories\?\S+: HTTP 502 "
+        + re.escape(FLATTENED_READ_ERROR),
+        refusal,
+    )
+    assert [line for line in summary.splitlines() if line.startswith("- fleet: ")] == [
+        f"- {refusal}"
+    ]
 
 
 def test_rest_read_500_is_not_tried_again(tmp_path):
