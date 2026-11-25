@@ -3396,6 +3396,62 @@ def test_sweep_triage_read_error_ranks_head_unknown(case: str) -> None:
         ]
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["default-branch-error-keeps-line", "cutoff-after-kept-error", "cap-after-kept-error"],
+)
+def test_sweep_keeps_triage_error_when_sweep_stops(
+    case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = "1" * 40, "2" * 40
+    fake = _review_sweep_transport([first, second])
+    first_statuses = STATUSES_URL.replace(SHA, first)
+    second_statuses = STATUSES_URL.replace(SHA, second)
+    repo_path = f"repos/{REPO}"
+    # One open-pulls read, the first head's attempts, and the second head's read.
+    cap = 1 + (1 + len(API_BACKOFF_SECONDS)) + 1
+    if case == "cap-after-kept-error":
+        monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+
+    def transport(path: str, **kwargs: Any) -> tuple[int, dict[str, str], bytes]:
+        reply = fake(path, **kwargs)
+        if path == first_statuses or (
+            case == "default-branch-error-keeps-line" and path == repo_path
+        ):
+            raise forge.ResponseError("bad gateway", status=502)
+        if case == "cutoff-after-kept-error" and path == second_statuses:
+            fake.clock.sleep(required_checks.WORK_DEADLINE_SECONDS + 1)
+            raise forge.ResponseError("bad gateway", status=502)
+        return reply
+
+    err = io.StringIO()
+    rc = run_sweep(
+        _review_config(targets="open-pulls", run_number=1),
+        transport=transport,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=io.StringIO(),
+        err=err,
+    )
+    lines = err.getvalue().splitlines()
+    assert rc == 1, lines
+    assert len(lines) == 2, lines
+    assert lines[0].startswith(
+        f"::error::Triage status read for {first} failed; it ranks as unknown"
+    )
+    if case == "cap-after-kept-error":
+        assert lines[1] == f"::warning::Sweep API call cap of {cap} reached during repository."
+        assert len(fake.calls) == cap and fake.calls[-1] == ("GET", second_statuses)
+    elif case == "cutoff-after-kept-error":
+        assert lines[1].startswith("::error::") and "session work cutoff" in lines[1]
+        assert "ranks as unknown" not in lines[1]
+    else:
+        assert lines[1].startswith(
+            "::error::Transient GitHub API failure: repository still answers HTTP 502"
+        )
+    assert fake.posts == []
+
+
 def test_sweep_caps_triage_at_exact_retry_attempt_boundary() -> None:
     heads = [f"{i:040x}" for i in range(1, OPEN_PULLS_MAX + 1)]
     fake = _review_sweep_transport(heads)

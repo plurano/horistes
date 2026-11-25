@@ -1446,12 +1446,11 @@ def _open_pull_head_shas(session: ApiSession, repository: str) -> list[str]:
 
 
 def _read_triage_statuses(
-    session: ApiSession, config: Config, heads: list[str]
-) -> tuple[dict[str, dict], list[str]]:
+    session: ApiSession, config: Config, heads: list[str], errors: list[str]
+) -> dict[str, dict]:
     """Read one status page per head until the triage attempt budget runs out."""
     key = status_context(config).casefold()
     judged: dict[str, dict] = {}
-    errors: list[str] = []
     for sha in heads[:OPEN_PULLS_MAX]:
         try:
             statuses, _ = _read_status_page_one(session, replace(config, sha=sha))
@@ -1465,18 +1464,18 @@ def _read_triage_statuses(
         newest = _all_statuses(statuses).get(key)
         if newest is not None:
             judged[sha] = newest
-    return judged, errors
+    return judged
 
 
 def _sweep_triage(
-    session: ApiSession, config: Config, heads: list[str]
-) -> tuple[dict[str, dict], list[str]]:
+    session: ApiSession, config: Config, heads: list[str], errors: list[str]
+) -> dict[str, dict]:
     """Cap triage independently so the same session can still judge targets."""
     sweep_cap = session.max_api_calls
     triage_cap = session.api_calls + TRIAGE_MAX_CALLS
     session.max_api_calls = triage_cap if sweep_cap is None else min(sweep_cap, triage_cap)
     try:
-        return _read_triage_statuses(session, config, heads)
+        return _read_triage_statuses(session, config, heads, errors)
     finally:
         session.max_api_calls = sweep_cap
         session.cap_reached = False
@@ -1490,14 +1489,14 @@ def _triage_priority(status: dict | None) -> tuple[int, float]:
 
 
 def _sweep_evaluation_order(
-    session: ApiSession, config: Config, heads: list[str]
-) -> tuple[list[str], list[str]]:
+    session: ApiSession, config: Config, heads: list[str], errors: list[str]
+) -> list[str]:
     """Build the priority list, rotating this run's balanced block and filling to max_targets."""
     pr_config = replace(config, event_name="pull_request")
-    judged, errors = _sweep_triage(session, pr_config, heads)
+    judged = _sweep_triage(session, pr_config, heads, errors)
     candidates = sorted(heads[:OPEN_PULLS_MAX], key=lambda sha: _triage_priority(judged.get(sha)))
     if not candidates:
-        return [], errors
+        return []
     n = len(candidates)
     budget = config.max_targets
     blocks = ceil(n / budget)
@@ -1509,7 +1508,7 @@ def _sweep_evaluation_order(
     members = candidates[lo:hi]
     start = cycle % len(members)
     fill = (candidates[hi:] + candidates[:lo])[: budget - len(members)]
-    return members[start:] + members[:start] + fill, errors
+    return members[start:] + members[:start] + fill
 
 
 def _default_branch_head(session: ApiSession, repository: str) -> tuple[str, str]:
@@ -1589,6 +1588,12 @@ def _sweep_pull_heads(
     return result
 
 
+def _write_triage_errors(err: TextIO, errors: list[str]) -> bool:
+    for line in errors[:OPEN_PULLS_MAX]:
+        err.write(f"::error::{line}\n")
+    return bool(errors)
+
+
 def run_sweep(
     config: Config,
     *,
@@ -1609,22 +1614,25 @@ def run_sweep(
         max_api_calls=SWEEP_MAX_CALLS,
     )
     sweep_cfg = replace(config, only_if_pending=False, targets=TARGETS_OPEN_PULLS)
+    triage_errors: list[str] = []
     try:
         heads = _open_pull_head_shas(session, config.repository)
-        to_eval, triage_errors = _sweep_evaluation_order(session, config, heads)
+        to_eval = _sweep_evaluation_order(session, config, heads, triage_errors)
         default_head = _default_branch_head(session, config.repository)
     except ApiCapReachedError as exc:
-        return _warn_api_cap(err, exc)
+        had_triage_errors = _write_triage_errors(err, triage_errors)
+        result = _warn_api_cap(err, exc)
+        return 1 if had_triage_errors else result
     except ApiFailureError as exc:
+        _write_triage_errors(err, triage_errors)
         err.write(f"::error::{exc}\n")
         return 1
-    for line in triage_errors[:OPEN_PULLS_MAX]:
-        err.write(f"::error::{line}\n")
+    had_triage_errors = _write_triage_errors(err, triage_errors)
     if _sweep_deadline_passed(session, err, "the default branch"):
         return 1
     result = _sweep_default_branch(session, sweep_cfg, default_head, out, err)
     result = _sweep_pull_heads(session, sweep_cfg, to_eval, result, out, err)
-    return 1 if triage_errors else result
+    return 1 if had_triage_errors else result
 
 
 def run_judge(
