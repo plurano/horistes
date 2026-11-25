@@ -36,6 +36,7 @@ import zipfile
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
@@ -2601,58 +2602,6 @@ def patches_key_build_module(call: ast.Call) -> bool:
     return module_name not in KEY_BUILD_SAFE_TARGETS
 
 
-def called_names(function: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-    """Collect direct function names called in the function body."""
-    return {
-        node.func.id
-        for statement in function.body
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-
-
-def include_callers(dependencies: dict[str, set[str]], callees: set[str]) -> set[str]:
-    """Include direct and transitive callers of the given functions."""
-    known = callees.copy()
-    for _ in range(len(dependencies)):
-        added = {name for name, calls in dependencies.items() if calls & known} - known
-        if not added:
-            break
-        known.update(added)
-    return known
-
-
-def derive_key_builders(module: ast.Module) -> set[str]:
-    """Follow module-level callers back to openssl, one layer at a time."""
-    dependencies = {
-        function.name: called_names(function)
-        for function in module.body
-        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    return include_callers(dependencies, {"openssl"})
-
-
-def derive_patching_helpers(module: ast.Module) -> set[str]:
-    """Find module-level helpers that patch shared modules directly or through a call."""
-    helpers = [
-        function
-        for function in module.body
-        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and not function.name.startswith("test_")
-    ]
-    direct_patchers = {
-        function.name
-        for function in helpers
-        if any(
-            isinstance(node, ast.Call) and patches_key_build_module(node)
-            for statement in function.body
-            for node in ast.walk(statement)
-        )
-    }
-    dependencies = {function.name: called_names(function) for function in helpers}
-    return include_callers(dependencies, direct_patchers)
-
-
 def own_scope_calls(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> tuple[list[ast.Call], list[ast.FunctionDef | ast.AsyncFunctionDef]]:
@@ -2676,59 +2625,179 @@ def own_scope_calls(
     return calls, nested
 
 
-def nested_roles(
-    nested: list[ast.FunctionDef | ast.AsyncFunctionDef],
-    builders: set[str],
-    patchers: set[str],
-) -> tuple[set[str], set[str]]:
-    """Classify nested functions that build keys or patch shared modules when called."""
-    dependencies: dict[str, set[str]] = {}
-    direct_patchers: set[str] = set()
-    for function in nested:
-        calls = called_names(function)
-        dependencies.setdefault(function.name, set()).update(calls)
-        if calls & patchers or any(
-            isinstance(node, ast.Call) and patches_key_build_module(node)
-            for statement in function.body
-            for node in ast.walk(statement)
-        ):
-            direct_patchers.add(function.name)
-    direct_builders = {name for name, calls in dependencies.items() if calls & builders}
-    return (
-        include_callers(dependencies, direct_builders),
-        include_callers(dependencies, direct_patchers),
+class FunctionScope(NamedTuple):
+    """One function scope with its enclosing index, own-scope calls, and local definitions."""
+
+    function: ast.FunctionDef | ast.AsyncFunctionDef
+    enclosing: int | None
+    calls: list[ast.Call]
+    local_defs: dict[str, int]
+
+
+def function_scopes(module: ast.Module) -> tuple[list[FunctionScope], dict[str, int]]:
+    """List every function scope in ast.walk order and map module-level function names."""
+    functions = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    index_by_id = {id(function): index for index, function in enumerate(functions)}
+    enclosing: list[int | None] = [None] * len(functions)
+    entries: list[
+        tuple[ast.FunctionDef | ast.AsyncFunctionDef, list[ast.Call], dict[str, int]]
+    ] = []
+    for index, function in enumerate(functions):
+        calls, nested = own_scope_calls(function)
+        local_defs: dict[str, int] = {}
+        for child in nested:
+            child_index = index_by_id[id(child)]
+            enclosing[child_index] = index
+            local_defs[child.name] = child_index
+        entries.append((function, calls, local_defs))
+    scopes = [
+        FunctionScope(function, enclosing[index], calls, local_defs)
+        for index, (function, calls, local_defs) in enumerate(entries)
+    ]
+    module_names = {
+        statement.name: index_by_id[id(statement)]
+        for statement in module.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    return scopes, module_names
+
+
+def resolve_callee(
+    scopes: list[FunctionScope],
+    module_names: dict[str, int],
+    index: int,
+    name: str,
+) -> int | None:
+    """Resolve a bare-name call from scope index through enclosing scopes to module names."""
+    current: int | None = index
+    for _ in range(len(scopes) + 1):
+        if current is None:
+            return module_names.get(name)
+        scope = scopes[current]
+        if name in scope.local_defs:
+            return scope.local_defs[name]
+        current = scope.enclosing
+    return module_names.get(name)
+
+
+def call_builds_key(
+    scopes: list[FunctionScope],
+    module_names: dict[str, int],
+    builders: set[int],
+    index: int,
+    call: ast.Call,
+) -> bool:
+    """Check whether a call in scope index invokes openssl or a resolved key-builder scope."""
+    if not isinstance(call.func, ast.Name):
+        return False
+    target = resolve_callee(scopes, module_names, index, call.func.id)
+    return (call.func.id == "openssl" and target is None) or target in builders
+
+
+def call_patches(
+    scopes: list[FunctionScope],
+    module_names: dict[str, int],
+    patchers: set[int],
+    index: int,
+    call: ast.Call,
+) -> bool:
+    """Check whether a call in scope index patches a shared module directly or via a patcher."""
+    if patches_key_build_module(call):
+        return True
+    if not isinstance(call.func, ast.Name):
+        return False
+    return resolve_callee(scopes, module_names, index, call.func.id) in patchers
+
+
+def scope_builds_key(
+    scopes: list[FunctionScope],
+    module_names: dict[str, int],
+    builders: set[int],
+    index: int,
+) -> bool:
+    """Check whether scope index has an own-scope call that builds a key."""
+    return any(
+        call_builds_key(scopes, module_names, builders, index, call) for call in scopes[index].calls
     )
+
+
+def scope_patches(
+    scopes: list[FunctionScope],
+    module_names: dict[str, int],
+    patchers: set[int],
+    index: int,
+) -> bool:
+    """Check whether scope index has an own-scope call that patches a shared module."""
+    return any(
+        call_patches(scopes, module_names, patchers, index, call) for call in scopes[index].calls
+    )
+
+
+def scope_roles(
+    scopes: list[FunctionScope], module_names: dict[str, int]
+) -> tuple[set[int], set[int]]:
+    """Derive builder and patcher scope indexes from own-scope calls to a fixpoint."""
+    builders = {module_names["openssl"]} if "openssl" in module_names else set()
+    non_test_scopes = set(range(len(scopes))) - {
+        index for name, index in module_names.items() if name.startswith("test_")
+    }
+    patchers: set[int] = set()
+    for _ in range(len(scopes) + 1):
+        next_builders = builders | {
+            index
+            for index in range(len(scopes))
+            if scope_builds_key(scopes, module_names, builders, index)
+        }
+        next_patchers = patchers | {
+            index
+            for index in non_test_scopes
+            if scope_patches(scopes, module_names, patchers, index)
+        }
+        if next_builders == builders and next_patchers == patchers:
+            break
+        builders, patchers = next_builders, next_patchers
+    return builders, patchers
+
+
+def derive_key_builders(module: ast.Module) -> set[str]:
+    """Find module-level functions whose own scope builds a key directly or through a call."""
+    scopes, module_names = function_scopes(module)
+    builders, _ = scope_roles(scopes, module_names)
+    return {"openssl"} | {name for name, index in module_names.items() if index in builders}
+
+
+def derive_patching_helpers(module: ast.Module) -> set[str]:
+    """Find module-level helpers whose own scope patches shared modules directly or via a call."""
+    scopes, module_names = function_scopes(module)
+    _, patchers = scope_roles(scopes, module_names)
+    return {name for name, index in module_names.items() if index in patchers}
 
 
 def key_builds_after_shared_module_patch(source: str) -> list[str]:
     """Find functions whose own scope builds a key at or after a shared patch."""
     module = ast.parse(source)
-    builders = derive_key_builders(module)
-    patching_helpers = derive_patching_helpers(module)
-    offenders = []
-    for function in ast.walk(module):
-        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        calls, nested = own_scope_calls(function)
-        nested_builders, nested_patchers = nested_roles(nested, builders, patching_helpers)
-        scope_builders = builders | nested_builders
-        scope_patchers = patching_helpers | nested_patchers
+    scopes, module_names = function_scopes(module)
+    builders, patchers = scope_roles(scopes, module_names)
+    offenders: list[str] = []
+    for index, scope in enumerate(scopes):
         patched_at = min(
             (
                 (call.end_lineno, call.end_col_offset)
-                for call in calls
-                if patches_key_build_module(call)
-                or (isinstance(call.func, ast.Name) and call.func.id in scope_patchers)
+                for call in scope.calls
+                if call_patches(scopes, module_names, patchers, index, call)
             ),
             default=None,
         )
         if patched_at is not None and any(
-            isinstance(call.func, ast.Name)
-            and call.func.id in scope_builders
+            call_builds_key(scopes, module_names, builders, index, call)
             and (call.lineno, call.col_offset) >= patched_at
-            for call in calls
+            for call in scope.calls
         ):
-            offenders.append(function.name)
+            offenders.append(scope.function.name)
     return offenders
 
 
@@ -2956,6 +3025,79 @@ NESTED_KEY_BUILD_CASES = [
         ["test_example"],
         id="default-arg-boundary",
     ),
+    pytest.param(
+        (
+            "def outer():\n    def unused():\n"
+            '        monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+            "outer()\napp_key()"
+        ),
+        [],
+        id="defined-not-called",
+    ),
+    pytest.param(
+        (
+            "def outer():\n    def unused():\n"
+            '        monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+            "    unused()\nouter()\napp_key()"
+        ),
+        ["test_example"],
+        id="called-through-outer",
+    ),
+    pytest.param(
+        "shrink(monkeypatch)\ndef outer():\n    def unused():\n        app_key()\nouter()",
+        [],
+        id="builder-defined-not-called",
+    ),
+    pytest.param(
+        (
+            "shrink(monkeypatch)\ndef outer():\n    def unused():\n"
+            "        app_key()\n    unused()\nouter()"
+        ),
+        ["test_example"],
+        id="builder-called-through-outer",
+    ),
+    pytest.param(
+        (
+            "def make():\n    return app_key()\ndef inner():\n"
+            '    monkeypatch.setattr(train_mod.os, "pipe", small)\n    make()\ninner()'
+        ),
+        ["inner"],
+        id="enclosing-builder-after-patch",
+    ),
+    pytest.param(
+        (
+            "def make():\n    return app_key()\ndef inner():\n    make()\n"
+            '    monkeypatch.setattr(train_mod.os, "pipe", small)\ninner()'
+        ),
+        [],
+        id="enclosing-builder-before-patch",
+    ),
+    pytest.param(
+        (
+            'def patch():\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+            "def inner():\n    patch()\n    app_key()\ninner()"
+        ),
+        ["inner"],
+        id="enclosing-patcher-before-key",
+    ),
+    pytest.param(
+        (
+            "def make():\n    return app_key()\ndef inner():\n    def make():\n        pass\n"
+            '    monkeypatch.setattr(train_mod.os, "pipe", small)\n    make()\ninner()'
+        ),
+        [],
+        id="local-def-shadows-enclosing",
+    ),
+    pytest.param(
+        "define_only(monkeypatch)\napp_key()",
+        [],
+        id="module-helper-defines-only",
+    ),
+    pytest.param(
+        "define_and_call(monkeypatch)\napp_key()",
+        ["test_example"],
+        id="module-helper-calls-nested",
+    ),
 ]
 
 
@@ -2966,6 +3108,10 @@ def test_key_build_order_nested_functions(body, expected):
     source = (
         'def app_key():\n    return openssl("genpkey")\n'
         'def shrink(monkeypatch):\n    monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+        "def define_only(monkeypatch):\n    def unused():\n"
+        '        monkeypatch.setattr(train_mod.os, "pipe", small)\n'
+        "def define_and_call(monkeypatch):\n    def used():\n"
+        '        monkeypatch.setattr(train_mod.os, "pipe", small)\n    used()\n'
         f"def test_example(monkeypatch):\n    {indented}\n"
     )
     assert key_builds_after_shared_module_patch(source) == expected
