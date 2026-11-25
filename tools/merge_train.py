@@ -795,7 +795,8 @@ def request_once(url, token, method, body, raw, redirect):
 def graphql_name(query):
     """Every train document declares its operation before the variables or selection."""
     operation = re.match(r"\s*(?:query|mutation)\s+([A-Za-z_]\w*)\b", query)
-    assert operation, "anonymous GraphQL operation"
+    if operation is None:
+        raise ValueError("anonymous GraphQL operation")
     return operation[1]
 
 

@@ -1671,6 +1671,13 @@ def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
         check([*documents, "query { viewer { login } }"])
 
 
+def test_anonymous_graphql_document_raises_value_error(tmp_path, monkeypatch):
+    train_mod = load_train(tmp_path, monkeypatch)
+    assert train_mod.graphql_name("query PullPage($n: Int!) { viewer { login } }") == "PullPage"
+    with pytest.raises(ValueError, match="anonymous GraphQL operation"):
+        train_mod.graphql_name("query { viewer { login } }")
+
+
 def test_forge_refuses_anonymous_graphql():
     forge = Forge(repository())
     assert forge.graphql_response("", "query { viewer { login } }", {}) == (
