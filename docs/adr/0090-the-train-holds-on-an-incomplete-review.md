@@ -60,6 +60,8 @@ The author sees `review body: review incomplete: <login> limit reached at <ts>`
 in the train summary and can ask the bot to review again. An armed pull request
 is disarmed with the same reason; both outcomes are checked by
 `test_planted_incomplete_review_train_holds` in `tests/test_merge_train.py`.
+The hold line may end with `; summary shape unmatched: <names>` as ADR-0092
+section E describes.
 
 `tools/review_state.py` is the single canonical reader. The fleet gate is to
 import it later from a pinned Horistes commit, and subsequent reader changes

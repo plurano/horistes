@@ -28,6 +28,49 @@ import ciwf
 
 ROOT = Path(__file__).resolve().parent.parent
 
+REVIEW_GENERATED = "<!-- coderabbit-ai-generated:v1 -->"
+REVIEW_COUNT_ZERO = "**Actionable comments posted: 0**"
+REVIEW_STATUS = "\n".join(
+    [
+        "<!-- recent_review_status_start -->",
+        "",
+        "No actionable comments were generated in the recent review.",
+        "",
+        "<!-- recent_review_status_end -->",
+    ]
+)
+
+
+def review_range_block(head):
+    return "\n".join(
+        [
+            "<details>",
+            "<summary><picture>x</picture> Commits</summary>",
+            "<dl>",
+            "<dd>",
+            "<br>",
+            "",
+            (
+                "Reviewing files that changed from the base of the PR and between "
+                f"{'a' * 40} and {head}."
+            ),
+            "",
+            "</dd>",
+            "</dl>",
+            "</details>",
+        ]
+    )
+
+
+def completed_head_summary(head="b" * 40, statement=REVIEW_COUNT_ZERO):
+    """Build the generated header and Commits block as they appear in CodeRabbit reviews."""
+    lines = [REVIEW_GENERATED, ""]
+    if statement is not None:
+        lines.extend([statement, ""])
+    lines.append(review_range_block(head))
+    return "\n".join(lines)
+
+
 # The consumer path each template's header names.
 CALLER_TEMPLATES: dict[str, str] = {
     "templates/callers/hook-copy.yml.tmpl": ".github/workflows/hook-copy.yml",

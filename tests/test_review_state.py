@@ -8,6 +8,13 @@ import re
 from pathlib import Path
 
 import pytest
+from conftest import (
+    REVIEW_COUNT_ZERO,
+    REVIEW_GENERATED,
+    REVIEW_STATUS,
+    completed_head_summary,
+    review_range_block,
+)
 from review_state import (
     MAX_COMMENTS,
     MAX_LINES,
@@ -600,7 +607,7 @@ _MIXED_NO_ACTIONABLE = "No actionable comments were generated in the recent revi
 
 
 def _mixed_pause_allowance_zero_action_params():
-    """Mixed pause plus allowance bodies need unfenced zero-action evidence for the head."""
+    """Mixed pause and allowance notices need zero actions at fixed CodeRabbit positions."""
     body, head, _, _ = _mixed_pause_allowance_body_parts()
     actionable = body.replace(_MIXED_NO_ACTIONABLE, "Actionable comments posted: 1")
     fenced_only = body.replace(
@@ -666,6 +673,7 @@ def test_review_incomplete_pr3507_replay(envelope):
     node = payload["data"]["repository"]["pullRequest"]
     assert review_incomplete(payload if envelope else node) == (
         "review incomplete: coderabbitai limit reached at 2026-11-16T16:40:51Z"
+        "; summary shape unmatched: range block layout"
     )
 
 
@@ -680,6 +688,7 @@ def test_review_incomplete_pr3507_body_replay():
     assert notice["body"].strip() == body.strip()
     assert review_incomplete(node) == (
         "review incomplete: coderabbitai limit reached at 2026-11-16T16:40:51Z"
+        "; summary shape unmatched: range block layout"
     )
 
 
@@ -1017,18 +1026,6 @@ def completed_head_pull(*runs, summary=None, notice_login="coderabbitai", head_c
     return pr
 
 
-def completed_head_summary(head=ADR92_HEAD, statement="Actionable comments posted: 0"):
-    """Use the reader's established reviewed-range wording with an actionable count."""
-    return (
-        "Reviewing files that changed from the base of the PR and between "
-        + "a" * 40
-        + " and "
-        + head
-        + ".\n"
-        + statement
-    )
-
-
 @pytest.mark.parametrize("form", ["check-run", "summary"])
 def test_completed_head_clears_old_allowance(form):
     """Reproduce the stale allowance after a push, then plant each completed-head form."""
@@ -1266,14 +1263,14 @@ def test_completed_head_commit_connection_bound(extra):
     [
         pytest.param(
             "No actionable comments were generated in the recent review.",
-            False,
+            True,
             id="exact-sentence",
         ),
-        pytest.param("Actionable comments posted: 0", False, id="zero-count"),
-        pytest.param("**Actionable comments posted:** 0", False, id="bold-label"),
+        pytest.param("Actionable comments posted: 0", True, id="zero-count"),
+        pytest.param("**Actionable comments posted:** 0", True, id="bold-label"),
         pytest.param("**Actionable comments posted: 0**", False, id="bold-line"),
-        pytest.param("Actionable comments posted: **0**", False, id="bold-count"),
-        pytest.param("Actionable comments posted: 1", True, id="nonzero"),
+        pytest.param("Actionable comments posted: **0**", True, id="bold-count"),
+        pytest.param("**Actionable comments posted: 1**", True, id="nonzero"),
         pytest.param(
             "Actionable comments posted: 0\nActionable comments posted: 1",
             True,
@@ -1311,11 +1308,11 @@ def test_completed_head_summary_ranges(variant):
     elif variant == "prefix":
         body = completed_head_summary(ADR92_HEAD[:7])
     elif variant == "two":
-        body += "\n" + completed_head_summary("c" * 40)
+        body += "\n" + review_range_block("c" * 40)
     elif variant == "duplicate":
-        body += "\n" + completed_head_summary()
+        body += "\n" + review_range_block(ADR92_HEAD)
     else:
-        body = "> " + body
+        body = "\n".join("> " + line for line in body.split("\n")[:MAX_LINES])
     assert review_incomplete(completed_head_pull(summary=body))
 
 
@@ -1365,7 +1362,8 @@ def test_completed_head_keeps_other_limit_rules(form, notice):
 @pytest.mark.parametrize("lines", [MAX_LINES, MAX_LINES + 1])
 def test_completed_head_summary_line_bound(lines):
     """Accept a body exactly at the local line bound and reject one additional line."""
-    body = completed_head_summary() + "\nblank" * (lines - 2)
+    summary = completed_head_summary()
+    body = summary + "\nblank" * (lines - len(summary.splitlines()))
     assert len(body.splitlines()) == lines
     assert bool(review_incomplete(completed_head_pull(summary=body))) is (lines > MAX_LINES)
 
@@ -1488,9 +1486,7 @@ def test_completed_head_malformed_suite_commit(commit):
 @pytest.mark.parametrize("size", [65536, 65537, 65748])
 def test_completed_head_summary_character_bound(size):
     """Exactly 65536 characters qualify; larger summaries cannot clear an allowance."""
-    summary = completed_head_summary(
-        statement="No actionable comments were generated in the recent review."
-    )
+    summary = completed_head_summary(statement=REVIEW_STATUS)
     body = summary + "\n" + "x" * (size - len(summary) - 1)
     assert len(body) == size
     assert bool(review_incomplete(completed_head_pull(summary=body))) is (size > 65536)
@@ -1686,13 +1682,7 @@ def adr93_paused_cases():
     }
     pr["comments"]["nodes"].append(summary)
     cases.append(_case("later-table", pr, True))
-    summary["body"] += (
-        "\nReviewing files that changed from the base of the PR and between "
-        + "1" * 40
-        + " and "
-        + pr["headRefOid"]
-        + "."
-    )
+    summary["body"] += "\n" + review_range_block(pr["headRefOid"])
     cases.append(_case("head-range", pr, False))
     pr["comments"]["nodes"] = [notice]
     cases.extend(adr93_second_summary_cases(pr, notice))
@@ -1937,197 +1927,165 @@ def test_bot_dependency_count_rejects_boolean():
             + " and "
             + "c" * 40
             + ".\n```",
-            False,
+            True,
             id="fenced-second-range-with-tilde",
         ),
     ],
 )
 def test_completed_head_second_range_declarations(extra_range, holds):
-    """Any unfenced second reviewed-range declaration line invalidates summary coverage."""
+    """A second reviewed-range declaration invalidates summary coverage anywhere in the body."""
     body = completed_head_summary() + extra_range
     assert bool(adr92_reader().review_incomplete(completed_head_pull(summary=body))) is holds
 
 
 @pytest.mark.parametrize(
-    ("statement", "holds"),
+    "statement",
     [
         pytest.param(
             "```\nActionable comments posted: 0\n```",
-            True,
             id="fenced-only-zero",
         ),
         pytest.param(
             "Actionable comments posted: 0\n```\nActionable comments posted: 1\n```",
-            False,
             id="standalone-zero-fenced-one",
         ),
         pytest.param(
             "```\nActionable comments posted: 0",
-            True,
             id="unclosed-fence-before-count",
         ),
         pytest.param(
             "~~~\nActionable comments posted: 0\n~~~",
-            True,
             id="tilde-fence",
         ),
         pytest.param(
             "```\n~~~\nActionable comments posted: 0\n```",
-            True,
             id="mixed-tilde-inside-backtick",
         ),
         pytest.param(
             "~~~\n```\nActionable comments posted: 0\n~~~",
-            True,
             id="mixed-backtick-inside-tilde",
         ),
         pytest.param(
             "````\n```\nActionable comments posted: 0\n````",
-            True,
             id="shorter-closer",
         ),
         pytest.param(
             "```\nActionable comments posted: 1\n````\nActionable comments posted: 0",
-            False,
             id="longer-closer-closes",
         ),
         pytest.param(
             "```\nActionable comments posted: 1\n``` x\nActionable comments posted: 0",
-            True,
             id="closer-with-text-stays-open",
         ),
         pytest.param(
             "```\nActionable comments posted: 1\n```   \nActionable comments posted: 0",
-            False,
             id="closer-trailing-spaces-closes",
         ),
         pytest.param(
             "```\nActionable comments posted: 1\n```\t\nActionable comments posted: 0",
-            True,
             id="closer-trailing-tab-stays-open",
         ),
         pytest.param(
             "```\nActionable comments posted: 1\n   ```\nActionable comments posted: 0",
-            False,
             id="closer-indent-three-closes",
         ),
         pytest.param(
             "```\nActionable comments posted: 1\n    ```\nActionable comments posted: 0",
-            True,
             id="closer-indent-four-stays-open",
         ),
         pytest.param(
             "```a`b\nActionable comments posted: 0",
-            False,
             id="backtick-info-with-backtick-opens-nothing",
         ),
         pytest.param(
             "~~~a`b\nActionable comments posted: 0\n~~~",
-            True,
             id="tilde-info-with-backtick-opens",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n\n  ```\n  code\n\n"
             "Actionable comments posted: 1",
-            True,
             id="nested-unclosed-fence-item-ends-after-blank",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n  ```\n  code\nActionable comments posted: 1",
-            True,
             id="nested-unclosed-fence-item-ends-unindented",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\nlazy\n  ```\n  code\n\n"
             "Actionable comments posted: 1",
-            True,
             id="nested-fence-lazy-line-keeps-item",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n1. item\n   ```\n   code\n\n"
             "Actionable comments posted: 1",
-            True,
             id="nested-fence-ordered-item",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n  ```\n"
             "  Actionable comments posted: 1\n  ```",
-            False,
             id="nested-closed-fence-hides-count",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n  ```\n\n  Actionable comments posted: 1",
-            False,
             id="nested-fence-blank-then-indented-stays-hidden",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n\ntext\n```\nActionable comments posted: 1",
-            False,
             id="top-level-unclosed-after-item-closed",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n\n ```\nActionable comments posted: 1",
-            False,
             id="fence-below-item-column-is-top-level",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n```\nActionable comments posted: 1",
-            False,
             id="fence-opener-below-item-column-is-top-level",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n  ```\n  x\n  ```\nafter\n  ```\n"
             "Actionable comments posted: 1",
-            False,
             id="item-closes-after-nested-fence-closer",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n# Heading\n  ```\n"
             "Actionable comments posted: 1",
-            False,
             id="item-closes-on-atx-heading",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n***\n  ```\nActionable comments posted: 1",
-            False,
             id="item-closes-on-thematic-break",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n> quote\n  ```\n"
             "Actionable comments posted: 1",
-            False,
             id="item-closes-on-block-quote",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n\n- - -\n  ```\n"
             "Actionable comments posted: 1",
-            False,
             id="thematic-break-dash-is-no-list-item",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n  ***\n  ```\n  code\nafter\n"
             "Actionable comments posted: 1",
-            True,
             id="indented-thematic-break-inside-item-keeps-item",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\nlazy\n  ```\n  code\n"
             "Actionable comments posted: 1",
-            True,
             id="lazy-line-after-list-item-keeps-fence-nested",
         ),
         pytest.param(
             "Actionable comments posted: 0\n\n- item\n  # Heading\n  ```\n  code\n\n"
             "Actionable comments posted: 1",
-            True,
             id="indented-heading-inside-item-keeps-item",
         ),
     ],
 )
-def test_completed_head_summary_fenced_code(statement, holds):
-    """Fenced code blocks cannot supply or contradict completion counts."""
+def test_completed_head_summary_fenced_code(statement):
+    """Misplaced count phrases keep the allowance hold in all historical fence cases."""
     body = completed_head_summary(statement=statement)
-    assert bool(adr92_reader().review_incomplete(completed_head_pull(summary=body))) is holds
+    assert adr92_reader().review_incomplete(completed_head_pull(summary=body))
 
 
 @pytest.mark.parametrize(
@@ -2185,11 +2143,11 @@ def test_unread_tail_mixed_notices(tail, expected):
 @pytest.mark.parametrize(
     ("statement", "holds"),
     [
-        pytest.param("Actionable comments posted: 1", True, id="count-one-holds"),
-        pytest.param("Actionable comments posted: 0", False, id="count-zero-clears"),
+        pytest.param("**Actionable comments posted: 1**", True, id="count-one-holds"),
+        pytest.param(REVIEW_COUNT_ZERO, False, id="count-zero-clears"),
         pytest.param(
             "```\nActionable comments posted: 1\n```\nActionable comments posted: 0",
-            False,
+            True,
             id="fenced-one-standalone-zero-clears",
         ),
         pytest.param(
@@ -2201,7 +2159,7 @@ def test_unread_tail_mixed_notices(tail, expected):
     ],
 )
 def test_same_body_allowance_zero_action(statement, holds):
-    """A summary carrying its own allowance notice requires unfenced zero-action evidence."""
+    """An allowance in the summary requires zero actions at fixed CodeRabbit positions."""
     body = completed_head_summary(statement=statement) + "\n0 remain after this review"
     pr = adr92_pull(adr92_comment(body))
     assert bool(adr92_reader().review_incomplete(pr)) is holds
@@ -2288,3 +2246,145 @@ def test_read_body_mixed_notices(case, expected):
         pure_verdict = reader.review_incomplete(pure)
         assert verdict == pure_verdict == expected
     assert verdict == expected
+
+
+SHAPE_HEAD = "c" * 40
+SHAPE_BLOCK = review_range_block(SHAPE_HEAD)
+
+
+def _shape_body(statement=None, tail=""):
+    summary = completed_head_summary(SHAPE_HEAD, statement)
+    return summary + "\n\n" + tail if tail else summary
+
+
+def _planted_shape_cases():
+    misplaced = ("count line position",)
+    return [
+        pytest.param(
+            _shape_body(tail="Intro\n2. item\n   ```\nActionable comments posted: 0\n```"),
+            False,
+            misplaced,
+            id="p1-ordered-marker-4690487397",
+        ),
+        pytest.param(
+            _shape_body(
+                REVIEW_COUNT_ZERO,
+                tail="- outer\n  - inner\n  ```\n  code\nActionable comments posted: 1",
+            ),
+            False,
+            ("count line count",),
+            id="p2-outer-item-4690487400",
+        ),
+        pytest.param(
+            _shape_body(tail="```\n```\u2028Actionable comments posted: 0\n```"),
+            False,
+            misplaced,
+            id="p3-u2028-4690487406",
+        ),
+        pytest.param(
+            _shape_body(tail="- item\n    ```\n  Actionable comments posted: 0\n    ```"),
+            False,
+            misplaced,
+            id="p4-fence-indent-4690487414",
+        ),
+        pytest.param(
+            _shape_body(tail="- ~~~\n  Actionable comments posted: 0\n  ~~~"),
+            False,
+            misplaced,
+            id="p5-marker-line-fence-4690487425",
+        ),
+        pytest.param(
+            REVIEW_GENERATED + "\u2028\u2028" + REVIEW_COUNT_ZERO + "\n\n" + SHAPE_BLOCK,
+            False,
+            misplaced,
+            id="p6-u2028-count-line",
+        ),
+    ]
+
+
+def _shape_controls():
+    one = "**Actionable comments posted: 1**"
+    other = _shape_body(REVIEW_COUNT_ZERO).replace("<picture>x</picture> Commits", "Review details")
+    synthetic = SHAPE_BLOCK.split("\n")[6] + "\nActionable comments posted: 0"
+    return [
+        pytest.param(_shape_body(REVIEW_COUNT_ZERO), True, (), id="ok-count-zero"),
+        pytest.param(_shape_body(tail=REVIEW_STATUS), True, (), id="ok-status-none"),
+        pytest.param(
+            _shape_body(REVIEW_COUNT_ZERO, tail=REVIEW_STATUS),
+            True,
+            (),
+            id="ok-count-zero-status-none",
+        ),
+        pytest.param(_shape_body(one), False, (), id="hold-count-one"),
+        pytest.param(
+            _shape_body(one, tail=REVIEW_STATUS), False, (), id="hold-count-one-status-none"
+        ),
+        pytest.param(
+            _shape_body("Actionable comments posted: 0"),
+            False,
+            ("count line position",),
+            id="hold-unbold-count",
+        ),
+        pytest.param(
+            _shape_body(tail=REVIEW_STATUS + "\n\nActionable comments posted: 1"),
+            False,
+            ("count line position",),
+            id="hold-status-with-unplaced-count",
+        ),
+        pytest.param(other, False, ("range block layout",), id="hold-other-summary"),
+        pytest.param(
+            synthetic,
+            False,
+            ("count line position", "range block layout"),
+            id="hold-synthetic-range",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("body", "expected", "names"), _planted_shape_cases() + _shape_controls())
+def test_completed_head_summary_shapes(body, expected, names):
+    reader = adr92_reader()
+    actual = reader._zero_action_summary(body, SHAPE_HEAD)
+    assert actual is expected
+    shape = reader._summary_shape(body)
+    assert shape.unmatched == names
+    assert shape.range_end == ("" if "range block layout" in names else SHAPE_HEAD)
+
+
+def test_summary_shape_hold_names():
+    body = (FIXTURES / "cr1976-summary-allowance-6900214744.md").read_text(encoding="utf-8")
+    head = "793a759aea1c963feace48e67e6cf3590a37e3dd"
+    pr = adr92_pull(adr92_comment(body + "\n\n```\nActionable comments posted: 0\n```"))
+    pr["headRefOid"] = head
+    assert review_incomplete(pr).endswith("; summary shape unmatched: count line position")
+    pr["headRefOid"] = "a" * 40
+    pr["comments"]["nodes"] = [adr92_comment(body)]
+    assert (
+        review_incomplete(pr) == "review incomplete: coderabbitai limit reached at " + ADR92_NOTICE
+    )
+
+
+def test_summary_lines_gfm_endings():
+    lines = adr92_reader()._lines
+    assert lines("a\u2028b\rc\r\nd\n") == ["a\u2028b", "c", "d"]
+    assert lines("") == []
+    body = "\n".join(["a"] * 2000)
+    assert len(lines(body)) == len(lines(body + "\n")) == 2000
+
+
+@pytest.mark.parametrize(
+    ("stem", "head"),
+    [
+        ("pr216-review-6051970050", "bc1ec81d57986bde546c80d6efb0593e96052a89"),
+        ("pr257-review-6050460861", "4eb5860e8ff1190af55c98376e48821109163c95"),
+        ("pr264-review-6049769524", "e61bf65d3982f240c0c22b66dfee7d018a463fee"),
+    ],
+    ids=["pr216-review-6051970050", "pr257-review-6050460861", "pr264-review-6049769524"],
+)
+def test_completed_head_summary_live_bodies(stem, head):
+    reader = adr92_reader()
+    body = (FIXTURES / (stem + ".md")).read_text(encoding="utf-8")
+    assert reader._allowance_head_reviewed(body, head)
+    assert not reader._allowance_head_reviewed(body, "f" * 40)
+    assert not reader._zero_action_summary(body, head)
+    assert reader._summary_shape(body).unmatched == ()

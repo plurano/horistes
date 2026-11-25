@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
-from conftest import ROOT, measured
+from conftest import REVIEW_STATUS, ROOT, completed_head_summary, measured, review_range_block
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
@@ -11059,7 +11059,10 @@ def test_retry_hold_deferral_ends_advancement_before_later_urgent(tmp_path):
 
 # ADR-0090: a skipped review holds even when no review body has findings.
 REVIEW_STATE_FIXTURES = ROOT / "tests/fixtures/review-state"
-INCOMPLETE_3507 = "review incomplete: coderabbitai limit reached at 2026-11-16T16:40:51Z"
+INCOMPLETE_3507 = (
+    "review incomplete: coderabbitai limit reached at 2026-11-16T16:40:51Z"
+    "; summary shape unmatched: range block layout"
+)
 
 
 def _incomplete_review_pull(*, armed=False):
@@ -11172,13 +11175,7 @@ def test_completed_review_clears_incomplete_hold(tmp_path, monkeypatch):
     for login in ("coderabbitai", "sourcery-ai"):
         summary = _completed_review_summary("2026-11-16T17:00:00Z")
         summary["author"]["login"] = login
-        summary["body"] += (
-            "\nReviewing files that changed from the base of the PR and between "
-            + "a" * 40
-            + " and "
-            + p["headRefOid"]
-            + "."
-        )
+        summary["body"] += "\n" + review_range_block(p["headRefOid"])
         detail["comments"]["nodes"].append(summary)
     detail["comments"]["totalCount"] = len(detail["comments"]["nodes"])
     assert merge_train.review_body_hold(p, detail) is None
@@ -11316,28 +11313,17 @@ def test_adr92_zero_review(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("statement", "clears"),
     [
-        pytest.param("\nActionable comments posted: 0", True, id="count-zero-clears"),
-        pytest.param(
-            "\nNo actionable comments were generated in the recent review.",
-            True,
-            id="no-actionable-clears",
-        ),
+        pytest.param("**Actionable comments posted: 0**", True, id="count-zero-clears"),
+        pytest.param(REVIEW_STATUS, True, id="no-actionable-clears"),
         pytest.param("", False, id="no-zero-action-statement-holds"),
-        pytest.param("\nActionable comments posted: 1", False, id="count-one-holds"),
+        pytest.param("**Actionable comments posted: 1**", False, id="count-one-holds"),
     ],
 )
 def test_adr92_allowance_head_evidence(tmp_path, monkeypatch, statement, clears):
     """A same-body allowance summary lifts its notice only with a zero-action statement."""
     mod = adr92_train(tmp_path, monkeypatch)
     p = pull(1, "CLEAN", author={"login": "person"})
-    body = (
-        "Reviewing files that changed from the base of the PR and between "
-        + "a" * 40
-        + " and "
-        + p["headRefOid"]
-        + ".\n0 remain after this review"
-        + statement
-    )
+    body = completed_head_summary(p["headRefOid"], statement) + "\n0 remain after this review"
     summary = _completed_review_summary("2026-11-16T17:00:00Z") | {"body": body}
     detail = _detail(comments=[summary])
     detail["commits"]["nodes"] = [{"commit": {"committedDate": "2026-11-16T16:10:16Z"}}]

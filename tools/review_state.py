@@ -9,6 +9,7 @@ Callers pass a GraphQL pullRequest node or its data/repository envelope.
 
 import re
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 MAX_COMMENTS = 100
 MAX_COMMITS = 100
@@ -23,15 +24,22 @@ MAX_SNIPPET = 160
 COMPLETED_STATES = frozenset({"COMMENTED", "APPROVED", "CHANGES_REQUESTED"})
 # Existing review-state fixtures and train body classifiers name these reviewers.
 REVIEWER_BOTS = frozenset({"coderabbitai", "copilot", "sourcery-ai", "codacy-production"})
-NO_ACTIONABLE_RE = re.compile(
-    r"^[ \t]*(?:\*\*)?No actionable comments were generated in the recent review\."
-    r"(?:\*\*)?[ \t]*\r?$",
-    re.MULTILINE,
+LINE_END_RE = re.compile(r"\r\n|\r|\n")
+# Layouts from tests/fixtures/review-state: cr1976, cr234, and the pr216, pr257, pr264 reviews.
+CR_GENERATED = "<!-- coderabbit-ai-generated:v1 -->"
+COUNT_WORDS = "actionable comments posted"
+COUNT_LINE_RE = re.compile(r"\*\*Actionable comments posted: ([0-9]{1,9})\*\*")
+STATUS_START = "<!-- recent_review_status_start -->"
+STATUS_END = "<!-- recent_review_status_end -->"
+NO_ACTION_SENTENCE = "No actionable comments were generated in the recent review."
+NO_ACTION_WORDS = "no actionable comments were generated"
+RANGE_WORDS = "reviewing files that changed from the base of the pr"
+RANGE_LINE_RE = re.compile(
+    r"Reviewing files that changed from the base of the PR and between "
+    r"([0-9a-f]{40}) and ([0-9a-f]{40})\."
 )
-ACTIONABLE_COUNT_RE = re.compile(
-    r"^[ \t]*(?:\*\*)?Actionable comments posted:(?:\*\*)?[ \t]*"
-    r"(?:\*\*)?([0-9]+)(?:\*\*)?[ \t]*\r?$",
-    re.MULTILINE,
+COMMITS_SUMMARY_RE = re.compile(
+    r"<summary>(<strong>)?<picture>.*</picture> Commits(?(1)</strong>)</summary>"
 )
 
 PRE_MERGE_MARKER = re.compile(r"pre[-_ ]merge[-_ ]checks", re.I)
@@ -64,23 +72,6 @@ LAST_REVIEWED_RE = re.compile(
     r"^[ \t]*(?:>[ \t]*)?(?:-[ \t]+)?Last reviewed commit:[ \t]*(.*?)[ \t]*$",
     re.IGNORECASE,
 )
-# Source: tests/fixtures/review-state/cr1976-summary-allowance-6900214744.md
-# (CodeRabbit's reviewed range).
-REVIEWED_RANGE_RE = re.compile(
-    r"^[ \t]*Reviewing files that changed from the base of the PR and between "
-    r"([0-9a-f]{40}) and ([0-9a-f]{40})\.[ \t]*\r?$",
-    re.IGNORECASE | re.MULTILINE,
-)
-REVIEWED_RANGE_LINE_RE = re.compile(
-    r"^[ \t]*Reviewing files that changed from the base of the PR and between "
-    r"\S+ and \S+\.[ \t]*\r?$",
-    re.IGNORECASE | re.MULTILINE,
-)
-FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-LIST_ITEM_RE = re.compile(r"^( {0,3})([-+*]|[0-9]{1,9}[.)])( {1,4})\S")
-ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
-THEMATIC_BREAK_RE = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
-BLOCK_QUOTE_RE = re.compile(r"^ {0,3}>")
 MAX_HEAD_CHECK_SUITES = 5
 MAX_HEAD_CHECK_RUNS = 5
 CODERABBIT_APP_ID = 347564
@@ -156,13 +147,23 @@ def _last_commit_at(pr: dict) -> datetime | None:
     return max(times) if times else None
 
 
+def _lines(body: str) -> list[str]:
+    """Split only at GFM line endings and retain an overflow item above the bound."""
+    if not body:
+        return []
+    lines = LINE_END_RE.split(body, maxsplit=MAX_LINES)
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def pre_merge_rows(body: str) -> list[tuple[str, str, str]]:
     """[(check_name, status, explanation)] from a Pre-merge checks markdown table."""
     text = str(body or "")
     if not PRE_MERGE_MARKER.search(text):
         return []
     rows = []
-    for raw in text.splitlines()[:MAX_LINES]:
+    for raw in _lines(text)[:MAX_LINES]:
         line = raw.strip()
         if not (line.startswith("|") and line.endswith("|")):
             continue
@@ -233,7 +234,7 @@ def _paused_block(lines: list[str], notice_idx: int) -> list[str]:
 
 def _pause_allowance_notices(body: str) -> tuple[list, bool, bool]:
     """Limit notices in body and whether the body is mixed pause plus allowance only."""
-    lines = body.splitlines()
+    lines = _lines(body)
     if len(lines) > MAX_LINES:
         return [], False, False
     notices = [
@@ -263,7 +264,7 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
     pause_notices = [(idx, match) for idx, match in notices[:MAX_LINES] if match.group("paused")]
     if not pause_notices:
         return False
-    lines = body.splitlines()
+    lines = _lines(body)
     reviewed = {
         match.group(1).lower()
         for line in lines[:MAX_LINES]
@@ -276,112 +277,93 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
         for idx, _match in pause_notices[:MAX_LINES]
     )
     if mixed:
-        return (
-            pause_ok
-            and _allowance_head_reviewed(body, head)
-            and _unfenced_zero_action_evidence(body)
-        )
+        return pause_ok and _allowance_head_reviewed(body, head) and _zero_action_evidence(body)
     return pause_ok
 
 
-def _fence_opener(line: str) -> tuple[str, int] | None:
-    """Return (fence_char, run_length) when line opens a Markdown fenced block."""
-    match = FENCE_OPEN_RE.fullmatch(line)
-    if not match or (match.group(1)[0] == "`" and "`" in match.group(2)):
-        return None
-    return match.group(1)[0], len(match.group(1))
+class SummaryShape(NamedTuple):
+    zero: bool
+    range_end: str
+    unmatched: tuple[str, ...]
 
 
-def _fence_closer(line: str, char: str, length: int) -> bool:
-    """Return True when line closes an open Markdown fence of char and length."""
-    match = FENCE_OPEN_RE.fullmatch(line)
-    return bool(
-        match
-        and match.group(1)[0] == char
-        and len(match.group(1)) >= length
-        and not match.group(2).strip(" ")
-    )
+def _summary_count(lines: list[str], lower: str) -> tuple[int | None, str]:
+    occurrences = lower.count(COUNT_WORDS)
+    if occurrences == 0:
+        return None, ""
+    if occurrences != 1:
+        return None, "count line count"
+    if (
+        len(lines) >= 3
+        and lines[:2] == [CR_GENERATED, ""]
+        and (match := COUNT_LINE_RE.fullmatch(lines[2]))
+    ):
+        return int(match[1]), ""
+    return None, "count line position"
 
 
-def _starts_block(line: str, opens_fence: bool) -> bool:
-    """Return True when line opens a fence, an ATX heading, or a block quote."""
-    return bool(opens_fence or ATX_HEADING_RE.match(line) or BLOCK_QUOTE_RE.match(line))
+def _summary_status(lines: list[str], body: str, lower: str) -> tuple[bool, str]:
+    markers = (body.count(STATUS_START), body.count(STATUS_END), lower.count(NO_ACTION_WORDS))
+    if markers == (0, 0, 0):
+        return False, ""
+    if markers != (1, 1, 1):
+        return False, "status block markers"
+    block = [STATUS_START, "", NO_ACTION_SENTENCE, "", STATUS_END]
+    for i, line in enumerate(lines[:MAX_LINES]):
+        if line == STATUS_START and lines[i : i + 5] == block:
+            return True, ""
+    return False, "status block layout"
 
 
-def _next_item_col(line: str, item_col: int, prev_para: bool, starts_block: bool) -> int:
-    """Return the active list-item content column after an outside Markdown line."""
-    if not line.strip(" \t"):
-        return item_col
-    indent = len(line) - len(line.lstrip(" "))
-    if THEMATIC_BREAK_RE.match(line):
-        return item_col if indent >= item_col else 0
-    if item := LIST_ITEM_RE.match(line):
-        return item.end(3)
-    if item_col and indent < item_col and (not prev_para or starts_block):
-        return 0
-    return item_col
+def _summary_range(lines: list[str], lower: str) -> tuple[str, str]:
+    occurrences = lower.count(RANGE_WORDS)
+    if occurrences == 0:
+        return "", ""
+    if occurrences != 1:
+        return "", "range line count"
+    for i, line in enumerate(lines[:MAX_LINES]):
+        if (
+            (match := RANGE_LINE_RE.fullmatch(line))
+            and i >= 6
+            and lines[i - 6] == "<details>"
+            and COMMITS_SUMMARY_RE.fullmatch(lines[i - 5])
+            and lines[i - 4 : i] == ["<dl>", "<dd>", "<br>", ""]
+            and lines[i + 1 : i + 5] == ["", "</dd>", "</dl>", "</details>"]
+        ):
+            return match[2], ""
+    return "", "range block layout"
 
 
-def _without_fenced_code(body: str) -> str:
-    """Return bounded summary text with fenced Markdown blocks removed.
-
-    A fence nested in a list item closes when a non-blank line below its column is not lazy
-    paragraph continuation text and closes that item.
-    """
-    kept: list[str] = []
-    fence_char, fence_len, fence_col = "", 0, 0
-    item_col = 0
-    prev_para = False
-    for line in body.splitlines()[:MAX_LINES]:
-        blank = not line.strip(" \t")
-        indent = len(line) - len(line.lstrip(" "))
-        if fence_col and not blank and indent < fence_col:
-            fence_char, fence_len, fence_col, item_col = "", 0, 0, 0
-        if fence_len:
-            if _fence_closer(line, fence_char, fence_len):
-                fence_char, fence_len, fence_col = "", 0, 0
-            prev_para = False
-            continue
-        opener = _fence_opener(line)
-        starts_block = _starts_block(line, opener is not None)
-        item_col = _next_item_col(line, item_col, prev_para, starts_block)
-        prev_para = not (blank or starts_block or THEMATIC_BREAK_RE.match(line))
-        if opener is not None:
-            fence_char, fence_len = opener
-            fence_col = item_col
-            continue
-        kept.append(line)
-    return "\n".join(kept)
+def _summary_shape(body: str) -> SummaryShape:
+    """Read each evidence family independently at fixed CodeRabbit positions."""
+    if len(body) > MAX_SUMMARY_CHARS:
+        return SummaryShape(False, "", ())
+    lines = _lines(body)
+    if len(lines) > MAX_LINES:
+        return SummaryShape(False, "", ())
+    lower = body.lower()
+    count, count_name = _summary_count(lines, lower)
+    status, status_name = _summary_status(lines, body, lower)
+    range_end, range_name = _summary_range(lines, lower)
+    zero = not count_name and not status_name and (count == 0 or (status and count in (None, 0)))
+    return SummaryShape(zero, range_end, tuple(filter(None, (count_name, status_name, range_name))))
 
 
 def _allowance_head_reviewed(body: str, head: str) -> bool:
-    """Require exactly one reviewed range ending at the full head in an allowance summary."""
-    if (
-        not re.fullmatch(r"[0-9a-f]{40}", head)
-        or len(body) > MAX_SUMMARY_CHARS
-        or len(body.splitlines()) > MAX_LINES
-    ):
-        return False
-    clean = _without_fenced_code(body)
-    declarations = list(REVIEWED_RANGE_LINE_RE.finditer(clean))[:MAX_LINES]
-    ranges = list(REVIEWED_RANGE_RE.finditer(clean))[:MAX_LINES]
-    return len(declarations) == 1 and len(ranges) == 1 and ranges[0].group(2).lower() == head
+    """Require a reviewed range ending at the full head at fixed CodeRabbit positions."""
+    return bool(re.fullmatch(r"[0-9a-f]{40}", head)) and _summary_shape(body).range_end == head
 
 
-def _unfenced_zero_action_evidence(body: str) -> bool:
-    """Unfenced text carries only zero actionable counts or an explicit no-action line."""
-    clean = _without_fenced_code(body)
-    counts = list(ACTIONABLE_COUNT_RE.finditer(clean))[:MAX_LINES]
-    if any(count.group(1).strip("0") for count in counts[:MAX_LINES]):
-        return False
-    return bool(counts or NO_ACTIONABLE_RE.search(clean))
+def _zero_action_evidence(body: str) -> bool:
+    """Read zero-action evidence at fixed CodeRabbit positions."""
+    return _summary_shape(body).zero
 
 
 def _zero_action_summary(body: str, head: str) -> bool:
-    """Require no non-allowance notice, one head range, and unfenced zero-action evidence."""
+    """Require the head range and zero actions at fixed CodeRabbit positions."""
     if _non_allowance_notice(body) or not _allowance_head_reviewed(body, head):
         return False
-    return _unfenced_zero_action_evidence(body)
+    return _zero_action_evidence(body)
 
 
 def _completed_summary_reviewers(pr: dict, head: str) -> set[str]:
@@ -462,7 +444,7 @@ def _run_summary_first_line(summary) -> str:
     """First line of a check-run summary; an empty summary has no first line."""
     if not isinstance(summary, str):
         return ""
-    lines = summary.splitlines()
+    lines = _lines(summary)
     return lines[0] if lines else ""
 
 
@@ -568,14 +550,17 @@ def _non_allowance_notice(body: str) -> bool:
     )
 
 
-def _head_evidence(comment: dict, head: str, formal_only: bool = False) -> bool:
-    """Allow only a completed formal review of the full head or an exact reviewed range."""
+def _head_evidence(
+    comment: dict, head: str, formal_only: bool = False, *, paused_head: bool = False
+) -> bool:
+    """Formal head reviews prove completion. Ordinary evidence may also use a pause or range."""
     if not re.fullmatch(r"[0-9a-f]{40}", head):
         return False
     commit = comment.get("commit")
     formal = comment.get("state") in COMPLETED_STATES and isinstance(commit, dict)
     return bool(formal and commit.get("oid") == head) or (
-        not formal_only and _allowance_head_reviewed(str(comment.get("body") or ""), head)
+        not formal_only
+        and (paused_head or _allowance_head_reviewed(str(comment.get("body") or ""), head))
     )
 
 
@@ -596,16 +581,14 @@ def review_evidence(
     evidence = []
     for comment in _all_comments(node)[: MAX_COMMENTS + MAX_REVIEWS]:
         login = _login(comment).lower().removesuffix("[bot]")
-        if not login or login in answerers:
-            continue
-        if not _can_complete(comment):
+        if not login or login in answerers or not _can_complete(comment):
             continue
         body = str(comment.get("body") or "")
         paused_head = _paused_head_reviewed(body, head)
         if _non_allowance_notice(body) and not paused_head:
             continue
         # A paused block proving the head clears a pause notice (ADR-0093), never an allowance.
-        on_head = (paused_head and not formal_only) or _head_evidence(comment, head, formal_only)
+        on_head = _head_evidence(comment, head, formal_only, paused_head=paused_head)
         if comment.get("state") in COMPLETED_STATES or pre_merge_rows(body) or on_head:
             when = _instant(comment.get("submittedAt")) if formal_only else _body_at(comment)
             evidence.append((login, when, on_head))
@@ -631,7 +614,7 @@ def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
 
 def _notice_read(body: str) -> tuple[str, bool]:
     """Read at most 65536 characters and 2000 lines; retain whether any tail is unread."""
-    lines = body[:MAX_SUMMARY_CHARS].splitlines()
+    lines = _lines(body[:MAX_SUMMARY_CHARS])
     return "\n".join(lines[:MAX_LINES]), len(body) > MAX_SUMMARY_CHARS or len(lines) > MAX_LINES
 
 
@@ -716,6 +699,16 @@ def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple, node: 
     )
 
 
+def _notice_reason(comment: dict, body: str, login: str) -> str:
+    """Name only the unmatched evidence in the comment carrying this notice."""
+    when = _body_at(comment)
+    stamp = when.isoformat().replace("+00:00", "Z") if when is not None else "head"
+    reason = f"review incomplete: {login or 'reviewer'} limit reached at {stamp}"
+    if names := _summary_shape(body).unmatched:
+        return reason + "; summary shape unmatched: " + ", ".join(names)
+    return reason
+
+
 def review_incomplete(pr: dict, me: str = "") -> str:
     """Report skipped reviews with per-login completion and fail-closed time comparisons."""
     node = _pr_node(pr)
@@ -736,13 +729,12 @@ def review_incomplete(pr: dict, me: str = "") -> str:
         login = _login(comment)
         if login.lower().removesuffix("[bot]") in answerers:
             continue
-        _prefix, cut = _notice_read(str(comment.get("body") or ""))
+        body = str(comment.get("body") or "")
+        _prefix, cut = _notice_read(body)
         if cut and _unread_notice_holds(comment, head, last_commit):
             return f"review incomplete: {login or 'reviewer'} notice body exceeds the read bound"
         if _notice_holds(comment, head, last_commit, evidence, node):
-            when = _body_at(comment)
-            stamp = when.isoformat().replace("+00:00", "Z") if when is not None else "head"
-            return f"review incomplete: {login or 'reviewer'} limit reached at {stamp}"
+            return _notice_reason(comment, body, login)
     return ""
 
 

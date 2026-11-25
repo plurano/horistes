@@ -76,12 +76,25 @@ head evidence. The check-run completion form is CodeRabbit's successful check
 run on the head, read through the headChecks reader of ADR-0114.
 A body that mixes an allowance notice with another notice holds while either
 part holds under its own rule, checked by `test_read_body_mixed_notices`.
-A mixed pause and allowance body proves the head only when its unfenced text
-carries zero-action evidence.
-Fenced blocks follow GitHub Flavored Markdown 0.29 section 4.5 (closing with
-the same character at least as long and only trailing spaces, opening nothing
-when a backtick fence has a backtick in its info string, and running to the end
-when unclosed), checked by `test_completed_head_summary_fenced_code`.
+A later formal review clears an allowance using its submission time, as
+`test_formal_evidence_submission_time` checks. A mixed pause and allowance
+body also requires zero-action evidence. The
+summary reader parses no Markdown. It reads the count only on line 3 as
+`**Actionable comments posted: N**`, after the generated marker and an empty
+line. It reads the no-action sentence only inside its five-line status block
+and the reviewed range only inside the Commits details block. Each phrase
+used as evidence must occur exactly once. Lines end only at LF, CR or CRLF
+(GitHub Flavored Markdown 0.29 section 2.1). Any other layout for a phrase
+proves nothing for that evidence family.
+
+The ADR-0090 hold line ends with `; summary shape unmatched: <names>` when
+the body carrying the limit notice contains an unmatched phrase or marker.
+A summary in a separate comment adds no name. The layouts come from the
+`cr1976` and `cr234` summaries and the `pr216-review-6051970050`,
+`pr257-review-6050460861` and `pr264-review-6049769524` review bodies in
+`tests/fixtures/review-state/`. The tests `test_completed_head_summary_shapes`,
+`test_completed_head_summary_live_bodies` and `test_summary_shape_hold_names`
+check these rules.
 `E-*` cases in `test_adr92_reader_planted` cover these rules.
 
 F. Unreadable or truncated connections hold before either review reader runs.

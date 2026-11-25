@@ -15,6 +15,8 @@ SPDX-License-Identifier: EUPL-1.2
 Sourcery budget line (`Sorry @…, you've used your own review budget…`). When such a
 notice is newer than the last commit, `_notice_holds` keeps the train waiting and
 `review_incomplete` reports `review incomplete: <login> limit reached at <instant>`.
+The hold line may end with `; summary shape unmatched: <names>` as ADR-0092
+section E describes.
 `review_body_hold` in [tools/merge_train.py](../../tools/merge_train.py) prefixes that
 with `review body:`.
 
