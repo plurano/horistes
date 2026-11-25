@@ -28,7 +28,7 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 import yaml
-from conftest import CHECKOUT, ROOT
+from conftest import ROOT, assert_action_pin, uses_lines
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
@@ -62,7 +62,6 @@ def check_release_checkout(path: Path) -> None:
     ]
     assert len(checkouts) == 1, "one release module checkout"
     checkout_index, checkout = checkouts[0]
-    assert checkout["uses"] == CHECKOUT.split()[0]
     assert checkout["with"] == {
         "repository": "${{ job.workflow_repository }}",
         "ref": "${{ job.workflow_sha }}",
@@ -88,6 +87,9 @@ def check_release_checkout(path: Path) -> None:
 
     assert checkout_index < positions["settings"] < release_index < positions["after"], (
         "checkout < settings < release < after"
+    )
+    assert_action_pin(
+        str(checkout["uses"]), "actions/checkout", uses_lines(path, "release")[checkout_index]
     )
 
 

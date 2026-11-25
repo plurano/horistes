@@ -17,13 +17,13 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import ROOT
+from conftest import MAX_WORKFLOW_STEPS, ROOT, assert_action_pin, uses_lines
 
 sys.path.insert(0, str(ROOT / "tools"))
 import ciwf
 
 WORKFLOW = ".github/workflows/draft-release.yml"
-DOWNLOAD_ACTION = "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"
+DOWNLOAD_ACTION = "actions/download-artifact"
 
 
 def get_workflow_doc(root: Path = ROOT) -> dict:
@@ -158,13 +158,25 @@ def test_artifact_validation_refuses_invalid_names(artifact: str):
     assert planted_done.returncode == 0
 
 
-def test_download_artifact_step():
-    """The download artifact step uses the pinned action with correct arguments."""
-    step = get_step("Fetch the release files")
-    assert step.get("uses", "").startswith(DOWNLOAD_ACTION)
+def check_download_artifact_step(root: Path = ROOT) -> None:
+    """Verify the download artifact step uses a pinned action, version comment, and arguments."""
+    doc = get_workflow_doc(root)
+    steps = doc["jobs"]["draft"]["steps"]
+    idx, step = next(
+        (i, s)
+        for i, s in enumerate(steps[:MAX_WORKFLOW_STEPS])
+        if isinstance(s, dict) and s.get("name") == "Fetch the release files"
+    )
+    line = uses_lines(root / WORKFLOW, "draft")[idx]
+    assert_action_pin(str(step.get("uses", "")), DOWNLOAD_ACTION, line)
     with_block = step.get("with", {})
     assert with_block.get("name") == "${{ inputs.artifact }}"
     assert with_block.get("path") == "dist"
+
+
+def test_download_artifact_step() -> None:
+    """The download artifact step uses the pinned action with correct arguments."""
+    check_download_artifact_step()
 
 
 REQUIRED_FLAGS = ("--draft", "--verify-tag", "--generate-notes")
