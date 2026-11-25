@@ -719,7 +719,7 @@ and reports to the forge's code scanning ([ADR-0043](docs/adr/0043-codeql-report
 | waiting time after a release | three days; none for a fix of a known vulnerability, own releases or container image digest updates; forks of outside projects keep three days |
 | merge by the bot | never |
 | after a Go module update | `go mod tidy` (`gomodTidy`) |
-| pull request body | `prHeader` adds the description and verification checklist; every box stays unticked, and every heading carries text beyond blanks and HTML comments (`pr_header_problems` in `tests/test_update_bot.py`). The header matches the template that `praetorctl adopt` ships. A repository with a different template sets its own `prHeader` in its `renovate.json`. |
+| pull request body | Shared preset: `prHeader` adds a neutral description and checklist that names no command (`neutral_header_problems` in `tests/test_update_bot.py`; [ADR-0116](docs/adr/0116-the-shared-update-header-names-no-command.md)). This repository sets its own `prHeader` in `renovate.json` so the header matches `.github/pull_request_template.md` (`pr_header_problems`). Every box stays unticked; every heading carries text beyond blanks and HTML comments. |
 | the machine a job runs on | not proposed |
 
 Own releases skip the waiting time; forks of outside projects keep three days
@@ -728,6 +728,11 @@ update of a container image skips the waiting time too, because a re-pushed tag
 restarts it; version updates of outside images keep three days, and the last
 package rule keeps fork image digests at three days
 ([ADR-0078](docs/adr/0078-docker-digest-updates-wait-for-no-release-age.md)).
+Version updates of outside images on GHCR, Quay, ECR, or other registries
+other than Docker Hub carry no release timestamp in Renovate; they stay pending
+under the default `timestamp-required` behaviour until a person requests them
+on the Dependency Dashboard ([ADR-0117](docs/adr/0117-undated-images-outside-docker-hub-keep-the-waiting-time.md)).
+Fork image digests still keep three days through the last package rule.
 The digest rule adds a `prBodyNotes` explanation to the proposal.
 
 A fix of a known vulnerability skips the waiting time

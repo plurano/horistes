@@ -112,6 +112,12 @@ TIDY = "gomodTidy"
 # The keys both files may hold: Renovate appends these lists, the repository's
 # entries behind the preset's.
 APPENDED = {"$schema", "extends", "packageRules"}
+# Keys a repository replaces with its own value; the same value in both files is still refused.
+REPLACED = {"prHeader"}
+COMMAND_CHECKLIST_ITEMS = (
+    "- [ ] Local verification passed: `make verify-all`",
+    "- [ ] Agent contexts in sync: `standardsctl compile-context --verify`",
+)
 # The settings-sync preset: the managers it switches off, and the one block
 # such a manager may hold. Allow-lists again: a misspelt manager is an unknown
 # key here, and a block that does more than switch off is refused.
@@ -228,7 +234,8 @@ def untidy_go_update(preset: dict) -> list[str]:
 
 def said_twice(config: dict, preset: dict) -> list[str]:
     """The keys a repository's own file repeats from the preset it extends."""
-    return sorted((set(config) & set(preset)) - APPENDED)
+    shared = (set(config) & set(preset)) - APPENDED
+    return sorted(key for key in shared if key not in REPLACED or config[key] == preset[key])
 
 
 def outside_settings_sync(preset: dict) -> list[str]:
@@ -607,45 +614,89 @@ def pr_header_problems(preset: dict) -> list[str]:
     return problems
 
 
-def test_preset_pr_header_carries_the_repository_template():
+def neutral_header_problems(preset: dict) -> list[str]:
+    """Preset header problems: missing sections or a checklist item that names a command."""
+    header = preset.get("prHeader")
+    if not isinstance(header, str) or not header.strip():
+        return ["prHeader"]
+    problems = [
+        f"{heading}: missing" for heading in PR_HEADINGS if heading not in header.splitlines()
+    ]
+    problems.extend(empty_sections(header))
+    if re.search(r"\[[xX]\]", header):
+        problems.append("ticked box")
+    for item in PR_CHECKBOX.findall(header):
+        if "`" in item:
+            problems.append(f"names a command: {' '.join(item.split())}")
+    return problems
+
+
+def test_preset_pr_header_names_no_command():
+    assert neutral_header_problems(PRESET) == []
+
+
+@pytest.mark.parametrize("item", COMMAND_CHECKLIST_ITEMS)
+def test_planted_preset_header_naming_a_command_is_refused(item):
+    header = PRESET["prHeader"] + f"\n{item}\n"
+    problem = f"names a command: {' '.join(item.split())}"
+    assert neutral_header_problems({**PRESET, "prHeader": header}) == [problem]
+
+
+@pytest.mark.parametrize("mark", ["x", "X"])
+def test_planted_neutral_header_ticked_box_is_refused(mark):
+    header = PRESET["prHeader"] + f"\n- [{mark}] Verification claimed by the bot\n"
+    assert neutral_header_problems({**PRESET, "prHeader": header}) == ["ticked box"]
+
+
+@pytest.mark.parametrize("missing", PR_HEADINGS)
+def test_planted_neutral_header_missing_heading_is_refused(missing):
+    header = PRESET["prHeader"].replace(missing, "")
+    assert neutral_header_problems({**PRESET, "prHeader": header}) == [f"{missing}: missing"]
+
+
+def test_own_pr_header_carries_the_repository_template():
     assert PR_HEADINGS and PR_CHECKLIST
-    assert pr_header_problems(PRESET) == []
+    assert pr_header_problems(CONFIG) == []
+
+
+def test_planted_same_pr_header_in_both_files_is_refused():
+    assert said_twice({**CONFIG, "prHeader": PRESET["prHeader"]}, PRESET) == ["prHeader"]
 
 
 def test_planted_preset_without_a_pr_header_is_refused():
-    preset = {key: value for key, value in PRESET.items() if key != "prHeader"}
+    preset = {key: value for key, value in CONFIG.items() if key != "prHeader"}
     assert pr_header_problems(preset) == ["prHeader"]
 
 
 @pytest.mark.parametrize("mark", ["x", "X"])
 def test_planted_ticked_pr_header_is_refused(mark):
-    header = PRESET["prHeader"] + f"\n- [{mark}] Verification claimed by the bot\n"
-    assert pr_header_problems({**PRESET, "prHeader": header}) == ["ticked box"]
+    header = CONFIG["prHeader"] + f"\n- [{mark}] Verification claimed by the bot\n"
+    assert pr_header_problems({**CONFIG, "prHeader": header}) == ["ticked box"]
 
 
 @pytest.mark.parametrize("missing", PR_HEADINGS + PR_CHECKLIST)
 def test_planted_incomplete_pr_header_is_refused(missing):
-    header = PRESET["prHeader"].replace(missing, "")
-    assert pr_header_problems({**PRESET, "prHeader": header}) == [missing]
+    header = CONFIG["prHeader"].replace(missing, "")
+    assert pr_header_problems({**CONFIG, "prHeader": header}) == [missing]
 
 
 def test_pr_header_accepts_a_folded_checklist_item():
-    header = re.sub(r"\n[ \t]+", " ", PRESET["prHeader"])
-    assert pr_header_problems({**PRESET, "prHeader": header}) == []
+    header = re.sub(r"\n[ \t]+", " ", CONFIG["prHeader"])
+    assert pr_header_problems({**CONFIG, "prHeader": header}) == []
 
 
 def with_description(text: str) -> dict:
-    """The preset with the text under its Description heading swapped for `text`."""
+    """The repository header with the text under its Description heading swapped for `text`."""
     pattern = re.compile(rf"(?<=^{DESCRIPTION}\n).*?(?=^## )", re.DOTALL | re.MULTILINE)
-    header, count = pattern.subn(lambda _: text, PRESET["prHeader"], count=1)
+    header, count = pattern.subn(lambda _: text, CONFIG["prHeader"], count=1)
     assert count == 1
-    return {**PRESET, "prHeader": header}
+    return {**CONFIG, "prHeader": header}
 
 
 def test_planted_header_copied_from_the_template_is_refused():
     # The template leaves the Description to the author: a comment and no text.
     assert DESCRIPTION in PR_HEADINGS
-    assert pr_header_problems({**PRESET, "prHeader": PR_TEMPLATE}) == [f"{DESCRIPTION}: no text"]
+    assert pr_header_problems({**CONFIG, "prHeader": PR_TEMPLATE}) == [f"{DESCRIPTION}: no text"]
 
 
 @pytest.mark.parametrize(
