@@ -289,6 +289,10 @@ def test_single_action_minor_bump_replay_keeps_checks_green(tmp_path: Path, vers
         pytest.param(f"      - uses: {SAMPLE_ACTION}@{SAMPLE_SHA} # v3", id="major-only"),
         pytest.param(f"      - uses: {SAMPLE_ACTION}@{SAMPLE_SHA} # v3.4", id="major-minor"),
         pytest.param(f"      - uses: {SAMPLE_ACTION}@{SAMPLE_SHA} # v3.4.0", id="semver"),
+        pytest.param(f'      - uses: "{SAMPLE_ACTION}@{SAMPLE_SHA}" # v3.4.0', id="double-quoted"),
+        pytest.param(f"      - uses: '{SAMPLE_ACTION}@{SAMPLE_SHA}' # v3", id="single-quoted"),
+        pytest.param(f'        uses: "{SAMPLE_ACTION}@{SAMPLE_SHA}" # v3.4', id="quoted-key-line"),
+        pytest.param(f"      - uses: {SAMPLE_ACTION}@{SAMPLE_SHA} # v3\r\n", id="crlf-ending"),
     ],
 )
 def test_assert_action_pin_accepts_valid_pins(line: str | None) -> None:
@@ -326,6 +330,41 @@ def test_assert_action_pin_accepts_valid_pins(line: str | None) -> None:
             f"{SAMPLE_ACTION}@{SAMPLE_SHA}",
             f"      - uses: {SAMPLE_ACTION}@{SAMPLE_SHA} # v3.4.0 extra",
             id="trailing-words",
+        ),
+        pytest.param(
+            f"{SAMPLE_ACTION}@{SAMPLE_SHA}",
+            f'      - uses: "{SAMPLE_ACTION}@{SAMPLE_SHA} # v3"',
+            id="comment-inside-quotes",
+        ),
+        pytest.param(
+            f"{SAMPLE_ACTION}@{SAMPLE_SHA}",
+            f'      - uses: "{SAMPLE_ACTION}@{SAMPLE_SHA} # v3',
+            id="unclosed-quote",
+        ),
+        pytest.param(
+            f"{SAMPLE_ACTION}@{SAMPLE_SHA}",
+            f'      - uses: "{SAMPLE_ACTION}@{SAMPLE_SHA}"',
+            id="quoted-no-comment",
+        ),
+        pytest.param(
+            f"{SAMPLE_ACTION}@{SAMPLE_SHA}",
+            f"      # - uses: {SAMPLE_ACTION}@{SAMPLE_SHA} # v3",
+            id="commented-out",
+        ),
+        pytest.param(
+            f"{SAMPLE_ACTION}@{SAMPLE_SHA}",
+            f'      # - uses: "{SAMPLE_ACTION}@{SAMPLE_SHA}" # v3',
+            id="quoted-commented-out",
+        ),
+        pytest.param(
+            f"{SAMPLE_ACTION}@{SAMPLE_SHA}",
+            f"      - uses: '{SAMPLE_ACTION}@{SAMPLE_SHA}' # main",
+            id="quoted-branch-comment",
+        ),
+        pytest.param(
+            f"{SAMPLE_ACTION}@{SAMPLE_SHA}",
+            f"      - uses: other/action@{SAMPLE_SHA} # v3",
+            id="line-names-other-action",
         ),
     ],
 )

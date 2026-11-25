@@ -30,12 +30,23 @@ import ciwf
 import pins
 
 ROOT = Path(__file__).resolve().parent.parent
-PIN_COMMENT = re.compile(r"^\s+# v\d+(?:\.\d+){0,2}$")
+PIN_COMMENT = re.compile(r" v\d+(?:\.\d+){0,2}")
 MAX_WORKFLOW_STEPS = 100
 
 
+def _line_call(line: str) -> pins.Call | None:
+    """Read a uses call and its trailing comment from a single YAML line."""
+    try:
+        node = yaml.compose(line, Loader=ciwf.StrictLoader)
+    except yaml.YAMLError:
+        return None
+    if isinstance(node, yaml.SequenceNode) and len(node.value) == 1:
+        node = node.value[0]
+    return pins._call(pins._pairs(node), False, [line])
+
+
 def assert_action_pin(uses: str, action: str, line: str | None = None) -> None:
-    """Assert `uses` pins `action` to a 40-hex commit, with `# v...` comment when `line` given."""
+    """Check a 40-hex pin and, given a line, read the version comment where the YAML scalar ends."""
     found_action, sep, sha = uses.partition("@")
     assert sep == "@" and found_action == action, f"expected action {action!r}, got {uses!r}"
     assert pins.COMMIT.fullmatch(sha) is not None, (
@@ -43,11 +54,12 @@ def assert_action_pin(uses: str, action: str, line: str | None = None) -> None:
     )
     if line is not None:
         stripped = line.rstrip("\r\n")
-        prefix, found_uses, tail = stripped.partition(uses)
+        call = _line_call(stripped)
         assert (
-            found_uses == uses
-            and not prefix.lstrip().startswith("#")
-            and PIN_COMMENT.fullmatch(tail) is not None
+            call is not None
+            and call.uses == uses
+            and call.comment is not None
+            and PIN_COMMENT.fullmatch(call.comment) is not None
         ), f"expected version comment for {action!r} after sha, got {line!r}"
 
 
