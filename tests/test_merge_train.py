@@ -1303,12 +1303,21 @@ class Handler(BaseHTTPRequestHandler):
                 f"refused: {reason}"
             ) from error
 
+    def storage_route_id(self) -> str | None:
+        """Return the decimal ID of a normalized storage read."""
+        if self.route == STORAGE_ROUTE:
+            ident = urlsplit(self.path).path.removeprefix("/storage/")
+            # A literal {id} also spells the route template after normalization.
+            if ascii_digits(ident):
+                return ident
+        return None
+
     def request_stage(self, pending) -> str:
         """Match the next request to its issuer's method, Location and authorization policy."""
         if pending is None:
             return "direct"
         method, location, authorization, issuer = pending
-        storage = issuer == ARCHIVE_ROUTE and self.route == STORAGE_ROUTE
+        storage = issuer == ARCHIVE_ROUTE and self.storage_id is not None
         followed = (self.command, self.request_url()) == (method, location) and (
             storage or self.headers.get("Authorization") == authorization
         )
@@ -1390,6 +1399,7 @@ class Handler(BaseHTTPRequestHandler):
         with forge.request_lock:
             pending, forge.redirect_location = forge.redirect_location, None
             self.route = self.normalized_route(pending)
+            self.storage_id = self.storage_route_id()
             stage = self.request_stage(pending)
             request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
             operation = graphql_operation(request["query"]) if request is not None else None
@@ -1397,7 +1407,7 @@ class Handler(BaseHTTPRequestHandler):
             key = (self.command, path, stage)
             forge.request_ledger.add(key)
             if (
-                self.route == STORAGE_ROUTE
+                self.storage_id is not None
                 and (auth := self.headers.get("Authorization")) is not None
             ):
                 forge.storage_auth_seen.append(auth)
@@ -1473,8 +1483,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.send_final(self.end_headers)
 
-    def _get_storage(self, path: str) -> None:
-        art_id = int(path.removeprefix("/storage/"))
+    def _get_storage(self, ident: str) -> None:
+        art_id = int(ident)
         self.server.forge.storage_reads.append(art_id)
         data = self.server.forge.storage.get(art_id)
         if data is None:
@@ -1560,6 +1570,12 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_get(self) -> None:
         """Dispatch a REST read after the common fault check."""
         path = urlsplit(self.path).path
+        if self.storage_id is not None:
+            self._get_storage(self.storage_id)
+            return
+        if path.startswith("/storage/"):
+            self.answer(404, {"message": f"Unknown storage route: {path}"})
+            return
         if self._dispatch_app(path):
             return
         if "/compare/" in path and path.startswith("/repos/"):
@@ -1575,8 +1591,6 @@ class Handler(BaseHTTPRequestHandler):
             self._get_artifacts(path)
         elif "/actions/artifacts/" in path and path.endswith("/zip"):
             self._get_artifact_zip(path)
-        elif path.startswith("/storage/"):
-            self._get_storage(path)
         elif self.route == JOBS_ROUTE:
             full, _, tail = path.removeprefix("/repos/").partition("/actions/runs/")
             run_id = int(tail.removesuffix("/jobs"))
@@ -12048,6 +12062,83 @@ def test_storage_redirect_refuses_authorization_before_queued_fault():
     assert (status, forge.storage_auth_seen, queued) == (400, [headers["Authorization"]], [418])
     assert body == {"message": "storage URL refuses Authorization header"}
     assert forge.fault_requests == []
+
+
+@pytest.mark.parametrize(
+    ("path", "forward_authorization", "expected_status", "expected_reads"),
+    [
+        pytest.param("/storage/+101", True, 404, [], id="noncanonical-with-authorization"),
+        pytest.param("/storage/101", False, 200, [101], id="canonical-without-authorization"),
+    ],
+)
+def test_storage_redirect_requires_a_canonical_id(
+    path, forward_authorization, expected_status, expected_reads
+):
+    """Follow the archive redirect to storage with the supplied header policy."""
+    forge = Forge(repository())
+    forge.tokens["archive-fixture"] = ("repo", 7, "fleet/app", {"actions": "read"})
+    forge.storage[101] = b"planted artifact"
+    forge.artifact_redirect_locations[101] = path
+    headers = {"Authorization": "Bearer archive-fixture"}
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request("GET", "/repos/fleet/app/actions/artifacts/101/zip", headers=headers)
+            redirect = conn.getresponse()
+            assert (redirect.status, redirect.getheader("Location")) == (302, path)
+            redirect.read()
+            conn.request("GET", path, headers=headers if forward_authorization else {})
+            response = conn.getresponse()
+            status, body = response.status, response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert (status, forge.storage_reads, forge.storage_auth_seen) == (
+        expected_status,
+        expected_reads,
+        [],
+    )
+    if expected_status == 404:
+        assert json.loads(body) == {"message": f"Unknown storage route: {path}"}
+    else:
+        assert body == forge.storage[101]
+
+
+@pytest.mark.parametrize(
+    "ident",
+    [
+        pytest.param("+101", id="plus"),
+        pytest.param("1_01", id="underscore"),
+        pytest.param("١٠١", id="arabic-indic"),
+    ],
+)
+def test_storage_refuses_noncanonical_ids_without_authorization(ident):
+    """Dispatch a follow-up directly so the Unicode target reaches the route parser."""
+    path = f"/storage/{ident}"
+    forge = Forge(repository())
+    forge.storage[101] = b"planted artifact"
+    forge.redirect_location = (
+        "GET",
+        f"http://127.0.0.1{path}",
+        "Bearer archive-fixture",
+        ARCHIVE_ROUTE,
+    )
+    handler = object.__new__(Handler)
+    handler.server = types.SimpleNamespace(forge=forge)
+    handler.command = "GET"
+    handler.path = path
+    handler.headers = {"Host": "127.0.0.1"}
+    handler.requestline = f"GET {path} HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.wfile = io.BytesIO()
+
+    handler.do_GET()
+
+    headers, _, body = handler.wfile.getvalue().partition(b"\r\n\r\n")
+    assert (headers.splitlines()[0], forge.storage_reads) == (b"HTTP/1.0 404 Not Found", [])
+    assert json.loads(body) == {"message": f"Unknown storage route: {path}"}
 
 
 def test_without_the_cut_cause_a_cut_read_refuses(tmp_path):
