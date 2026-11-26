@@ -38,6 +38,10 @@ and the first line of the original refusal. If the repository is later refused,
 include the split in its refusal line. If the smallest request fails, report
 its size and cursor and fail the sweep. Mutations still run once.
 
+Write each report record as one physical line to stdout and the step summary.
+Escape pipes in table cells. Write workflow annotations on one line and keep
+the release outputs as JSON.
+
 Start the 1,500-second sweep budget after settings validation, including the
 app-key check. Check the budget before every pull-page attempt, including
 splits and retries after a backoff. A budget refusal names the document,

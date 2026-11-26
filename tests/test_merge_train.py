@@ -22,7 +22,6 @@ import functools
 import hashlib
 import http.client
 import importlib.util
-import inspect
 import io
 import itertools
 import json
@@ -506,6 +505,7 @@ class Forge:
         self.jobs_calls: list[int] = []
         # Queued HTTP faults by REST route or GraphQL operation name.
         self.rest_faults: dict[str, list[int | str | tuple[int, bytes]]] = {}
+        self.fault_requests: list[tuple[str, str]] = []
         self.label_missing = False
         self.unlabel_status: int | None = None
         self.repository_moves: dict[str, str] = {}
@@ -1045,6 +1045,31 @@ class Forge:
         return 404, {"message": "Not Found"}
 
 
+ARTIFACTS_ROUTE = "GET /repos/{owner}/{repo}/actions/artifacts"
+JOBS_ROUTE = "GET /repos/{owner}/{repo}/actions/runs/{id}/jobs"
+INSTALLATION_REPOSITORIES_ROUTE = "GET /installation/repositories"
+REVOKE_ROUTE = "DELETE /installation/token"
+
+REST_PATH_PARTS = (
+    (r"^/repos/[^/]+/[^/]+", "/repos/{owner}/{repo}"),
+    (r"^/users/[^/]+$", "/users/{login}"),
+    (r"/contents/(?!\.github/generated-files$).+$", "/contents/{path}"),
+    (r"/compare/[^/]+\.\.\.[^/]+$", "/compare/{base}...{head}"),
+    (r"/collaborators/[^/]+/permission$", "/collaborators/{login}/permission"),
+    (r"/labels/[^/]+$", "/labels/{label}"),
+    (r"/(?:\d+|~)(?=/|$)", "/{id}"),
+)
+
+
+def rest_route(method, url):
+    """Normalize a requested or source-derived REST URL to a method and path."""
+    path = urlsplit(url).path
+    assert path.startswith("/"), f"unresolved REST URL: {url}"
+    for pattern, placeholder in REST_PATH_PARTS:
+        path = re.sub(pattern, placeholder, path)
+    return f"{method} {path}"
+
+
 class Handler(BaseHTTPRequestHandler):
     """The stand-in forge's HTTP side; what it serves is the Forge on its server."""
 
@@ -1079,6 +1104,7 @@ class Handler(BaseHTTPRequestHandler):
         queued = self.server.forge.rest_faults.get(kind, [])
         if not queued:
             return False
+        self.server.forge.fault_requests.append((self.command, self.path))
         fault = queued.pop(0)
         if fault == DROP:
             self.close_connection = True
@@ -1087,6 +1113,39 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.answer(int(fault), {"message": f"stand-in forge: queued HTTP {fault}"})
         return True
+
+    def dispatch(self, serve_rest) -> None:
+        """Check the operation or route fault queue before serving any request."""
+        request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
+        operation = (
+            re.match(r"\s*(?:query|mutation)\s+(\w+)", request["query"]) if request else None
+        )
+        key = operation[1] if operation else rest_route(self.command, self.path)
+        if not self.fault(key):
+            if request is None:
+                serve_rest()
+            else:
+                self._serve_graphql(request)
+
+    def do_GET(self) -> None:
+        """Dispatch a GET through the common fault check."""
+        self.dispatch(self._serve_get)
+
+    def do_POST(self) -> None:
+        """Dispatch a POST through the common fault check."""
+        self.dispatch(self._serve_post)
+
+    def do_PUT(self) -> None:
+        """Dispatch a PUT through the common fault check."""
+        self.dispatch(self._serve_put)
+
+    def do_PATCH(self) -> None:
+        """Dispatch a PATCH through the common fault check."""
+        self.dispatch(self._serve_patch)
+
+    def do_DELETE(self) -> None:
+        """Dispatch a DELETE through the common fault check."""
+        self.dispatch(self._serve_delete)
 
     def app_call(self) -> bool:
         """Refuse a call of the app whose JWT does not hold; True when refused."""
@@ -1178,8 +1237,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.answer(200, self.server.forge.installation_list())
             return True
         if path == "/installation/repositories":
-            if not self.fault("installation/repositories"):
-                self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
+            self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
             return True
         if re.fullmatch(r"/(repos/[^/]+/[^/]+|repositories/\d+)", path):
             self._get_repository(path)
@@ -1220,7 +1278,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.answer(code, body)
 
-    def do_GET(self) -> None:
+    def _serve_get(self) -> None:
+        """Dispatch a REST read after the common fault check."""
         path = urlsplit(self.path).path
         if self._dispatch_app(path):
             return
@@ -1234,8 +1293,7 @@ class Handler(BaseHTTPRequestHandler):
         elif "/contents/" in path and path.startswith("/repos/"):
             self._get_contents(path)
         elif path.startswith("/repos/") and path.endswith("/actions/artifacts"):
-            if not self.fault("artifacts"):
-                self._get_artifacts(path)
+            self._get_artifacts(path)
         elif "/actions/artifacts/" in path and path.endswith("/zip"):
             self._get_artifact_zip(path)
         elif path.startswith("/storage/"):
@@ -1243,13 +1301,12 @@ class Handler(BaseHTTPRequestHandler):
         elif re.fullmatch(r"/repos/[^/]+/[^/]+/actions/runs/\d+/jobs", path):
             full, _, tail = path.removeprefix("/repos/").partition("/actions/runs/")
             run_id = int(tail.removesuffix("/jobs"))
-            if self.fault("jobs"):
-                return
             self.answer(*self.server.forge.run_jobs(self.headers["Authorization"], full, run_id))
         else:
             raise AssertionError(self.path)
 
-    def do_POST(self) -> None:
+    def _serve_post(self) -> None:
+        """Serve REST POST requests after the common fault check."""
         if self.path.startswith("/repos/") and self.path.endswith("/comments"):
             full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
             number = int(tail.removesuffix("/comments"))
@@ -1261,27 +1318,25 @@ class Handler(BaseHTTPRequestHandler):
             write = ("label", int(tail.removesuffix("/labels")), *self.body()["labels"])
             self.answer(*self.server.forge.label_write(self.headers["Authorization"], full, write))
             return
-        if self.path == "/graphql":
-            request = self.body()
-            query = request["query"]
-            operation = re.match(r"\s*(?:query|mutation)\s+(\w+)", query)
-            if operation and self.fault(operation[1]):
-                return
-            forge = self.server.forge
-            header = self.headers["Authorization"]
-            code, body = forge.graphql_response(header, query, request["variables"])
-            if forge.graphql_cut(query):
-                self.cut_answer(code, body)
-            else:
-                self.answer(code, body)
-            return
         prefix, _, tail = self.path.partition("/app/installations/")
         number, _, action = tail.partition("/")
         assert (prefix, action) == ("", "access_tokens"), self.path
         if not self.app_call():
             self.answer(*self.server.forge.mint(int(number), self.body()))
 
-    def do_PUT(self) -> None:
+    def _serve_graphql(self, request) -> None:
+        """Serve a GraphQL request whose operation fault queue was already checked."""
+        forge = self.server.forge
+        query = request["query"]
+        header = self.headers["Authorization"]
+        code, body = forge.graphql_response(header, query, request["variables"])
+        if forge.graphql_cut(query):
+            self.cut_answer(code, body)
+        else:
+            self.answer(code, body)
+
+    def _serve_put(self) -> None:
+        """Serve a branch update after the common fault check."""
         prefix, _, tail = self.path.rpartition("/pulls/")
         number, _, action = tail.partition("/")
         assert prefix.startswith("/repos/") and action == "update-branch", self.path
@@ -1290,13 +1345,15 @@ class Handler(BaseHTTPRequestHandler):
             *self.server.forge.update(self.headers["Authorization"], full, int(number), self.body())
         )
 
-    def do_PATCH(self) -> None:
+    def _serve_patch(self) -> None:
+        """Serve an issue close after the common fault check."""
         full, _, number = self.path.removeprefix("/repos/").partition("/issues/")
         body = self.body()
         write = ("close", int(number), body["state"], body["state_reason"])
         self.answer(*self.server.forge.issue_write(self.headers["Authorization"], full, write))
 
-    def do_DELETE(self) -> None:
+    def _serve_delete(self) -> None:
+        """Serve a label removal or revocation after the common fault check."""
         if "/labels/" in self.path:
             full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
             number, _, name = tail.partition("/labels/")
@@ -1304,8 +1361,6 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(*self.server.forge.label_write(self.headers["Authorization"], full, write))
             return
         assert self.path == "/installation/token", self.path
-        if self.fault("revoke"):
-            return
         self.server.forge.revoked.append(self.headers["Authorization"].removeprefix("Bearer "))
         self.answer(204, None)
 
@@ -3333,7 +3388,9 @@ def allowed_report_opens(text):
     tree = ast.parse(text)
     expected = {
         "append": ast.dump(ast.parse('open(path, "a", encoding="utf-8")', mode="eval").body),
-        "summary": ast.dump(ast.parse('open(path, "w", encoding="utf-8")', mode="eval").body),
+        "write_release_outputs": ast.dump(
+            ast.parse('open(path, "w", encoding="utf-8")', mode="eval").body
+        ),
     }
     sites = [
         (function.name, ast.dump(node))
@@ -10600,23 +10657,23 @@ def test_planted_input_wiring_mutants_are_found(mutator, drop, finding):
 def test_transient_rest_read_is_tried_again(tmp_path, fault):
     """Planted: the jobs read fails once at the gateway or drops; the refresh still runs."""
     forge = stopped_forge()
-    forge.rest_faults["jobs"] = [fault]
+    forge.rest_faults[JOBS_ROUTE] = [fault]
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == refreshed(1)
-    assert forge.rest_faults["jobs"] == []
+    assert forge.rest_faults[JOBS_ROUTE] == []
     assert "### fleet/app: refreshed #1" in summary
 
 
 @pytest.mark.parametrize("fault", [502, DROP])
 def test_exhausted_rest_read_retries_refuse_the_repository(tmp_path, fault):
     forge = stopped_forge()
-    forge.rest_faults["jobs"] = [fault] * 4
+    forge.rest_faults[JOBS_ROUTE] = [fault] * 4
     done, _ = train(tmp_path, forge)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "::error title=Merge train refused::fleet/app: GET " in done.stdout
     assert "Traceback" not in done.stderr
-    assert forge.rest_faults["jobs"] == [fault]
+    assert forge.rest_faults[JOBS_ROUTE] == [fault]
     assert forge.writes == []
 
 
@@ -10624,11 +10681,11 @@ def test_exhausted_installation_read_refusal_stays_on_one_line(tmp_path):
     """Three gateway failures refuse the installation and keep both body lines in each report."""
     forge = Forge(repository(pull(1, "CLEAN")))
     failure = (502, MULTILINE_READ_ERROR)
-    forge.rest_faults["installation/repositories"] = [failure] * 4
+    forge.rest_faults[INSTALLATION_REPOSITORIES_ROUTE] = [failure] * 4
     done, summary = train(tmp_path, forge)
 
     assert done.returncode == 1, done.stdout + done.stderr
-    assert forge.rest_faults["installation/repositories"] == [failure]
+    assert forge.rest_faults[INSTALLATION_REPOSITORIES_ROUTE] == [failure]
     assert forge.writes == []
     prefix = "::error title=Merge train refused::"
     (annotation,) = [line for line in done.stdout.splitlines() if line.startswith(prefix)]
@@ -10645,11 +10702,11 @@ def test_exhausted_installation_read_refusal_stays_on_one_line(tmp_path):
 
 def test_rest_read_500_is_not_tried_again(tmp_path):
     forge = stopped_forge()
-    forge.rest_faults["jobs"] = [500, 500]
+    forge.rest_faults[JOBS_ROUTE] = [500, 500]
     done, _ = train(tmp_path, forge)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "HTTP 500" in done.stdout
-    assert forge.rest_faults["jobs"] == [500]
+    assert forge.rest_faults[JOBS_ROUTE] == [500]
 
 
 def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
@@ -10658,7 +10715,7 @@ def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
     old = 'retries = READ_ATTEMPTS - 1 if method == "GET" else 0'
     assert text.count(old) == 1
     forge = stopped_forge()
-    forge.rest_faults["jobs"] = [502]
+    forge.rest_faults[JOBS_ROUTE] = [502]
     done, _ = train(tmp_path, forge, text.replace(old, "retries = 0"))
     assert done.returncode == 1, done.stdout + done.stderr
     assert forge.writes == []
@@ -10670,7 +10727,7 @@ def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
 def test_failed_revocation_warns_and_the_sweep_goes_on(tmp_path, fault):
     """Planted: the first revocation drops or fails; every repository is still served."""
     forge = sweep_forge()
-    forge.rest_faults["revoke"] = [fault]
+    forge.rest_faults[REVOKE_ROUTE] = [fault]
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.where == [
@@ -11095,11 +11152,11 @@ def test_artifact_list_refusal_stays_in_one_notes_cell(tmp_path):
     dep = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
     forge = Forge(repository(dep))
     forge.set_allowlist("fleet/app", "main", ["notices.txt"])
-    forge.rest_faults["artifacts"] = [(502, b"first line\r\nsecond line")] * 3
+    forge.rest_faults[ARTIFACTS_ROUTE] = [(502, b"first line\r\nsecond line")] * 3
     done, summary = train(tmp_path, forge)
 
     assert done.returncode == 0, done.stdout + done.stderr
-    assert forge.rest_faults["artifacts"] == []
+    assert forge.rest_faults[ARTIFACTS_ROUTE] == []
     assert forge.writes == []
     for text in (summary, done.stdout):
         note = pull_note_cell(text, 1, "BLOCKED")
@@ -11140,48 +11197,203 @@ def test_retry_read_refusal_stays_in_one_notes_cell(tmp_path):
 
 
 FORGE_FAULT_BODY = b"first line\r\nsecond line"
+FORGE_FAULT_LINE = "first line second line"
 UNREACHED_FORGE_FAULTS: dict[str, str] = {}
-NONFATAL_FORGE_REFUSALS = frozenset(
-    {"LanderLease", "ReviewBodies", "RetryHistory", "FileModes", "artifacts", "revoke"}
-)
+
+ALLOWLIST_ROUTE = "GET /repos/{owner}/{repo}/contents/.github/generated-files"
+ARCHIVE_ROUTE = "GET /repos/{owner}/{repo}/actions/artifacts/{id}/zip"
+STORAGE_ROUTE = "GET /storage/{id}"
+FILE_CONTENTS_ROUTE = "GET /repos/{owner}/{repo}/contents/{path}"
+COMPARE_ROUTE = "GET /repos/{owner}/{repo}/compare/{base}...{head}"
+PERMISSION_ROUTE = "GET /repos/{owner}/{repo}/collaborators/{login}/permission"
+RELEASE_NAME_ROUTE = "GET /repos/{owner}/{repo}"
+RELEASE_ID_ROUTE = "GET /repositories/{id}"
+LIST_INSTALLATIONS_ROUTE = "GET /app/installations"
+MINT_ROUTE = "POST /app/installations/{id}/access_tokens"
+ISSUE_COMMENT_ROUTE = "POST /repos/{owner}/{repo}/issues/{id}/comments"
+ISSUE_CLOSE_ROUTE = "PATCH /repos/{owner}/{repo}/issues/{id}"
+ADD_LABEL_ROUTE = "POST /repos/{owner}/{repo}/issues/{id}/labels"
+REMOVE_LABEL_ROUTE = "DELETE /repos/{owner}/{repo}/issues/{id}/labels/{label}"
+
+FORGE_ISSUED_URLS = {
+    ("download_artifact", "art['archive_download_url']"): (ARCHIVE_ROUTE,),
+    ("download_artifact", "redirect.get('location')"): (STORAGE_ROUTE,),
+    # A name redirect uses the same normalized route as the initial name lookup.
+    ("release_off_repository_id", "answer['location']"): (RELEASE_ID_ROUTE,),
+}
+REST_URL_ARGS = {"call": (0, "url"), "pages": (2, "path"), "release_off_get": (0, "url")}
+FORWARDED_URLS = {
+    (
+        "pages",
+        "call",
+        ast.unparse(
+            ast.parse(
+                '''f"{env['GITHUB_API_URL']}{path}?per_page=100&page={page}"''', mode="eval"
+            ).body
+        ),
+    ),
+    ("release_off_get", "call", "url"),
+}
+URL_FRAGMENTS = {
+    "api": "",
+    "env['GITHUB_API_URL']": "",
+    "env['GITHUB_REPOSITORY']": "~/~",
+    "target['full_name']": "~/~",
+    "urllib.parse.quote(entry, safe='/')": "~/~",
+}
+
+
+def scoped_nodes(tree):
+    """Yield each AST node with its innermost named function or the module."""
+    scopes = {tree: tree}
+    for node in ast.walk(tree):
+        scope = node if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else scopes[node]
+        yield scope, node
+        scopes.update(dict.fromkeys(ast.iter_child_nodes(node), scope))
+
+
+def call_argument(node, index, name, *, default=None):
+    """Find a positional or keyword argument on a direct call."""
+    if index < len(node.args):
+        return node.args[index]
+    return next((arg.value for arg in node.keywords if arg.arg == name), default)
+
+
+def expand_url_part(node, bindings):
+    """Expand a local name or an f-string by one level, leaving runtime values opaque."""
+    if isinstance(node, ast.JoinedStr):
+        return node.values
+    if isinstance(node, ast.FormattedValue):
+        return [node.value]
+    if isinstance(node, ast.Name) and node.id in bindings:
+        assert len(bindings[node.id]) == 1, f"ambiguous URL fragment: {node.id}"
+        return list(bindings[node.id].values())
+    return [node]
+
+
+def url_parts(url, assignments):
+    """Resolve earlier local assignments and nested f-strings for a URL argument."""
+    bindings = {}
+    for assignment in assignments:
+        if assignment.lineno < url.lineno:
+            for target in assignment.targets:
+                if isinstance(target, ast.Name):
+                    value = assignment.value
+                    bindings.setdefault(target.id, {})[ast.dump(value)] = value
+    parts = [url]
+    for _ in range(3 * len(bindings) + 4):
+        expanded = [part for node in parts for part in expand_url_part(node, bindings)]
+        if expanded == parts:
+            return parts
+        parts = expanded
+    pytest.fail(f"could not resolve REST URL at line {url.lineno}: {ast.unparse(url)}")
+
+
+def source_path(parts):
+    """Fill symbolic URL parts so the same normalizer handles source and requests."""
+    return "".join(
+        str(part.value)
+        if isinstance(part, ast.Constant)
+        else URL_FRAGMENTS.get(ast.unparse(part), "~")
+        for part in parts
+    )
+
+
+def rest_call_routes(scope, node, assignments, forwarded, issued):
+    """Resolve a train transport call, counting explicit forwards and forge-issued URLs."""
+    called = node.func.id
+    index, argument = REST_URL_ARGS[called]
+    url = call_argument(node, index, argument)
+    assert url is not None, ast.unparse(node)
+    name = getattr(scope, "name", "<module>")
+    site = (name, called, ast.unparse(url))
+    if site in FORWARDED_URLS:
+        forwarded.append(site)
+        return ()
+    if called == "call" and ast.unparse(url) == "env['GITHUB_GRAPHQL_URL']":
+        return ()
+    method = call_argument(node, 2, "method", default=ast.Constant("POST"))
+    assert called != "call" or isinstance(method, ast.Constant), ast.unparse(node)
+    parts = url_parts(url, assignments)
+    if len(parts) == 1 and (external := (name, ast.unparse(parts[0]))) in FORGE_ISSUED_URLS:
+        issued.append(external)
+        return FORGE_ISSUED_URLS[external]
+    return (rest_route(method.value if called == "call" else "GET", source_path(parts)),)
 
 
 def rest_fault_routes():
-    """Find the literal REST route keys served by the stand-in forge's fault queue."""
-    keys = [
-        node.args[0]
-        for node in ast.walk(ast.parse(inspect.getsource(Handler)))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "fault"
-    ]
-    assert sum(not isinstance(key, ast.Constant) for key in keys) == 1  # The GraphQL dispatcher.
-    return {key.value for key in keys if isinstance(key, ast.Constant)}
+    """Find every train REST route from its transport call sites and forwarding wrappers."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    assignments = {}
+    calls = []
+    for scope, node in scoped_nodes(tree):
+        if isinstance(node, ast.Assign):
+            assignments.setdefault(scope, []).append(node)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in REST_URL_ARGS
+        ):
+            calls.append((scope, node))
+    forwarded, issued = [], []
+    routes = {}
+    for scope, node in calls:
+        for route in rest_call_routes(scope, node, assignments.get(scope, ()), forwarded, issued):
+            routes.setdefault(route, []).append(getattr(scope, "name", "<module>"))
+    assert sorted(forwarded) == sorted(FORWARDED_URLS)
+    assert sorted(issued) == sorted(FORGE_ISSUED_URLS)
+    return routes
+
+
+def rest_fault_cases():
+    """Require separate scenarios when different callers use the same REST route."""
+    cases = {}
+    for route, callers in rest_fault_routes().items():
+        once = not route.startswith("GET ")
+        if len(callers) == 1:
+            cases[route] = (route, once, None)
+        else:
+            assert len(callers) == len(set(callers)), (route, callers)
+            for caller in callers:
+                cases[f"{route} [{caller}]"] = (route, once, caller)
+    return cases
+
+
+def forge_fault_inventory(train_mod, rules, patch):
+    """Pair every GraphQL operation and source-derived REST route with its retry policy."""
+    docs = train_graphql_documents(train_mod, rules, file_modes_document(train_mod, patch))
+    operations = {
+        (name := train_mod.graphql_name(doc)): (name, doc.lstrip().startswith("mutation"), None)
+        for doc in docs
+    }
+    routes = rest_fault_cases()
+    assert operations.keys().isdisjoint(routes)
+    return operations | routes
 
 
 def pytest_generate_tests(metafunc):
-    """Parametrize the fault sweep from the shared document and forge route inventories."""
+    """Parametrize the fault sweep from the train's GraphQL and REST inventories."""
     if "forge_fault" not in metafunc.fixturenames:
         return
     with tempfile.TemporaryDirectory() as temporary, pytest.MonkeyPatch.context() as patch:
         path = Path(temporary)
         rules = load_rules(path)
         patch.setitem(sys.modules, "train_rules", rules)
-        train_mod = load_train(path, patch)
-        documents = train_graphql_documents(train_mod, rules, file_modes_document(train_mod, patch))
-        operations = {
-            train_mod.graphql_name(doc): doc.lstrip().startswith("mutation") for doc in documents
-        }
-    routes = rest_fault_routes()
-    assert operations.keys().isdisjoint(routes)
-    assert UNREACHED_FORGE_FAULTS.keys() <= operations.keys() | routes
+        inventory = forge_fault_inventory(load_train(path, patch), rules, patch)
+    cases = [pytest.param((case, *detail), id=case) for case, detail in sorted(inventory.items())]
+    metafunc.parametrize("forge_fault", cases)
+
+
+def test_forge_fault_inventory(tmp_path, monkeypatch):
+    """New and removed forge routes require a matching scenario or a reason."""
+    rules = load_rules(tmp_path)
+    inventory = forge_fault_inventory(load_train(tmp_path, monkeypatch), rules, monkeypatch)
+    assert FAULT_SCENARIOS.keys() <= inventory.keys()
+    assert inventory.keys() - FAULT_SCENARIOS.keys() == UNREACHED_FORGE_FAULTS.keys()
     assert all(
         reason.strip() and len(reason.splitlines()) == 1
         for reason in UNREACHED_FORGE_FAULTS.values()
     )
-    single_attempt = {**operations, **{route: route == "revoke" for route in routes}}
-    cases = [pytest.param((key, once), id=key) for key, once in sorted(single_attempt.items())]
-    metafunc.parametrize("forge_fault", cases)
 
 
 def artifact_fault_forge():
@@ -11192,29 +11404,136 @@ def artifact_fault_forge():
     return forge
 
 
-def fault_scenario(key):
-    """Choose a whole-sweep scenario that reaches the requested forge operation."""
-    settings = {}
-    if key in {"FileModes", "RetryHistory"}:
-        return retry_forge("BEHIND"), settings
-    if key in {"artifacts", "CreateCommit", "MergeState"}:
-        return artifact_fault_forge(), settings
-    if key == "jobs":
-        return stopped_forge(), settings
-    if key == "Draft":
-        return Forge(repository(*held_pair(), rules=LINEAR)), settings
-    if key == "Ready":
-        held = pull(1, "CLEAN", headRefName="renovate/go-snaps", isDraft=True, labels=(HOLD,))
-        return Forge(repository(held)), settings
-    if key in {"Dequeue", "Disarm", "PullPageWithStatus"}:
-        settings["required_status"] = "lanes/booked"
-        if key == "Dequeue":
-            return Forge(repository(pull(1, "CLEAN", isInMergeQueue=True), queue=True)), settings
-        if key == "Disarm":
-            armed_pull = pull(1, "BLOCKED", autoMergeRequest=armed_squash("change 1 (#1)"))
-            return Forge(repository(armed_pull)), settings
-    p = pull(1, "BEHIND" if key == "Arm" else "CLEAN")
-    return Forge(repository(p, queue=key == "Enqueue")), settings
+def pull_fault_forge(state="CLEAN", *, queue=False, **fields):
+    """One pull request in a repository with optional merge queue support."""
+    return Forge(repository(pull(1, state, **fields), queue=queue))
+
+
+def issue_fault_forge():
+    """A recent train merge links to an open issue."""
+    forge = pull_fault_forge("BLOCKED")
+    forge.merged_pulls["fleet/app"] = [merged_pull(5, (3, "OPEN"))]
+    return forge
+
+
+def dependency_hold_fault_forge():
+    """A security update holds an armed dependency update."""
+    return Forge(repository(*held_pair(), rules=LINEAR))
+
+
+def unsigned_label_fault_forge():
+    """An unsigned dependency update asks the update bot to recreate it."""
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    return forge
+
+
+def reviewed_fault_forge():
+    """A reviewed pull request and a clean follower can both be served."""
+    return Forge(
+        repository(*(pull(number, "CLEAN", author={"login": "person"}) for number in (1, 2)))
+    )
+
+
+def release_fault_forge():
+    """An old repository name redirects to the release-enabled repository's ID."""
+    forge = Forge(repository(pull(1, "CLEAN"), release=(True, True)))
+    forge.repository_moves["/repos/former/app"] = "/repositories/7000"
+    return forge
+
+
+HELD_DRAFT_SCENARIO = functools.partial(
+    pull_fault_forge, headRefName="renovate/go-snaps", isDraft=True, labels=(HOLD,)
+)
+RECREATE_LABEL_CASE = f"{ADD_LABEL_ROUTE} [_ask_update_bot_recreate]"
+
+FAULT_SCENARIOS = {
+    **dict.fromkeys(
+        (
+            "LanderLease",
+            "Merge",
+            "Merged",
+            "Commits",
+            "PullPage",
+            "PullPageWithStatus",
+            LIST_INSTALLATIONS_ROUTE,
+            "GET /app",
+            "GET /users/{login}",
+            INSTALLATION_REPOSITORIES_ROUTE,
+            MINT_ROUTE,
+            REVOKE_ROUTE,
+        ),
+        pull_fault_forge,
+    ),
+    **dict.fromkeys(
+        ("FileModes", "RetryHistory", COMPARE_ROUTE), functools.partial(retry_forge, "BEHIND")
+    ),
+    **dict.fromkeys(
+        (
+            ARTIFACTS_ROUTE,
+            ALLOWLIST_ROUTE,
+            ARCHIVE_ROUTE,
+            STORAGE_ROUTE,
+            FILE_CONTENTS_ROUTE,
+            "CreateCommit",
+            "MergeState",
+        ),
+        artifact_fault_forge,
+    ),
+    **dict.fromkeys(
+        (
+            JOBS_ROUTE,
+            f"{ADD_LABEL_ROUTE} [toggle_refresh]",
+            f"{REMOVE_LABEL_ROUTE} [toggle_refresh]",
+        ),
+        stopped_forge,
+    ),
+    **dict.fromkeys((ISSUE_COMMENT_ROUTE, ISSUE_CLOSE_ROUTE), issue_fault_forge),
+    **dict.fromkeys(
+        ("Arm", "PUT /repos/{owner}/{repo}/pulls/{id}/update-branch"),
+        functools.partial(pull_fault_forge, "BEHIND"),
+    ),
+    **dict.fromkeys(
+        ("Draft", f"{ADD_LABEL_ROUTE} [apply_dependency_holds]"), dependency_hold_fault_forge
+    ),
+    **dict.fromkeys(
+        ("Ready", f"{REMOVE_LABEL_ROUTE} [apply_dependency_holds]"), HELD_DRAFT_SCENARIO
+    ),
+    "Dequeue": functools.partial(pull_fault_forge, queue=True, isInMergeQueue=True),
+    "Disarm": functools.partial(
+        pull_fault_forge, "BLOCKED", autoMergeRequest=armed_squash("change 1 (#1)")
+    ),
+    "Enqueue": functools.partial(pull_fault_forge, queue=True),
+    "ReviewBodies": reviewed_fault_forge,
+    PERMISSION_ROUTE: functools.partial(_maintainer_forge, comments=(_maintainer_answer(),)),
+    RECREATE_LABEL_CASE: unsigned_label_fault_forge,
+    **dict.fromkeys((RELEASE_NAME_ROUTE, RELEASE_ID_ROUTE), release_fault_forge),
+}
+FAULT_SETTINGS = {
+    **dict.fromkeys(
+        ("Dequeue", "Disarm", "PullPageWithStatus"), {"required_status": "lanes/booked"}
+    ),
+    **dict.fromkeys((RELEASE_NAME_ROUTE, RELEASE_ID_ROUTE), {"release_off": "former/app"}),
+    RECREATE_LABEL_CASE: {"min_age_days": "0"},
+}
+
+
+def observe_rest_fault_callers(train_mod, patch, route):
+    """Record the immediate caller of each final refusal on a shared REST route."""
+    call = train_mod.call
+    callers = []
+
+    def observed(url, token=None, method="POST", *args, **kwargs):
+        """Forward the call and record the source function if the route is refused."""
+        try:
+            return call(url, token, method, *args, **kwargs)
+        except train_mod.RefusedError:
+            if rest_route(method, url) == route:
+                callers.append(sys._getframe(1).f_code.co_name)
+            raise
+
+    patch.setattr(train_mod, "call", observed)
+    return callers
 
 
 def observe_sweep_refusals(train_mod, patch):
@@ -11232,19 +11551,149 @@ def observe_sweep_refusals(train_mod, patch):
     return refusals
 
 
+ANNOTATION_COMMAND = re.compile(r"::(?:error|warning|notice)\b")
+
+
 def assert_one_line_fault_output(text):
-    """Reject a traceback, orphaned response line or multiple commands on one line."""
+    """Reject traces, broken fault bodies and inline or duplicated workflow commands."""
     assert "Traceback" not in text
     for line in text.splitlines():
-        assert not re.match(r"^[\s#>|*+`_~-]*second line", line), line
-        if line.startswith("::"):
-            assert line.count("::") == 2, line
+        if "second line" in line:
+            assert "first line" in line.partition("second line")[0], line
+        if command := ANNOTATION_COMMAND.search(line):
+            assert command.start() == 0 and line.count("::") == 2, line
 
 
-def test_forge_fault_sweep(tmp_path, monkeypatch, capsys, record_property, forge_fault):
-    """Spend a forge operation's HTTP 502 retries and inspect the full sweep's output."""
-    key, once = forge_fault
-    forge, settings = fault_scenario(key)
+@pytest.mark.parametrize(
+    "line",
+    [
+        "note: second line",
+        "| #1 | CLEAN | second line |",
+        "- ::warning title=Merge train::in a report row",
+        "::warning title=Merge train::first ::notice title=Again::second",
+    ],
+)
+def test_fault_output_check_rejects_broken_lines(line):
+    """The scanner rejects broken copies even after an intact diagnostic."""
+    with pytest.raises(AssertionError):
+        assert_one_line_fault_output(f"first line second line\n{line}")
+
+
+def fault_destinations(env, captured):
+    """Read every log and output destination from this sweep."""
+    files = {
+        "summary": "GITHUB_STEP_SUMMARY",
+        "output": "GITHUB_OUTPUT",
+        "release": "TRAIN_RELEASE_FILE",
+    }
+    paths = {name: Path(env[key]) for name, key in files.items() if key in env}
+    return {
+        "stdout": captured.out,
+        "stderr": captured.err,
+        **{
+            name: path.read_text(encoding="utf-8") if path.exists() else ""
+            for name, path in paths.items()
+        },
+    }
+
+
+def assert_fault_diagnostics(destinations, **expected):
+    """Require the complete expected diagnostic lines in each destination, and no extra copies."""
+    for name, text in destinations.items():
+        assert_one_line_fault_output(text)
+        found = [line for line in text.splitlines() if "HTTP 502" in line or "first line" in line]
+        assert found == expected.get(name, []), (name, found, expected)
+
+
+def fault_reason(key, forge, origin):
+    """Reconstruct the HTTP refusal from the last faulted request."""
+    method, path = forge.fault_requests[-1]
+    reason = f"{method} {origin}{path}: HTTP 502 {FORGE_FAULT_LINE}"
+    return f"graphql {key}: {reason}" if path == "/graphql" else reason
+
+
+FAULT_NOTES = {
+    "LanderLease": ("CLEAN", "lander lease unreadable: RefusedError: "),
+    "ReviewBodies": ("CLEAN", "review body: cannot read: "),
+    "RetryHistory": ("BEHIND", "held for retry: history unreadable: "),
+    "FileModes": ("BEHIND", "held for retry: history unreadable: "),
+    COMPARE_ROUTE: ("BEHIND", "held for retry: history unreadable: "),
+    PERMISSION_ROUTE: ("CLEAN", "review body: cannot read the right of maintainer: "),
+    **dict.fromkeys(
+        (ARTIFACTS_ROUTE, ARCHIVE_ROUTE, STORAGE_ROUTE, FILE_CONTENTS_ROUTE),
+        ("BLOCKED", "generated files refused: "),
+    ),
+}
+
+
+def assert_note_disposition(key, forge, reason, destinations):
+    """Verify a held pull or artifact note in both reports and the resulting writes."""
+    state, prefix = FAULT_NOTES[key]
+    note = prefix + reason
+    row = f"| #1 | {state} | {note} |"
+    lines = [row]
+    expected_writes = []
+    if key == "LanderLease":
+        lines.insert(0, f"### fleet/app: {note}")
+    elif key == "ReviewBodies":
+        expected_writes = [landed(2)]
+    elif key in {"RetryHistory", "FileModes", COMPARE_ROUTE}:
+        expected_writes = [updated(2)]
+    assert forge.writes == expected_writes
+    assert_fault_diagnostics(destinations, stdout=lines, summary=lines)
+
+
+def assert_fault_warning(key, forge, reason, destinations):
+    """Verify report warning placement and that the sweep continued as intended."""
+    prefix = "::warning title=Merge train::"
+    assert forge.writes == [landed(1)]
+    if key == REVOKE_ROUTE:
+        warning = f"{prefix}token not revoked, it expires within the hour: {reason}"
+        assert len(forge.revoked) == len(forge.tokens) - 1
+        assert_fault_diagnostics(destinations, stdout=[warning])
+    else:
+        warning = (
+            f"{prefix}release_off entry former/app: HTTP 502; release train off for installation 7"
+        )
+        assert "Release train off: fleet/app" in destinations["summary"].splitlines()
+        assert len(forge.revoked) == len(forge.tokens)
+        assert json.loads(destinations["release"])["releases"] == []
+        assert_fault_diagnostics(destinations, stdout=[warning], summary=[warning])
+
+
+def assert_fatal_fault(case, reason, refusals, destinations):
+    """Check the one error annotation and the matching summary refusal when written."""
+    prefix = "::error title=Merge train refused::"
+    if case == LIST_INSTALLATIONS_ROUTE:
+        assert refusals == []
+        assert not any(destinations[name] for name in ("summary", "output", "release"))
+        assert_fault_diagnostics(destinations, stdout=[prefix + reason])
+        return
+    (refusal,) = refusals
+    assert refusal.splitlines() == [refusal]
+    if case in {"PullPage", "PullPageWithStatus"}:
+        operation, _, request = reason.partition(": ")
+        initial = reason.removesuffix(" second line")
+        reason = (
+            f"{operation}: Split open pull request page to 6 after {initial}: "
+            f"page size 6, cursor start: {request}"
+        )
+    account_faults = {"GET /app", "GET /users/{login}", INSTALLATION_REPOSITORIES_ROUTE, MINT_ROUTE}
+    target = "fleet" if case in account_faults else "fleet/app"
+    if case == RECREATE_LABEL_CASE:
+        reason = f"#1: could not ask the update bot to recreate it: {reason}"
+    assert refusal == f"{target}: {reason}"
+    assert_fault_diagnostics(
+        destinations, stdout=[f"- {refusal}", prefix + refusal], summary=[f"- {refusal}"]
+    )
+
+
+def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, forge_fault):
+    """Spend each operation's 502 retries and inspect its disposition and every destination."""
+    case, key, once, caller = forge_fault
+    assert case in FAULT_SCENARIOS or case in UNREACHED_FORGE_FAULTS, case
+    forge = FAULT_SCENARIOS.get(case, pull_fault_forge)()
+    settings = {**FAULT_SETTINGS.get(case, {}), "release_file": str(tmp_path / "releases.json")}
     train_mod = load_train(tmp_path, monkeypatch)
     attempts = 1 if once else train_mod.READ_ATTEMPTS
     if key in {"PullPage", "PullPageWithStatus"}:
@@ -11261,84 +11710,121 @@ def test_forge_fault_sweep(tmp_path, monkeypatch, capsys, record_property, forge
             lambda *handlers: opener(urllib.request.ProxyHandler({}), *handlers),
         )
         refusals = observe_sweep_refusals(train_mod, monkeypatch)
+        callers = observe_rest_fault_callers(train_mod, monkeypatch, key) if caller else []
         code = train_mod.main(env)
 
-    out, err = capsys.readouterr()
-    summary_path = tmp_path / "summary.md"
-    summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
-    body_visible = any("first line second line" in text for text in (out, err, summary))
-    consumed = attempts - len(faults)
+    output = fault_destinations(env, capfd.readouterr())
+    consumed = len(forge.fault_requests)
     record_property("faults_consumed", consumed)
-    record_property("body_visible", body_visible)
-    assert_one_line_fault_output(out)
-    assert_one_line_fault_output(err)
-    assert_one_line_fault_output(summary)
-    if key in UNREACHED_FORGE_FAULTS:
-        assert consumed == 0, f"{key} is now reached"
+    if case in UNREACHED_FORGE_FAULTS:
+        assert consumed == 0, f"{case} is now reached"
         return
-    assert consumed == attempts, f"{key}: consumed {consumed} of {attempts} faults"
-    assert all(refusal.splitlines() == [refusal] for refusal in refusals), refusals
-    expected = 0 if key in NONFATAL_FORGE_REFUSALS else 1
-    assert code == expected, out + err
-    if expected == 1:
-        assert "::error title=Merge train refused::" in out, out
-    assert body_visible, out + err
+    assert not faults and consumed == attempts, f"{case}: consumed {consumed} of {attempts} faults"
+    if caller:
+        assert callers == [caller]
+    reason = fault_reason(key, forge, env["GITHUB_API_URL"])
+    if key in FAULT_NOTES or key in {REVOKE_ROUTE, RELEASE_NAME_ROUTE, RELEASE_ID_ROUTE}:
+        assert code == 0 and refusals == [], output
+        if key in FAULT_NOTES:
+            assert_note_disposition(key, forge, reason, output)
+        else:
+            assert_fault_warning(key, forge, reason, output)
+    else:
+        assert code == 1, output
+        assert_fatal_fault(case, reason, refusals, output)
+    if key != LIST_INSTALLATIONS_ROUTE:
+        (line,) = output["output"].splitlines()
+        assert line.startswith("releases=")
+        assert (
+            json.loads(line.removeprefix("releases=")) == json.loads(output["release"])["releases"]
+        )
 
 
 def test_report_escapes_pipe_in_notes_cell(tmp_path, monkeypatch):
     """A literal pipe in the train's note preserves the three table cells."""
     mod = load_train(tmp_path, monkeypatch)
     p = pull(1, "CLEAN")
-    report = mod.report("fleet/app", repository(p), [(p, "land")], {1: "left | right"}, "done")
-    assert pull_note_cell(report, 1, "CLEAN") == r"left \| right"
+    records = mod.report("fleet/app", repository(p), [(p, "land")], {1: "left | right"}, "done")
+    assert pull_note_cell("\n".join(records), 1, "CLEAN") == r"left \| right"
 
 
-def fstrings_starting_with(tree, prefixes):
-    """Find f-strings by the prefix of their first literal segment."""
-    return [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.JoinedStr)
-        and node.values
-        and isinstance(node.values[0], ast.Constant)
-        and node.values[0].value.startswith(prefixes)
-    ]
+@pytest.mark.parametrize("suffix", ["", " | tail"], ids=["newline", "newline-and-pipe"])
+def test_pull_page_merge_state_stays_in_one_cell(tmp_path, suffix):
+    """The pull page's multiline merge state renders in one row in both reports."""
+    state = "DIRTY\r\nsecond line" + suffix
+    forge = Forge(repository(pull(1, state)))
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = "DIRTY second line" + suffix.replace("|", r"\|")
+    for text in (done.stdout, summary):
+        assert pull_note_cell(text, 1, expected) == f"merge state {expected}"
 
 
-def calls_name(value, names):
-    """Whether the expression directly calls one of the named functions."""
-    return (
-        isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in names
+def test_emit_writes_each_record_on_one_line(tmp_path, monkeypatch, capfd):
+    """Both destinations flatten raw records and preserve account table cells."""
+    mod = load_train(tmp_path, monkeypatch)
+    summary_path = tmp_path / "summary.md"
+    env = {"GITHUB_STEP_SUMMARY": str(summary_path)}
+    accounts = {
+        "active|account": {"repositories": 4, "landed": 3, "updated": 2, "refused": 1},
+        "stopped|account": "suspended\r\nsecond cell |",
+    }
+    records = mod.summary(env, accounts, [], [], [], [], [], [])
+    mod.emit(env, [*records, "note: first line\r\nsecond line", ""])
+    stdout, stderr = capfd.readouterr()
+    assert stderr == ""
+    assert summary_path.read_text(encoding="utf-8") == stdout
+    assert stdout.endswith("note: first line second line\n\n")
+    assert r"| active\|account | 4 | 3 | 2 | 1 |" in stdout.splitlines()
+    assert r"| stopped\|account | suspended second cell \| | | | |" in stdout.splitlines()
+
+
+TRAIN_WRITERS = {
+    "annotate": "Writes workflow annotations to stdout.",
+    "append": "Appends rendered reports or JSON workflow outputs to their files.",
+    "emit": "Writes the same report records to stdout and the step summary.",
+    "write_release_outputs": "Serializes the release payload to its JSON file.",
+    "write_key": "Feeds the app key into the subprocess pipe.",
+}
+
+
+def writes_output(node):
+    """Recognize direct writes, printing, JSON dumps and opens with writable modes."""
+    if not isinstance(node, ast.Call):
+        return False
+    function = ast.unparse(node.func)
+    name = function.rsplit(".", 1)[-1]
+    if (
+        name in {"print", "write", "write_text", "write_bytes", "writelines"}
+        or function == "json.dump"
+    ):
+        return True
+    if name not in {"open", "fdopen"} or function == "opener.open":
+        return False
+    index = 1 if function in {"open", "builtins.open", "io.open", "os.fdopen"} else 0
+    mode = call_argument(node, index, "mode")
+    return mode is not None and (
+        not isinstance(mode, ast.Constant) or any(flag in str(mode.value) for flag in "wax+")
     )
 
 
-def test_annotation_fstrings_flatten_runtime_text():
-    """Guard annotation text written directly or through summary sections."""
+def test_train_writes_only_through_declared_writers():
+    """A new writer or inline annotation literal must pass through the allowed boundary."""
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    annotations = fstrings_starting_with(tree, ("::error", "::warning", "::notice"))
-    assert annotations
-    unsafe = [
-        f"line {node.lineno}: {ast.unparse(part.value)}"
-        for node in annotations
-        for part in node.values
-        if isinstance(part, ast.FormattedValue)
-        and not isinstance(part.value, ast.Constant)
-        and not calls_name(part.value, ("refusal_line", "len", "int"))
-    ]
-    assert unsafe == []
-
-
-def test_report_fstrings_render_notes_through_note_cell():
-    """Guard the notes cell of every f-string that renders a pull request row."""
-    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    report = next(
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "report"
-    )
-    rows = fstrings_starting_with(report, "| #")
-    assert rows
-    for row in rows:
-        cells = [part.value for part in row.values if isinstance(part, ast.FormattedValue)]
-        assert len(cells) == 3 and calls_name(cells[2], ("note_cell",)), ast.unparse(row)
+    writers, inline_commands = set(), []
+    for scope, node in scoped_nodes(tree):
+        name = getattr(scope, "name", "<module>")
+        if writes_output(node):
+            writers.add(name)
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and ANNOTATION_COMMAND.search(node.value)
+            and name != "annotate"
+        ):
+            inline_commands.append((name, node.lineno))
+    assert (writers, inline_commands) == (set(TRAIN_WRITERS), [])
 
 
 @pytest.mark.parametrize("operation", ["RetryHistory", "FileModes"])
@@ -12682,7 +13168,7 @@ def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
         "GITHUB_OUTPUT": str(tmp_path / "output"),
     }
-    mod.summary(env, {}, [], [], [], [], [], [])
+    mod.emit(env, mod.summary(env, {}, [], [], [], [], [], []))
     assert capsys.readouterr().out.count("review bots: none set, zero-review hold off") == 1
 
 
@@ -12852,7 +13338,8 @@ def test_summary_release_file_matches_output(tmp_path, monkeypatch, write_file):
     if write_file:
         env["TRAIN_RELEASE_FILE"] = str(path)
     releases = [{"owner": "a", "name": f"r{i}"} for i in range(mod.MAX_RELEASES + 1)]
-    mod.summary(env, {}, [], [], [], releases, [], [])
+    mod.emit(env, mod.summary(env, {}, [], [], [], releases, [], []))
+    mod.write_release_outputs(env, releases)
     assert path.exists() == write_file
     if write_file:
         assert json.loads(path.read_text()) == {

@@ -996,7 +996,7 @@ def _ask_update_bot_recreate(env, pull, regen, guard):
         call(url, env["TRAIN_TOKEN"], "POST", {"labels": [regen, guard]})
     except RefusedError as err:
         msg = f"#{pull['number']}: could not ask the update bot to recreate it"
-        raise RefusedError(msg) from err
+        raise RefusedError(f"{msg}: {err}") from err
     add_pull_labels(pull, regen, guard)
 
 
@@ -2323,7 +2323,7 @@ def serve_pending(env, conf, repo, served, notes, now, lease):
 
 
 def report(name, repo, rows, notes, outcome):
-    """The section of one repository with open pull requests."""
+    """Return the report records for one repository with open pull requests."""
     lines = [
         f"### {name}: {refusal_line(outcome)}",
         "",
@@ -2331,12 +2331,13 @@ def report(name, repo, rows, notes, outcome):
         "|---|---|---|",
     ]
     lines += [
-        f"| #{pull['number']} | {pull['mergeStateStatus']} | {note_cell(notes[pull['number']])} |"
+        f"| #{note_cell(pull['number'])} | {note_cell(pull['mergeStateStatus'])} "
+        f"| {note_cell(notes[pull['number']])} |"
         for pull, _ in rows
     ]
     if repo["pullRequests"]["pageInfo"]["hasNextPage"]:
-        lines.append("\nOnly the 100 oldest open pull requests were read.")
-    return "\n".join(lines) + "\n"
+        lines += ["", "Only the 100 oldest open pull requests were read."]
+    return lines
 
 
 def b64url(data):
@@ -2410,10 +2411,7 @@ def revoke(env, token):
     try:
         call(f"{env['GITHUB_API_URL']}/installation/token", token, "DELETE")
     except RefusedError as err:
-        sys.stdout.write(
-            "::warning title=Merge train::token not revoked, it expires within the hour: "
-            f"{refusal_line(err)}\n"
-        )
+        annotate("warning", "Merge train", f"token not revoked, it expires within the hour: {err}")
 
 
 def release_off_get(url, token):
@@ -2461,8 +2459,9 @@ def release_off_fallback(installation, listed, entry, reason):
         f"release_off entry {entry}: {reason}; "
         f"release train off for installation {installation['id']}"
     )
-    warning = f"::warning title=Merge train::{refusal_line(message)}"
-    return frozenset(target["id"] for target in listed), [warning]
+    warnings = []
+    annotate("warning", "Merge train", message, records=warnings)
+    return frozenset(target["id"] for target in listed), warnings
 
 
 def release_off_ids(env, conf, installation, token, listed, started):
@@ -2576,12 +2575,12 @@ def one(env, conf, installation, target, now, started):
         or note == "generated files committed"
         for note in notes.values()
     )
-    section = report(target["full_name"], repo, rows, notes, outcome) if rows else ""
+    section = report(target["full_name"], repo, rows, notes, outcome) if rows else []
     if split_note := reader.split_note():
         section_notes.insert(0, split_note)
     if section_notes:
-        section = section or f"### {target['full_name']}: {outcome}\n"
-        section += "\n" + "\n".join(section_notes) + "\n"
+        section = section or [f"### {target['full_name']}: {refusal_line(outcome)}"]
+        section += ["", *section_notes]
     unsigned_bots = unsigned_bot_entries(target, notes)
     return (
         outcome,
@@ -2641,17 +2640,19 @@ def sweep(env, conf, started):
                 continue
             tally["landed"] += outcome.startswith("landed")
             tally["updated"] += moved
-            sections.append(section)
+            if section:
+                sections.extend([*section, ""])
             unsigned_bots.extend(unsigned)
             if release:
                 if release_is_off(target, conf, resolved):
                     off.append(target["full_name"])
                 else:
                     releases.append({"owner": account, "name": target["name"]})
-    return accounts, [s for s in sections if s], refusals, skipped, releases, off, unsigned_bots
+    return accounts, sections, refusals, skipped, releases, off, unsigned_bots
 
 
 def append(path, text):
+    """Append rendered report text or a JSON workflow output to its destination."""
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(text)
 
@@ -2681,7 +2682,7 @@ def release_summary(releases, off):
 
 
 def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots):
-    """Render the sweep report to standard output and the job step summary."""
+    """Return the sweep's report records and cap the release matrix."""
     lines = [
         "## Merge train sweep",
         "",
@@ -2692,10 +2693,10 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
     ]
     for account, tally in sorted(accounts.items(), key=lambda item: item[0].lower()):
         if isinstance(tally, str):
-            lines.append(f"| {account} | {tally} | | | |")
+            lines.append(f"| {note_cell(account)} | {note_cell(tally)} | | | |")
         else:
             lines.append(
-                f"| {account} | {tally['repositories']} | {tally['landed']} "
+                f"| {note_cell(account)} | {tally['repositories']} | {tally['landed']} "
                 f"| {tally['updated']} | {tally['refused']} |"
             )
     if refusals:
@@ -2709,10 +2710,27 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
         ]
     if skipped:
         lines += ["", f"Not reached within {SWEEP_SECONDS} s: {', '.join(skipped)}"]
-    lines += release_summary(releases, off)
-    text = "\n".join([*lines, "", *sections]) + "\n"
+    return [*lines, *release_summary(releases, off), "", *sections]
+
+
+def annotate(level, title, text, *, records=None):
+    """Write a workflow annotation or queue it as a record for both report destinations."""
+    line = f"::{level} title={title}::{refusal_line(text)}"
+    if records is None:
+        sys.stdout.write(line + "\n")
+    else:
+        records.append(line)
+
+
+def emit(env, records):
+    """Write the same single-line records to stdout and the step summary."""
+    text = "\n".join(refusal_line(record) for record in records) + "\n"
     sys.stdout.write(text)
     append(env["GITHUB_STEP_SUMMARY"], text)
+
+
+def write_release_outputs(env, releases):
+    """Write the selected releases as JSON for the downstream workflow and release file."""
     append(env["GITHUB_OUTPUT"], f"releases={json.dumps(releases, separators=(',', ':'))}\n")
     if path := env.get("TRAIN_RELEASE_FILE"):
         payload = {"format": 1, "hold_labels": env["TRAIN_HOLD_LABELS"], "releases": releases}
@@ -2726,7 +2744,7 @@ def refusal_line(err):
 
 
 def note_cell(note):
-    """Render a diagnostic as one Markdown table cell."""
+    """Render a value as one Markdown table cell."""
     return refusal_line(note).replace("|", r"\|")
 
 
@@ -2735,20 +2753,21 @@ def main(env):
     try:
         conf = settings(env)
     except InvalidSettingError as err:
-        sys.stdout.write(f"::error title=Merge train setting::{refusal_line(err)}\n")
+        annotate("error", "Merge train setting", err)
         return 3
     try:
         accounts, sections, refusals, skipped, releases, off, unsigned_bots = sweep(
             env, conf, time.monotonic()
         )
     except RefusedError as err:
-        sys.stdout.write(f"::error title=Merge train refused::{refusal_line(err)}\n")
+        annotate("error", "Merge train refused", err)
         return 1
-    summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots)
+    emit(env, summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_bots))
+    write_release_outputs(env, releases)
     for line in refusals:
-        sys.stdout.write(f"::error title=Merge train refused::{refusal_line(line)}\n")
+        annotate("error", "Merge train refused", line)
     if skipped:
-        sys.stdout.write(f"::warning title=Merge train::{len(skipped)} repositories not reached\n")
+        annotate("warning", "Merge train", f"{len(skipped)} repositories not reached")
     return 1 if refusals else 0
 
 
