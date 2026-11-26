@@ -50,6 +50,9 @@ f-strings. The annotation check covers command literals and colon fragments in
 concatenation, formatting, joins and f-strings. Every merge-train test also
 checks the captured file descriptors, child process output and named report
 files for physical line and table shape across the paths the tests exercise.
+The net checks each line per destination and cannot attribute individually valid
+lines to one record, so record-level flattening is tested at `write_records`,
+`annotate` and `note_cell`, with further harness forms tracked in issue 269.
 
 Start the 1,500-second sweep budget after settings validation, including the
 app-key check. Check the budget before every pull-page attempt, including

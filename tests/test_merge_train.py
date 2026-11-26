@@ -43,7 +43,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urljoin, urlsplit
+from urllib.parse import parse_qs, unquote, urldefrag, urljoin, urlsplit
 
 import pytest
 from conftest import ROOT, measured
@@ -536,8 +536,8 @@ class Forge:
         self.rest_faults: dict[str | tuple[str, str, str], list[int | str | tuple[int, bytes]]] = {}
         self.fault_requests: list[tuple[str, str]] = []
         self.request_ledger: set[tuple[str, str, str]] = set()
-        self.redirect_locations: Counter[str] = Counter()
-        self.redirect_lock = threading.Lock()
+        self.redirect_locations: set[tuple[str, str | None]] = set()
+        self.request_lock = threading.Lock()
         self.label_missing = False
         self.unlabel_status: int | None = None
         self.repository_moves: dict[str, str] = {}
@@ -694,8 +694,18 @@ class Forge:
         return {"data": {"createCommitOnBranch": {"commit": {"oid": "c" * 40}}}}
 
     def _record_message(self, kind: str, query: str, variables: dict) -> None:
-        headline = variables.get("headline") if "commitHeadline: $headline" in query else None
-        body = variables.get("body") if "commitBody: $body" in query else None
+        """Record variables used as message arguments on the declared mutation field."""
+        args = graphql_mutation_arguments(query, GRAPHQL_MUTATIONS[kind.capitalize()])
+        headline = (
+            variables.get("headline")
+            if graphql_contains(args, "commitHeadline", ":", "$", "headline")
+            else None
+        )
+        body = (
+            variables.get("body")
+            if graphql_contains(args, "commitBody", ":", "$", "body")
+            else None
+        )
         self.messages.append((kind, variables["id"], headline, body))
 
     def graphql(self, header: str, operation: str, query: str, variables: dict) -> dict:
@@ -775,10 +785,26 @@ class Forge:
             if key.startswith("p") and ascii_digits(key[1:])
         ]
         self.mode_calls.append(paths)
+        tokens = tuple(graphql_tokens(query))
         for index, path in enumerate(paths):
-            assert f"$p{index}: String!" in query
-            assert f"f{index}: file(path: $p{index}) {{ mode }}" in query
-            assert path not in query
+            variable = f"p{index}"
+            assert graphql_contains(tokens, "$", variable, ":", "String", "!")
+            assert graphql_contains(
+                tokens,
+                f"f{index}",
+                ":",
+                "file",
+                "(",
+                "path",
+                ":",
+                "$",
+                variable,
+                ")",
+                "{",
+                "mode",
+                "}",
+            )
+            assert all(path not in token for token in tokens)
         if self.mode_error:
             return {"errors": [{"message": self.mode_error}]}
         return {"data": {"repository": retry_modes(variables, self.modes)}}
@@ -911,7 +937,11 @@ class Forge:
         if "status" in variables:
             expected["status"] = variables["status"]
         assert variables == expected, variables
-        assert "$first: Int!" in query and "pullRequests(states: OPEN, first: $first," in query
+        tokens = tuple(graphql_tokens(query))
+        assert graphql_contains(tokens, "$", "first", ":", "Int", "!")
+        assert graphql_contains(
+            tokens, "pullRequests", "(", "states", ":", "OPEN", "first", ":", "$", "first"
+        )
         if after is None:
             reads = self.reads[full]
             self.active_reads[full] = reads.pop(0) if len(reads) > 1 else reads[0]
@@ -1114,9 +1144,11 @@ def rest_route(method, url, *, source=False):
     parts = path[1:].split("/")
 
     def field(value):
+        """Accept a source placeholder or a nonempty runtime field."""
         return value == "~" if source else bool(value)
 
     def number(value):
+        """Accept a source placeholder or a decimal runtime identifier."""
         return field(value) if source else ascii_digits(value)
 
     match parts:
@@ -1138,13 +1170,73 @@ def rest_route(method, url, *, source=False):
     return f"{method} {path}"
 
 
+GRAPHQL_NAME = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
+GRAPHQL_LEXEME = re.compile(
+    r"(?P<ignored>[ \t\r\n,\ufeff]+|#[^\r\n]*)"
+    r'|(?P<token>"""(?:\\"""|(?!""")[\s\S])*"""|"(?:\\[^\r\n]|[^"\\\r\n])*"'
+    r"|[_A-Za-z][_0-9A-Za-z]*|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+    r"|\.\.\.|[!$():=@\[\]{|}&])"
+    r"|(?P<invalid>.)"
+)
+
+
+def graphql_tokens(query):
+    """Yield GraphQL tokens, skipping comments and keeping strings opaque."""
+    for match in GRAPHQL_LEXEME.finditer(query):
+        if token := match["token"]:
+            yield token
+        elif invalid := match["invalid"]:
+            raise AssertionError(f"invalid stand-in GraphQL token: {invalid!r}")
+
+
 def graphql_operation(query):
     """Read the declared operation name without matching the document body."""
-    lines = (line for line in query.splitlines() if not line.lstrip().startswith("#"))
-    declaration = "\n".join(lines).split("(", 1)[0].split("{", 1)[0].split()
-    if len(declaration) == 2 and declaration[0] in {"query", "mutation"}:
-        return declaration[1]
+    tokens = graphql_tokens(query)
+    kind, name = next(tokens, ""), next(tokens, "")
+    if kind in {"query", "mutation"} and GRAPHQL_NAME.fullmatch(name):
+        return name
     return None
+
+
+def graphql_level(tokens):
+    """Yield one level of tokens, keeping nested values outside the sequence."""
+    depth = 0
+    for token in tokens:
+        if token in (")", "]", "}"):
+            if not depth:
+                return
+            depth -= 1
+        elif not depth:
+            yield token
+        if token in ("(", "[", "{"):
+            depth += 1
+
+
+def graphql_mutation_arguments(query, mutation):
+    """Read the arguments of the declared mutation's outer field."""
+    tokens = graphql_tokens(query)
+    assert next(tokens, None) == "mutation", mutation
+    assert "{" in graphql_level(tokens), mutation
+    field, following = next(tokens, ""), next(tokens, "")
+    if following == ":":
+        field, following = next(tokens, ""), next(tokens, "")
+    assert field == mutation, (field, mutation)
+    return graphql_input_fields(tokens) if following == "(" else ()
+
+
+def graphql_input_fields(tokens):
+    """Read only the immediate fields of the mutation's input argument."""
+    recent: tuple[str, ...] = ()
+    for token in graphql_level(tokens):
+        recent = (*recent[-2:], token)
+        if recent == ("input", ":", "{"):
+            return tuple(graphql_level(tokens))
+    return ()
+
+
+def graphql_contains(tokens, *pattern):
+    """Match a contiguous token sequence."""
+    return any(tokens[index : index + len(pattern)] == pattern for index in range(len(tokens)))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1160,23 +1252,16 @@ class Handler(BaseHTTPRequestHandler):
     def send_header(self, keyword, value) -> None:
         """Record every Location header the stand-in forge issues."""
         if keyword.lower() == "location":
-            forge = self.server.forge
-            location = urljoin(self.request_url(), value)
-            with forge.redirect_lock:
-                forge.redirect_locations[location] += 1
+            location, _ = urldefrag(urljoin(self.request_url(), value))
+            self.server.forge.redirect_locations.add((location, self.headers.get("Authorization")))
         super().send_header(keyword, value)
 
     def request_stage(self) -> str:
-        """Consume one issued Location when the next request reaches its URL."""
-        forge = self.server.forge
-        url = self.request_url()
-        with forge.redirect_lock:
-            pending = forge.redirect_locations[url]
-            if pending == 1:
-                del forge.redirect_locations[url]
-            elif pending > 1:
-                forge.redirect_locations[url] -= 1
-        return "redirect" if pending else "direct"
+        """HTTP cannot tell a same-URL/token direct request from an immediate redirect follow-up."""
+        pending = self.server.forge.redirect_locations
+        followed = (self.request_url(), self.headers.get("Authorization")) in pending
+        pending.clear()
+        return "redirect" if followed else "direct"
 
     def answer(self, code: int, body: dict | list | bytes | None) -> None:
         data = body
@@ -1220,17 +1305,24 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self, serve_rest) -> None:
         """Record the request and check its operation or staged route fault queue."""
         forge = self.server.forge
-        request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
-        operation = graphql_operation(request["query"]) if request is not None else None
-        self.route = rest_route(self.command, self.path)
-        path = f"/graphql [{operation}]" if operation else self.route.split(" ", 1)[1]
-        key = (self.command, path, self.request_stage())
-        forge.request_ledger.add(key)
-        if not self.fault(key, operation or self.route):
-            if request is None:
-                serve_rest()
-            else:
-                self._serve_graphql(request)
+        assert forge.request_lock.acquire(blocking=False), (
+            f"concurrent stand-in forge request: {self.command} {self.path}"
+        )
+        try:
+            stage = self.request_stage()
+            request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
+            operation = graphql_operation(request["query"]) if request is not None else None
+            self.route = rest_route(self.command, self.path)
+            path = f"/graphql [{operation}]" if operation else self.route.split(" ", 1)[1]
+            key = (self.command, path, stage)
+            forge.request_ledger.add(key)
+            if not self.fault(key, operation or self.route):
+                if request is None:
+                    serve_rest()
+                else:
+                    self._serve_graphql(request)
+        finally:
+            forge.request_lock.release()
 
     def do_GET(self) -> None:
         """Dispatch a GET through the common fault check."""
@@ -1493,7 +1585,18 @@ REPORT_LINES = re.compile(
 REPORT_ANNOTATION = re.compile(r"::(?:error|warning|notice) title=(?:(?!::).)*::.*")
 TABLE_PIPE = re.compile(r"(?<!\\)\|")
 RECORD_CONTROLS = frozenset("\0\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+# Leave headroom above measured fixture output while bounding each retained destination.
+LINE_SHAPE_MAX_BYTES = 64 * 1024
+LINE_SHAPE_PLANT_PYTEST = "line-shape plant pytest"
 LINE_SHAPE_EXCEPTIONS = {
+    (
+        None,
+        f"{LINE_SHAPE_PLANT_PYTEST} stdout",
+    ): "Nested pytest reports the planted teardown error.",
+    (
+        None,
+        f"{LINE_SHAPE_PLANT_PYTEST} stderr",
+    ): "Nested pytest may report its own diagnostics on stderr.",
     (None, "ADR-92/93 pytest stdout"): "Nested pytest writes its own progress and failure report.",
     (None, "ADR-92/93 pytest stderr"): "Nested pytest may report its own diagnostics on stderr.",
     (
@@ -1546,7 +1649,12 @@ def check_report_line(destination, number, line, columns):
 
 
 def check_line_shape(destination, text, *, allow_external=False):
-    """Check the physical separators and the record shapes for this destination."""
+    """Check the physical separators and the record shapes for this destination.
+
+    The net checks each line per destination and cannot attribute individually valid
+    lines to one record. Record-level flattening is tested at write_records,
+    annotate and note_cell. Further harness forms are tracked in issue 269.
+    """
     columns = None
     for number, line in enumerate(text.split("\n"), 1):
         where = f"{destination}:{number}"
@@ -1570,18 +1678,43 @@ class LineShapeCapture:
     """Keep the outputs that capfd.readouterr and subprocess PIPEs would otherwise drain."""
 
     def __init__(self, readouterr, caplog, test_name):
+        """Set up capture buffers and per-destination byte accounting for one test."""
         self.readouterr = readouterr
         self.caplog = caplog
         self.test_name = test_name
-        self.fd_reads = []
+        self.fd_streams = {"fd stdout": [], "fd stderr": []}
         self.process_streams = []
         self.files = set()
+        self.sizes = Counter()
+        self.overflow = None
+
+    def reserve(self, destination, size):
+        """Count bytes before retaining them and defer any overflow error to teardown."""
+        self.sizes[destination] += size
+        total = self.sizes[destination]
+        if total <= LINE_SHAPE_MAX_BYTES:
+            return True
+        if self.overflow is None:
+            self.overflow = LineShapeError(
+                f"{destination}:1: {total} bytes exceeds the "
+                f"{LINE_SHAPE_MAX_BYTES}-byte capture limit"
+            )
+        return False
 
     def read_fd(self):
         """Return captured descriptors to the caller and retain them for teardown."""
         captured = self.readouterr()
-        self.fd_reads.append(captured)
+        for name, text in zip(self.fd_streams, captured, strict=True):
+            if self.reserve(name, len(text.encode("utf-8"))):
+                self.fd_streams[name].append(text)
         return captured
+
+    def record_process(self, destination, raw):
+        """Retain a child pipe only when the full destination fits its byte allowance."""
+        text = raw.decode("utf-8")
+        if self.reserve(destination, len(raw)):
+            self.process_streams.append((destination, text))
+        return text
 
     def watch_files(self, env):
         """Register destinations from an in-process or child train environment."""
@@ -1589,22 +1722,42 @@ class LineShapeCapture:
         return env
 
     def snapshot_files(self, files):
-        """Read bytes so universal-newline conversion cannot mask a carriage return."""
+        """Read bounded binary snapshots so newline conversion cannot mask a carriage return."""
         for name, path in sorted(files):
-            if path.exists():
-                self.process_streams.append((f"{name} ({path})", path.read_bytes().decode("utf-8")))
+            if not path.exists():
+                continue
+            destination = f"{name} ({path})"
+            remaining = max(0, LINE_SHAPE_MAX_BYTES - self.sizes[destination])
+            with path.open("rb") as handle:
+                raw = handle.read(remaining + 1)
+                size = len(raw)
+                if size > remaining:
+                    size = max(size, os.fstat(handle.fileno()).st_size)
+            if self.reserve(destination, size):
+                self.process_streams.append((destination, raw.decode("utf-8")))
 
     def check(self):
-        """Check descriptors, process pipes, logs and registered files after the body."""
+        """Check descriptors, process pipes, logs and registered files after the body.
+
+        The net checks each line per destination and cannot attribute individually valid
+        lines to one record. Record-level flattening is tested at write_records,
+        annotate and note_cell. Further harness forms are tracked in issue 269.
+        """
         self.read_fd()
         self.snapshot_files(self.files)
         self.files.clear()
         streams, self.process_streams = self.process_streams, []
-        reads, self.fd_reads = self.fd_reads, []
+        descriptors = self.fd_streams
+        self.fd_streams = {"fd stdout": [], "fd stderr": []}
         logs = self.caplog.get_records("call")
         self.caplog.clear()
-        for name, msg in (("fd stdout", "out"), ("fd stderr", "err")):
-            check_line_shape(name, "".join(getattr(read, msg) for read in reads))
+        self.reserve(
+            "logging stderr", sum(len(record.getMessage().encode("utf-8")) for record in logs)
+        )
+        if self.overflow is not None:
+            raise self.overflow
+        for name, chunks in descriptors.items():
+            check_line_shape(name, "".join(chunks))
         for name, text in streams:
             external = (None, name) in LINE_SHAPE_EXCEPTIONS or (
                 self.test_name,
@@ -1623,7 +1776,12 @@ ACTIVE_LINE_SHAPE: ContextVar[LineShapeCapture] = ContextVar("merge_train_line_s
 
 @pytest.fixture(autouse=True)
 def line_shape(capfd, caplog, request):
-    """Check every train test's fd streams, child pipes and named report destinations."""
+    """Check every train test's fd streams, child pipes and named report destinations.
+
+    The net checks each line per destination and cannot attribute individually valid
+    lines to one record. Record-level flattening is tested at write_records,
+    annotate and note_cell. Further harness forms are tracked in issue 269.
+    """
     capture = LineShapeCapture(capfd.readouterr, caplog, request.node.name)
     token = ACTIVE_LINE_SHAPE.set(capture)
     # Fixture plumbing is separate from patches tracked by the app-key build guard.
@@ -1648,12 +1806,9 @@ def run_train_process(command, *, descriptor, env, timeout, cwd=None):
     done = subprocess.run(
         command, env=env, capture_output=True, timeout=timeout, check=False, cwd=cwd
     )
-    done.stdout = done.stdout.decode("utf-8")
-    done.stderr = done.stderr.decode("utf-8")
     capture = ACTIVE_LINE_SHAPE.get()
-    capture.process_streams.extend(
-        ((f"{descriptor} stdout", done.stdout), (f"{descriptor} stderr", done.stderr))
-    )
+    done.stdout = capture.record_process(f"{descriptor} stdout", done.stdout)
+    done.stderr = capture.record_process(f"{descriptor} stderr", done.stderr)
     capture.snapshot_files((name, Path(env[name])) for name in REPORT_FILES if env.get(name))
     return done
 
@@ -2073,11 +2228,11 @@ def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
 
 
 def test_forge_operation_key_comes_from_tokens(monkeypatch):
-    """Read a declaration with whitespace and delimiters without a regex match."""
+    """Read declaration tokens with whitespace and delimiters."""
 
     def reject_match(*args, **kwargs):
-        """Fail if operation dispatch falls back to regular expressions."""
-        pytest.fail("operation dispatch attempted a regex match")
+        """Fail if operation dispatch matches a declaration pattern."""
+        pytest.fail("operation dispatch attempted a declaration match")
 
     with monkeypatch.context() as patch:
         patch.setattr(re, "match", reject_match)
@@ -2090,15 +2245,8 @@ def test_forge_operation_key_comes_from_tokens(monkeypatch):
         assert graphql_operation("query { viewer { login } }") is None
 
 
-def test_forge_dispatch_uses_declared_operation_over_comment():
-    """A real POST keys the fault ledger and serves the selection after a misleading comment."""
-    forge = Forge(repository())
-    forge.tokens["test-token"] = ("repo", 7, "fleet/app", READ)
-    forge.merge_states[1] = "CLEAN"
-    query = (
-        "# query Other { status { state } }\nquery MergeState { pullRequest { mergeStateStatus } }"
-    )
-    variables = {"owner": "fleet", "name": "app", "number": 1}
+def post_forge_graphql(forge, query, variables):
+    """Send a GraphQL document through the real stand-in HTTP handler."""
     server = serve(forge)
     try:
         host, port = server.server_address
@@ -2115,9 +2263,56 @@ def test_forge_dispatch_uses_declared_operation_over_comment():
         server.shutdown()
         server.server_close()
 
+    return response.status, body
+
+
+def test_forge_dispatch_uses_declared_operation_over_comment():
+    """A real POST keys the fault ledger and serves the selection after a misleading comment."""
+    forge = Forge(repository())
+    forge.tokens["test-token"] = ("repo", 7, "fleet/app", READ)
+    forge.merge_states[1] = "CLEAN"
+    query = (
+        "# query Other { status { state } }\nquery MergeState { pullRequest { mergeStateStatus } }"
+    )
+    variables = {"owner": "fleet", "name": "app", "number": 1}
+    status, body = post_forge_graphql(forge, query, variables)
+
     assert forge.request_ledger == {("POST", "/graphql [MergeState]", "direct")}
-    assert response.status == 200, body
+    assert status == 200, body
     assert body == {"data": {"repository": {"pullRequest": {"mergeStateStatus": "CLEAN"}}}}
+
+
+@pytest.mark.parametrize("operation", ["Arm", "Merge"])
+@pytest.mark.parametrize("argument", ["body", "headline"])
+@pytest.mark.parametrize("shape", ["comment", "string", "block-string", "nested", "present"])
+def test_forge_records_only_mutation_message_arguments(operation, argument, shape):
+    """A real mutation POST recognizes only variable arguments on the top-level field."""
+    forge = Forge(repository())
+    forge.tokens["test-token"] = ("repo", 7, "fleet/app", WRITE)
+    name = f"commit{argument.capitalize()}"
+    binding = f"{name}: ${argument}"
+    planted = {
+        "comment": f"# {binding}\n",
+        "string": f'clientMutationId: "quoted \\" {binding}"',
+        "block-string": f'clientMutationId: """block \\""" {binding}\nignored"""',
+        "nested": f"extra: {{ {binding} }}",
+        "present": binding,
+    }[shape]
+    variables = {"id": "PR_1", "oid": "head", "method": "SQUASH", argument: "planted message"}
+    field = GRAPHQL_MUTATIONS[operation]
+    declaration = f", ${argument}: String" if shape in {"nested", "present"} else ""
+    query = (
+        f"mutation {operation}($id: ID!, $oid: GitObjectID!, "
+        f"$method: PullRequestMergeMethod!{declaration}) {{ "
+        f"{field}(input: {{pullRequestId: $id, expectedHeadOid: $oid, "
+        f"mergeMethod: $method, {planted}}}) "
+        "{ clientMutationId } }"
+    )
+    status, result = post_forge_graphql(forge, query, variables)
+    assert status == 200 and field in result["data"], result
+    value = variables[argument] if shape == "present" else None
+    headline, body = (value, None) if argument == "headline" else (None, value)
+    assert forge.messages == [(operation.lower(), "PR_1", headline, body)]
 
 
 def test_anonymous_graphql_document_raises_document_error(tmp_path, monkeypatch):
@@ -3864,6 +4059,7 @@ def queue_faults_after_location(forge, key, faults):
     repository_read = forge.repository_read
 
     def queue_direct_fault(header, path):
+        """Queue a fault once the stand-in responds with a repository Location."""
         response = repository_read(header, path)
         if response[0] == 301:
             forge.rest_faults[key] = faults
@@ -3888,6 +4084,108 @@ def test_release_off_redirect_then_direct_lookup_at_same_url(tmp_path):
     assert "release_off entry other/app: HTTP 403" in summary
     assert "release_off entry former/app:" not in summary
     assert releases_of(tmp_path) == []
+
+
+def test_release_off_rejected_redirect_cannot_stage_another_installation(tmp_path):
+    """A rejected second Location cannot consume another installation's direct fault."""
+    forge = release_forge()
+    forge.repository_moves.update(
+        {
+            "/repos/former/d": "{api}/repos/other/old-name",
+            "/repos/other/old-name": "{api}/repos/fleet/app",
+        }
+    )
+    direct, redirected = [403], [418]
+    repository_read = forge.repository_read
+
+    def queue_faults(header, path):
+        """Arm both staged queues only after installation 7 reaches the second Location."""
+        response = repository_read(header, path)
+        if (header, path) == ("Bearer list-token-7", "/repos/other/old-name"):
+            forge.rest_faults[fault_request_key(RELEASE_NAME_ROUTE)] = direct
+            forge.rest_faults[fault_request_key(RELEASE_RENAMED_CASE)] = redirected
+        return response
+
+    forge.repository_read = queue_faults
+    done, summary = train(tmp_path, forge, release_off="fleet/app former/d")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (direct, redirected) == ([], [418])
+    assert forge.fault_requests == [("GET", "/repos/fleet/app")]
+    assert (
+        summary.splitlines().count(
+            "::warning title=Merge train::release_off entry former/d: second repository redirect; "
+            "release train off for installation 7"
+        )
+        == 1
+    )
+    assert (
+        summary.splitlines().count(
+            "::warning title=Merge train::release_off entry fleet/app: HTTP 403; "
+            "release train off for installation 9"
+        )
+        == 1
+    )
+    assert "Release train off: fleet/app, other/d" in summary.splitlines()
+    assert releases_of(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("fragment", "next_token", "stage"),
+    [
+        pytest.param("#moved", "one", "redirect", id="fragment"),
+        pytest.param("", "two", "direct", id="different-token"),
+    ],
+)
+def test_forge_redirect_stage_matches_next_request(fragment, next_token, stage):
+    """A same-origin follow-up drops its fragment and must retain the issuing Authorization."""
+    forge = Forge(repository())
+    forge.tokens.update(one=("list", 7, None), two=("list", 7, None))
+    forge.repository_moves["/repos/former/app"] = f"/repos/fleet/app{fragment}"
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request("GET", "/repos/former/app", headers={"Authorization": "Bearer one"})
+            response = conn.getresponse()
+            assert response.status == 301
+            assert response.getheader("Location") == f"/repos/fleet/app{fragment}"
+            response.read()
+            conn.request(
+                "GET", "/repos/fleet/app", headers={"Authorization": f"Bearer {next_token}"}
+            )
+            assert conn.getresponse().read()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    method, route, _ = fault_request_key(RELEASE_NAME_ROUTE)
+    assert forge.request_ledger == {
+        fault_request_key(RELEASE_NAME_ROUTE),
+        (method, route, stage),
+    }
+
+
+def test_forge_rejects_overlapping_dispatch():
+    """A second dispatch fails by route while the first request is still being served."""
+    forge = Forge(repository())
+    first, second = object.__new__(Handler), object.__new__(Handler)
+    first.server = second.server = types.SimpleNamespace(forge=forge)
+    first.command = second.command = "GET"
+    first.path, second.path = "/app", "/app/installations"
+    first.headers = second.headers = {"Host": "127.0.0.1"}
+
+    def overlap():
+        """Arrive during the first request's dispatch callback."""
+        second.dispatch(serve_second)
+
+    def serve_second():
+        """Finish the nested request if the serial guard is missing."""
+
+    with pytest.raises(
+        AssertionError, match="concurrent stand-in forge request: GET /app/installations"
+    ):
+        first.dispatch(overlap)
 
 
 def test_release_off_exact_match_needs_no_repository_lookup(tmp_path):
@@ -11569,7 +11867,6 @@ COMPARE_ROUTE = "GET /repos/{owner}/{repo}/compare/{base}...{head}"
 PERMISSION_ROUTE = "GET /repos/{owner}/{repo}/collaborators/{login}/permission"
 RELEASE_NAME_ROUTE = "GET /repos/{owner}/{repo}"
 RELEASE_ID_ROUTE = "GET /repositories/{id}"
-STORAGE_CASE = f"{STORAGE_ROUTE} [redirect]"
 RELEASE_RENAMED_CASE = f"{RELEASE_NAME_ROUTE} [redirect]"
 RELEASE_ID_CASE = f"{RELEASE_ID_ROUTE} [redirect]"
 LIST_INSTALLATIONS_ROUTE = "GET /app/installations"
@@ -11581,7 +11878,7 @@ REMOVE_LABEL_ROUTE = "DELETE /repos/{owner}/{repo}/issues/{id}/labels/{label}"
 
 FORGE_ISSUED_URLS = {
     ("download_artifact", "art['archive_download_url']"): (ARCHIVE_ROUTE,),
-    ("download_artifact", "redirect.get('location')"): (STORAGE_CASE,),
+    ("download_artifact", "redirect.get('location')"): (STORAGE_ROUTE,),
     ("release_off_repository_id", "answer['location']"): (RELEASE_RENAMED_CASE, RELEASE_ID_CASE),
 }
 TRANSPORT_URL = {
@@ -11597,20 +11894,15 @@ OPENER_SETUP = ast.dump(
     ).body[0]
 )
 TRANSPORT_FORWARDS = {
-    (
-        "pages",
-        "call",
-        ast.unparse(
-            ast.parse(
-                '''f"{env['GITHUB_API_URL']}{path}?per_page=100&page={page}"''', mode="eval"
-            ).body
-        ),
+    ("pages", "call"): (
+        '''f"{env['GITHUB_API_URL']}{path}?per_page=100&page={page}"''',
+        {"env": "parameter", "path": "parameter", "page": "loop"},
     ),
-    ("release_off_get", "call", "url"),
-    ("call", "request_once", "url"),
-    ("request_once", "urllib.request.Request", "url"),
-    ("request_once", "forge_opener.open", "request"),
-    ("graphql", "call", "env['GITHUB_GRAPHQL_URL']"),
+    ("release_off_get", "call"): ("url", {"url": "parameter"}),
+    ("call", "request_once"): ("url", {"url": "parameter"}),
+    ("request_once", "urllib.request.Request"): ("url", {"url": "parameter"}),
+    ("request_once", "forge_opener.open"): ("request", {"url": "parameter"}),
+    ("graphql", "call"): ("env['GITHUB_GRAPHQL_URL']", {"env": "parameter"}),
 }
 URL_FRAGMENTS = {
     "api": "",
@@ -11859,20 +12151,91 @@ def transport_calls(tree):
         yield scope, name, ref, parent
 
 
+def forwarding_url(ref, operand, bindings):
+    """Resolve the opener's request object to the URL in its single constructor binding."""
+    if ref != "forge_opener.open":
+        return operand
+    assert isinstance(operand, ast.Name) and operand.id == "request", (
+        f"{SCRIPT}:{operand.lineno}: unsupported forwarding request: {ast.unparse(operand)}"
+    )
+    request = url_binding(operand, bindings)
+    assert (
+        isinstance(request, ast.Call) and ast.unparse(request.func) == "urllib.request.Request"
+    ), f"{SCRIPT}:{operand.lineno}: unsupported forwarding request binding: {operand.id}"
+    return call_argument(request, 0, "url")
+
+
+def forwarding_loop_target(binding, url, parents):
+    """Recognize the simple for target whose body contains the forwarding expression."""
+    loop = parents.get(binding)
+    return (
+        isinstance(loop, ast.For)
+        and loop.target is binding
+        and any(url is item for statement in loop.body for item in ast.walk(statement))
+    )
+
+
+def check_forwarding_name(name, url, kind, parameters, body_bindings, parents):
+    """Check a declared parameter or the single for target that may supply a URL name."""
+    sites = body_bindings[name.id]
+    if kind == "parameter":
+        expected, allowed = None, name.id in parameters
+    else:
+        assert kind == "loop", kind
+        expected = next(
+            (site for site in sites if forwarding_loop_target(site, url, parents)), None
+        )
+        allowed = expected is not None and name.id not in parameters
+    unexpected = next((site for site in sites if site is not expected), None)
+    bad = unexpected if unexpected is not None else name
+    assert allowed and unexpected is None, (
+        f"{SCRIPT}:{bad.lineno}: unsupported forwarding URL binding: {name.id}"
+    )
+
+
+def check_forwarding_site(scope, ref, operand, spec, bindings, parents):
+    """Check all names in the forwarded expression before accepting its declared shape."""
+    template, declared = spec
+    url = forwarding_url(ref, operand, bindings.get(scope, {}))
+    assert url is not None, f"{SCRIPT}:{operand.lineno}: missing forwarding URL"
+    parameters = {
+        part.arg for part in ast.iter_child_nodes(scope.args) if isinstance(part, ast.arg)
+    }
+    body = {item for statement in scope.body for item in ast.walk(statement)}
+    body_bindings = {
+        name: [
+            site
+            for scope_sites in bindings.values()
+            for site in scope_sites.get(name, ())
+            if site in body
+        ]
+        for name in declared
+    }
+    for part in ast.walk(url):
+        if isinstance(part, ast.Name):
+            assert part.id in declared, (
+                f"{SCRIPT}:{part.lineno}: unsupported forwarding URL name: {part.id}"
+            )
+            check_forwarding_name(part, url, declared[part.id], parameters, body_bindings, parents)
+    assert ast.unparse(operand) == template, (
+        f"{SCRIPT}:{operand.lineno}: unsupported forwarding URL: {ast.unparse(operand)}"
+    )
+
+
 def rest_fault_routes(tree):
     """Derive REST routes independently of the stand-in forge and fault scenarios."""
     bindings = url_binding_sites(tree)
+    parents = parent_nodes(tree)
     routes = {}
     for scope, name, ref, node in transport_calls(tree):
         url = call_argument(node, *TRANSPORT_URL.get(ref, (0, "url")))
-        site = (name, ref, ast.unparse(url) if url is not None else "")
-        if site in TRANSPORT_FORWARDS:
-            if isinstance(url, ast.Name):
-                url_binding(url, bindings.get(scope, {}))
-            continue
-        assert ref in TRANSPORT_URL and url is not None, (
+        forwarding = TRANSPORT_FORWARDS.get((name, ref))
+        assert url is not None and (forwarding is not None or ref in TRANSPORT_URL), (
             f"{SCRIPT}:{node.lineno}: unsupported transport call: {ast.unparse(node)}"
         )
+        if forwarding is not None:
+            check_forwarding_site(scope, ref, url, forwarding, bindings, parents)
+            continue
         for route in rest_call_routes(name, ref, node, url, bindings.get(scope, {})):
             routes.setdefault(route, []).append(name)
     return routes
@@ -11973,6 +12336,39 @@ def test_source_route_does_not_match_another_routes_placeholder():
     assert route not in FAULT_SCENARIOS
 
 
+@pytest.mark.parametrize(
+    ("statement", "name"),
+    [
+        pytest.param('path += "/extra"', "path", id="augmented"),
+        pytest.param('path = path + "/x"', "path", id="assignment"),
+        pytest.param('(path := path + "/x")', "path", id="walrus"),
+        pytest.param("for path in (): pass", "path", id="for"),
+        pytest.param("del path", "path", id="delete"),
+        pytest.param("page = 1", "page", id="loop-rebinding"),
+        pytest.param(None, "unlisted", id="undeclared-f-string-name"),
+    ],
+)
+def test_transport_forwarding_rejects_undeclared_bindings(statement, name):
+    """Forwarding URL names must come only from the declared binding kind."""
+    source = script()
+    if statement is None:
+        old = "?per_page=100&page={page}"
+        assert source.count(old) == 1
+        planted = source.replace(old, "?per_page=100&page={unlisted}")
+        line = next(
+            line for line, text in enumerate(planted.splitlines(), 1) if "{unlisted}" in text
+        )
+    else:
+        planted = plant_statement(source, "pages", statement)
+        pages = top_level_functions(ast.parse(planted))["pages"]
+        line = pages.body[1].lineno
+    with pytest.raises(
+        AssertionError,
+        match=rf"merge_train.py:{line}: unsupported forwarding URL (?:binding|name): {name}",
+    ):
+        rest_fault_routes(ast.parse(planted))
+
+
 def artifact_fault_forge():
     """A dependency update with a changed artifact and a live merge-state recheck."""
     dep = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
@@ -12050,7 +12446,7 @@ FAULT_SCENARIOS = {
             ARTIFACTS_ROUTE,
             ALLOWLIST_ROUTE,
             ARCHIVE_ROUTE,
-            STORAGE_CASE,
+            STORAGE_ROUTE,
             FILE_CONTENTS_ROUTE,
             "CreateCommit",
             "MergeState",
@@ -12432,14 +12828,21 @@ def test_annotation_title_stays_on_one_line(tmp_path, monkeypatch, capfd, queued
     """A multiline annotation title remains on the same line as its diagnostic."""
     mod = load_train(tmp_path, monkeypatch)
     records = [] if queued else None
+    written = []
+    if not queued:
+        monkeypatch.setattr(mod, "write_records", written.extend)
+
     mod.annotate("warning", "first line\r\nsecond line", "message", records=records)
     expected = "::warning title=first line second line::message\n"
-    if queued:
-        assert records == [expected.removesuffix("\n")]
-        assert capfd.readouterr().out == ""
-        summary = tmp_path / "summary"
-        mod.emit(watch_report_files({"GITHUB_STEP_SUMMARY": str(summary)}), records)
-        assert summary.read_text(encoding="utf-8") == expected
+    if not queued:
+        assert written == [expected.removesuffix("\n")]
+        return
+
+    assert records == [expected.removesuffix("\n")]
+    assert capfd.readouterr().out == ""
+    summary = tmp_path / "summary"
+    mod.emit(watch_report_files({"GITHUB_STEP_SUMMARY": str(summary)}), records)
+    assert summary.read_text(encoding="utf-8") == expected
     captured = capfd.readouterr()
     assert captured.out == expected
     assert captured.err == ""
@@ -12660,112 +13063,185 @@ def plant_statement(source, target, statement, *, after=0):
     return "".join(lines)
 
 
-@pytest.mark.parametrize(
-    ("target", "statement", "message", "state", "after"),
-    [
+TRAIN_LINE_SHAPE_PLANTS = {
+    "inherited-fds": (
+        "summary",
         (
-            "summary",
-            (
-                'subprocess.run([sys.executable, "-c", '
-                "\"print('note: first', 'second', sep=chr(10))\"], check=True, timeout=5)"
-            ),
-            r"train stdout:2: unrecognized report record: 'second'",
-            "DIRTY",
-            0,
+            'subprocess.run([sys.executable, "-c", '
+            "\"print('note: first', 'second', sep=chr(10))\"], check=True, timeout=5)"
         ),
+        r"train stdout:2: unrecognized report record: 'second'",
+        "DIRTY",
+        0,
+    ),
+    "logging": (
+        "summary",
+        'import logging\nlogging.getLogger("x").warning("a\\nb")',
+        r"train stderr:1: unexpected stderr record: 'a'",
+        "DIRTY",
+        0,
+    ),
+    "sink-comprehension": (
+        REPORT_SINK,
+        '[sys.stdout.write("note: first\\nsecond\\n") for raw in (1,)]',
+        r"train stdout:2: unrecognized report record: 'second'",
+        "DIRTY",
+        0,
+    ),
+    "concatenated-row": (
+        "report",
         (
-            "summary",
-            'import logging\nlogging.getLogger("x").warning("a\\nb")',
-            r"train stderr:1: unexpected stderr record: 'a'",
-            "DIRTY",
-            0,
+            'state = rows[0][0]["mergeStateStatus"]\n'
+            'lines.append("| #1 | " + state + " | no action |")'
         ),
+        r"train stdout:\d+: expected 3 table cells, got 4",
+        "DIRTY | extra",
+        1,
+    ),
+    "annotation": (
+        "summary",
         (
-            REPORT_SINK,
-            '[sys.stdout.write("note: first\\nsecond\\n") for raw in (1,)]',
-            r"train stdout:2: unrecognized report record: 'second'",
-            "DIRTY",
-            0,
+            'marker = ": ".strip() * 2\n'
+            'title = "first\\r\\nsecond"\n'
+            'command = marker + "warning title=" + title + marker + "message\\n"\n'
+            'subprocess.run([sys.executable, "-c", '
+            '"import sys; sys.stdout.write(sys.argv[1])", command], check=True, timeout=5)'
         ),
-        (
-            "report",
-            (
-                'state = rows[0][0]["mergeStateStatus"]\n'
-                'lines.append("| #1 | " + state + " | no action |")'
-            ),
-            r"train stdout:\d+: expected 3 table cells, got 4",
-            "DIRTY | extra",
-            1,
-        ),
-        (
-            "summary",
-            (
-                'marker = ": ".strip() * 2\n'
-                'title = "first\\r\\nsecond"\n'
-                'command = marker + "warning title=" + title + marker + "message\\n"\n'
-                'subprocess.run([sys.executable, "-c", '
-                '"import sys; sys.stdout.write(sys.argv[1])", command], check=True, timeout=5)'
-            ),
-            r"train stdout:1: forbidden record separator or NUL",
-            "DIRTY",
-            0,
-        ),
-    ],
-    ids=["inherited-fds", "logging", "sink-comprehension", "concatenated-row", "annotation"],
-)
-def test_line_shape_rejects_unguarded_output(
-    tmp_path, line_shape, target, statement, message, state, after
-):
-    """These forms pass the static tripwires and fail on the actual output."""
-    source = plant_statement(script(), target, statement, after=after)
-    tree = ast.parse(source)
-    assert writer_violations(tree) == []
-    assert raw_table_cells(tree) == []
-    done, _ = train(tmp_path, Forge(repository(pull(1, state))), source)
+        r"train stdout:1: forbidden record separator or NUL",
+        "DIRTY",
+        0,
+    ),
+}
+
+RELEASE_LINE_SHAPE_PLANTS = {
+    "workflow-output": ("GITHUB_OUTPUT", b"releases=[\n]\n", "expected compact releases= JSON"),
+    "spaced-release": (
+        "TRAIN_RELEASE_FILE",
+        b'{"releases": []}',
+        "expected one compact JSON document",
+    ),
+    "two-release-documents": (
+        "TRAIN_RELEASE_FILE",
+        b"{}\n{}",
+        "expected one compact JSON document",
+    ),
+}
+
+
+@pytest.fixture
+def line_shape_plant(request):
+    """Enable one deliberately failing inner test by its full case name."""
+    if os.environ.get("HORISTES_LINE_SHAPE_PLANT") != request.node.name:
+        pytest.skip("enabled only in the named line-shape plant session")
+
+
+def line_shape_train_source(case):
+    """Build the plant that emits through the actual train subprocess."""
+    target, statement, _, _, after = TRAIN_LINE_SHAPE_PLANTS[case]
+    return plant_statement(script(), target, statement, after=after)
+
+
+@pytest.mark.parametrize("case", TRAIN_LINE_SHAPE_PLANTS)
+def test_line_shape_train_plant(tmp_path, line_shape_plant, case):
+    """Emit output whose writer passes the static tripwires."""
+    state = TRAIN_LINE_SHAPE_PLANTS[case][3]
+    done, _ = train(tmp_path, Forge(repository(pull(1, state))), line_shape_train_source(case))
     assert done.returncode == 0, done.stdout + done.stderr
-    with pytest.raises(LineShapeError, match=message):
-        line_shape.check()
 
 
-def test_line_shape_checks_fd_stderr(line_shape, capfd):
-    """A child's inherited stderr is still checked after a test drains capfd."""
+def test_line_shape_fd_stderr_plant(line_shape_plant, capfd):
+    """Write inherited stderr and drain the descriptors during the call phase."""
     subprocess.run(
         [sys.executable, "-c", "import sys; sys.stderr.write('a\\nb\\n')"], check=True, timeout=5
     )
-    assert capfd.readouterr().out == ""
-    with pytest.raises(LineShapeError, match=r"fd stderr:1: unexpected stderr record"):
-        line_shape.check()
+    capfd.readouterr()
 
 
-def test_line_shape_checks_step_summary(tmp_path, line_shape):
-    """Check the raw step-summary bytes even when stdout is empty."""
+def test_line_shape_step_summary_plant(tmp_path, line_shape_plant):
+    """Write a carriage return to the named summary without writing stdout."""
     path = tmp_path / "any-summary-name"
     watch_report_files({"GITHUB_STEP_SUMMARY": str(path)})
     path.write_bytes(b"review bots: first\r\nsecond\n")
-    with pytest.raises(
-        LineShapeError, match=r"GITHUB_STEP_SUMMARY .*:1: forbidden record separator"
-    ):
-        line_shape.check()
 
 
-@pytest.mark.parametrize(
-    ("name", "content", "message"),
-    [
-        ("GITHUB_OUTPUT", b"releases=[\n]\n", "expected compact releases= JSON"),
-        ("TRAIN_RELEASE_FILE", b'{"releases": []}', "expected one compact JSON document"),
-        ("TRAIN_RELEASE_FILE", b"{}\n{}", "expected one compact JSON document"),
-    ],
-    ids=["workflow-output", "spaced-release", "two-release-documents"],
-)
-def test_line_shape_rejects_noncompact_release_outputs(
-    tmp_path, line_shape, name, content, message
-):
-    """Both release destinations reject JSON that breaks their compact-record contract."""
+@pytest.mark.parametrize("case", RELEASE_LINE_SHAPE_PLANTS)
+def test_line_shape_release_output_plant(tmp_path, line_shape_plant, case):
+    """Write the selected malformed payload to its release destination."""
+    name, content, _ = RELEASE_LINE_SHAPE_PLANTS[case]
     path = tmp_path / "release-output"
     watch_report_files({name: str(path)})
     path.write_bytes(content)
-    with pytest.raises(LineShapeError, match=rf"{name} .*:1: {message}"):
-        line_shape.check()
+
+
+def test_line_shape_byte_cap_plant(line_shape_plant):
+    """Write one byte over the cap using only valid note records on inherited stdout."""
+    count, extra = divmod(LINE_SHAPE_MAX_BYTES + 1 - len(b"note: \n"), len(b"note: x\n"))
+    command = (
+        "import sys; count, extra = map(int, sys.argv[1:]); "
+        "sys.stdout.buffer.write(b'note: x\\n' * count + b'note: ' + b'x' * extra + b'\\n')"
+    )
+    subprocess.run([sys.executable, "-c", command, str(count), str(extra)], check=True, timeout=5)
+
+
+@pytest.mark.usefixtures("line_shape")
+@pytest.mark.parametrize(
+    ("plant", "message"),
+    [
+        *(
+            pytest.param(f"test_line_shape_train_plant[{case}]", plant[2], id=case)
+            for case, plant in TRAIN_LINE_SHAPE_PLANTS.items()
+        ),
+        pytest.param(
+            "test_line_shape_fd_stderr_plant",
+            r"fd stderr:1: unexpected stderr record",
+            id="fd-stderr",
+        ),
+        pytest.param(
+            "test_line_shape_step_summary_plant",
+            r"GITHUB_STEP_SUMMARY .*:1: forbidden record separator",
+            id="step-summary",
+        ),
+        *(
+            pytest.param(
+                f"test_line_shape_release_output_plant[{case}]", rf"{name} .*:1: {message}", id=case
+            )
+            for case, (name, _, message) in RELEASE_LINE_SHAPE_PLANTS.items()
+        ),
+        pytest.param(
+            "test_line_shape_byte_cap_plant",
+            rf"fd stdout:1: {LINE_SHAPE_MAX_BYTES + 1} bytes exceeds the "
+            rf"{LINE_SHAPE_MAX_BYTES}-byte capture limit",
+            id="byte-cap",
+        ),
+    ],
+)
+def test_line_shape_rejects_unguarded_output(plant, message):
+    """Require the actual autouse teardown to reject a plant that passed its call phase."""
+    if plant.startswith("test_line_shape_train_plant["):
+        case = plant.partition("[")[2].removesuffix("]")
+        tree = ast.parse(line_shape_train_source(case))
+        assert writer_violations(tree) == []
+        assert raw_table_cells(tree) == []
+    env = {**os.environ, "HORISTES_LINE_SHAPE_PLANT": plant, "PYTHONDONTWRITEBYTECODE": "1"}
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-p",
+        "no:cacheprovider",
+        "-vv",
+        "--show-capture=no",
+        f"tests/test_merge_train.py::{plant}",
+    ]
+    done = run_train_process(
+        command, descriptor=LINE_SHAPE_PLANT_PYTEST, env=env, timeout=120, cwd=ROOT
+    )
+    output = done.stdout + done.stderr
+    assert done.returncode == 1, output
+    assert f"::{plant} PASSED" in output, output
+    assert f"ERROR at teardown of {plant}" in output, output
+    assert re.search(r"LineShapeError: " + message, output), output
+    assert "1 passed, 1 error" in output, output
 
 
 @pytest.mark.parametrize(
