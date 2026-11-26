@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -1307,10 +1308,13 @@ class Handler(BaseHTTPRequestHandler):
         return "redirect" if followed else "direct"
 
     def send_final(self, write, *args) -> None:
-        """Send the last bytes and publish completion before the next admission check."""
+        """Count a response as sent at its last byte or its bodyless ``Content-Length: 0``
+        header block, with the final write outside the admission lock and cuts and drops
+        completing at socket close.
+        """
         forge = self.server.forge
+        write(*args)
         with forge.response_lock:
-            write(*args)
             forge.pending_response = None
 
     def send_body(self, data: bytes) -> None:
@@ -1360,7 +1364,10 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def dispatch(self, serve_rest) -> None:
-        """Refuse a concurrent request only while another response is unsent."""
+        """Refuse overlap until the last response byte or the bodyless ``Content-Length: 0``
+        header block is written outside the admission lock, or until the socket closes for
+        a cut or dropped response.
+        """
         forge = self.server.forge
         with forge.response_lock:
             if forge.pending_response is not None:
@@ -1444,6 +1451,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(302)
         if loc is not None:
             self.send_header("Location", loc)
+        self.send_header("Content-Length", "0")
         self.send_final(self.end_headers)
 
     def _get_storage(self, path: str) -> None:
@@ -1525,6 +1533,7 @@ class Handler(BaseHTTPRequestHandler):
             location = str(body).format(api=f"http://{host}:{port}", port=port)
             self.send_response(code)
             self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
             self.send_final(self.end_headers)
         elif isinstance(body, bytes):
             self.send_response(code)
@@ -4397,18 +4406,49 @@ def test_forge_rejects_overlapping_dispatch():
 def test_forge_accepts_request_after_response_sent(monkeypatch):
     """A new connection can follow a complete response while its handler is still serving."""
     forge = Forge(repository())
-    second_sent, first_finished = threading.Event(), threading.Event()
+    first_sent, first_finished = threading.Event(), threading.Event()
+    second_entered, second_decided = threading.Event(), threading.Event()
+    dispatch, request_lock = Handler.dispatch, forge.request_lock
+
+    class ObservedRequestLock:
+        """Signal admission before the second handler waits for state access."""
+
+        acquire, release = request_lock.acquire, request_lock.release
+
+        def __enter__(self):
+            """Observe the second worker after the admission check."""
+            if second_entered.is_set():
+                second_decided.set()
+            assert self.acquire(timeout=5), "admitted worker could not acquire request_lock"
+
+        def __exit__(self, *_exc):
+            """Release the underlying request lock."""
+            self.release()
+
+    def observe_dispatch(self, serve_rest):
+        """Signal second dispatch entry and preserve any named refusal."""
+        if self.path == "/app/installations":
+            second_entered.set()
+        try:
+            dispatch(self, serve_rest)
+        except ForgeRequestRefusalError:
+            if self.path == "/app/installations":
+                second_decided.set()
+            raise
 
     def serve_get(self):
         """Pause the first request after its wire response and check the serialized handoff."""
         if self.path == "/app/installations":
-            assert first_finished.is_set()
+            assert first_finished.is_set(), "second worker served before the first finished"
         self.answer(200, {"path": self.path})
         if self.path == "/app":
-            assert second_sent.wait(5)
-            time.sleep(0.2)
+            first_sent.set()
+            assert second_entered.wait(5), "second worker did not enter dispatch"
+            assert second_decided.wait(5), "second worker did not reach its admission decision"
             first_finished.set()
 
+    forge.request_lock = ObservedRequestLock()
+    monkeypatch.setattr(Handler, "dispatch", observe_dispatch)
     monkeypatch.setattr(Handler, "_serve_get", serve_get)
     server = serve(forge)
     host, port = server.server_address
@@ -4416,12 +4456,11 @@ def test_forge_accepts_request_after_response_sent(monkeypatch):
         with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as first:
             first.request("GET", "/app")
             assert first.getresponse().read() == b'{"path": "/app"}'
+        assert first_sent.wait(5), "first worker did not complete its response"
         with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as second:
             second.request("GET", "/app/installations")
-            second_sent.set()
             assert second.getresponse().read() == b'{"path": "/app/installations"}'
     finally:
-        second_sent.set()
         server.shutdown()
         server.server_close()
 
@@ -4464,6 +4503,128 @@ def test_forge_rejects_request_before_response_sent(monkeypatch):
         except ForgeRequestRefusalError as error:
             reported = str(error)
     assert reported == refusal
+
+
+def fill_socket_buffers(sock, data):
+    """Return the unsent body suffix after the TCP socket reports backpressure."""
+    remaining = memoryview(data)
+    sock.setblocking(False)
+    try:
+        for _ in range(32):
+            sent = sock.send(remaining)
+            assert 0 < sent < len(remaining), "first response fit in the socket buffers"
+            remaining = remaining[sent:]
+    except BlockingIOError:
+        return remaining
+    finally:
+        sock.settimeout(10)
+    raise AssertionError("first response did not fill the socket buffers in 32 writes")
+
+
+def test_forge_rejects_request_while_final_write_blocked(monkeypatch):
+    """Require the named refusal while the first client leaves its response unread."""
+    forge = Forge(repository())
+    payload = b"z" * (1024 * 1024)
+    forge.storage.update({1: payload, 2: b"second"})
+    write_blocked = threading.Event()
+    send_final = Handler.send_final
+
+    def observe_final_write(self, write, *args):
+        """Signal backpressure inside the real final write of the large reply."""
+        if self.path != "/storage/1":
+            return send_final(self, write, *args)
+        self.request.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+
+        def write_body(data):
+            """Resume the body write as soon as the first client starts reading."""
+            remaining = fill_socket_buffers(self.request, data)
+            write_blocked.set()
+            write(remaining)
+
+        return send_final(self, write_body, *args)
+
+    monkeypatch.setattr(Handler, "send_final", observe_final_write)
+    server = serve(forge)
+    host, port = server.server_address
+    refusal = "concurrent stand-in forge request: GET /storage/2"
+    reported = None
+    try:
+        with (
+            socket.socket() as receiver,
+            contextlib.closing(http.client.HTTPConnection(host, port, timeout=10)) as first,
+            contextlib.closing(http.client.HTTPConnection(host, port, timeout=2)) as second,
+        ):
+            receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            receiver.settimeout(10)
+            receiver.connect((host, port))
+            first.sock = receiver
+            first.request("GET", "/storage/1")
+            timed_out = False
+            try:
+                assert write_blocked.wait(5), "first response did not reach a blocked write"
+                second.request("GET", "/storage/2")
+                with pytest.raises(http.client.RemoteDisconnected):
+                    second.getresponse()
+            except TimeoutError as error:
+                timed_out = True
+                raise AssertionError(f"{refusal}: second client timed out") from error
+            finally:
+                assert first.getresponse().read() == payload
+                if timed_out:
+                    second.getresponse().read()
+    finally:
+        server.shutdown()
+        try:
+            server.server_close()
+        except ForgeRequestRefusalError as error:
+            reported = str(error)
+    assert reported == refusal
+
+
+@pytest.mark.parametrize(
+    ("path", "token", "status", "location"),
+    [
+        pytest.param(
+            "/repos/fleet/app/actions/artifacts/1/zip", "repo", 302, "/storage/1", id="302"
+        ),
+        pytest.param("/repos/former/app", "list", 301, "/repositories/7000", id="301"),
+    ],
+)
+def test_forge_redirect_empty_body_completes_before_close(
+    monkeypatch, path, token, status, location
+):
+    """Read the empty redirect while the stand-in's HTTP/1.0 shutdown is held open."""
+    forge = release_fault_forge()
+    forge.tokens.update(repo=("repo", 7, "fleet/app", READ), list=("list", 7, None))
+    closing, allow_close = threading.Event(), threading.Event()
+    shutdown_request = ForgeServer.shutdown_request
+
+    def hold_close(self, request):
+        """Withhold EOF until the client completes or fails its read."""
+        closing.set()
+        try:
+            assert allow_close.wait(5), f"HTTP {status}: timed out waiting to close redirect socket"
+        finally:
+            shutdown_request(self, request)
+
+    monkeypatch.setattr(ForgeServer, "shutdown_request", hold_close)
+    server = serve(forge)
+    host, port = server.server_address
+    try:
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=2)) as conn:
+            conn.request("GET", path, headers={"Authorization": f"Bearer {token}"})
+            response = conn.getresponse()
+            assert response.status == status
+            assert response.getheader("Location") == location
+            assert closing.wait(5), f"HTTP {status}: server did not reach redirect shutdown"
+            assert response.getheader("Content-Length") == "0", (
+                f"HTTP {status}: missing empty length"
+            )
+            assert response.read() == b""
+    finally:
+        allow_close.set()
+        server.shutdown()
+        server.server_close()
 
 
 def test_release_off_exact_match_needs_no_repository_lookup(tmp_path):
