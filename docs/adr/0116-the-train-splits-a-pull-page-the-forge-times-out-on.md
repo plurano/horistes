@@ -38,9 +38,10 @@ and the first line of the original refusal. If the repository is later refused,
 include the split in its refusal line. If the smallest request fails, report
 its size and cursor and fail the sweep. Mutations still run once.
 
-Write each report record as one physical line to stdout and the step summary.
-Escape pipes in table cells. Write workflow annotations on one line and keep
-the release outputs as JSON.
+Pass report records, workflow annotations and serialized release outputs
+through one writer that flattens each record to one physical line. Escape pipes
+in table cells. Keep the release file as compact JSON without a trailing newline
+and the workflow's `releases=` output as compact JSON on one line.
 
 Start the 1,500-second sweep budget after settings validation, including the
 app-key check. Check the budget before every pull-page attempt, including

@@ -30,7 +30,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import types
@@ -42,7 +41,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 
 import pytest
 from conftest import ROOT, measured
@@ -504,8 +503,10 @@ class Forge:
         self.jobs: dict[int, list[dict]] = {}
         self.jobs_calls: list[int] = []
         # Queued HTTP faults by REST route or GraphQL operation name.
-        self.rest_faults: dict[str, list[int | str | tuple[int, bytes]]] = {}
+        self.rest_faults: dict[str | tuple[str, str, str], list[int | str | tuple[int, bytes]]] = {}
         self.fault_requests: list[tuple[str, str]] = []
+        self.request_ledger: set[tuple[str, str, str]] = set()
+        self.redirect_locations: set[str] = set()
         self.label_missing = False
         self.unlabel_status: int | None = None
         self.repository_moves: dict[str, str] = {}
@@ -1051,23 +1052,49 @@ INSTALLATION_REPOSITORIES_ROUTE = "GET /installation/repositories"
 REVOKE_ROUTE = "DELETE /installation/token"
 
 REST_PATH_PARTS = (
-    (r"^/repos/[^/]+/[^/]+", "/repos/{owner}/{repo}"),
-    (r"^/users/[^/]+$", "/users/{login}"),
-    (r"/contents/(?!\.github/generated-files$).+$", "/contents/{path}"),
-    (r"/compare/[^/]+\.\.\.[^/]+$", "/compare/{base}...{head}"),
-    (r"/collaborators/[^/]+/permission$", "/collaborators/{login}/permission"),
-    (r"/labels/[^/]+$", "/labels/{label}"),
-    (r"/(?:\d+|~)(?=/|$)", "/{id}"),
+    (r"^/repos/{part}/{part}(?=/|$)", "/repos/{owner}/{repo}"),
+    (r"^/users/{login}$", "/users/{login}"),
+    (
+        r"(?<=^/repos/\{owner\}/\{repo\})/contents/(?!\.github/generated-files$){tail}$",
+        "/contents/{path}",
+    ),
+    (r"(?<=^/repos/\{owner\}/\{repo\})/compare/{part}\.\.\.{part}$", "/compare/{base}...{head}"),
+    (
+        r"(?<=^/repos/\{owner\}/\{repo\})/collaborators/{part}/permission$",
+        "/collaborators/{login}/permission",
+    ),
+    (r"(?<=^/repos/\{owner\}/\{repo\}/issues/){number}(?=/|$)", "{id}"),
+    (r"(?<=^/repos/\{owner\}/\{repo\}/issues/\{id\})/labels/{part}$", "/labels/{label}"),
+    (r"(?<=^/repos/\{owner\}/\{repo\}/pulls/){number}(?=/|$)", "{id}"),
+    (r"(?<=^/repos/\{owner\}/\{repo\}/actions/artifacts/){number}(?=/zip$)", "{id}"),
+    (r"(?<=^/repos/\{owner\}/\{repo\}/actions/runs/){number}(?=/jobs$)", "{id}"),
+    (r"(?<=^/app/installations/){number}(?=/access_tokens$)", "{id}"),
+    (r"(?<=^/repositories/){number}$", "{id}"),
+    (r"(?<=^/storage/){number}$", "{id}"),
 )
 
 
-def rest_route(method, url):
-    """Normalize a requested or source-derived REST URL to a method and path."""
+def rest_route(method, url, *, source=False):
+    """Normalize route fields while keeping literal source paths distinct."""
     path = urlsplit(url).path
     assert path.startswith("/"), f"unresolved REST URL: {url}"
+    fields = {"{part}": "~", "{tail}": "~", "{number}": "~", "{login}": r"~(?:\[bot\])?"}
+    if not source:
+        fields = {"{part}": "[^/]+", "{tail}": ".+", "{number}": "[0-9]+", "{login}": "[^/]+"}
     for pattern, placeholder in REST_PATH_PARTS:
+        for field, value in fields.items():
+            pattern = pattern.replace(field, value)
         path = re.sub(pattern, placeholder, path)
+    assert not source or "~" not in path, f"unknown REST route shape: {method} {url}"
     return f"{method} {path}"
+
+
+def graphql_operation(query):
+    """Read the declared operation name without matching the document body."""
+    declaration = query.split("(", 1)[0].split("{", 1)[0].split(maxsplit=2)
+    if len(declaration) == 2 and declaration[0] in {"query", "mutation"}:
+        return declaration[1]
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1075,6 +1102,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args) -> None:
         pass
+
+    def request_url(self) -> str:
+        """Return the exact URL used to match this request against issued redirects."""
+        return f"http://{self.headers['Host']}{self.path}"
+
+    def send_header(self, keyword, value) -> None:
+        """Record every Location header the stand-in forge issues."""
+        if keyword.lower() == "location":
+            self.server.forge.redirect_locations.add(urljoin(self.request_url(), value))
+        super().send_header(keyword, value)
 
     def answer(self, code: int, body: dict | list | bytes | None) -> None:
         data = body
@@ -1099,9 +1136,10 @@ class Handler(BaseHTTPRequestHandler):
     def body(self) -> dict:
         return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
 
-    def fault(self, kind: str) -> bool:
+    def fault(self, key, legacy_key) -> bool:
         """Serve the next queued fault, or close without an answer for DROP."""
-        queued = self.server.forge.rest_faults.get(kind, [])
+        faults = self.server.forge.rest_faults
+        queued = faults.get(key, faults.get(legacy_key, []) if key[2] == "direct" else [])
         if not queued:
             return False
         self.server.forge.fault_requests.append((self.command, self.path))
@@ -1115,13 +1153,16 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def dispatch(self, serve_rest) -> None:
-        """Check the operation or route fault queue before serving any request."""
+        """Record the request and check its operation or staged route fault queue."""
+        forge = self.server.forge
         request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
-        operation = (
-            re.match(r"\s*(?:query|mutation)\s+(\w+)", request["query"]) if request else None
-        )
-        key = operation[1] if operation else rest_route(self.command, self.path)
-        if not self.fault(key):
+        operation = graphql_operation(request["query"]) if request is not None else None
+        route = rest_route(self.command, self.path)
+        path = f"/graphql [{operation}]" if operation else route.split(" ", 1)[1]
+        stage = "redirect" if self.request_url() in forge.redirect_locations else "direct"
+        key = (self.command, path, stage)
+        forge.request_ledger.add(key)
+        if not self.fault(key, operation or route):
             if request is None:
                 serve_rest()
             else:
@@ -1771,6 +1812,7 @@ def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
         for doc in docs:
             match = re.match(r"\s*(?:query|mutation)\s+([A-Z][A-Za-z0-9]*)\s*[(\{]", doc)
             assert match, "missing PascalCase operation name"
+            assert graphql_operation(doc) == match[1]
             names.append(match[1])
         assert len(set(names)) == len(names), "duplicate operation name"
 
@@ -1781,6 +1823,24 @@ def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
     monkeypatch.setattr(train_mod, "MERGE_STATE", duplicate)
     with pytest.raises(AssertionError, match="duplicate"):
         check(documents())
+
+
+def test_forge_operation_key_comes_from_tokens(monkeypatch):
+    """Read a declaration with whitespace and delimiters without a regex match."""
+
+    def reject_match(*args, **kwargs):
+        """Fail if operation dispatch falls back to regular expressions."""
+        pytest.fail("operation dispatch attempted a regex match")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(re, "match", reject_match)
+        assert graphql_operation(" \r\nquery   OpenPulls($limit: Int) { viewer { login } }") == (
+            "OpenPulls"
+        )
+        assert graphql_operation("mutation Land{ mergePullRequest { clientMutationId } }") == (
+            "Land"
+        )
+        assert graphql_operation("query { viewer { login } }") is None
 
 
 def test_anonymous_graphql_document_raises_document_error(tmp_path, monkeypatch):
@@ -1854,6 +1914,7 @@ FLATTENED_READ_ERROR = " ".join(MULTILINE_READ_ERROR.decode().splitlines())
 
 
 def pull_refusal_line(stdout, summary):
+    """Read the pull refusal and require its summary and annotation copies to match."""
     prefix = "::error title=Merge train refused::"
     annotations = [
         line.removeprefix(prefix) for line in stdout.splitlines() if line.startswith(prefix)
@@ -3384,23 +3445,15 @@ def plain_open(node):
 
 
 def allowed_report_opens(text):
-    """Exact allow-list of the summary append and release artifact writer sites."""
+    """Pin the only file open and its append-versus-replace modes to the report sink."""
     tree = ast.parse(text)
-    expected = {
-        "append": ast.dump(ast.parse('open(path, "a", encoding="utf-8")', mode="eval").body),
-        "write_release_outputs": ast.dump(
-            ast.parse('open(path, "w", encoding="utf-8")', mode="eval").body
-        ),
-    }
-    sites = [
-        (function.name, ast.dump(node))
-        for function in tree.body
-        if isinstance(function, ast.FunctionDef)
-        for node in ast.walk(function)
-        if plain_open(node)
-    ]
-    all_opens = sum(plain_open(node) for node in ast.walk(tree))
-    return all_opens == len(expected) and sorted(sites) == sorted(expected.items())
+    sink = top_level_functions(tree).get("write_records")
+    expected = ast.parse('open(path, mode, encoding="utf-8")', mode="eval").body
+    sites = [(scope, ast.dump(node)) for scope, node in scoped_nodes(tree) if plain_open(node)]
+    if sites != [(sink, ast.dump(expected))]:
+        return False
+    mode = ast.dump(ast.parse('mode = "w" if replace else "a"').body[0])
+    return any(ast.dump(node) == mode for node in ast.walk(sink))
 
 
 def key_on_disk(text: str) -> list[str]:
@@ -11198,8 +11251,6 @@ def test_retry_read_refusal_stays_in_one_notes_cell(tmp_path):
 
 FORGE_FAULT_BODY = b"first line\r\nsecond line"
 FORGE_FAULT_LINE = "first line second line"
-UNREACHED_FORGE_FAULTS: dict[str, str] = {}
-
 ALLOWLIST_ROUTE = "GET /repos/{owner}/{repo}/contents/.github/generated-files"
 ARCHIVE_ROUTE = "GET /repos/{owner}/{repo}/actions/artifacts/{id}/zip"
 STORAGE_ROUTE = "GET /storage/{id}"
@@ -11208,6 +11259,9 @@ COMPARE_ROUTE = "GET /repos/{owner}/{repo}/compare/{base}...{head}"
 PERMISSION_ROUTE = "GET /repos/{owner}/{repo}/collaborators/{login}/permission"
 RELEASE_NAME_ROUTE = "GET /repos/{owner}/{repo}"
 RELEASE_ID_ROUTE = "GET /repositories/{id}"
+STORAGE_CASE = f"{STORAGE_ROUTE} [redirect]"
+RELEASE_RENAMED_CASE = f"{RELEASE_NAME_ROUTE} [redirect]"
+RELEASE_ID_CASE = f"{RELEASE_ID_ROUTE} [redirect]"
 LIST_INSTALLATIONS_ROUTE = "GET /app/installations"
 MINT_ROUTE = "POST /app/installations/{id}/access_tokens"
 ISSUE_COMMENT_ROUTE = "POST /repos/{owner}/{repo}/issues/{id}/comments"
@@ -11217,12 +11271,22 @@ REMOVE_LABEL_ROUTE = "DELETE /repos/{owner}/{repo}/issues/{id}/labels/{label}"
 
 FORGE_ISSUED_URLS = {
     ("download_artifact", "art['archive_download_url']"): (ARCHIVE_ROUTE,),
-    ("download_artifact", "redirect.get('location')"): (STORAGE_ROUTE,),
-    # A name redirect uses the same normalized route as the initial name lookup.
-    ("release_off_repository_id", "answer['location']"): (RELEASE_ID_ROUTE,),
+    ("download_artifact", "redirect.get('location')"): (STORAGE_CASE,),
+    ("release_off_repository_id", "answer['location']"): (RELEASE_RENAMED_CASE, RELEASE_ID_CASE),
 }
-REST_URL_ARGS = {"call": (0, "url"), "pages": (2, "path"), "release_off_get": (0, "url")}
-FORWARDED_URLS = {
+TRANSPORT_URL = {
+    "call": (0, "url"),
+    "pages": (2, "path"),
+    "release_off_get": (0, "url"),
+}
+TRANSPORT_NAMES = {*TRANSPORT_URL, "request_once"}
+OPENER_SETUP = ast.dump(
+    ast.parse(
+        "forge_opener = urllib.request.build_opener() if redirect "
+        "else urllib.request.build_opener(NoRedirect)"
+    ).body[0]
+)
+TRANSPORT_FORWARDS = {
     (
         "pages",
         "call",
@@ -11233,6 +11297,10 @@ FORWARDED_URLS = {
         ),
     ),
     ("release_off_get", "call", "url"),
+    ("call", "request_once", "url"),
+    ("request_once", "urllib.request.Request", "url"),
+    ("request_once", "forge_opener.open", "request"),
+    ("graphql", "call", "env['GITHUB_GRAPHQL_URL']"),
 }
 URL_FRAGMENTS = {
     "api": "",
@@ -11244,12 +11312,24 @@ URL_FRAGMENTS = {
 
 
 def scoped_nodes(tree):
-    """Yield each AST node with its innermost named function or the module."""
+    """Yield nodes with their innermost definition, lambda or module."""
     scopes = {tree: tree}
     for node in ast.walk(tree):
-        scope = node if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else scopes[node]
+        scope = scopes[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            scope = node
         yield scope, node
         scopes.update(dict.fromkeys(ast.iter_child_nodes(node), scope))
+
+
+def parent_nodes(tree):
+    """Index each AST child by its immediate parent."""
+    return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def top_level_functions(tree):
+    """Index the module's synchronous functions by name."""
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
 
 
 def call_argument(node, index, name, *, default=None):
@@ -11257,6 +11337,18 @@ def call_argument(node, index, name, *, default=None):
     if index < len(node.args):
         return node.args[index]
     return next((arg.value for arg in node.keywords if arg.arg == name), default)
+
+
+def url_bindings(url, assignments):
+    """Collect each local URL fragment assigned before this use."""
+    bindings = {}
+    for assignment in assignments:
+        if assignment.lineno < url.lineno:
+            for target in assignment.targets:
+                if isinstance(target, ast.Name):
+                    value = assignment.value
+                    bindings.setdefault(target.id, {})[ast.dump(value)] = value
+    return bindings
 
 
 def expand_url_part(node, bindings):
@@ -11271,129 +11363,213 @@ def expand_url_part(node, bindings):
     return [node]
 
 
-def url_parts(url, assignments):
-    """Resolve earlier local assignments and nested f-strings for a URL argument."""
-    bindings = {}
-    for assignment in assignments:
-        if assignment.lineno < url.lineno:
-            for target in assignment.targets:
-                if isinstance(target, ast.Name):
-                    value = assignment.value
-                    bindings.setdefault(target.id, {})[ast.dump(value)] = value
+def url_expression(url, bindings):
+    """Resolve an argument's local name to its defining expression."""
+    for _ in range(len(bindings) + 1):
+        (expression,) = expand_url_part(url, bindings) if isinstance(url, ast.Name) else [url]
+        if expression is url:
+            return url
+        url = expression
+    pytest.fail(f"cyclic transport URL at {SCRIPT}:{url.lineno}: {ast.unparse(url)}")
+
+
+def source_path(url, bindings):
+    """Fill f-string fields with markers and preserve literal path components."""
     parts = [url]
     for _ in range(3 * len(bindings) + 4):
         expanded = [part for node in parts for part in expand_url_part(node, bindings)]
         if expanded == parts:
-            return parts
+            return "".join(
+                str(part.value)
+                if isinstance(part, ast.Constant)
+                else URL_FRAGMENTS.get(ast.unparse(part), "~")
+                for part in parts
+            )
         parts = expanded
-    pytest.fail(f"could not resolve REST URL at line {url.lineno}: {ast.unparse(url)}")
+    pytest.fail(f"unresolved REST URL at {SCRIPT}:{url.lineno}: {ast.unparse(url)}")
 
 
-def source_path(parts):
-    """Fill symbolic URL parts so the same normalizer handles source and requests."""
-    return "".join(
-        str(part.value)
-        if isinstance(part, ast.Constant)
-        else URL_FRAGMENTS.get(ast.unparse(part), "~")
-        for part in parts
-    )
-
-
-def rest_call_routes(scope, node, assignments, forwarded, issued):
-    """Resolve a train transport call, counting explicit forwards and forge-issued URLs."""
-    called = node.func.id
-    index, argument = REST_URL_ARGS[called]
-    url = call_argument(node, index, argument)
-    assert url is not None, ast.unparse(node)
-    name = getattr(scope, "name", "<module>")
-    site = (name, called, ast.unparse(url))
-    if site in FORWARDED_URLS:
-        forwarded.append(site)
-        return ()
-    if called == "call" and ast.unparse(url) == "env['GITHUB_GRAPHQL_URL']":
-        return ()
+def rest_call_routes(name, called, node, url, assignments):
+    """Accept only URLs derived from literal, formatted or declared forge values."""
+    bindings = url_bindings(url, assignments)
+    expression = url_expression(url, bindings)
+    issued = FORGE_ISSUED_URLS.get((name, ast.unparse(expression)))
+    if issued:
+        return issued
+    assert isinstance(expression, ast.JoinedStr) or (
+        isinstance(expression, ast.Constant) and isinstance(expression.value, str)
+    ), f"{SCRIPT}:{url.lineno}: unsupported {called} URL: {ast.unparse(expression)}"
     method = call_argument(node, 2, "method", default=ast.Constant("POST"))
-    assert called != "call" or isinstance(method, ast.Constant), ast.unparse(node)
-    parts = url_parts(url, assignments)
-    if len(parts) == 1 and (external := (name, ast.unparse(parts[0]))) in FORGE_ISSUED_URLS:
-        issued.append(external)
-        return FORGE_ISSUED_URLS[external]
-    return (rest_route(method.value if called == "call" else "GET", source_path(parts)),)
+    assert called != "call" or isinstance(method, ast.Constant), (
+        f"{SCRIPT}:{node.lineno}: unsupported transport method: {ast.unparse(method)}"
+    )
+    try:
+        route = rest_route(
+            method.value if called == "call" else "GET",
+            source_path(expression, bindings),
+            source=True,
+        )
+    except AssertionError as failure:
+        raise AssertionError(f"{SCRIPT}:{url.lineno}: {failure}") from failure
+    return (route,)
 
 
-def rest_fault_routes():
-    """Find every train REST route from its transport call sites and forwarding wrappers."""
-    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+def transport_reference(node, parent):
+    """Identify transport references and reject aliases of the underlying urllib module."""
+    if isinstance(node, ast.Name) and node.id in TRANSPORT_NAMES:
+        return node.id
+    if isinstance(node, ast.Attribute) and (
+        node.attr in TRANSPORT_NAMES
+        or (isinstance(node.value, ast.Name) and node.value.id == "forge_opener")
+    ):
+        return ast.unparse(node)
+    if isinstance(node, ast.Name) and node.id == "forge_opener":
+        if isinstance(parent, ast.Attribute) and parent.attr == "open":
+            return None
+        return node.id
+    if (
+        isinstance(node, ast.Name)
+        and node.id == "urllib"
+        and (
+            not isinstance(parent, ast.Attribute)
+            or parent.attr not in {"error", "parse", "request"}
+        )
+    ):
+        return node.id
+    if isinstance(node, ast.Attribute) and ast.unparse(node) == "urllib.request":
+        if not isinstance(parent, ast.Attribute):
+            return "urllib.request"
+        return None
+    if isinstance(node, ast.Attribute) and ast.unparse(node.value) == "urllib.request":
+        return ast.unparse(node)
+    return None
+
+
+def allowed_opener_use(name, ref, node, parents, tree):
+    """Allow only the production request adapter's opener construction and handler class."""
+    parent = parents.get(node)
+    if ref == "urllib.request.HTTPRedirectHandler":
+        return (
+            isinstance(parent, ast.ClassDef)
+            and parent.name == "NoRedirect"
+            and parent in tree.body
+            and node in parent.bases
+        )
+    if name != "request_once":
+        return False
+    if ref == "forge_opener" and isinstance(node.ctx, ast.Store):
+        return isinstance(parent, ast.Assign) and ast.dump(parent) == OPENER_SETUP
+    if (
+        ref == "urllib.request.build_opener"
+        and isinstance(parent, ast.Call)
+        and parent.func is node
+    ):
+        branch = parents[parent]
+        return isinstance(branch, ast.IfExp) and ast.dump(parents[branch]) == OPENER_SETUP
+    return False
+
+
+def transport_calls(tree):
+    """Yield every direct transport call and refuse other transport references."""
+    parents = parent_nodes(tree)
+    top = set(top_level_functions(tree).values())
+    for scope, node in scoped_nodes(tree):
+        name = scope.name if scope in top else "<non-top-level>"
+        parent = parents.get(node)
+        if isinstance(node, ast.Import):
+            assert not any(
+                alias.asname and alias.name in {"urllib", "urllib.request"} for alias in node.names
+            ), f"{SCRIPT}:{node.lineno}: urllib request import alias"
+        if isinstance(node, ast.ImportFrom):
+            assert node.module != "urllib.request" and (
+                node.module != "urllib"
+                or all(alias.name not in {"request", "*"} for alias in node.names)
+            ), f"{SCRIPT}:{node.lineno}: urllib request import alias"
+        ref = transport_reference(node, parent)
+        if ref is None or allowed_opener_use(name, ref, node, parents, tree):
+            continue
+        assert (
+            isinstance(parent, ast.Call)
+            and parent.func is node
+            and not isinstance(scope, (ast.Lambda, ast.ClassDef))
+        ), f"{SCRIPT}:{node.lineno}: unsupported transport reference: {ref}"
+        yield scope, name, ref, parent
+
+
+def rest_fault_routes(tree):
+    """Derive REST routes independently of the stand-in forge and fault scenarios."""
     assignments = {}
-    calls = []
     for scope, node in scoped_nodes(tree):
         if isinstance(node, ast.Assign):
             assignments.setdefault(scope, []).append(node)
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in REST_URL_ARGS
-        ):
-            calls.append((scope, node))
-    forwarded, issued = [], []
     routes = {}
-    for scope, node in calls:
-        for route in rest_call_routes(scope, node, assignments.get(scope, ()), forwarded, issued):
-            routes.setdefault(route, []).append(getattr(scope, "name", "<module>"))
-    assert sorted(forwarded) == sorted(FORWARDED_URLS)
-    assert sorted(issued) == sorted(FORGE_ISSUED_URLS)
+    for scope, name, ref, node in transport_calls(tree):
+        url = call_argument(node, *TRANSPORT_URL.get(ref, (0, "url")))
+        site = (name, ref, ast.unparse(url) if url is not None else "")
+        if site in TRANSPORT_FORWARDS:
+            continue
+        assert ref in TRANSPORT_URL and url is not None, (
+            f"{SCRIPT}:{node.lineno}: unsupported transport call: {ast.unparse(node)}"
+        )
+        for route in rest_call_routes(name, ref, node, url, assignments.get(scope, ())):
+            routes.setdefault(route, []).append(name)
     return routes
 
 
-def rest_fault_cases():
-    """Require separate scenarios when different callers use the same REST route."""
-    cases = {}
-    for route, callers in rest_fault_routes().items():
-        once = not route.startswith("GET ")
+def rest_fault_cases(tree):
+    """Keep distinct call-site fault cases when direct routes are shared."""
+    cases = set()
+    for route, callers in rest_fault_routes(tree).items():
         if len(callers) == 1:
-            cases[route] = (route, once, None)
+            cases.add(route)
         else:
             assert len(callers) == len(set(callers)), (route, callers)
-            for caller in callers:
-                cases[f"{route} [{caller}]"] = (route, once, caller)
+            cases.update(f"{route} [{caller}]" for caller in callers)
     return cases
 
 
-def forge_fault_inventory(train_mod, rules, patch):
-    """Pair every GraphQL operation and source-derived REST route with its retry policy."""
-    docs = train_graphql_documents(train_mod, rules, file_modes_document(train_mod, patch))
-    operations = {
-        (name := train_mod.graphql_name(doc)): (name, doc.lstrip().startswith("mutation"), None)
-        for doc in docs
-    }
-    routes = rest_fault_cases()
-    assert operations.keys().isdisjoint(routes)
-    return operations | routes
-
-
-def pytest_generate_tests(metafunc):
-    """Parametrize the fault sweep from the train's GraphQL and REST inventories."""
-    if "forge_fault" not in metafunc.fixturenames:
-        return
-    with tempfile.TemporaryDirectory() as temporary, pytest.MonkeyPatch.context() as patch:
-        path = Path(temporary)
-        rules = load_rules(path)
-        patch.setitem(sys.modules, "train_rules", rules)
-        inventory = forge_fault_inventory(load_train(path, patch), rules, patch)
-    cases = [pytest.param((case, *detail), id=case) for case, detail in sorted(inventory.items())]
-    metafunc.parametrize("forge_fault", cases)
-
-
 def test_forge_fault_inventory(tmp_path, monkeypatch):
-    """New and removed forge routes require a matching scenario or a reason."""
+    """Require a fault scenario for every source-derived REST route and GraphQL document."""
     rules = load_rules(tmp_path)
-    inventory = forge_fault_inventory(load_train(tmp_path, monkeypatch), rules, monkeypatch)
-    assert FAULT_SCENARIOS.keys() <= inventory.keys()
-    assert inventory.keys() - FAULT_SCENARIOS.keys() == UNREACHED_FORGE_FAULTS.keys()
-    assert all(
-        reason.strip() and len(reason.splitlines()) == 1
-        for reason in UNREACHED_FORGE_FAULTS.values()
-    )
+    train_mod = load_train(tmp_path, monkeypatch)
+    docs = train_graphql_documents(train_mod, rules, file_modes_document(train_mod, monkeypatch))
+    static_cases = rest_fault_cases(ast.parse(script())) | {
+        train_mod.graphql_name(doc) for doc in docs
+    }
+    assert FAULT_SCENARIOS.keys() == static_cases
+
+
+@pytest.mark.parametrize(
+    ("fragment", "message"),
+    [
+        ("api_get = call", "unsupported transport reference: call"),
+        ("alias = pages", "unsupported transport reference: pages"),
+        ("send(release_off_get)", "unsupported transport reference: release_off_get"),
+        ("def get(): return call", "unsupported transport reference: call"),
+        ("functools.partial(call, '/app')", "unsupported transport reference: call"),
+        ("def get(api): return api.call('/app')", r"unsupported transport call: api\.call"),
+        ("run = lambda: call('/app')", "unsupported transport reference: call"),
+        ("def get(url): return call(url)", "unsupported call URL: url"),
+        ("from urllib import request as api", "urllib request import alias"),
+        ("opener = urllib.request.build_opener()", r"unsupported transport call: urllib\.request"),
+        ("urllib.request.urlopen('/app')", r"unsupported transport call: urllib\.request"),
+        ("def get(): return forge_opener", "unsupported transport reference: forge_opener"),
+    ],
+)
+def test_transport_allow_list_refuses_undeclared_uses(fragment, message):
+    """Reject indirect transport references and forwarding through undeclared wrappers."""
+    with pytest.raises(AssertionError, match=rf"merge_train.py:\d+: {message}"):
+        rest_fault_routes(ast.parse(f"{fragment}\n"))
+
+
+def test_source_route_does_not_match_another_routes_placeholder():
+    """Keep literal contents endpoints intact when deriving source coverage."""
+    source = """def get(api, target):
+    return call(f"{api}/repos/{target['full_name']}/contents/fixed.txt", method="GET")
+"""
+    route = "GET /repos/{owner}/{repo}/contents/fixed.txt"
+    assert rest_fault_cases(ast.parse(source)) == {route}
+    assert route not in FAULT_SCENARIOS
 
 
 def artifact_fault_forge():
@@ -11435,10 +11611,10 @@ def reviewed_fault_forge():
     )
 
 
-def release_fault_forge():
-    """An old repository name redirects to the release-enabled repository's ID."""
+def release_fault_forge(location="/repositories/7000"):
+    """An old name redirects to metadata for a release-enabled repository."""
     forge = Forge(repository(pull(1, "CLEAN"), release=(True, True)))
-    forge.repository_moves["/repos/former/app"] = "/repositories/7000"
+    forge.repository_moves["/repos/former/app"] = location
     return forge
 
 
@@ -11473,7 +11649,7 @@ FAULT_SCENARIOS = {
             ARTIFACTS_ROUTE,
             ALLOWLIST_ROUTE,
             ARCHIVE_ROUTE,
-            STORAGE_ROUTE,
+            STORAGE_CASE,
             FILE_CONTENTS_ROUTE,
             "CreateCommit",
             "MergeState",
@@ -11507,15 +11683,45 @@ FAULT_SCENARIOS = {
     "ReviewBodies": reviewed_fault_forge,
     PERMISSION_ROUTE: functools.partial(_maintainer_forge, comments=(_maintainer_answer(),)),
     RECREATE_LABEL_CASE: unsigned_label_fault_forge,
-    **dict.fromkeys((RELEASE_NAME_ROUTE, RELEASE_ID_ROUTE), release_fault_forge),
+    **dict.fromkeys((RELEASE_NAME_ROUTE, RELEASE_ID_CASE), release_fault_forge),
+    RELEASE_RENAMED_CASE: functools.partial(release_fault_forge, "/repos/fleet/app"),
 }
 FAULT_SETTINGS = {
     **dict.fromkeys(
         ("Dequeue", "Disarm", "PullPageWithStatus"), {"required_status": "lanes/booked"}
     ),
-    **dict.fromkeys((RELEASE_NAME_ROUTE, RELEASE_ID_ROUTE), {"release_off": "former/app"}),
+    **dict.fromkeys(
+        (RELEASE_NAME_ROUTE, RELEASE_RENAMED_CASE, RELEASE_ID_CASE), {"release_off": "former/app"}
+    ),
     RECREATE_LABEL_CASE: {"min_age_days": "0"},
 }
+
+
+def fault_request_key(case):
+    """Translate a case ID to the forge's method, route and stage key."""
+    route, _, variant = case.partition(" [")
+    method, separator, path = route.partition(" ")
+    if not separator:
+        return "POST", f"/graphql [{case}]", "direct"
+    return method, path, "redirect" if variant == "redirect]" else "direct"
+
+
+def fault_case_caller(case):
+    """Identify the expected caller when several write sites use the same route."""
+    _, _, variant = case.partition(" [")
+    return variant.removesuffix("]") if variant and variant != "redirect]" else None
+
+
+def graphql_fault_attempts(case, train_mod, patch, path):
+    """Use the document's read policy and include both pull-page splits."""
+    docs = train_graphql_documents(
+        train_mod, load_rules(path), file_modes_document(train_mod, patch)
+    )
+    (document,) = (doc for doc in docs if train_mod.graphql_name(doc) == case)
+    if document.lstrip().startswith("mutation"):
+        return 1
+    splits = 2 if case in {"PullPage", "PullPageWithStatus"} else 0
+    return train_mod.READ_ATTEMPTS + splits
 
 
 def observe_rest_fault_callers(train_mod, patch, route):
@@ -11624,6 +11830,7 @@ FAULT_NOTES = {
         ("BLOCKED", "generated files refused: "),
     ),
 }
+RELEASE_FAULTS = {RELEASE_NAME_ROUTE, RELEASE_RENAMED_CASE, RELEASE_ID_CASE}
 
 
 def assert_note_disposition(key, forge, reason, destinations):
@@ -11688,18 +11895,9 @@ def assert_fatal_fault(case, reason, refusals, destinations):
     )
 
 
-def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, forge_fault):
-    """Spend each operation's 502 retries and inspect its disposition and every destination."""
-    case, key, once, caller = forge_fault
-    assert case in FAULT_SCENARIOS or case in UNREACHED_FORGE_FAULTS, case
-    forge = FAULT_SCENARIOS.get(case, pull_fault_forge)()
+def run_fault_scenario(tmp_path, forge, case, train_mod, monkeypatch, capfd, caller=None):
+    """Run a clean or faulted scenario with the same fake clock and transport."""
     settings = {**FAULT_SETTINGS.get(case, {}), "release_file": str(tmp_path / "releases.json")}
-    train_mod = load_train(tmp_path, monkeypatch)
-    attempts = 1 if once else train_mod.READ_ATTEMPTS
-    if key in {"PullPage", "PullPageWithStatus"}:
-        attempts += 2  # The two splits precede the retries at the minimum page size.
-    faults = [(502, FORGE_FAULT_BODY)] * attempts
-    forge.rest_faults[key] = faults
     with train_environment(tmp_path, forge, settings) as env:
         clock = types.SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None, time=time.time)
         monkeypatch.setattr(train_mod, "time", clock)
@@ -11710,34 +11908,73 @@ def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, forge_
             lambda *handlers: opener(urllib.request.ProxyHandler({}), *handlers),
         )
         refusals = observe_sweep_refusals(train_mod, monkeypatch)
-        callers = observe_rest_fault_callers(train_mod, monkeypatch, key) if caller else []
+        route = case.partition(" [")[0]
+        callers = observe_rest_fault_callers(train_mod, monkeypatch, route) if caller else []
         code = train_mod.main(env)
+    return (
+        code,
+        refusals,
+        callers,
+        fault_destinations(env, capfd.readouterr()),
+        env["GITHUB_API_URL"],
+    )
 
-    output = fault_destinations(env, capfd.readouterr())
-    consumed = len(forge.fault_requests)
-    record_property("faults_consumed", consumed)
-    if case in UNREACHED_FORGE_FAULTS:
-        assert consumed == 0, f"{case} is now reached"
-        return
-    assert not faults and consumed == attempts, f"{case}: consumed {consumed} of {attempts} faults"
-    if caller:
-        assert callers == [caller]
-    reason = fault_reason(key, forge, env["GITHUB_API_URL"])
-    if key in FAULT_NOTES or key in {REVOKE_ROUTE, RELEASE_NAME_ROUTE, RELEASE_ID_ROUTE}:
+
+def assert_fault_disposition(case, forge, code, refusals, output, origin):
+    """Check the scenario's exit, writes, exact diagnostics and release destinations."""
+    route = case.partition(" [")[0]
+    reason = fault_reason(route, forge, origin)
+    if route in FAULT_NOTES or case in RELEASE_FAULTS or case == REVOKE_ROUTE:
         assert code == 0 and refusals == [], output
-        if key in FAULT_NOTES:
-            assert_note_disposition(key, forge, reason, output)
+        if route in FAULT_NOTES:
+            assert_note_disposition(route, forge, reason, output)
         else:
-            assert_fault_warning(key, forge, reason, output)
+            assert_fault_warning(case, forge, reason, output)
     else:
         assert code == 1, output
         assert_fatal_fault(case, reason, refusals, output)
-    if key != LIST_INSTALLATIONS_ROUTE:
+    if case != LIST_INSTALLATIONS_ROUTE:
         (line,) = output["output"].splitlines()
         assert line.startswith("releases=")
         assert (
             json.loads(line.removeprefix("releases=")) == json.loads(output["release"])["releases"]
         )
+
+
+@pytest.mark.parametrize("case", sorted(FAULT_SCENARIOS))
+def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case):
+    """Require faults for every clean request, then exhaust this case's fault queue."""
+    key = fault_request_key(case)
+    clean = FAULT_SCENARIOS[case]()
+    clean_path = tmp_path / "clean"
+    clean_path.mkdir()
+    with monkeypatch.context() as patch:
+        train_mod = load_train(clean_path, patch)
+        code, refusals, _, output, _ = run_fault_scenario(
+            clean_path, clean, case, train_mod, patch, capfd
+        )
+    covered = {fault_request_key(scenario) for scenario in FAULT_SCENARIOS}
+    assert not (missing := clean.request_ledger - covered), f"{case}: no fault cases for {missing}"
+    assert code == 0 and not refusals, output
+    assert key in clean.request_ledger, f"{case}: clean run never reached {key}"
+
+    forge = FAULT_SCENARIOS[case]()
+    train_mod = load_train(tmp_path, monkeypatch)
+    attempts = train_mod.READ_ATTEMPTS if key[0] == "GET" else 1
+    if key[1].startswith("/graphql ["):
+        attempts = graphql_fault_attempts(case, train_mod, monkeypatch, tmp_path)
+    faults = [(502, FORGE_FAULT_BODY)] * attempts
+    forge.rest_faults[key] = faults
+    caller = fault_case_caller(case)
+    code, refusals, callers, output, origin = run_fault_scenario(
+        tmp_path, forge, case, train_mod, monkeypatch, capfd, caller
+    )
+    consumed = len(forge.fault_requests)
+    record_property("request_key", key)
+    record_property("faults_consumed", consumed)
+    assert not faults and consumed == attempts, f"{case}: consumed {consumed} of {attempts} faults"
+    assert callers == ([caller] if caller else [])
+    assert_fault_disposition(case, forge, code, refusals, output, origin)
 
 
 def test_report_escapes_pipe_in_notes_cell(tmp_path, monkeypatch):
@@ -11780,51 +12017,234 @@ def test_emit_writes_each_record_on_one_line(tmp_path, monkeypatch, capfd):
     assert r"| stopped\|account | suspended second cell \| | | | |" in stdout.splitlines()
 
 
-TRAIN_WRITERS = {
-    "annotate": "Writes workflow annotations to stdout.",
-    "append": "Appends rendered reports or JSON workflow outputs to their files.",
-    "emit": "Writes the same report records to stdout and the step summary.",
-    "write_release_outputs": "Serializes the release payload to its JSON file.",
-    "write_key": "Feeds the app key into the subprocess pipe.",
+@pytest.mark.parametrize("queued", [False, True], ids=["immediate", "queued"])
+def test_annotation_title_stays_on_one_line(tmp_path, monkeypatch, capfd, queued):
+    """A multiline annotation title remains on the same line as its diagnostic."""
+    mod = load_train(tmp_path, monkeypatch)
+    records = [] if queued else None
+    mod.annotate("warning", "first line\r\nsecond line", "message", records=records)
+    expected = "::warning title=first line second line::message\n"
+    if queued:
+        assert capfd.readouterr().out == ""
+        summary = tmp_path / "summary"
+        mod.emit({"GITHUB_STEP_SUMMARY": str(summary)}, records)
+        assert summary.read_text(encoding="utf-8") == expected
+    captured = capfd.readouterr()
+    assert captured.out == expected
+    assert captured.err == ""
+
+
+REPORT_SINK = "write_records"
+PIPE_WRITER = "write_key"  # The app key goes to an openssl pipe.
+RAW_WRITES = {
+    "print",
+    "write",
+    "write_text",
+    "write_bytes",
+    "writelines",
+    "json.dump",
+    "logging.basicConfig",
+    "logging.handlers",
+    "logging.log",
+    "logging.error",
+    "logging.warning",
+    "logging.info",
+    "logging.debug",
+    "logging.critical",
+    "addHandler",
+    "shutil.copy",
+    "shutil.copy2",
+    "shutil.copyfile",
+    "shutil.copyfileobj",
+    "shutil.copytree",
+    "shutil.move",
+    "os.open",
 }
+WRITER_OPENS = {"open", "builtins.open", "io.open", "os.fdopen"}
+WRITER_MODULES = {"builtins", "io", "json", "logging", "os", "shutil"}
 
 
-def writes_output(node):
-    """Recognize direct writes, printing, JSON dumps and opens with writable modes."""
-    if not isinstance(node, ast.Call):
-        return False
-    function = ast.unparse(node.func)
+def raw_writer_name(function):
+    """Recognize sink APIs regardless of whether a reference invokes or aliases them."""
     name = function.rsplit(".", 1)[-1]
-    if (
-        name in {"print", "write", "write_text", "write_bytes", "writelines"}
-        or function == "json.dump"
-    ):
-        return True
-    if name not in {"open", "fdopen"} or function == "opener.open":
-        return False
-    index = 1 if function in {"open", "builtins.open", "io.open", "os.fdopen"} else 0
-    mode = call_argument(node, index, "mode")
-    return mode is not None and (
-        not isinstance(mode, ast.Constant) or any(flag in str(mode.value) for flag in "wax+")
+    return (
+        function in RAW_WRITES
+        or name in RAW_WRITES
+        or (function.startswith("logging.") and name.endswith("Handler"))
     )
 
 
-def test_train_writes_only_through_declared_writers():
-    """A new writer or inline annotation literal must pass through the allowed boundary."""
-    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    writers, inline_commands = set(), []
+def writes_output(node, parent):
+    """Recognize raw output functions and opens with writable or unresolved modes."""
+    if isinstance(node, ast.alias):
+        if isinstance(parent, ast.ImportFrom):
+            module = parent.module or ""
+            return module.split(".")[0] in WRITER_MODULES and (
+                raw_writer_name(f"{module}.{node.name}") or node.name in {"open", "fdopen", "*"}
+            )
+        return bool(node.asname) and node.name.split(".")[0] in WRITER_MODULES
+    if not isinstance(node, (ast.Attribute, ast.Name)):
+        return False
+    function = ast.unparse(node)
+    if raw_writer_name(function):
+        return True
+    name = function.rsplit(".", 1)[-1]
+    if name not in {"open", "fdopen"} or function == "forge_opener.open":
+        return False
+    if not isinstance(parent, ast.Call) or parent.func is not node:
+        return True
+    index = int(function in WRITER_OPENS)
+    mode = call_argument(parent, index, "mode")
+    if mode is None:
+        return any(isinstance(arg, ast.Starred) for arg in parent.args) or any(
+            arg.arg is None for arg in parent.keywords
+        )
+    return not isinstance(mode, ast.Constant) or any(flag in str(mode.value) for flag in "wax+")
+
+
+def annotation_fragment(node, parents):
+    """Reserve workflow command delimiters and split delimiter fragments for annotate."""
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        return False
+    text = node.value
+    parent = parents[node]
+    if (
+        isinstance(parent, ast.Call)
+        and ast.unparse(parent.func) == "re.compile"
+        and not ANNOTATION_COMMAND.search(text)
+    ):
+        text = text.replace("(?::", "(?:")
+    if text == ":":
+        keyword = parents[parent]
+        call = parents.get(keyword)
+        return not (
+            isinstance(parent, ast.Tuple)
+            and isinstance(keyword, ast.keyword)
+            and keyword.arg == "separators"
+            and isinstance(call, ast.Call)
+            and ast.unparse(call.func) == "json.dumps"
+        )
+    return "::" in text or (text.startswith(":") and not text[1].isspace())
+
+
+def writer_violations(tree):
+    """Find writes and command fragments outside their exact top-level definitions."""
+    functions = top_level_functions(tree)
+    writers = {functions[REPORT_SINK], functions[PIPE_WRITER]}
+    writer_body = {
+        node: writer for writer in writers for stmt in writer.body for node in ast.walk(stmt)
+    }
+    annotation = functions["annotate"]
+    annotation_body = {node for stmt in annotation.body for node in ast.walk(stmt)}
+    parents = parent_nodes(tree)
+    found = []
     for scope, node in scoped_nodes(tree):
-        name = getattr(scope, "name", "<module>")
-        if writes_output(node):
-            writers.add(name)
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and ANNOTATION_COMMAND.search(node.value)
-            and name != "annotate"
+        parent = parents.get(node)
+        name = getattr(scope, "name", type(scope).__name__)
+        writer = writer_body.get(node)
+        if scope is node and writer is not None:
+            found.append((node.lineno, f"nested {name} in {writer.name}"))
+        if writes_output(node, parent) and (
+            writer is not scope
+            or (
+                scope is functions[PIPE_WRITER]
+                and ast.unparse(node) not in {"os.fdopen", "pipe.write"}
+            )
         ):
-            inline_commands.append((name, node.lineno))
-    assert (writers, inline_commands) == (set(TRAIN_WRITERS), [])
+            found.append((node.lineno, f"{name} writes through {ast.unparse(node)}"))
+        if (scope is not annotation or node not in annotation_body) and annotation_fragment(
+            node, parents
+        ):
+            found.append((node.lineno, f"{name} builds a workflow annotation"))
+    return [f"{SCRIPT}:{line}: {message}" for line, message in found]
+
+
+def test_train_writes_only_through_declared_writers():
+    """Reject raw writes outside the report sink and the subprocess pipe writer."""
+    assert writer_violations(ast.parse(script())) == []
+
+
+@pytest.mark.parametrize(
+    ("statement", "target", "message"),
+    [
+        ('print("line")', "emit", "emit writes through print"),
+        ('sys.stderr.write("line")', "summary", "summary writes through sys.stderr.write"),
+        ('os.write(1, b"line")', "summary", "summary writes through os.write"),
+        ('Path("file").write_text("line")', "summary", "summary writes through"),
+        ('Path("file").write_bytes(b"line")', "summary", "summary writes through"),
+        ('open("file", "w")', "summary", "summary writes through open"),
+        ('io.open("file", mode)', "summary", "summary writes through io.open"),
+        ('io.open("file", **options)', "summary", "summary writes through io.open"),
+        ('os.fdopen(fd, "a")', "summary", "summary writes through os.fdopen"),
+        ("json.dump(data, handle)", "summary", "summary writes through json.dump"),
+        ("shutil.copyfile(src, dst)", "summary", "summary writes through shutil.copyfile"),
+        ("logging.FileHandler(path)", "summary", "summary writes through logging.FileHandler"),
+        ("from logging import FileHandler as log", "summary", "summary writes through FileHandler"),
+        ('def emit(): sys.stdout.write("line")', "summary", "emit writes through sys.stdout.write"),
+        ('def emit(): return "line"', REPORT_SINK, "nested emit in write_records"),
+        ('action = lambda: "line"', REPORT_SINK, "nested Lambda in write_records"),
+        ("class Writer: pass", PIPE_WRITER, "nested Writer in write_key"),
+        ('sys.stdout.write("line")', PIPE_WRITER, "write_key writes through sys.stdout.write"),
+    ],
+)
+def test_writer_boundary_refuses_raw_writes_and_nested_scopes(statement, target, message):
+    """Exercise forbidden APIs, repeated writer names and nested scope identities."""
+    source = script()
+    function = top_level_functions(ast.parse(source))[target]
+    lines = source.splitlines(keepends=True)
+    lines.insert(function.body[0].end_lineno, f"    {statement}\n")
+    assert any(message in error for error in writer_violations(ast.parse("".join(lines))))
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        '"::notice title=Train::line"',
+        '":" + ":warning title=Train::line"',
+        '"%s%s%s" % (":", ":", "error title=Train")',
+        '"{}{}notice".format(":", ":")',
+        '"".join((":", ":", "warning"))',
+        "f\"{':' * 2}error\"",
+    ],
+    ids=["literal", "concatenation", "percent", "format", "join", "f-string"],
+)
+def test_annotation_boundary_refuses_command_fragments(expression):
+    """Reject command syntax, including constants split across a construction."""
+    tree = ast.parse(f"{script()}\nCOMMAND = {expression}\n")
+    assert any("Module builds a workflow annotation" in error for error in writer_violations(tree))
+
+
+def raw_table_cells(tree):
+    """Find fields that can introduce a row break or an extra cell."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        literals = "".join(value.value for value in node.values if isinstance(value, ast.Constant))
+        if not literals.startswith("|"):
+            continue
+        for part in node.values:
+            if isinstance(part, ast.FormattedValue) and not (
+                isinstance(part.value, ast.Call)
+                and ast.unparse(part.value.func) == "note_cell"
+                and len(part.value.args) == 1
+                and not part.value.keywords
+                and part.conversion == -1
+                and part.format_spec is None
+            ):
+                found.append(f"{SCRIPT}:{part.value.lineno}: {ast.unparse(part.value)}")
+    return found
+
+
+def test_table_rows_escape_every_cell():
+    """Require note_cell for each interpolated field in any table-row f-string."""
+    assert raw_table_cells(ast.parse(script())) == []
+
+
+def test_table_cell_guard_refuses_raw_interpolation():
+    """A row using note_cell in one field still needs it in every other field."""
+    tree = ast.parse('row = f"| {note_cell(account)} | {raw_tally} |"')
+    assert raw_table_cells(tree) == [f"{SCRIPT}:1: raw_tally"]
 
 
 @pytest.mark.parametrize("operation", ["RetryHistory", "FileModes"])
@@ -13168,7 +13588,9 @@ def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
         "GITHUB_OUTPUT": str(tmp_path / "output"),
     }
-    mod.emit(env, mod.summary(env, {}, [], [], [], [], [], []))
+    records = mod.summary(env, {}, [], [], [], [], [], [])
+    if records is not None:
+        mod.emit(env, records)
     assert capsys.readouterr().out.count("review bots: none set, zero-review hold off") == 1
 
 
@@ -13340,14 +13762,13 @@ def test_summary_release_file_matches_output(tmp_path, monkeypatch, write_file):
     releases = [{"owner": "a", "name": f"r{i}"} for i in range(mod.MAX_RELEASES + 1)]
     mod.emit(env, mod.summary(env, {}, [], [], [], releases, [], []))
     mod.write_release_outputs(env, releases)
+    assert len(releases) == mod.MAX_RELEASES
+    expected = json.dumps(releases, separators=(",", ":"))
+    assert (tmp_path / "output").read_text(encoding="utf-8") == f"releases={expected}\n"
     assert path.exists() == write_file
     if write_file:
-        assert json.loads(path.read_text()) == {
-            "format": 1,
-            "hold_labels": "hold,exact ",
-            "releases": releases_of(tmp_path),
-        }
-        assert len(releases_of(tmp_path)) == mod.MAX_RELEASES
+        payload = {"format": 1, "hold_labels": "hold,exact ", "releases": releases_of(tmp_path)}
+        assert path.read_bytes() == json.dumps(payload, separators=(",", ":")).encode()
 
 
 @pytest.mark.parametrize("mutation", ["extra-open", "wrong-path", "wrong-mode"])
@@ -13357,12 +13778,10 @@ def test_report_writer_open_allow_list_refuses_other_files(mutation):
         source += "\nopen('unexpected.txt', 'w')\n"
     elif mutation == "wrong-path":
         source = source.replace(
-            'open(path, "w", encoding="utf-8")', 'open("unexpected.txt", "w", encoding="utf-8")'
+            'open(path, mode, encoding="utf-8")', 'open("unexpected.txt", mode, encoding="utf-8")'
         )
     else:
-        source = source.replace(
-            'open(path, "a", encoding="utf-8")', 'open(path, "w", encoding="utf-8")'
-        )
+        source = source.replace('mode = "w" if replace else "a"', 'mode = "w"')
     assert not allowed_report_opens(source)
     assert key_on_disk(source) == ["open() outside the summary and release file writers"]
 

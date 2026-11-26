@@ -766,9 +766,11 @@ def request_once(url, token, method, body, raw, redirect):
         request.add_header("Authorization", f"Bearer {token}")
     request.add_header("Accept", "application/vnd.github+json")
     request.add_header("X-GitHub-Api-Version", "2022-11-28")
-    opener = urllib.request.build_opener() if redirect else urllib.request.build_opener(NoRedirect)
+    forge_opener = (
+        urllib.request.build_opener() if redirect else urllib.request.build_opener(NoRedirect)
+    )
     try:
-        with opener.open(request, timeout=TIMEOUT) as answer:
+        with forge_opener.open(request, timeout=TIMEOUT) as answer:
             content = answer.read(MAX_ARTIFACT_BYTES + 1)
             if len(content) > MAX_ARTIFACT_BYTES:
                 raise RefusedError(f"{method} {url}: response exceeds {MAX_ARTIFACT_BYTES} bytes")
@@ -831,6 +833,7 @@ def pull_page_budget_message(query):
 
 
 def add_refusal_context(err, context):
+    """Insert context after the operation name while preserving the exception and cause."""
     message = str(err)
     if message.startswith("graphql "):
         operation, _, reason = message.partition(": ")
@@ -2651,10 +2654,17 @@ def sweep(env, conf, started):
     return accounts, sections, refusals, skipped, releases, off, unsigned_bots
 
 
-def append(path, text):
-    """Append rendered report text or a JSON workflow output to its destination."""
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(text)
+def write_records(records, *, path=None, replace=False):
+    """Flatten each record and write it to stdout or the requested file."""
+    text = "\n".join(refusal_line(record) for record in records)
+    if not replace:
+        text += "\n"
+    if path is None:
+        sys.stdout.write(text)
+    else:
+        mode = "w" if replace else "a"
+        with open(path, mode, encoding="utf-8") as handle:
+            handle.write(text)
 
 
 def review_bots_note(env):
@@ -2696,8 +2706,9 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
             lines.append(f"| {note_cell(account)} | {note_cell(tally)} | | | |")
         else:
             lines.append(
-                f"| {note_cell(account)} | {tally['repositories']} | {tally['landed']} "
-                f"| {tally['updated']} | {tally['refused']} |"
+                f"| {note_cell(account)} | {note_cell(tally['repositories'])} "
+                f"| {note_cell(tally['landed'])} | {note_cell(tally['updated'])} "
+                f"| {note_cell(tally['refused'])} |"
             )
     if refusals:
         lines += ["", "Refused:", ""] + [f"- {refusal_line(line)}" for line in refusals]
@@ -2717,29 +2728,29 @@ def annotate(level, title, text, *, records=None):
     """Write a workflow annotation or queue it as a record for both report destinations."""
     line = f"::{level} title={title}::{refusal_line(text)}"
     if records is None:
-        sys.stdout.write(line + "\n")
+        write_records([line])
     else:
         records.append(line)
 
 
 def emit(env, records):
     """Write the same single-line records to stdout and the step summary."""
-    text = "\n".join(refusal_line(record) for record in records) + "\n"
-    sys.stdout.write(text)
-    append(env["GITHUB_STEP_SUMMARY"], text)
+    write_records(records)
+    write_records(records, path=env["GITHUB_STEP_SUMMARY"])
 
 
 def write_release_outputs(env, releases):
     """Write the selected releases as JSON for the downstream workflow and release file."""
-    append(env["GITHUB_OUTPUT"], f"releases={json.dumps(releases, separators=(',', ':'))}\n")
+    write_records(
+        [f"releases={json.dumps(releases, separators=(',', ':'))}"], path=env["GITHUB_OUTPUT"]
+    )
     if path := env.get("TRAIN_RELEASE_FILE"):
         payload = {"format": 1, "hold_labels": env["TRAIN_HOLD_LABELS"], "releases": releases}
-        with open(path, "w", encoding="utf-8") as output:
-            json.dump(payload, output, separators=(",", ":"))
+        write_records([json.dumps(payload, separators=(",", ":"))], path=path, replace=True)
 
 
 def refusal_line(err):
-    """Render a refusal on one line for annotations and the summary."""
+    """Render a report record on one line."""
     return " ".join(str(err).splitlines())
 
 
