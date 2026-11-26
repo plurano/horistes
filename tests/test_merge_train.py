@@ -536,6 +536,7 @@ class Forge:
         self.rest_faults: dict[str | tuple[str, str, str], list[int | str | tuple[int, bytes]]] = {}
         self.fault_requests: list[tuple[str, str]] = []
         self.request_ledger: set[tuple[str, str, str]] = set()
+        self.request_refusals: list[str] = []
         self.redirect_location: tuple[str, str, str | None, str] | None = None
         self.request_lock = threading.Lock()
         self.label_missing = False
@@ -1239,8 +1240,14 @@ def graphql_contains(tokens, *pattern):
     return any(tokens[index : index + len(pattern)] == pattern for index in range(len(tokens)))
 
 
+class ForgeRequestRefusalError(AssertionError):
+    """A named request refusal to report on the test thread."""
+
+
 class Handler(BaseHTTPRequestHandler):
     """The stand-in forge's HTTP side; what it serves is the Forge on its server."""
+
+    response_location: str | None = None
 
     def log_message(self, *args) -> None:
         pass
@@ -1250,8 +1257,21 @@ class Handler(BaseHTTPRequestHandler):
         return urldefrag(f"http://{self.headers['Host']}{self.path}").url
 
     def send_header(self, keyword, value) -> None:
-        """Record every Location header the stand-in forge issues."""
+        """Refuse a second Location before sending the response headers."""
         if keyword.lower() == "location":
+            if self.response_location is not None:
+                raise ForgeRequestRefusalError(
+                    f"{self.command} {self.path}: second Location {value!r} "
+                    f"after {self.response_location!r}"
+                )
+            self.response_location = value
+        super().send_header(keyword, value)
+
+    def end_headers(self) -> None:
+        """Stage the single Location once the response headers have been sent."""
+        super().end_headers()
+        value, self.response_location = self.response_location, None
+        if value is not None:
             location, _ = urldefrag(urljoin(self.request_url(), value))
             self.server.forge.redirect_location = (
                 self.command,
@@ -1259,12 +1279,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.headers.get("Authorization"),
                 self.route,
             )
-        super().send_header(keyword, value)
 
-    def request_stage(self) -> str:
+    def normalized_route(self, pending) -> str:
+        """Name the pending redirect if the incoming route cannot be normalized."""
+        try:
+            return rest_route(self.command, self.path)
+        except (AssertionError, ValueError) as error:
+            if pending is None:
+                raise
+            _, location, _, issuer = pending
+            reason = str(error).partition("\n")[0]
+            raise ForgeRequestRefusalError(
+                f"{self.command} {self.path}: pending redirect from {issuer} to {location} "
+                f"refused: {reason}"
+            ) from error
+
+    def request_stage(self, pending) -> str:
         """Match the next request to its issuer's method, Location and authorization policy."""
-        forge = self.server.forge
-        pending, forge.redirect_location = forge.redirect_location, None
         if pending is None:
             return "direct"
         method, location, authorization, issuer = pending
@@ -1320,8 +1351,9 @@ class Handler(BaseHTTPRequestHandler):
             f"concurrent stand-in forge request: {self.command} {self.path}"
         )
         try:
-            self.route = rest_route(self.command, self.path)
-            stage = self.request_stage()
+            pending, forge.redirect_location = forge.redirect_location, None
+            self.route = self.normalized_route(pending)
+            stage = self.request_stage(pending)
             request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
             operation = graphql_operation(request["query"]) if request is not None else None
             path = f"/graphql [{operation}]" if operation else self.route.split(" ", 1)[1]
@@ -1573,9 +1605,30 @@ class Handler(BaseHTTPRequestHandler):
         self.answer(204, None)
 
 
-def serve(forge: Forge) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.forge = forge
+class ForgeServer(ThreadingHTTPServer):
+    """Report named HTTP worker refusals on the test thread."""
+
+    def __init__(self, forge: Forge) -> None:
+        """Attach the forge and bind to a loopback port."""
+        self.forge = forge
+        super().__init__(("127.0.0.1", 0), Handler)
+
+    def handle_error(self, request, client_address) -> None:
+        """Record named refusals on the HTTP worker error path."""
+        if isinstance(error := sys.exception(), ForgeRequestRefusalError):
+            self.forge.request_refusals.append(str(error))
+        else:
+            super().handle_error(request, client_address)
+
+    def server_close(self) -> None:
+        """Close the server and fail the test with any named request refusals."""
+        super().server_close()
+        if self.forge.request_refusals:
+            raise ForgeRequestRefusalError("\n".join(self.forge.request_refusals))
+
+
+def serve(forge: Forge) -> ForgeServer:
+    server = ForgeServer(forge)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -3331,12 +3384,12 @@ def test_missing_app_credential_stops_before_any_call(tmp_path, key, value):
     assert (forge.minted, forge.where) == ([], [])
 
 
-def load_train(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def load_train(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, source: Path | None = None):
     """The merge train script, imported with its rules module written to RUNNER_TEMP."""
     (tmp_path / "train_rules.py").write_text(module(), encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
-    spec = importlib.util.spec_from_file_location("merge_train", SCRIPT)
+    spec = importlib.util.spec_from_file_location("merge_train", source or SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -4213,6 +4266,88 @@ def test_forge_redirect_stage_matches_next_request(fragment, next_token, stage):
         fault_request_key(RELEASE_NAME_ROUTE),
         (method, route, stage),
     }
+
+
+def test_forge_refuses_second_location(tmp_path, monkeypatch):
+    """Reject an ambiguous repository redirect before either destination can be staged."""
+    forge = release_fault_forge()
+    queued = [418]
+    forge.rest_faults[fault_request_key(RELEASE_ID_CASE)] = queued
+
+    class DuplicateLocationHandler(Handler):
+        """Send two Locations in the same answer to the old-name lookup."""
+
+        def _get_repository(self, path):
+            """Plant two redirect destinations on one repository lookup."""
+            if path != "/repos/former/app":
+                return super()._get_repository(path)
+            self.send_response(301)
+            self.send_header("Location", "/repositories/7000")
+            self.send_header("location", "/repositories/8000")
+            self.end_headers()
+
+    monkeypatch.setattr(sys.modules[__name__], "Handler", DuplicateLocationHandler)
+    refusal = (
+        "GET /repos/former/app: second Location '/repositories/8000' after '/repositories/7000'"
+    )
+    with pytest.raises(AssertionError, match=re.escape(refusal)):
+        done, _ = train(tmp_path, forge, release_off="former/app")
+        pytest.fail(
+            f"ambiguous response accepted: exit {done.returncode}, "
+            f"lookups {forge.repository_calls}, redirect faults left {queued}"
+        )
+    assert forge.redirect_location is None
+    assert queued == [418]
+    assert all(path != "/repositories/7000" for _, path in forge.repository_calls)
+
+
+def test_forge_raising_dispatch_discards_pending_redirect():
+    """A request rejected by route normalization cannot leave a redirect for a later GET."""
+    forge = release_fault_forge()
+    forge.tokens["one"] = ("list", 7, None)
+    key = fault_request_key(RELEASE_ID_CASE)
+    queued = [418]
+    forge.rest_faults[key] = queued
+    server = serve(forge)
+    host, port = server.server_address
+    refusal = (
+        f"GET *: pending redirect from {RELEASE_NAME_ROUTE} to http://{host}:{port}"
+        "/repositories/7000 refused: unresolved REST URL: *"
+    )
+
+    reported = None
+    try:
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            headers = {"Authorization": "Bearer one"}
+            conn.request("GET", "/repos/former/app", headers=headers)
+            response = conn.getresponse()
+            assert response.status == 301
+            assert response.getheader("Location") == "/repositories/7000"
+            response.read()
+            conn.request("GET", "*", headers=headers)
+            with pytest.raises(http.client.RemoteDisconnected):
+                conn.getresponse()
+            conn.request("GET", "/repositories/7000", headers=headers)
+            response = conn.getresponse()
+            response.read()
+    finally:
+        server.shutdown()
+        try:
+            server.server_close()
+        except AssertionError as error:
+            reported = str(error)
+
+    assert (response.status, queued) == (200, [418]), (
+        f"{key}: expected an unconsumed redirect fault after GET *, "
+        f"got HTTP {response.status} and queue {queued}"
+    )
+    assert (*key[:2], "direct") in forge.request_ledger
+    assert key not in forge.request_ledger
+    assert reported == refusal
+    with pytest.raises(
+        AssertionError, match=re.escape(f"{RELEASE_ID_CASE}: consumed 0 of 1 faults")
+    ):
+        assert_faults_consumed(RELEASE_ID_CASE, queued, (), len(forge.fault_requests), 1)
 
 
 def test_forge_rejects_overlapping_dispatch():
@@ -12282,6 +12417,9 @@ def rest_fault_routes(tree):
     leaves writes through a declared name (subscript, augmented subscript, or attribute)
     to issue 269, and relies on the runtime transport allow-list to refuse requests
     outside the declared routes.
+    After every faulted scenario the runtime allow-list checks its ledger, and the
+    stand-in refuses by name a second Location in one response and a pending redirect
+    when route normalization raises during dispatch.
     """
     bindings = url_binding_sites(tree)
     parents = parent_nodes(tree)
@@ -12562,9 +12700,11 @@ def fault_request_key(case):
     return method, path, "redirect" if variant == "redirect]" else "direct"
 
 
-def assert_declared_requests(case, forge):
-    """Refuse runtime request keys that lack a declared fault scenario."""
+def assert_declared_requests(case, forge, *, retry_key=None):
+    """Refuse request keys outside the declared scenarios and this scenario's retry."""
     covered = {fault_request_key(scenario) for scenario in FAULT_SCENARIOS}
+    if retry_key is not None:
+        covered.add(retry_key)
     assert not (missing := forge.request_ledger - covered), f"{case}: no fault cases for {missing}"
 
 
@@ -12584,6 +12724,57 @@ def test_transport_runtime_refuses_forwarded_subscript_write(tmp_path):
     missing = {key}
     with pytest.raises(AssertionError, match=re.escape(f"no fault cases for {missing}")):
         assert_declared_requests("pages", forge)
+
+
+def test_transport_runtime_refuses_faulted_forwarded_subscript_write(
+    tmp_path, monkeypatch, capfd, record_property
+):
+    """Refuse a forwarded URL subscript write reached only while handling a delivered fault."""
+    source = script()
+    planted = plant_statement(
+        source,
+        "pages",
+        'if env.get("PLANTED_FAULT_HANDLING"):\n    env["GITHUB_API_URL"] += "/extra"',
+    )
+    assert rest_fault_routes(ast.parse(planted)) == rest_fault_routes(ast.parse(source))
+    path = tmp_path / "planted_train.py"
+    path.write_text(planted, encoding="utf-8")
+    follow_ups = []
+
+    class FaultFollowUpHandler(Handler):
+        """Serve the planted route only for this test."""
+
+        def _dispatch_app(self, request_path):
+            """Answer the planted GET without consuming another scenario fault."""
+            if request_path != "/extra/app/installations":
+                return super()._dispatch_app(request_path)
+            follow_ups.append((self.command, request_path))
+            self.answer(200, [])
+            return True
+
+    def load(path_to_run, patch):
+        """Load the plant and make a follow-up only after pages receives its refusal."""
+        mod = load_train(path_to_run, patch, source=path)
+        pages = mod.pages
+
+        def pages_with_follow_up(env, token, request_path, key=None):
+            """Follow up on the refused read and preserve its original disposition."""
+            try:
+                return pages(env, token, request_path, key)
+            except mod.RefusedError:
+                pages({**env, "PLANTED_FAULT_HANDLING": True}, token, request_path, key)
+                raise
+
+        mod.pages = pages_with_follow_up
+        return mod
+
+    monkeypatch.setattr(sys.modules[__name__], "Handler", FaultFollowUpHandler)
+    case = LIST_INSTALLATIONS_ROUTE
+    missing = {("GET", "/extra/app/installations", "direct")}
+    with pytest.raises(AssertionError, match=re.escape(f"{case}: no fault cases for {missing}")):
+        run_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case, load=load)
+        pytest.fail(f"faulted sweep accepted undeclared requests: {follow_ups}")
+    assert follow_ups == [("GET", "/extra/app/installations")]
 
 
 def fault_case_caller(case):
@@ -12817,15 +13008,27 @@ def assert_fault_disposition(case, forge, code, refusals, output, origin):
         )
 
 
+def assert_faults_consumed(case, faults, retries, consumed, attempts):
+    """Report any scenario fault that still has a response queued."""
+    assert not faults and not retries and consumed == attempts, (
+        f"{case}: consumed {consumed} of {attempts} faults"
+    )
+
+
 @pytest.mark.parametrize("case", sorted(FAULT_SCENARIOS))
 def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case):
     """Require faults for every clean request, then exhaust this case's fault queue."""
+    run_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case)
+
+
+def run_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case, *, load=load_train):
+    """Run both sides of a sweep with the same train source."""
     key = fault_request_key(case)
     clean = FAULT_SCENARIOS[case]()
     clean_path = tmp_path / "clean"
     clean_path.mkdir()
     with monkeypatch.context() as patch:
-        train_mod = load_train(clean_path, patch)
+        train_mod = load(clean_path, patch)
         code, refusals, _, output, _ = run_fault_scenario(
             clean_path, clean, case, train_mod, patch, capfd
         )
@@ -12834,33 +13037,33 @@ def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case):
     assert key in clean.request_ledger, f"{case}: clean run never reached {key}"
 
     forge = FAULT_SCENARIOS[case]()
-    train_mod = load_train(tmp_path, monkeypatch)
+    train_mod = load(tmp_path, monkeypatch)
     attempts = train_mod.READ_ATTEMPTS if key[0] == "GET" else 1
     if key[1].startswith("/graphql ["):
         attempts = graphql_fault_attempts(case, train_mod, monkeypatch, tmp_path)
     response = (502, FORGE_FAULT_BODY)
     faults = [response] * attempts
     retries = []
+    retry_key = None
     if key[2] == "redirect":
         faults = [response]
         retries = [response] * (attempts - 1)
-        direct = (*key[:2], "direct")
-        if direct == fault_request_key(RELEASE_NAME_ROUTE):
+        retry_key = (*key[:2], "direct")
+        if retry_key == fault_request_key(RELEASE_NAME_ROUTE):
             # The old name uses the same route template. Queue retries when it issues Location.
-            queue_faults_after_location(forge, direct, retries)
+            queue_faults_after_location(forge, retry_key, retries)
         else:
-            forge.rest_faults[direct] = retries
+            forge.rest_faults[retry_key] = retries
     forge.rest_faults[key] = faults
     caller = fault_case_caller(case)
     code, refusals, callers, output, origin = run_fault_scenario(
         tmp_path, forge, case, train_mod, monkeypatch, capfd, caller
     )
+    assert_declared_requests(case, forge, retry_key=retry_key)
     consumed = len(forge.fault_requests)
     record_property("request_key", key)
     record_property("faults_consumed", consumed)
-    assert not faults and not retries and consumed == attempts, (
-        f"{case}: consumed {consumed} of {attempts} faults"
-    )
+    assert_faults_consumed(case, faults, retries, consumed, attempts)
     assert callers == ([caller] if caller else [])
     assert_fault_disposition(case, forge, code, refusals, output, origin)
 

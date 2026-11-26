@@ -57,6 +57,9 @@ The static forwarding inventory checks only name bindings and declared names,
 leaves writes through a declared name (subscript, augmented subscript, or attribute)
 to issue 269, and relies on the runtime transport allow-list to refuse requests
 outside the declared routes.
+After every faulted scenario the runtime allow-list checks its ledger, and the
+stand-in refuses by name a second Location in one response and a pending redirect
+when route normalization raises during dispatch.
 
 Start the 1,500-second sweep budget after settings validation, including the
 app-key check. Check the budget before every pull-page attempt, including
