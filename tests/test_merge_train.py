@@ -1656,6 +1656,7 @@ def check_line_shape(destination, text, *, allow_external=False):
     annotate and note_cell. Further harness forms are tracked in issue 269.
     """
     columns = None
+    release_records = 0
     for number, line in enumerate(text.split("\n"), 1):
         where = f"{destination}:{number}"
         if RECORD_CONTROLS.intersection(line):
@@ -1665,6 +1666,9 @@ def check_line_shape(destination, text, *, allow_external=False):
         if destination.startswith("GITHUB_OUTPUT"):
             if line and not (line.startswith("releases=") and compact_json(line[9:])):
                 raise LineShapeError(f"{where}: expected compact releases= JSON: {line!r}")
+            release_records += bool(line)
+            if release_records > 1:
+                raise LineShapeError(f"{where}: more than one releases= record")
         elif destination.endswith(" stderr"):
             if line:
                 raise LineShapeError(f"{where}: unexpected stderr record: {line!r}")
@@ -1884,6 +1888,7 @@ def train(
         shutil.copyfile(ROOT / "tools/release_workflows.py", tmp_path / "release_workflows.py")
         command = [sys.executable, *flags, str(path)]
     with train_environment(tmp_path, forge, settings) as env:
+        Path(env["GITHUB_OUTPUT"]).unlink(missing_ok=True)  # Each sweep starts a new step.
         done = run_train_process(command, descriptor="train", env=env, timeout=120)
     summary = tmp_path / "summary.md"
     written = summary.read_text(encoding="utf-8") if summary.exists() else ""
@@ -13114,16 +13119,21 @@ TRAIN_LINE_SHAPE_PLANTS = {
 }
 
 RELEASE_LINE_SHAPE_PLANTS = {
-    "workflow-output": ("GITHUB_OUTPUT", b"releases=[\n]\n", "expected compact releases= JSON"),
+    "workflow-output": ("GITHUB_OUTPUT", b"releases=[\n]\n", "1: expected compact releases= JSON"),
+    "two-release-records": (
+        "GITHUB_OUTPUT",
+        b'releases=[]\nreleases=[{"tag":"v1"}]\n',
+        "2: more than one releases= record",
+    ),
     "spaced-release": (
         "TRAIN_RELEASE_FILE",
         b'{"releases": []}',
-        "expected one compact JSON document",
+        "1: expected one compact JSON document",
     ),
     "two-release-documents": (
         "TRAIN_RELEASE_FILE",
         b"{}\n{}",
-        "expected one compact JSON document",
+        "1: expected one compact JSON document",
     ),
 }
 
@@ -13203,7 +13213,7 @@ def test_line_shape_byte_cap_plant(line_shape_plant):
         ),
         *(
             pytest.param(
-                f"test_line_shape_release_output_plant[{case}]", rf"{name} .*:1: {message}", id=case
+                f"test_line_shape_release_output_plant[{case}]", rf"{name} .*:{message}", id=case
             )
             for case, (name, _, message) in RELEASE_LINE_SHAPE_PLANTS.items()
         ),
@@ -13242,6 +13252,14 @@ def test_line_shape_rejects_unguarded_output(plant, message):
     assert f"ERROR at teardown of {plant}" in output, output
     assert re.search(r"LineShapeError: " + message, output), output
     assert "1 passed, 1 error" in output, output
+
+
+@pytest.mark.parametrize(
+    "text", [pytest.param("releases=[]\n", id="one-record"), pytest.param("", id="empty-text")]
+)
+def test_line_shape_accepts_workflow_output(text):
+    """Accept zero or one compact releases= record."""
+    check_line_shape("GITHUB_OUTPUT", text)
 
 
 @pytest.mark.parametrize(
