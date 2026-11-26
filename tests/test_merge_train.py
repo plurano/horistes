@@ -37,7 +37,9 @@ import urllib.error
 import urllib.request
 import weakref
 import zipfile
+from collections import Counter
 from collections.abc import Iterator
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -448,6 +450,34 @@ def repository(
     }
 
 
+# The train documents and their generated variants are checked against these tables below.
+GRAPHQL_MUTATIONS = {
+    "Arm": "enablePullRequestAutoMerge",
+    "CreateCommit": "createCommitOnBranch",
+    "Dequeue": "dequeuePullRequest",
+    "Disarm": "disablePullRequestAutoMerge",
+    "Draft": "convertPullRequestToDraft",
+    "Enqueue": "enqueuePullRequest",
+    "Merge": "mergePullRequest",
+    "Ready": "markPullRequestReadyForReview",
+}
+GRAPHQL_STATUS_SELECTION = dict.fromkeys(
+    (
+        *GRAPHQL_MUTATIONS,
+        "Commits",
+        "FileModes",
+        "LanderLease",
+        "Merged",
+        "MergeState",
+        "PullPage",
+        "RetryHistory",
+        "ReviewBodies",
+    ),
+    False,
+) | {"PullPageWithStatus": True}
+PULL_PAGE_OPERATIONS = {"PullPage", "PullPageWithStatus"}
+
+
 class Forge:
     """What the stand-in forge serves, and every write, token and revocation it saw.
 
@@ -506,7 +536,8 @@ class Forge:
         self.rest_faults: dict[str | tuple[str, str, str], list[int | str | tuple[int, bytes]]] = {}
         self.fault_requests: list[tuple[str, str]] = []
         self.request_ledger: set[tuple[str, str, str]] = set()
-        self.redirect_locations: set[str] = set()
+        self.redirect_locations: Counter[str] = Counter()
+        self.redirect_lock = threading.Lock()
         self.label_missing = False
         self.unlabel_status: int | None = None
         self.repository_moves: dict[str, str] = {}
@@ -667,44 +698,35 @@ class Forge:
         body = variables.get("body") if "commitBody: $body" in query else None
         self.messages.append((kind, variables["id"], headline, body))
 
-    def graphql(self, header: str, query: str, variables: dict) -> dict:
+    def graphql(self, header: str, operation: str, query: str, variables: dict) -> dict:
         """Serve one GraphQL call: a mutation needs write rights and is recorded."""
         full, rights = self.repo_of(header)
-        mutations = (
-            "mergePullRequest",
-            "enqueuePullRequest",
-            "dequeuePullRequest",
-            "enablePullRequestAutoMerge",
-            "disablePullRequestAutoMerge",
-            "createCommitOnBranch",
-            "convertPullRequestToDraft",
-            "markPullRequestReadyForReview",
-        )
-        if any(name in query for name in mutations):
+        mutation = GRAPHQL_MUTATIONS.get(operation)
+        if mutation is not None:
             assert rights in (WRITE, {**WRITE, **STATUSES}), rights
-        if "convertPullRequestToDraft" in query:
+        if mutation == "convertPullRequestToDraft":
             self.write(full, ("draft", variables["id"]))
             return {"data": {"convertPullRequestToDraft": {"pullRequest": {"isDraft": True}}}}
-        if "markPullRequestReadyForReview" in query:
+        if mutation == "markPullRequestReadyForReview":
             self.write(full, ("ready", variables["id"]))
             return {"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}}}
-        if "disablePullRequestAutoMerge" in query:
+        if mutation == "disablePullRequestAutoMerge":
             self.write(full, ("disarm", variables["id"]))
             return {
                 "data": {"disablePullRequestAutoMerge": {"pullRequest": {"autoMergeRequest": None}}}
             }
-        if "dequeuePullRequest" in query:
+        if mutation == "dequeuePullRequest":
             self.write(full, ("dequeue", variables["id"]))
             return {
                 "data": {"dequeuePullRequest": {"mergeQueueEntry": {"id": f"MQ_{variables['id']}"}}}
             }
-        if "enqueuePullRequest" in query:
+        if mutation == "enqueuePullRequest":
             self.write(full, ("enqueue", variables["id"], variables["oid"]))
             if self.enqueue_errors:
                 return {"errors": self.enqueue_errors}
             entry = {"state": "QUEUED"} if self.merged else None
             return {"data": {"enqueuePullRequest": {"mergeQueueEntry": entry}}}
-        if "mergePullRequest" in query:
+        if mutation == "mergePullRequest":
             self._record_message("merge", query, variables)
             self.write(full, ("merge", variables["id"], variables["oid"], variables["method"]))
             if (self.active_reads.get(full) or {}).get("mergeQueue"):
@@ -714,39 +736,44 @@ class Forge:
             if self.refuse_merge or full in self.refuse_merge_in:
                 return {"errors": [{"message": self.refuse_merge or "refused here"}]}
             return {"data": {"mergePullRequest": {"pullRequest": {"merged": self.merged}}}}
-        if "enablePullRequestAutoMerge" in query:
+        if mutation == "enablePullRequestAutoMerge":
             self._record_message("arm", query, variables)
             self.write(full, ("arm", variables["id"], variables["oid"], variables["method"]))
             armed = {"autoMergeRequest": {"enabledAt": NOW.isoformat()}}
             return {"data": {"enablePullRequestAutoMerge": {"pullRequest": armed}}}
-        if "createCommitOnBranch" in query:
+        if mutation == "createCommitOnBranch":
             return self._handle_commit_mutation(full, variables)
-        return self._read_graphql(full, query, variables)
+        return self._read_graphql(full, operation, query, variables)
 
-    def _read_graphql(self, full: str, query: str, variables: dict) -> dict:
-        if 'label(name: "merge-train: lander lease")' in query and "pullRequests(" not in query:
+    def _read_graphql(self, full: str, operation: str, query: str, variables: dict) -> dict:
+        if operation == "LanderLease":
             self.lease_calls += 1
             default = {
                 "data": {"repository": {"landerLease": self.active_reads[full]["landerLease"]}}
             }
             return self.lease_read or default
-        if "fragment M on Commit" in query:
+        if operation == "FileModes":
             return self.pull_modes(query, variables)
-        if "HEAD_REF_FORCE_PUSHED_EVENT" in query:
+        if operation == "RetryHistory":
             return self.pull_retry_history(full, variables)
-        if "mergeStateStatus" in query and "pullRequest(" in query:
+        if operation == "MergeState":
             return self.pull_merge_state(full, variables)
-        if "reviews(first: 100)" in query:
+        if operation == "ReviewBodies":
             return self.pull_review_bodies(full, variables)
-        if "pullRequest(" in query:
+        if operation == "Commits":
             return self.pull_commits(full, variables)
-        if "states: MERGED" in query:
+        if operation == "Merged":
             nodes = self.merged_pulls.get(full, [])
             return {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
-        return self.pull_page(full, query, variables)
+        assert operation in PULL_PAGE_OPERATIONS, operation
+        return self.pull_page(full, operation, query, variables)
 
     def pull_modes(self, query: str, variables: dict) -> dict:
-        paths = [value for key, value in variables.items() if re.fullmatch(r"p\d+", key)]
+        paths = [
+            value
+            for key, value in variables.items()
+            if key.startswith("p") and ascii_digits(key[1:])
+        ]
         self.mode_calls.append(paths)
         for index, path in enumerate(paths):
             assert f"$p{index}: String!" in query
@@ -850,10 +877,10 @@ class Forge:
         return None
 
     def _extract_page_nodes(
-        self, nodes: list[dict], start: int, size: int, query: str, variables: dict
+        self, nodes: list[dict], start: int, size: int, operation: str, variables: dict
     ) -> list[dict]:
         """One page of pull requests, the head status resolved by name where the query asks."""
-        selects_status = bool(re.search(r"\bstatus\s*\{", query))
+        selects_status = GRAPHQL_STATUS_SELECTION[operation]
         status_name = variables.get("status")
         page_nodes = []
         for p in nodes[start : min(start + size, len(nodes))]:
@@ -876,7 +903,7 @@ class Forge:
             page_nodes.append(p_copy)
         return page_nodes
 
-    def pull_page(self, full: str, query: str, variables: dict) -> dict:
+    def pull_page(self, full: str, operation: str, query: str, variables: dict) -> dict:
         """Answer the open pull request query: check its variables, return the asked page."""
         owner, name = full.split("/")
         after, size = variables["after"], variables["first"]
@@ -892,7 +919,7 @@ class Forge:
         start = int(after.removeprefix("cursor-")) if after else 0
         nodes = read["pullRequests"]["nodes"]
         end = min(start + size, len(nodes))
-        page_nodes = self._extract_page_nodes(nodes, start, size, query, variables)
+        page_nodes = self._extract_page_nodes(nodes, start, size, operation, variables)
         page = {
             "nodes": page_nodes,
             "pageInfo": {"hasNextPage": end < len(nodes), "endCursor": f"cursor-{end}"},
@@ -903,21 +930,21 @@ class Forge:
         self, header: str, query: str, variables: dict
     ) -> tuple[int, dict | bytes]:
         """HTTP status and body of one GraphQL call; a status read without the right fails."""
-        if not re.match(r"\s*(?:query|mutation)\s+[_A-Za-z]\w*\s*[(\{]", query):
+        operation = graphql_operation(query)
+        if operation is None:
             return 400, {"message": "stand-in forge: anonymous operation"}
         full, rights = self.repo_of(header)
         self.queries.append(query)
-        if re.search(r"\bstatus\s*\{", query) and rights.get("statuses") != "read":
+        if GRAPHQL_STATUS_SELECTION[operation] and rights.get("statuses") != "read":
             return 200, {
                 "errors": [
                     {"type": "FORBIDDEN", "message": "Resource not accessible by integration"}
                 ]
             }
-        if query.lstrip().startswith("mutation"):
-            body = self.graphql(header, query, variables)
-            operation = re.search(r"\b(\w+)\(\s*input:", query)[1]
-            statuses = self.mutation_statuses.get(operation, [])
-        elif "pullRequests(" in query and "states: MERGED" not in query:
+        if mutation := GRAPHQL_MUTATIONS.get(operation):
+            body = self.graphql(header, operation, query, variables)
+            statuses = self.mutation_statuses.get(mutation, [])
+        elif operation in PULL_PAGE_OPERATIONS:
             self.read_calls.append((full, dict(variables)))
             size = variables["first"]
             if size > 25:
@@ -928,7 +955,7 @@ class Forge:
                 )
             statuses = self.read_statuses.get(full, [])
             body = None
-        elif "mergeStateStatus" in query and "pullRequest(" in query:
+        elif operation == "MergeState":
             statuses = self.merge_state_statuses
             body = None
         else:
@@ -939,12 +966,11 @@ class Forge:
             if statuses is self.read_statuses.get(full) and status in self.read_error_bodies:
                 return status, self.read_error_bodies[status]
             return status, {"message": f"stand-in forge: queued HTTP {status}"}
-        return status, body or self.graphql(header, query, variables)
+        return status, body or self.graphql(header, operation, query, variables)
 
     def graphql_cut(self, query: str) -> bool:
         """Whether this GraphQL answer is cut: a cut of its kind is still queued."""
-        match = re.search(r"\b(\w+)\(\s*input:", query)
-        kind = match[1] if query.lstrip().startswith("mutation") and match else "read"
+        kind = GRAPHQL_MUTATIONS.get(graphql_operation(query), "read")
         if self.graphql_cuts.get(kind, 0) <= 0:
             return False
         self.graphql_cuts[kind] -= 1
@@ -1051,47 +1077,71 @@ JOBS_ROUTE = "GET /repos/{owner}/{repo}/actions/runs/{id}/jobs"
 INSTALLATION_REPOSITORIES_ROUTE = "GET /installation/repositories"
 REVOKE_ROUTE = "DELETE /installation/token"
 
-REST_PATH_PARTS = (
-    (r"^/repos/{part}/{part}(?=/|$)", "/repos/{owner}/{repo}"),
-    (r"^/users/{login}$", "/users/{login}"),
-    (
-        r"(?<=^/repos/\{owner\}/\{repo\})/contents/(?!\.github/generated-files$){tail}$",
-        "/contents/{path}",
-    ),
-    (r"(?<=^/repos/\{owner\}/\{repo\})/compare/{part}\.\.\.{part}$", "/compare/{base}...{head}"),
-    (
-        r"(?<=^/repos/\{owner\}/\{repo\})/collaborators/{part}/permission$",
-        "/collaborators/{login}/permission",
-    ),
-    (r"(?<=^/repos/\{owner\}/\{repo\}/issues/){number}(?=/|$)", "{id}"),
-    (r"(?<=^/repos/\{owner\}/\{repo\}/issues/\{id\})/labels/{part}$", "/labels/{label}"),
-    (r"(?<=^/repos/\{owner\}/\{repo\}/pulls/){number}(?=/|$)", "{id}"),
-    (r"(?<=^/repos/\{owner\}/\{repo\}/actions/artifacts/){number}(?=/zip$)", "{id}"),
-    (r"(?<=^/repos/\{owner\}/\{repo\}/actions/runs/){number}(?=/jobs$)", "{id}"),
-    (r"(?<=^/app/installations/){number}(?=/access_tokens$)", "{id}"),
-    (r"(?<=^/repositories/){number}$", "{id}"),
-    (r"(?<=^/storage/){number}$", "{id}"),
-)
+
+def ascii_digits(value):
+    """Match decimal IDs and variable suffixes without parsing them as expressions."""
+    return value.isascii() and value.isdecimal()
+
+
+def repository_route(parts, field, number, *, source):
+    """Normalize the repository suffix, preserving fixed source paths."""
+    match parts:
+        case ["contents", *tail] if (
+            tail and tail != [".github", "generated-files"] and (not source or tail == ["~"])
+        ):
+            return ["contents", "{path}"]
+        case ["compare", refs]:
+            base, sep, head = refs.partition("...")
+            if sep and field(base) and field(head):
+                return ["compare", "{base}...{head}"]
+        case ["collaborators", login, "permission"] if field(login):
+            return ["collaborators", "{login}", "permission"]
+        case ["issues", ident, "labels", label] if number(ident) and field(label):
+            return ["issues", "{id}", "labels", "{label}"]
+        case ["issues" | "pulls", ident, *tail] if number(ident):
+            return [parts[0], "{id}", *tail]
+        case ["actions", "artifacts", ident, "zip"] if number(ident):
+            return ["actions", "artifacts", "{id}", "zip"]
+        case ["actions", "runs", ident, "jobs"] if number(ident):
+            return ["actions", "runs", "{id}", "jobs"]
+    return parts
 
 
 def rest_route(method, url, *, source=False):
     """Normalize route fields while keeping literal source paths distinct."""
     path = urlsplit(url).path
     assert path.startswith("/"), f"unresolved REST URL: {url}"
-    fields = {"{part}": "~", "{tail}": "~", "{number}": "~", "{login}": r"~(?:\[bot\])?"}
-    if not source:
-        fields = {"{part}": "[^/]+", "{tail}": ".+", "{number}": "[0-9]+", "{login}": "[^/]+"}
-    for pattern, placeholder in REST_PATH_PARTS:
-        for field, value in fields.items():
-            pattern = pattern.replace(field, value)
-        path = re.sub(pattern, placeholder, path)
+    parts = path[1:].split("/")
+
+    def field(value):
+        return value == "~" if source else bool(value)
+
+    def number(value):
+        return field(value) if source else ascii_digits(value)
+
+    match parts:
+        case ["repos", owner, repo, *tail] if field(owner) and field(repo):
+            parts = [
+                "repos",
+                "{owner}",
+                "{repo}",
+                *repository_route(tail, field, number, source=source),
+            ]
+        case ["users", login] if field(login.removesuffix("[bot]") if source else login):
+            parts = ["users", "{login}"]
+        case ["app", "installations", ident, "access_tokens"] if number(ident):
+            parts = ["app", "installations", "{id}", "access_tokens"]
+        case ["repositories" | "storage", ident] if number(ident):
+            parts = [parts[0], "{id}"]
+    path = "/" + "/".join(parts)
     assert not source or "~" not in path, f"unknown REST route shape: {method} {url}"
     return f"{method} {path}"
 
 
 def graphql_operation(query):
     """Read the declared operation name without matching the document body."""
-    declaration = query.split("(", 1)[0].split("{", 1)[0].split(maxsplit=2)
+    lines = (line for line in query.splitlines() if not line.lstrip().startswith("#"))
+    declaration = "\n".join(lines).split("(", 1)[0].split("{", 1)[0].split()
     if len(declaration) == 2 and declaration[0] in {"query", "mutation"}:
         return declaration[1]
     return None
@@ -1110,8 +1160,23 @@ class Handler(BaseHTTPRequestHandler):
     def send_header(self, keyword, value) -> None:
         """Record every Location header the stand-in forge issues."""
         if keyword.lower() == "location":
-            self.server.forge.redirect_locations.add(urljoin(self.request_url(), value))
+            forge = self.server.forge
+            location = urljoin(self.request_url(), value)
+            with forge.redirect_lock:
+                forge.redirect_locations[location] += 1
         super().send_header(keyword, value)
+
+    def request_stage(self) -> str:
+        """Consume one issued Location when the next request reaches its URL."""
+        forge = self.server.forge
+        url = self.request_url()
+        with forge.redirect_lock:
+            pending = forge.redirect_locations[url]
+            if pending == 1:
+                del forge.redirect_locations[url]
+            elif pending > 1:
+                forge.redirect_locations[url] -= 1
+        return "redirect" if pending else "direct"
 
     def answer(self, code: int, body: dict | list | bytes | None) -> None:
         data = body
@@ -1157,12 +1222,11 @@ class Handler(BaseHTTPRequestHandler):
         forge = self.server.forge
         request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
         operation = graphql_operation(request["query"]) if request is not None else None
-        route = rest_route(self.command, self.path)
-        path = f"/graphql [{operation}]" if operation else route.split(" ", 1)[1]
-        stage = "redirect" if self.request_url() in forge.redirect_locations else "direct"
-        key = (self.command, path, stage)
+        self.route = rest_route(self.command, self.path)
+        path = f"/graphql [{operation}]" if operation else self.route.split(" ", 1)[1]
+        key = (self.command, path, self.request_stage())
         forge.request_ledger.add(key)
-        if not self.fault(key, operation or route):
+        if not self.fault(key, operation or self.route):
             if request is None:
                 serve_rest()
             else:
@@ -1280,7 +1344,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/installation/repositories":
             self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
             return True
-        if re.fullmatch(r"/(repos/[^/]+/[^/]+|repositories/\d+)", path):
+        if self.route in {RELEASE_NAME_ROUTE, RELEASE_ID_ROUTE}:
             self._get_repository(path)
             return True
         return False
@@ -1329,7 +1393,7 @@ class Handler(BaseHTTPRequestHandler):
             assert self.headers["Accept"] == "application/vnd.github+json"
             self.answer(*self.server.forge.compare(self.headers["Authorization"], full, refs))
             return
-        if re.fullmatch(r"/repos/[^/]+/[^/]+/collaborators/[^/]+/permission", path):
+        if self.route == PERMISSION_ROUTE:
             self._get_collaborator(path)
         elif "/contents/" in path and path.startswith("/repos/"):
             self._get_contents(path)
@@ -1339,7 +1403,7 @@ class Handler(BaseHTTPRequestHandler):
             self._get_artifact_zip(path)
         elif path.startswith("/storage/"):
             self._get_storage(path)
-        elif re.fullmatch(r"/repos/[^/]+/[^/]+/actions/runs/\d+/jobs", path):
+        elif self.route == JOBS_ROUTE:
             full, _, tail = path.removeprefix("/repos/").partition("/actions/runs/")
             run_id = int(tail.removesuffix("/jobs"))
             self.answer(*self.server.forge.run_jobs(self.headers["Authorization"], full, run_id))
@@ -1354,7 +1418,7 @@ class Handler(BaseHTTPRequestHandler):
             write = ("comment", number, self.body()["body"])
             self.answer(*self.server.forge.issue_write(self.headers["Authorization"], full, write))
             return
-        if re.fullmatch(r"/repos/[^/]+/[^/]+/issues/\d+/labels", self.path):
+        if self.route == ADD_LABEL_ROUTE:
             full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
             write = ("label", int(tail.removesuffix("/labels")), *self.body()["labels"])
             self.answer(*self.server.forge.label_write(self.headers["Authorization"], full, write))
@@ -1413,6 +1477,187 @@ def serve(forge: Forge) -> ThreadingHTTPServer:
     return server
 
 
+REPORT_FILES = ("GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT", "TRAIN_RELEASE_FILE")
+REPORT_HEADINGS = {
+    "| Account | Repositories | Landed | Updated | Refused |",
+    "| Pull request | Merge state | Train |",
+}
+REPORT_LINES = re.compile(
+    r"## Merge train sweep|### \S+: .*|review bots: .*|Refused:|"
+    r"Bot pull requests without Signed-off-by, their producers sign them:|"
+    r"- .+|Not reached within .*|No release run, the job matrix holds .*|"
+    r"Release train off: .*|Release pull requests and releases next: .*|"
+    r"Only the 100 oldest open pull requests were read\.|"
+    r"Split open pull request page to .*|Closed issue #.*|note: .*"
+)
+REPORT_ANNOTATION = re.compile(r"::(?:error|warning|notice) title=(?:(?!::).)*::.*")
+TABLE_PIPE = re.compile(r"(?<!\\)\|")
+RECORD_CONTROLS = frozenset("\0\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+LINE_SHAPE_EXCEPTIONS = {
+    (None, "ADR-92/93 pytest stdout"): "Nested pytest writes its own progress and failure report.",
+    (None, "ADR-92/93 pytest stderr"): "Nested pytest may report its own diagnostics on stderr.",
+    (
+        "test_planted_dependency_unsigned_note_without_value_error_refusal",
+        "train stderr",
+    ): "The test asserts the deliberately uncaught refusal and its Python traceback.",
+    (
+        "test_anonymous_retry_document_stops_the_run[document-error-RetryHistory]",
+        "train stderr",
+    ): "The test asserts the traceback from refusing a planted anonymous RetryHistory document.",
+    (
+        "test_anonymous_retry_document_stops_the_run[document-error-FileModes]",
+        "train stderr",
+    ): "The test asserts the traceback from refusing a planted anonymous FileModes document.",
+}
+
+
+class LineShapeError(AssertionError):
+    """A captured train destination contained a malformed record."""
+
+
+def compact_json(text):
+    """The release destinations use one compact JSON value."""
+    try:
+        return json.dumps(json.loads(text), separators=(",", ":"), allow_nan=False) == text
+    except (ValueError, RecursionError):
+        return False
+
+
+def table_cells(line):
+    """Count Markdown cells without treating escaped pipes as separators."""
+    if not line.endswith("|"):
+        return -1
+    return len(TABLE_PIPE.findall(line)) - 1
+
+
+def check_report_line(destination, number, line, columns):
+    """Validate a report record and carry the surrounding table's column count."""
+    where = f"{destination}:{number}"
+    if line.startswith("|"):
+        cells = table_cells(line)
+        if line in REPORT_HEADINGS:
+            return cells
+        if columns is None or cells != columns:
+            raise LineShapeError(f"{where}: expected {columns} table cells, got {cells}: {line!r}")
+        return columns
+    if line and not (REPORT_LINES.fullmatch(line) or REPORT_ANNOTATION.fullmatch(line)):
+        raise LineShapeError(f"{where}: unrecognized report record: {line!r}")
+    return None
+
+
+def check_line_shape(destination, text, *, allow_external=False):
+    """Check the physical separators and the record shapes for this destination."""
+    columns = None
+    for number, line in enumerate(text.split("\n"), 1):
+        where = f"{destination}:{number}"
+        if RECORD_CONTROLS.intersection(line):
+            raise LineShapeError(f"{where}: forbidden record separator or NUL: {line!r}")
+        if allow_external or destination.startswith("TRAIN_RELEASE_FILE"):
+            continue
+        if destination.startswith("GITHUB_OUTPUT"):
+            if line and not (line.startswith("releases=") and compact_json(line[9:])):
+                raise LineShapeError(f"{where}: expected compact releases= JSON: {line!r}")
+        elif destination.endswith(" stderr"):
+            if line:
+                raise LineShapeError(f"{where}: unexpected stderr record: {line!r}")
+        else:
+            columns = check_report_line(destination, number, line, columns)
+    if destination.startswith("TRAIN_RELEASE_FILE") and not compact_json(text):
+        raise LineShapeError(f"{destination}:1: expected one compact JSON document")
+
+
+class LineShapeCapture:
+    """Keep the outputs that capfd.readouterr and subprocess PIPEs would otherwise drain."""
+
+    def __init__(self, readouterr, caplog, test_name):
+        self.readouterr = readouterr
+        self.caplog = caplog
+        self.test_name = test_name
+        self.fd_reads = []
+        self.process_streams = []
+        self.files = set()
+
+    def read_fd(self):
+        """Return captured descriptors to the caller and retain them for teardown."""
+        captured = self.readouterr()
+        self.fd_reads.append(captured)
+        return captured
+
+    def watch_files(self, env):
+        """Register destinations from an in-process or child train environment."""
+        self.files.update((name, Path(env[name])) for name in REPORT_FILES if env.get(name))
+        return env
+
+    def snapshot_files(self, files):
+        """Read bytes so universal-newline conversion cannot mask a carriage return."""
+        for name, path in sorted(files):
+            if path.exists():
+                self.process_streams.append((f"{name} ({path})", path.read_bytes().decode("utf-8")))
+
+    def check(self):
+        """Check descriptors, process pipes, logs and registered files after the body."""
+        self.read_fd()
+        self.snapshot_files(self.files)
+        self.files.clear()
+        streams, self.process_streams = self.process_streams, []
+        reads, self.fd_reads = self.fd_reads, []
+        logs = self.caplog.get_records("call")
+        self.caplog.clear()
+        for name, msg in (("fd stdout", "out"), ("fd stderr", "err")):
+            check_line_shape(name, "".join(getattr(read, msg) for read in reads))
+        for name, text in streams:
+            external = (None, name) in LINE_SHAPE_EXCEPTIONS or (
+                self.test_name,
+                name,
+            ) in LINE_SHAPE_EXCEPTIONS
+            check_line_shape(name, text, allow_external=external)
+        for number, record in enumerate(logs, 1):
+            if (RECORD_CONTROLS | {"\n"}).intersection(record.getMessage()):
+                raise LineShapeError(
+                    f"logging stderr:{number}: multiline log: {record.getMessage()!r}"
+                )
+
+
+ACTIVE_LINE_SHAPE: ContextVar[LineShapeCapture] = ContextVar("merge_train_line_shape")
+
+
+@pytest.fixture(autouse=True)
+def line_shape(capfd, caplog, request):
+    """Check every train test's fd streams, child pipes and named report destinations."""
+    capture = LineShapeCapture(capfd.readouterr, caplog, request.node.name)
+    token = ACTIVE_LINE_SHAPE.set(capture)
+    # Fixture plumbing is separate from patches tracked by the app-key build guard.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(capfd, "readouterr", capture.read_fd)
+        try:
+            yield capture
+        finally:
+            try:
+                capture.check()
+            finally:
+                ACTIVE_LINE_SHAPE.reset(token)
+
+
+def watch_report_files(env):
+    """Register the train's output paths before it can write to them."""
+    return ACTIVE_LINE_SHAPE.get().watch_files(env)
+
+
+def run_train_process(command, *, descriptor, env, timeout, cwd=None):
+    """Capture child output byte-for-byte and retain both pipes for the line-shape check."""
+    done = subprocess.run(
+        command, env=env, capture_output=True, timeout=timeout, check=False, cwd=cwd
+    )
+    done.stdout = done.stdout.decode("utf-8")
+    done.stderr = done.stderr.decode("utf-8")
+    capture = ACTIVE_LINE_SHAPE.get()
+    capture.process_streams.extend(
+        ((f"{descriptor} stdout", done.stdout), (f"{descriptor} stderr", done.stderr))
+    )
+    capture.snapshot_files((name, Path(env[name])) for name in REPORT_FILES if env.get(name))
+    return done
+
+
 # The step's environment apart from the forge address, the paths and the app key.
 TRAIN_DEFAULTS = {
     "PATH": "/usr/bin:/bin",
@@ -1442,7 +1687,7 @@ def train_environment(tmp_path, forge, settings):
     server = serve(forge)
     url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        yield measured(
+        env = measured(
             TRAIN_DEFAULTS
             | {
                 "GITHUB_API_URL": url,
@@ -1454,6 +1699,7 @@ def train_environment(tmp_path, forge, settings):
                 **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
             }
         )
+        yield watch_report_files(env)
     finally:
         server.shutdown()
         server.server_close()
@@ -1483,14 +1729,7 @@ def train(
         shutil.copyfile(ROOT / "tools/release_workflows.py", tmp_path / "release_workflows.py")
         command = [sys.executable, *flags, str(path)]
     with train_environment(tmp_path, forge, settings) as env:
-        done = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=120,
-        )
+        done = run_train_process(command, descriptor="train", env=env, timeout=120)
     summary = tmp_path / "summary.md"
     written = summary.read_text(encoding="utf-8") if summary.exists() else ""
     return done, written
@@ -1817,6 +2056,14 @@ def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
         assert len(set(names)) == len(names), "duplicate operation name"
 
     check(documents())
+    assert {
+        graphql_operation(doc): bool(re.search(r"\bstatus\s*\{", doc)) for doc in documents()
+    } == GRAPHQL_STATUS_SELECTION
+    assert {
+        graphql_operation(doc): doc.split(") {", 1)[1].split("(", 1)[0].strip()
+        for doc in documents()
+        if doc.lstrip().startswith("mutation")
+    } == GRAPHQL_MUTATIONS
     with pytest.raises(AssertionError, match="missing"):
         check([*documents(), "query { viewer { login } }"])
     duplicate = train_mod.MERGE_STATE.replace("query MergeState(", "query FileModes(", 1)
@@ -1841,6 +2088,36 @@ def test_forge_operation_key_comes_from_tokens(monkeypatch):
             "Land"
         )
         assert graphql_operation("query { viewer { login } }") is None
+
+
+def test_forge_dispatch_uses_declared_operation_over_comment():
+    """A real POST keys the fault ledger and serves the selection after a misleading comment."""
+    forge = Forge(repository())
+    forge.tokens["test-token"] = ("repo", 7, "fleet/app", READ)
+    forge.merge_states[1] = "CLEAN"
+    query = (
+        "# query Other { status { state } }\nquery MergeState { pullRequest { mergeStateStatus } }"
+    )
+    variables = {"owner": "fleet", "name": "app", "number": 1}
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request(
+                "POST",
+                "/graphql",
+                json.dumps({"query": query, "variables": variables}),
+                {"Authorization": "Bearer test-token"},
+            )
+            response = conn.getresponse()
+            body = json.load(response)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert forge.request_ledger == {("POST", "/graphql [MergeState]", "direct")}
+    assert response.status == 200, body
+    assert body == {"data": {"repository": {"pullRequest": {"mergeStateStatus": "CLEAN"}}}}
 
 
 def test_anonymous_graphql_document_raises_document_error(tmp_path, monkeypatch):
@@ -3580,6 +3857,37 @@ def test_release_off_follows_an_absolute_same_origin_redirect(tmp_path, location
     assert (9, "/repos/former/d") in forge.repository_calls
     assert (9, path) in forge.repository_calls
     assert len(forge.revoked) == len(forge.minted)
+
+
+def queue_faults_after_location(forge, key, faults):
+    """Arm a direct-route queue after the old name has issued its Location."""
+    repository_read = forge.repository_read
+
+    def queue_direct_fault(header, path):
+        response = repository_read(header, path)
+        if response[0] == 301:
+            forge.rest_faults[key] = faults
+        return response
+
+    forge.repository_read = queue_direct_fault
+
+
+def test_release_off_redirect_then_direct_lookup_at_same_url(tmp_path):
+    """The issued Location stages one lookup, and the later entry uses the direct fault."""
+    forge = release_fault_forge("/repos/other/app")
+    redirected = [404]  # A missing moved repository lets release_off process the next entry.
+    direct = [403]
+    forge.rest_faults[fault_request_key(RELEASE_RENAMED_CASE)] = redirected
+    queue_faults_after_location(forge, fault_request_key(RELEASE_NAME_ROUTE), direct)
+
+    done, summary = train(tmp_path, forge, release_off="former/app other/app")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not redirected and not direct
+    assert forge.fault_requests == [("GET", "/repos/other/app")] * 2
+    assert "release_off entry other/app: HTTP 403" in summary
+    assert "release_off entry former/app:" not in summary
+    assert releases_of(tmp_path) == []
 
 
 def test_release_off_exact_match_needs_no_repository_lookup(tmp_path):
@@ -10966,7 +11274,9 @@ def retry_file(**changes):
 
 def retry_modes(variables, modes=None):
     modes = modes or {}
-    paths = [value for key, value in variables.items() if re.fullmatch(r"p\d+", key)]
+    paths = [
+        value for key, value in variables.items() if key.startswith("p") and ascii_digits(key[1:])
+    ]
     return {
         side: {
             f"f{index}": {"mode": modes.get((variables[side], path), 33188)}
@@ -11311,6 +11621,14 @@ URL_FRAGMENTS = {
 }
 
 
+# These values occupy one dynamic route field. A request URL itself still needs a plain binding.
+URL_RUNTIME_FIELDS = {
+    "apply_dependency_holds": {"number"},
+    "close_issues": {"issue"},
+    "filter_changed_files": {"path"},
+}
+
+
 def scoped_nodes(tree):
     """Yield nodes with their innermost definition, lambda or module."""
     scopes = {tree: tree}
@@ -11339,27 +11657,73 @@ def call_argument(node, index, name, *, default=None):
     return next((arg.value for arg in node.keywords if arg.arg == name), default)
 
 
-def url_bindings(url, assignments):
-    """Collect each local URL fragment assigned before this use."""
-    bindings = {}
-    for assignment in assignments:
-        if assignment.lineno < url.lineno:
-            for target in assignment.targets:
-                if isinstance(target, ast.Name):
-                    value = assignment.value
-                    bindings.setdefault(target.id, {})[ast.dump(value)] = value
-    return bindings
+def names_bound_by(node):
+    """Include both explicit name targets and bindings attached to other AST nodes."""
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return node.names
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [name.asname or name.name.split(".")[0] for name in node.names]
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, ast.MatchMapping):
+        return [node.rest] if node.rest else []
+    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return [node.name] if node.name else []
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return [node.name]
+    return []
 
 
-def expand_url_part(node, bindings):
+def url_binding_sites(tree):
+    """Index every binding or deletion by name and its enclosing definition."""
+    parents = parent_nodes(tree)
+    scopes = {}
+    sites = {}
+    for scope, node in scoped_nodes(tree):
+        scopes[node] = scope
+        if scope is node and node in parents:
+            scope = scopes[parents[node]]
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            parent = parents[node]
+            binding = (
+                parent if isinstance(parent, ast.Assign) and parent.targets == [node] else node
+            )
+            sites.setdefault(scope, {}).setdefault(node.id, []).append(binding)
+        for name in names_bound_by(node):
+            sites.setdefault(scope, {}).setdefault(name, []).append(node)
+    return sites
+
+
+def url_binding(name, sites):
+    """Allow one single-target plain assignment whose value precedes the name's use."""
+    bindings = sites.get(name.id, [])
+    if not bindings:
+        return None
+    first, *others = sorted(bindings, key=lambda node: (node.lineno, node.col_offset))
+    if not others and isinstance(first, ast.arg):
+        return None  # Function parameters stay opaque inside f-string fields.
+    if (
+        not others
+        and isinstance(first, ast.Assign)
+        and (first.end_lineno, first.end_col_offset) <= (name.lineno, name.col_offset)
+    ):
+        return first.value
+    bad = others[0] if others else first
+    raise AssertionError(f"{SCRIPT}:{bad.lineno}: unsupported URL binding: {name.id}")
+
+
+def expand_url_part(node, bindings, opaque=()):
     """Expand a local name or an f-string by one level, leaving runtime values opaque."""
     if isinstance(node, ast.JoinedStr):
         return node.values
     if isinstance(node, ast.FormattedValue):
         return [node.value]
-    if isinstance(node, ast.Name) and node.id in bindings:
-        assert len(bindings[node.id]) == 1, f"ambiguous URL fragment: {node.id}"
-        return list(bindings[node.id].values())
+    if (
+        isinstance(node, ast.Name)
+        and node.id not in opaque
+        and (value := url_binding(node, bindings)) is not None
+    ):
+        return [value]
     return [node]
 
 
@@ -11373,11 +11737,11 @@ def url_expression(url, bindings):
     pytest.fail(f"cyclic transport URL at {SCRIPT}:{url.lineno}: {ast.unparse(url)}")
 
 
-def source_path(url, bindings):
+def source_path(url, bindings, opaque):
     """Fill f-string fields with markers and preserve literal path components."""
     parts = [url]
     for _ in range(3 * len(bindings) + 4):
-        expanded = [part for node in parts for part in expand_url_part(node, bindings)]
+        expanded = [part for node in parts for part in expand_url_part(node, bindings, opaque)]
         if expanded == parts:
             return "".join(
                 str(part.value)
@@ -11389,9 +11753,8 @@ def source_path(url, bindings):
     pytest.fail(f"unresolved REST URL at {SCRIPT}:{url.lineno}: {ast.unparse(url)}")
 
 
-def rest_call_routes(name, called, node, url, assignments):
+def rest_call_routes(name, called, node, url, bindings):
     """Accept only URLs derived from literal, formatted or declared forge values."""
-    bindings = url_bindings(url, assignments)
     expression = url_expression(url, bindings)
     issued = FORGE_ISSUED_URLS.get((name, ast.unparse(expression)))
     if issued:
@@ -11406,7 +11769,7 @@ def rest_call_routes(name, called, node, url, assignments):
     try:
         route = rest_route(
             method.value if called == "call" else "GET",
-            source_path(expression, bindings),
+            source_path(expression, bindings, URL_RUNTIME_FIELDS.get(name, ())),
             source=True,
         )
     except AssertionError as failure:
@@ -11498,20 +11861,19 @@ def transport_calls(tree):
 
 def rest_fault_routes(tree):
     """Derive REST routes independently of the stand-in forge and fault scenarios."""
-    assignments = {}
-    for scope, node in scoped_nodes(tree):
-        if isinstance(node, ast.Assign):
-            assignments.setdefault(scope, []).append(node)
+    bindings = url_binding_sites(tree)
     routes = {}
     for scope, name, ref, node in transport_calls(tree):
         url = call_argument(node, *TRANSPORT_URL.get(ref, (0, "url")))
         site = (name, ref, ast.unparse(url) if url is not None else "")
         if site in TRANSPORT_FORWARDS:
+            if isinstance(url, ast.Name):
+                url_binding(url, bindings.get(scope, {}))
             continue
         assert ref in TRANSPORT_URL and url is not None, (
             f"{SCRIPT}:{node.lineno}: unsupported transport call: {ast.unparse(node)}"
         )
-        for route in rest_call_routes(name, ref, node, url, assignments.get(scope, ())):
+        for route in rest_call_routes(name, ref, node, url, bindings.get(scope, {})):
             routes.setdefault(route, []).append(name)
     return routes
 
@@ -11560,6 +11922,45 @@ def test_transport_allow_list_refuses_undeclared_uses(fragment, message):
     """Reject indirect transport references and forwarding through undeclared wrappers."""
     with pytest.raises(AssertionError, match=rf"merge_train.py:\d+: {message}"):
         rest_fault_routes(ast.parse(f"{fragment}\n"))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        'url += "/extra"',
+        'if enabled: url = "/app"',
+        'url: str = "/app"',
+        '(url := "/app")',
+        "for url in routes: pass",
+        "with make_url() as url: pass",
+        "try: setup()\n    except Error as url: pass",
+        "url, extra = parts",
+        "global url",
+        "nonlocal url",
+        "del url",
+    ],
+    ids=[
+        "augmented",
+        "branch",
+        "annotated",
+        "walrus",
+        "for",
+        "with",
+        "except",
+        "unpacking",
+        "global",
+        "nonlocal",
+        "delete",
+    ],
+)
+def test_transport_url_binding_refuses_rebinding(mutation):
+    """Inventory refuses any second or non-plain binding by name and source line."""
+    source = f'def get():\n    url = "/app"\n    {mutation}\n    return call(url, method="GET")\n'
+    line = 4 if mutation.startswith("try:") else 3
+    with pytest.raises(
+        AssertionError, match=rf"merge_train.py:{line}: unsupported URL binding: url"
+    ):
+        rest_fault_routes(ast.parse(source))
 
 
 def test_source_route_does_not_match_another_routes_placeholder():
@@ -11787,11 +12188,7 @@ def test_fault_output_check_rejects_broken_lines(line):
 
 def fault_destinations(env, captured):
     """Read every log and output destination from this sweep."""
-    files = {
-        "summary": "GITHUB_STEP_SUMMARY",
-        "output": "GITHUB_OUTPUT",
-        "release": "TRAIN_RELEASE_FILE",
-    }
+    files = dict(zip(("summary", "output", "release"), REPORT_FILES, strict=True))
     paths = {name: Path(env[key]) for name, key in files.items() if key in env}
     return {
         "stdout": captured.out,
@@ -11963,7 +12360,18 @@ def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case):
     attempts = train_mod.READ_ATTEMPTS if key[0] == "GET" else 1
     if key[1].startswith("/graphql ["):
         attempts = graphql_fault_attempts(case, train_mod, monkeypatch, tmp_path)
-    faults = [(502, FORGE_FAULT_BODY)] * attempts
+    response = (502, FORGE_FAULT_BODY)
+    faults = [response] * attempts
+    retries = []
+    if key[2] == "redirect":
+        faults = [response]
+        retries = [response] * (attempts - 1)
+        direct = (*key[:2], "direct")
+        if direct == fault_request_key(RELEASE_NAME_ROUTE):
+            # The old name uses the same route template. Queue retries when it issues Location.
+            queue_faults_after_location(forge, direct, retries)
+        else:
+            forge.rest_faults[direct] = retries
     forge.rest_faults[key] = faults
     caller = fault_case_caller(case)
     code, refusals, callers, output, origin = run_fault_scenario(
@@ -11972,7 +12380,9 @@ def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case):
     consumed = len(forge.fault_requests)
     record_property("request_key", key)
     record_property("faults_consumed", consumed)
-    assert not faults and consumed == attempts, f"{case}: consumed {consumed} of {attempts} faults"
+    assert not faults and not retries and consumed == attempts, (
+        f"{case}: consumed {consumed} of {attempts} faults"
+    )
     assert callers == ([caller] if caller else [])
     assert_fault_disposition(case, forge, code, refusals, output, origin)
 
@@ -12002,7 +12412,7 @@ def test_emit_writes_each_record_on_one_line(tmp_path, monkeypatch, capfd):
     """Both destinations flatten raw records and preserve account table cells."""
     mod = load_train(tmp_path, monkeypatch)
     summary_path = tmp_path / "summary.md"
-    env = {"GITHUB_STEP_SUMMARY": str(summary_path)}
+    env = watch_report_files({"GITHUB_STEP_SUMMARY": str(summary_path)})
     accounts = {
         "active|account": {"repositories": 4, "landed": 3, "updated": 2, "refused": 1},
         "stopped|account": "suspended\r\nsecond cell |",
@@ -12025,9 +12435,10 @@ def test_annotation_title_stays_on_one_line(tmp_path, monkeypatch, capfd, queued
     mod.annotate("warning", "first line\r\nsecond line", "message", records=records)
     expected = "::warning title=first line second line::message\n"
     if queued:
+        assert records == [expected.removesuffix("\n")]
         assert capfd.readouterr().out == ""
         summary = tmp_path / "summary"
-        mod.emit({"GITHUB_STEP_SUMMARY": str(summary)}, records)
+        mod.emit(watch_report_files({"GITHUB_STEP_SUMMARY": str(summary)}), records)
         assert summary.read_text(encoding="utf-8") == expected
     captured = capfd.readouterr()
     assert captured.out == expected
@@ -12160,7 +12571,7 @@ def writer_violations(tree):
 
 
 def test_train_writes_only_through_declared_writers():
-    """Reject raw writes outside the report sink and the subprocess pipe writer."""
+    """Tripwire for listed writes, opens, import aliases and nested definitions in the sinks."""
     assert writer_violations(ast.parse(script())) == []
 
 
@@ -12188,12 +12599,10 @@ def test_train_writes_only_through_declared_writers():
     ],
 )
 def test_writer_boundary_refuses_raw_writes_and_nested_scopes(statement, target, message):
-    """Exercise forbidden APIs, repeated writer names and nested scope identities."""
+    """Tripwire for listed write APIs, aliases, and nested functions, classes and lambdas."""
     source = script()
-    function = top_level_functions(ast.parse(source))[target]
-    lines = source.splitlines(keepends=True)
-    lines.insert(function.body[0].end_lineno, f"    {statement}\n")
-    assert any(message in error for error in writer_violations(ast.parse("".join(lines))))
+    tree = ast.parse(plant_statement(source, target, statement))
+    assert any(message in error for error in writer_violations(tree))
 
 
 @pytest.mark.parametrize(
@@ -12209,7 +12618,7 @@ def test_writer_boundary_refuses_raw_writes_and_nested_scopes(statement, target,
     ids=["literal", "concatenation", "percent", "format", "join", "f-string"],
 )
 def test_annotation_boundary_refuses_command_fragments(expression):
-    """Reject command syntax, including constants split across a construction."""
+    """Tripwire for literal commands and colons in concatenation, format, joins and f-strings."""
     tree = ast.parse(f"{script()}\nCOMMAND = {expression}\n")
     assert any("Module builds a workflow annotation" in error for error in writer_violations(tree))
 
@@ -12237,12 +12646,144 @@ def raw_table_cells(tree):
 
 
 def test_table_rows_escape_every_cell():
-    """Require note_cell for each interpolated field in any table-row f-string."""
+    """Tripwire for table-row f-strings whose interpolations bypass note_cell."""
     assert raw_table_cells(ast.parse(script())) == []
 
 
+def plant_statement(source, target, statement, *, after=0):
+    """Insert an executable test statement after a known function-body statement."""
+    function = top_level_functions(ast.parse(source))[target]
+    lines = source.splitlines(keepends=True)
+    lines.insert(
+        function.body[after].end_lineno, "".join(f"    {line}\n" for line in statement.splitlines())
+    )
+    return "".join(lines)
+
+
+@pytest.mark.parametrize(
+    ("target", "statement", "message", "state", "after"),
+    [
+        (
+            "summary",
+            (
+                'subprocess.run([sys.executable, "-c", '
+                "\"print('note: first', 'second', sep=chr(10))\"], check=True, timeout=5)"
+            ),
+            r"train stdout:2: unrecognized report record: 'second'",
+            "DIRTY",
+            0,
+        ),
+        (
+            "summary",
+            'import logging\nlogging.getLogger("x").warning("a\\nb")',
+            r"train stderr:1: unexpected stderr record: 'a'",
+            "DIRTY",
+            0,
+        ),
+        (
+            REPORT_SINK,
+            '[sys.stdout.write("note: first\\nsecond\\n") for raw in (1,)]',
+            r"train stdout:2: unrecognized report record: 'second'",
+            "DIRTY",
+            0,
+        ),
+        (
+            "report",
+            (
+                'state = rows[0][0]["mergeStateStatus"]\n'
+                'lines.append("| #1 | " + state + " | no action |")'
+            ),
+            r"train stdout:\d+: expected 3 table cells, got 4",
+            "DIRTY | extra",
+            1,
+        ),
+        (
+            "summary",
+            (
+                'marker = ": ".strip() * 2\n'
+                'title = "first\\r\\nsecond"\n'
+                'command = marker + "warning title=" + title + marker + "message\\n"\n'
+                'subprocess.run([sys.executable, "-c", '
+                '"import sys; sys.stdout.write(sys.argv[1])", command], check=True, timeout=5)'
+            ),
+            r"train stdout:1: forbidden record separator or NUL",
+            "DIRTY",
+            0,
+        ),
+    ],
+    ids=["inherited-fds", "logging", "sink-comprehension", "concatenated-row", "annotation"],
+)
+def test_line_shape_rejects_unguarded_output(
+    tmp_path, line_shape, target, statement, message, state, after
+):
+    """These forms pass the static tripwires and fail on the actual output."""
+    source = plant_statement(script(), target, statement, after=after)
+    tree = ast.parse(source)
+    assert writer_violations(tree) == []
+    assert raw_table_cells(tree) == []
+    done, _ = train(tmp_path, Forge(repository(pull(1, state))), source)
+    assert done.returncode == 0, done.stdout + done.stderr
+    with pytest.raises(LineShapeError, match=message):
+        line_shape.check()
+
+
+def test_line_shape_checks_fd_stderr(line_shape, capfd):
+    """A child's inherited stderr is still checked after a test drains capfd."""
+    subprocess.run(
+        [sys.executable, "-c", "import sys; sys.stderr.write('a\\nb\\n')"], check=True, timeout=5
+    )
+    assert capfd.readouterr().out == ""
+    with pytest.raises(LineShapeError, match=r"fd stderr:1: unexpected stderr record"):
+        line_shape.check()
+
+
+def test_line_shape_checks_step_summary(tmp_path, line_shape):
+    """Check the raw step-summary bytes even when stdout is empty."""
+    path = tmp_path / "any-summary-name"
+    watch_report_files({"GITHUB_STEP_SUMMARY": str(path)})
+    path.write_bytes(b"review bots: first\r\nsecond\n")
+    with pytest.raises(
+        LineShapeError, match=r"GITHUB_STEP_SUMMARY .*:1: forbidden record separator"
+    ):
+        line_shape.check()
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "message"),
+    [
+        ("GITHUB_OUTPUT", b"releases=[\n]\n", "expected compact releases= JSON"),
+        ("TRAIN_RELEASE_FILE", b'{"releases": []}', "expected one compact JSON document"),
+        ("TRAIN_RELEASE_FILE", b"{}\n{}", "expected one compact JSON document"),
+    ],
+    ids=["workflow-output", "spaced-release", "two-release-documents"],
+)
+def test_line_shape_rejects_noncompact_release_outputs(
+    tmp_path, line_shape, name, content, message
+):
+    """Both release destinations reject JSON that breaks their compact-record contract."""
+    path = tmp_path / "release-output"
+    watch_report_files({name: str(path)})
+    path.write_bytes(content)
+    with pytest.raises(LineShapeError, match=rf"{name} .*:1: {message}"):
+        line_shape.check()
+
+
+@pytest.mark.parametrize(
+    "separator", sorted(RECORD_CONTROLS), ids=lambda value: f"U+{ord(value):04X}"
+)
+def test_emit_flattens_record_controls(tmp_path, monkeypatch, capfd, separator):
+    """Check the flattened value in both destinations for every forbidden separator."""
+    mod = load_train(tmp_path, monkeypatch)
+    path = tmp_path / "summary"
+    mod.emit(
+        watch_report_files({"GITHUB_STEP_SUMMARY": str(path)}), [f"note: first{separator}second"]
+    )
+    assert capfd.readouterr().out == "note: first second\n"
+    assert path.read_bytes() == b"note: first second\n"
+
+
 def test_table_cell_guard_refuses_raw_interpolation():
-    """A row using note_cell in one field still needs it in every other field."""
+    """Tripwire for a table-row f-string mixing escaped and raw interpolations."""
     tree = ast.parse('row = f"| {note_cell(account)} | {raw_tally} |"')
     assert raw_table_cells(tree) == [f"{SCRIPT}:1: raw_tally"]
 
@@ -13525,9 +14066,7 @@ def adr92_mutation_run(root, selector, log):
         "-k",
         selector,
     ]
-    done = subprocess.run(
-        command, env=env, capture_output=True, text=True, timeout=120, check=False, cwd=ROOT
-    )
+    done = run_train_process(command, descriptor="ADR-92/93 pytest", env=env, timeout=120, cwd=ROOT)
     log.write_text(done.stdout + done.stderr)
     return done
 
@@ -13581,17 +14120,18 @@ def test_adr92_readable_connection_count(tmp_path, monkeypatch):
     assert mod.review_body_hold(pull(1, "CLEAN"), detail) is None
 
 
-def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
+def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capfd):
     mod = adr92_train(tmp_path, monkeypatch)
     env = {
         "TRAIN_REVIEW_BOTS": " , \t\n",
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
         "GITHUB_OUTPUT": str(tmp_path / "output"),
     }
+    watch_report_files(env)
     records = mod.summary(env, {}, [], [], [], [], [], [])
     if records is not None:
         mod.emit(env, records)
-    assert capsys.readouterr().out.count("review bots: none set, zero-review hold off") == 1
+    assert capfd.readouterr().out.count("review bots: none set, zero-review hold off") == 1
 
 
 @pytest.mark.parametrize("all_bot", [False, True], ids=["person-holds", "bots-land"])
@@ -13759,6 +14299,7 @@ def test_summary_release_file_matches_output(tmp_path, monkeypatch, write_file):
     }
     if write_file:
         env["TRAIN_RELEASE_FILE"] = str(path)
+    watch_report_files(env)
     releases = [{"owner": "a", "name": f"r{i}"} for i in range(mod.MAX_RELEASES + 1)]
     mod.emit(env, mod.summary(env, {}, [], [], [], releases, [], []))
     mod.write_release_outputs(env, releases)

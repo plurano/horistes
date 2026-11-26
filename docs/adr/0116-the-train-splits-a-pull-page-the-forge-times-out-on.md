@@ -43,6 +43,14 @@ through one writer that flattens each record to one physical line. Escape pipes
 in table cells. Keep the release file as compact JSON without a trailing newline
 and the workflow's `releases=` output as compact JSON on one line.
 
+The static writer tripwire covers listed print, write, serialization, logging and
+file-copy APIs, their import aliases, writable or unresolved opens, and nested
+functions, classes and lambdas in writer bodies. The row check covers table-row
+f-strings. The annotation check covers command literals and colon fragments in
+concatenation, formatting, joins and f-strings. Every merge-train test also
+checks the captured file descriptors, child process output and named report
+files for physical line and table shape across the paths the tests exercise.
+
 Start the 1,500-second sweep budget after settings validation, including the
 app-key check. Check the budget before every pull-page attempt, including
 splits and retries after a backoff. A budget refusal names the document,

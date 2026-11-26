@@ -2726,7 +2726,7 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
 
 def annotate(level, title, text, *, records=None):
     """Write a workflow annotation or queue it as a record for both report destinations."""
-    line = f"::{level} title={title}::{refusal_line(text)}"
+    line = f"::{level} title={refusal_line(title)}::{refusal_line(text)}"
     if records is None:
         write_records([line])
     else:
@@ -2751,7 +2751,7 @@ def write_release_outputs(env, releases):
 
 def refusal_line(err):
     """Render a report record on one line."""
-    return " ".join(str(err).splitlines())
+    return " ".join(str(err).replace("\0", " ").splitlines())
 
 
 def note_cell(note):
