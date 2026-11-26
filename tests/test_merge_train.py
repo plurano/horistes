@@ -1396,6 +1396,13 @@ class Handler(BaseHTTPRequestHandler):
             path = f"/graphql [{operation}]" if operation else self.route.split(" ", 1)[1]
             key = (self.command, path, stage)
             forge.request_ledger.add(key)
+            if (
+                self.route == STORAGE_ROUTE
+                and (auth := self.headers.get("Authorization")) is not None
+            ):
+                forge.storage_auth_seen.append(auth)
+                self.answer(400, {"message": "storage URL refuses Authorization header"})
+                return
             if not self.fault(key, operation or self.route):
                 if request is None:
                     serve_rest()
@@ -1467,10 +1474,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_final(self.end_headers)
 
     def _get_storage(self, path: str) -> None:
-        if self.headers.get("Authorization"):
-            self.server.forge.storage_auth_seen.append(self.headers["Authorization"])
-            self.answer(400, {"message": "storage URL refuses Authorization header"})
-            return
         art_id = int(path.removeprefix("/storage/"))
         self.server.forge.storage_reads.append(art_id)
         data = self.server.forge.storage.get(art_id)
@@ -12017,6 +12020,36 @@ def test_cut_artifact_body_once_is_downloaded_again(tmp_path):
     assert forge.storage_auth_seen == []
 
 
+def test_storage_redirect_refuses_authorization_before_queued_fault():
+    """A client that forwards its archive header is refused before the redirect fault runs."""
+    forge = Forge(repository())
+    forge.tokens["archive-fixture"] = ("repo", 7, "fleet/app", {"actions": "read"})
+    headers = {"Authorization": "Bearer archive-fixture"}
+    queued = [418]
+    key = fault_request_key(STORAGE_CASE)
+    forge.rest_faults[key] = queued
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request("GET", "/repos/fleet/app/actions/artifacts/101/zip", headers=headers)
+            redirect = conn.getresponse()
+            assert redirect.status == 302
+            location = redirect.getheader("Location")
+            redirect.read()
+            conn.request("GET", location, headers=headers)
+            response = conn.getresponse()
+            status, body = response.status, json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert key in forge.request_ledger
+    assert (status, forge.storage_auth_seen, queued) == (400, [headers["Authorization"]], [418])
+    assert body == {"message": "storage URL refuses Authorization header"}
+    assert forge.fault_requests == []
+
+
 def test_without_the_cut_cause_a_cut_read_refuses(tmp_path):
     """Mutation: a cut refusal without its cause is not transient, so the planted read fails."""
     assert script().count(CUT_CAUSE) == 1
@@ -13331,8 +13364,9 @@ def assert_fatal_fault(case, reason, refusals, destinations):
     if case == RECREATE_LABEL_CASE:
         reason = f"#1: could not ask the update bot to recreate it: {reason}"
     assert refusal == f"{target}: {reason}"
+    annotation = prefix + refusal.replace("%", "%25")
     assert_fault_diagnostics(
-        destinations, stdout=[f"- {refusal}", prefix + refusal], summary=[f"- {refusal}"]
+        destinations, stdout=[f"- {refusal}", annotation], summary=[f"- {refusal}"]
     )
 
 
@@ -13505,6 +13539,38 @@ def test_annotation_title_stays_on_one_line(tmp_path, monkeypatch, capfd, queued
     captured = capfd.readouterr()
     assert captured.out == expected
     assert captured.err == ""
+
+
+@pytest.mark.parametrize("field", ["data", "title"])
+def test_annotation_escapes_runner_fields(tmp_path, monkeypatch, capfd, field):
+    """Runner decoding preserves literal escapes and the title's property punctuation."""
+    mod = load_train(tmp_path, monkeypatch)
+    title = "forge:\r\nrefused, retry"
+    message = "literal %0A and %25\r\nsecond line"
+    if field == "title":
+        records = []
+        mod.annotate("warning", title, message, records=records)
+        summary = tmp_path / "summary"
+        mod.emit(watch_report_files({"GITHUB_STEP_SUMMARY": str(summary)}), records)
+    else:
+        mod.annotate("warning", title, message)
+
+    stdout, stderr = capfd.readouterr()
+    assert stderr == ""
+    (line,) = stdout.splitlines()
+    encoded_title, separator, data = line.removeprefix("::warning title=").partition("::")
+    assert separator == "::"
+    encoded = data if field == "data" else encoded_title
+    if field == "title":
+        assert encoded_title == "forge%3A refused%2C retry"
+    for escape, char in (("%0A", "\n"), ("%0D", "\r"), ("%3A", ":"), ("%2C", ","), ("%25", "%")):
+        encoded = encoded.replace(escape, char)
+    assert encoded == mod.refusal_line(message if field == "data" else title)
+    if field == "title":
+        assert summary.read_text(encoding="utf-8") == (
+            "::warning title=forge: refused, retry::literal %0A and %25 second line\n"
+        )
+    assert mod.note_cell(message) == "literal %0A and %25 second line"
 
 
 REPORT_SINK = "write_records"
@@ -15228,7 +15294,14 @@ def adr92_followup_mutations():
 
 def adr92_mutation_run(root, selector, log):
     """Run only the named regression files; writes bytecode nowhere."""
-    env = {**os.environ, "HORISTES_READER_SOURCE": str(root), "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {
+        **os.environ,
+        "HORISTES_READER_SOURCE": str(root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "GITHUB_STEP_SUMMARY": str(log.with_suffix(".summary.md")),
+        "GITHUB_OUTPUT": str(log.with_suffix(".output")),
+        "TRAIN_RELEASE_FILE": str(log.with_suffix(".release.json")),
+    }
     command = [
         sys.executable,
         "-m",
@@ -15243,6 +15316,36 @@ def adr92_mutation_run(root, selector, log):
     done = run_train_process(command, descriptor="ADR-92/93 pytest", env=env, timeout=120, cwd=ROOT)
     log.write_text(done.stdout + done.stderr)
     return done
+
+
+def test_adr92_mutation_run_uses_test_owned_report_paths(tmp_path, monkeypatch):
+    """Capture the child environment without running nested pytest."""
+    parent = tmp_path / "runner"
+    parent.mkdir()
+    inherited = {}
+    for name in REPORT_FILES:
+        path = parent / name
+        path.write_text("## Test results\n", encoding="utf-8")
+        inherited[name] = path
+        monkeypatch.setenv(name, str(path))
+
+    captured = {}
+
+    def capture_process(_command, *, env, **_settings):
+        captured.update((name, Path(env[name])) for name in REPORT_FILES)
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(sys.modules[__name__], "run_train_process", capture_process)
+    work = tmp_path / "mutation-test"
+    work.mkdir()
+    adr92_mutation_run(work / "mutation", "unused", work / "control.log")
+
+    assert set(captured) == set(REPORT_FILES)
+    assert {path.parent for path in captured.values()} == {work}
+    assert len(set(captured.values())) == len(REPORT_FILES)
+    assert all(
+        path.read_text(encoding="utf-8") == "## Test results\n" for path in inherited.values()
+    )
 
 
 @pytest.mark.parametrize(

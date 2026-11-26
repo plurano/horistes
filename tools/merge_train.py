@@ -2724,18 +2724,37 @@ def summary(env, accounts, sections, refusals, skipped, releases, off, unsigned_
     return [*lines, *release_summary(releases, off), "", *sections]
 
 
+class AnnotationRecord(str):
+    """Plain summary text with its encoded stdout command."""
+
+    def __new__(cls, summary_text, command):
+        record = super().__new__(cls, summary_text)
+        record.command = command
+        return record
+
+
+def escape_annotation(value, properties=None):
+    """Encode flattened workflow command data or property text for the Actions runner."""
+    escapes = {"%": "%25", "\r": "%0D", "\n": "%0A"}
+    return value.translate(str.maketrans(escapes | (properties or {})))
+
+
 def annotate(level, title, text, *, records=None):
     """Write a workflow annotation or queue it as a record for both report destinations."""
-    line = f"::{level} title={refusal_line(title)}::{refusal_line(text)}"
+    title, text = refusal_line(title), refusal_line(text)
+    encoded_title = escape_annotation(title, {":": "%3A", ",": "%2C"})
+    line = f"::{level} title={encoded_title}::{escape_annotation(text)}"
     if records is None:
         write_records([line])
     else:
-        records.append(line)
+        records.append(AnnotationRecord(f"::{level} title={title}::{text}", line))
 
 
 def emit(env, records):
-    """Write the same single-line records to stdout and the step summary."""
-    write_records(records)
+    """Write single-line records, encoding workflow commands only on stdout."""
+    write_records(
+        record.command if isinstance(record, AnnotationRecord) else record for record in records
+    )
     write_records(records, path=env["GITHUB_STEP_SUMMARY"])
 
 
