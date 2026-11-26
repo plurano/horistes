@@ -538,7 +538,8 @@ class Forge:
         self.request_ledger: set[tuple[str, str, str]] = set()
         self.request_refusals: list[str] = []
         self.redirect_location: tuple[str, str, str | None, str] | None = None
-        self.request_lock = threading.Lock()
+        self.request_lock, self.response_lock = threading.Lock(), threading.Lock()
+        self.pending_response: object | None = None
         self.label_missing = False
         self.unlabel_status: int | None = None
         self.repository_moves: dict[str, str] = {}
@@ -1305,6 +1306,21 @@ class Handler(BaseHTTPRequestHandler):
         )
         return "redirect" if followed else "direct"
 
+    def send_final(self, write, *args) -> None:
+        """Send the last bytes and publish completion before the next admission check."""
+        forge = self.server.forge
+        with forge.response_lock:
+            write(*args)
+            forge.pending_response = None
+
+    def send_body(self, data: bytes) -> None:
+        """Complete a length-delimited response at the last body byte or empty header block."""
+        if data:
+            self.end_headers()
+            self.send_final(self.wfile.write, data)
+        else:
+            self.send_final(self.end_headers)
+
     def answer(self, code: int, body: dict | list | bytes | None) -> None:
         data = body
         if not isinstance(body, bytes):
@@ -1312,8 +1328,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self.send_body(data)
 
     def cut_answer(self, code: int, body: dict) -> None:
         """Answer under the full Content-Length with half the body, then close."""
@@ -1345,12 +1360,15 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def dispatch(self, serve_rest) -> None:
-        """Record the request and check its operation or staged route fault queue."""
+        """Refuse a concurrent request only while another response is unsent."""
         forge = self.server.forge
-        assert forge.request_lock.acquire(blocking=False), (
-            f"concurrent stand-in forge request: {self.command} {self.path}"
-        )
-        try:
+        with forge.response_lock:
+            if forge.pending_response is not None:
+                raise ForgeRequestRefusalError(
+                    f"concurrent stand-in forge request: {self.command} {self.path}"
+                )
+            forge.pending_response = getattr(self, "request", self)
+        with forge.request_lock:
             pending, forge.redirect_location = forge.redirect_location, None
             self.route = self.normalized_route(pending)
             stage = self.request_stage(pending)
@@ -1364,8 +1382,6 @@ class Handler(BaseHTTPRequestHandler):
                     serve_rest()
                 else:
                     self._serve_graphql(request)
-        finally:
-            forge.request_lock.release()
 
     def do_GET(self) -> None:
         """Dispatch a GET through the common fault check."""
@@ -1428,7 +1444,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(302)
         if loc is not None:
             self.send_header("Location", loc)
-        self.end_headers()
+        self.send_final(self.end_headers)
 
     def _get_storage(self, path: str) -> None:
         if self.headers.get("Authorization"):
@@ -1444,16 +1460,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
         cut = self.server.forge.storage_cut.get(art_id)
         left = self.server.forge.storage_cuts_left.get(art_id)
         if left is not None:
             self.server.forge.storage_cuts_left[art_id] = left - 1
         if cut is not None and (left is None or left > 0):
+            self.end_headers()
             self.wfile.write(data[:cut])
             self.close_connection = True
             return
-        self.wfile.write(data)
+        self.send_body(data)
 
     def _dispatch_app(self, path: str) -> bool:
         if path == "/app":
@@ -1509,12 +1525,11 @@ class Handler(BaseHTTPRequestHandler):
             location = str(body).format(api=f"http://{host}:{port}", port=port)
             self.send_response(code)
             self.send_header("Location", location)
-            self.end_headers()
+            self.send_final(self.end_headers)
         elif isinstance(body, bytes):
             self.send_response(code)
             self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_body(body)
         else:
             self.answer(code, body)
 
@@ -1619,6 +1634,13 @@ class ForgeServer(ThreadingHTTPServer):
             self.forge.request_refusals.append(str(error))
         else:
             super().handle_error(request, client_address)
+
+    def shutdown_request(self, request) -> None:
+        """Complete cuts, drops and aborted answers when the socket signals EOF."""
+        with self.forge.response_lock:
+            super().shutdown_request(request)
+            if self.forge.pending_response is request:
+                self.forge.pending_response = None
 
     def server_close(self) -> None:
         """Close the server and fail the test with any named request refusals."""
@@ -4370,6 +4392,78 @@ def test_forge_rejects_overlapping_dispatch():
         AssertionError, match="concurrent stand-in forge request: GET /app/installations"
     ):
         first.dispatch(overlap)
+
+
+def test_forge_accepts_request_after_response_sent(monkeypatch):
+    """A new connection can follow a complete response while its handler is still serving."""
+    forge = Forge(repository())
+    second_sent, first_finished = threading.Event(), threading.Event()
+
+    def serve_get(self):
+        """Pause the first request after its wire response and check the serialized handoff."""
+        if self.path == "/app/installations":
+            assert first_finished.is_set()
+        self.answer(200, {"path": self.path})
+        if self.path == "/app":
+            assert second_sent.wait(5)
+            time.sleep(0.2)
+            first_finished.set()
+
+    monkeypatch.setattr(Handler, "_serve_get", serve_get)
+    server = serve(forge)
+    host, port = server.server_address
+    try:
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as first:
+            first.request("GET", "/app")
+            assert first.getresponse().read() == b'{"path": "/app"}'
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as second:
+            second.request("GET", "/app/installations")
+            second_sent.set()
+            assert second.getresponse().read() == b'{"path": "/app/installations"}'
+    finally:
+        second_sent.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_forge_rejects_request_before_response_sent(monkeypatch):
+    """A second connection is refused by name while the first answer is still pending."""
+    forge = Forge(repository())
+    awaiting_answer, release_answer = threading.Event(), threading.Event()
+
+    def serve_get(self):
+        """Keep the first response unsent until the client has checked the second connection."""
+        if self.path == "/app":
+            awaiting_answer.set()
+            assert release_answer.wait(10)
+        self.answer(200, {"path": self.path})
+
+    monkeypatch.setattr(Handler, "_serve_get", serve_get)
+    server = serve(forge)
+    host, port = server.server_address
+    refusal = "concurrent stand-in forge request: GET /app/installations"
+    reported = None
+    try:
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as first:
+            first.request("GET", "/app")
+            try:
+                assert awaiting_answer.wait(5)
+                with contextlib.closing(
+                    http.client.HTTPConnection(host, port, timeout=5)
+                ) as second:
+                    second.request("GET", "/app/installations")
+                    with pytest.raises(http.client.RemoteDisconnected):
+                        second.getresponse()
+            finally:
+                release_answer.set()
+                assert first.getresponse().read() == b'{"path": "/app"}'
+    finally:
+        server.shutdown()
+        try:
+            server.server_close()
+        except ForgeRequestRefusalError as error:
+            reported = str(error)
+    assert reported == refusal
 
 
 def test_release_off_exact_match_needs_no_repository_lookup(tmp_path):
