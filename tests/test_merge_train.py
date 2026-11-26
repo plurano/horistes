@@ -89,6 +89,8 @@ NOT_MERGEABLE = {
 }
 # A queued REST fault that closes the connection without an answer (RemoteDisconnected).
 DROP = "drop"
+# Leave the refusal time to reach the second client, whose shortest timeout is 2 seconds.
+SERIAL_GRACE_SECONDS = 0.5
 CLIENT_ID = "Iv23planted"
 WRITE = {
     "metadata": "read",
@@ -539,8 +541,7 @@ class Forge:
         self.request_ledger: set[tuple[str, str, str]] = set()
         self.request_refusals: list[str] = []
         self.redirect_location: tuple[str, str, str | None, str] | None = None
-        self.request_lock, self.response_lock = threading.Lock(), threading.Lock()
-        self.pending_response: object | None = None
+        self._init_admission()
         self.label_missing = False
         self.unlabel_status: int | None = None
         self.repository_moves: dict[str, str] = {}
@@ -548,6 +549,12 @@ class Forge:
         self.repository_bodies: dict[str, object] = {}
         self.repository_calls: list[tuple[int, str]] = []
         self.install(7, "fleet", app=list(reads))
+
+    def _init_admission(self) -> None:
+        """Initialize the request serialization and response admission state."""
+        self.request_lock, self.response_lock = threading.Lock(), threading.Lock()
+        self.response_done = threading.Condition(self.response_lock)
+        self.pending_response: object | None = None
 
     def _init_pull_reads(self) -> None:
         self.commits: dict[int, list[tuple[str, int]]] = {}
@@ -1308,14 +1315,16 @@ class Handler(BaseHTTPRequestHandler):
         return "redirect" if followed else "direct"
 
     def send_final(self, write, *args) -> None:
-        """Count a response as sent at its last byte or its bodyless ``Content-Length: 0``
-        header block, with the final write outside the admission lock and cuts and drops
-        completing at socket close.
+        """Clear the slot under the admission lock to mark a response sent after writing its
+        last byte or bodyless ``Content-Length: 0`` header block outside the lock (at socket
+        close for cuts and drops), waking admissions that wait up to ``SERIAL_GRACE_SECONDS``
+        for a held slot to clear before refusing by name.
         """
         forge = self.server.forge
         write(*args)
         with forge.response_lock:
             forge.pending_response = None
+            forge.response_done.notify_all()
 
     def send_body(self, data: bytes) -> None:
         """Complete a length-delimited response at the last body byte or empty header block."""
@@ -1364,13 +1373,16 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def dispatch(self, serve_rest) -> None:
-        """Refuse overlap until the last response byte or the bodyless ``Content-Length: 0``
-        header block is written outside the admission lock, or until the socket closes for
-        a cut or dropped response.
+        """Wait up to ``SERIAL_GRACE_SECONDS`` for a held slot to clear before refusing by name,
+        counting a response as sent when its writer clears the slot under the admission lock
+        after writing its last byte or bodyless ``Content-Length: 0`` header block outside the
+        lock (at socket close for cuts and drops).
         """
         forge = self.server.forge
         with forge.response_lock:
-            if forge.pending_response is not None:
+            if not forge.response_done.wait_for(
+                lambda: forge.pending_response is None, timeout=SERIAL_GRACE_SECONDS
+            ):
                 raise ForgeRequestRefusalError(
                     f"concurrent stand-in forge request: {self.command} {self.path}"
                 )
@@ -1650,6 +1662,7 @@ class ForgeServer(ThreadingHTTPServer):
             super().shutdown_request(request)
             if self.forge.pending_response is request:
                 self.forge.pending_response = None
+                self.forge.response_done.notify_all()
 
     def server_close(self) -> None:
         """Close the server and fail the test with any named request refusals."""
@@ -4384,6 +4397,8 @@ def test_forge_raising_dispatch_discards_pending_redirect():
 def test_forge_rejects_overlapping_dispatch():
     """A second dispatch fails by route while the first request is still being served."""
     forge = Forge(repository())
+    # Let the nested callback return if the admission guard is removed.
+    forge.request_lock = threading.RLock()
     first, second = object.__new__(Handler), object.__new__(Handler)
     first.server = second.server = types.SimpleNamespace(forge=forge)
     first.command = second.command = "GET"
@@ -4465,6 +4480,61 @@ def test_forge_accepts_request_after_response_sent(monkeypatch):
         server.server_close()
 
 
+def test_forge_accepts_request_while_completion_is_published(monkeypatch):
+    """Admit a follow-up sent after the final write and before slot publication."""
+    forge = Forge(repository())
+    admission_started, publish = threading.Event(), threading.Event()
+    send_final, handle_error = Handler.send_final, ForgeServer.handle_error
+
+    class ObservedCompletion(threading.Condition):
+        """Signal when the second worker starts its bounded admission wait."""
+
+        def wait(self, timeout=None):
+            """Let the client release the first writer before waiting for publication."""
+            admission_started.set()
+            return super().wait(timeout)
+
+    def report_refusal(self, request, client_address):
+        """Surface a refusal immediately if admission fails before waiting."""
+        handle_error(self, request, client_address)
+        if isinstance(sys.exception(), ForgeRequestRefusalError):
+            admission_started.set()
+
+    def hold_publication(self, write, *args):
+        """Hold publication after the first final write returns."""
+        if self.path != "/storage/1":
+            return send_final(self, write, *args)
+
+        def write_then_wait(*args):
+            """Wait for the second worker after writing the complete first response."""
+            write(*args)
+            assert publish.wait(5), "first writer did not get permission to publish completion"
+
+        return send_final(self, write_then_wait, *args)
+
+    forge.response_done = ObservedCompletion(forge.response_lock)
+    forge.storage.update({1: b"first", 2: b"second"})
+    monkeypatch.setattr(ForgeServer, "handle_error", report_refusal)
+    monkeypatch.setattr(Handler, "send_final", hold_publication)
+    server = serve(forge)
+    host, port = server.server_address
+    try:
+        with (
+            contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as first,
+            contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as second,
+        ):
+            first.request("GET", "/storage/1")
+            assert first.getresponse().read() == b"first"
+            second.request("GET", "/storage/2")
+            assert admission_started.wait(5), "second worker did not reach admission"
+            publish.set()
+            assert second.getresponse().read() == b"second"
+    finally:
+        publish.set()
+        server.shutdown()
+        server.server_close()
+
+
 def test_forge_rejects_request_before_response_sent(monkeypatch):
     """A second connection is refused by name while the first answer is still pending."""
     forge = Forge(repository())
@@ -4521,12 +4591,11 @@ def fill_socket_buffers(sock, data):
     raise AssertionError("first response did not fill the socket buffers in 32 writes")
 
 
-def test_forge_rejects_request_while_final_write_blocked(monkeypatch):
-    """Require the named refusal while the first client leaves its response unread."""
-    forge = Forge(repository())
+def assert_blocked_write_refusal(monkeypatch, forge):
+    """Check the named refusal while the first client leaves its response unread."""
     payload = b"z" * (1024 * 1024)
     forge.storage.update({1: payload, 2: b"second"})
-    write_blocked = threading.Event()
+    write_blocked, second_checked = threading.Event(), threading.Event()
     send_final = Handler.send_final
 
     def observe_final_write(self, write, *args):
@@ -4540,6 +4609,7 @@ def test_forge_rejects_request_while_final_write_blocked(monkeypatch):
             remaining = fill_socket_buffers(self.request, data)
             write_blocked.set()
             write(remaining)
+            assert second_checked.wait(5), "second client did not check the blocked response"
 
         return send_final(self, write_body, *args)
 
@@ -4559,19 +4629,17 @@ def test_forge_rejects_request_while_final_write_blocked(monkeypatch):
             receiver.connect((host, port))
             first.sock = receiver
             first.request("GET", "/storage/1")
-            timed_out = False
             try:
                 assert write_blocked.wait(5), "first response did not reach a blocked write"
                 second.request("GET", "/storage/2")
                 with pytest.raises(http.client.RemoteDisconnected):
                     second.getresponse()
             except TimeoutError as error:
-                timed_out = True
+                second.close()
                 raise AssertionError(f"{refusal}: second client timed out") from error
             finally:
+                second_checked.set()
                 assert first.getresponse().read() == payload
-                if timed_out:
-                    second.getresponse().read()
     finally:
         server.shutdown()
         try:
@@ -4579,6 +4647,43 @@ def test_forge_rejects_request_while_final_write_blocked(monkeypatch):
         except ForgeRequestRefusalError as error:
             reported = str(error)
     assert reported == refusal
+
+
+def test_forge_rejects_request_while_final_write_blocked(monkeypatch):
+    """Require both the disconnect and exact refusal during the final write."""
+    assert_blocked_write_refusal(monkeypatch, Forge(repository()))
+
+
+def test_forge_blocked_write_timeout_keeps_named_assertion(monkeypatch):
+    """Report the named assertion when the second client times out awaiting refusal."""
+    forge = Forge(repository())
+    refusal_held, release_refusal = threading.Event(), threading.Event()
+    handle_error = ForgeServer.handle_error
+    read_response = http.client.HTTPConnection.getresponse
+
+    def hold_refusal(self, request, client_address):
+        """Hold the refusal open until the second client's real socket timeout."""
+        if isinstance(sys.exception(), ForgeRequestRefusalError):
+            refusal_held.set()
+            assert release_refusal.wait(5), "fixture did not observe the second client timeout"
+        handle_error(self, request, client_address)
+
+    def getresponse(self):
+        """Release the refusal once the second response read times out."""
+        try:
+            return read_response(self)
+        except TimeoutError:
+            assert refusal_held.is_set(), "second client timed out before the refusal was held"
+            release_refusal.set()
+            raise
+
+    monkeypatch.setattr(ForgeServer, "handle_error", hold_refusal)
+    monkeypatch.setattr(http.client.HTTPConnection, "getresponse", getresponse)
+    with pytest.raises(
+        AssertionError,
+        match="^concurrent stand-in forge request: GET /storage/2: second client timed out$",
+    ):
+        assert_blocked_write_refusal(monkeypatch, forge)
 
 
 @pytest.mark.parametrize(
