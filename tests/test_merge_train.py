@@ -536,7 +536,7 @@ class Forge:
         self.rest_faults: dict[str | tuple[str, str, str], list[int | str | tuple[int, bytes]]] = {}
         self.fault_requests: list[tuple[str, str]] = []
         self.request_ledger: set[tuple[str, str, str]] = set()
-        self.redirect_locations: set[tuple[str, str | None]] = set()
+        self.redirect_location: tuple[str, str, str | None, str] | None = None
         self.request_lock = threading.Lock()
         self.label_missing = False
         self.unlabel_status: int | None = None
@@ -1247,20 +1247,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def request_url(self) -> str:
         """Return the exact URL used to match this request against issued redirects."""
-        return f"http://{self.headers['Host']}{self.path}"
+        return urldefrag(f"http://{self.headers['Host']}{self.path}").url
 
     def send_header(self, keyword, value) -> None:
         """Record every Location header the stand-in forge issues."""
         if keyword.lower() == "location":
             location, _ = urldefrag(urljoin(self.request_url(), value))
-            self.server.forge.redirect_locations.add((location, self.headers.get("Authorization")))
+            self.server.forge.redirect_location = (
+                self.command,
+                location,
+                self.headers.get("Authorization"),
+                self.route,
+            )
         super().send_header(keyword, value)
 
     def request_stage(self) -> str:
-        """HTTP cannot tell a same-URL/token direct request from an immediate redirect follow-up."""
-        pending = self.server.forge.redirect_locations
-        followed = (self.request_url(), self.headers.get("Authorization")) in pending
-        pending.clear()
+        """Match the next request to its issuer's method, Location and authorization policy."""
+        forge = self.server.forge
+        pending, forge.redirect_location = forge.redirect_location, None
+        if pending is None:
+            return "direct"
+        method, location, authorization, issuer = pending
+        storage = issuer == ARCHIVE_ROUTE and self.route == STORAGE_ROUTE
+        followed = (self.command, self.request_url()) == (method, location) and (
+            storage or self.headers.get("Authorization") == authorization
+        )
         return "redirect" if followed else "direct"
 
     def answer(self, code: int, body: dict | list | bytes | None) -> None:
@@ -1309,10 +1320,10 @@ class Handler(BaseHTTPRequestHandler):
             f"concurrent stand-in forge request: {self.command} {self.path}"
         )
         try:
+            self.route = rest_route(self.command, self.path)
             stage = self.request_stage()
             request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
             operation = graphql_operation(request["query"]) if request is not None else None
-            self.route = rest_route(self.command, self.path)
             path = f"/graphql [{operation}]" if operation else self.route.split(" ", 1)[1]
             key = (self.command, path, stage)
             forge.request_ledger.add(key)
@@ -1691,10 +1702,11 @@ class LineShapeCapture:
         self.files = set()
         self.sizes = Counter()
         self.overflow = None
+        self.file_error = None
 
-    def reserve(self, destination, size):
-        """Count bytes before retaining them and defer any overflow error to teardown."""
-        self.sizes[destination] += size
+    def reserve(self, destination, size, *, replace=False):
+        """Track current file sizes or accumulated stream bytes and defer overflow errors."""
+        self.sizes[destination] = size if replace else self.sizes[destination] + size
         total = self.sizes[destination]
         if total <= LINE_SHAPE_MAX_BYTES:
             return True
@@ -1726,19 +1738,22 @@ class LineShapeCapture:
         return env
 
     def snapshot_files(self, files):
-        """Read bounded binary snapshots so newline conversion cannot mask a carriage return."""
+        """Validate bounded binary snapshots without keeping copies or translating newlines."""
         for name, path in sorted(files):
             if not path.exists():
                 continue
             destination = f"{name} ({path})"
-            remaining = max(0, LINE_SHAPE_MAX_BYTES - self.sizes[destination])
             with path.open("rb") as handle:
-                raw = handle.read(remaining + 1)
+                raw = handle.read(LINE_SHAPE_MAX_BYTES + 1)
                 size = len(raw)
-                if size > remaining:
+                if size > LINE_SHAPE_MAX_BYTES:
                     size = max(size, os.fstat(handle.fileno()).st_size)
-            if self.reserve(destination, size):
-                self.process_streams.append((destination, raw.decode("utf-8")))
+            if self.reserve(destination, size, replace=True):
+                try:
+                    check_line_shape(destination, raw.decode("utf-8"))
+                except LineShapeError as error:
+                    if self.file_error is None:
+                        self.file_error = LineShapeError(str(error))
 
     def check(self):
         """Check descriptors, process pipes, logs and registered files after the body.
@@ -1768,6 +1783,8 @@ class LineShapeCapture:
                 name,
             ) in LINE_SHAPE_EXCEPTIONS
             check_line_shape(name, text, allow_external=external)
+        if self.file_error is not None:
+            raise self.file_error
         for number, record in enumerate(logs, 1):
             if (RECORD_CONTROLS | {"\n"}).intersection(record.getMessage()):
                 raise LineShapeError(
@@ -4133,6 +4150,33 @@ def test_release_off_rejected_redirect_cannot_stage_another_installation(tmp_pat
     )
     assert "Release train off: fleet/app, other/d" in summary.splitlines()
     assert releases_of(tmp_path) == []
+
+
+@pytest.mark.parametrize("stage", ["direct", "redirect"])
+def test_release_off_rejected_redirect_cannot_stage_revoke(tmp_path, stage):
+    """A rejected GET Location cannot move a DELETE into the redirect fault queue."""
+    forge = release_fault_forge("/installation/token")
+    forge.installations[0]["repos"].clear()
+    direct_key = fault_request_key(REVOKE_ROUTE)
+    faults = [403]
+    queue_faults_after_location(forge, (*direct_key[:2], stage), faults)
+
+    done, summary = train(tmp_path, forge, release_off="former/app")
+
+    expect_fault = stage == "direct"
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert faults == ([] if expect_fault else [403])
+    assert forge.fault_requests == ([direct_key[:2]] if expect_fault else [])
+    assert forge.revoked == ([] if expect_fault else ["list-token-7"])
+    assert direct_key in forge.request_ledger
+    assert (*direct_key[:2], "redirect") not in forge.request_ledger
+    assert "release_off entry former/app: unsafe repository redirect" in summary
+    warnings = [line for line in done.stdout.splitlines() if "token not revoked" in line]
+    if expect_fault:
+        (warning,) = warnings
+        assert re.search(r"DELETE \S+/installation/token: HTTP 403\b", warning)
+    else:
+        assert warnings == []
 
 
 @pytest.mark.parametrize(
@@ -11459,6 +11503,9 @@ def test_cut_artifact_body_once_is_downloaded_again(tmp_path):
     assert any(w[0] == "commit" for w in forge.writes)
     assert "body cut" not in summary
     assert forge.storage_reads == [101, 101]
+    assert fault_request_key(f"{STORAGE_ROUTE} [redirect]") in forge.request_ledger
+    assert fault_request_key(STORAGE_ROUTE) in forge.request_ledger
+    assert forge.storage_auth_seen == []
 
 
 def test_without_the_cut_cause_a_cut_read_refuses(tmp_path):
@@ -11867,6 +11914,7 @@ FORGE_FAULT_LINE = "first line second line"
 ALLOWLIST_ROUTE = "GET /repos/{owner}/{repo}/contents/.github/generated-files"
 ARCHIVE_ROUTE = "GET /repos/{owner}/{repo}/actions/artifacts/{id}/zip"
 STORAGE_ROUTE = "GET /storage/{id}"
+STORAGE_CASE = f"{STORAGE_ROUTE} [redirect]"
 FILE_CONTENTS_ROUTE = "GET /repos/{owner}/{repo}/contents/{path}"
 COMPARE_ROUTE = "GET /repos/{owner}/{repo}/compare/{base}...{head}"
 PERMISSION_ROUTE = "GET /repos/{owner}/{repo}/collaborators/{login}/permission"
@@ -11883,7 +11931,7 @@ REMOVE_LABEL_ROUTE = "DELETE /repos/{owner}/{repo}/issues/{id}/labels/{label}"
 
 FORGE_ISSUED_URLS = {
     ("download_artifact", "art['archive_download_url']"): (ARCHIVE_ROUTE,),
-    ("download_artifact", "redirect.get('location')"): (STORAGE_ROUTE,),
+    ("download_artifact", "redirect.get('location')"): (STORAGE_CASE,),
     ("release_off_repository_id", "answer['location']"): (RELEASE_RENAMED_CASE, RELEASE_ID_CASE),
 }
 TRANSPORT_URL = {
@@ -12228,7 +12276,13 @@ def check_forwarding_site(scope, ref, operand, spec, bindings, parents):
 
 
 def rest_fault_routes(tree):
-    """Derive REST routes independently of the stand-in forge and fault scenarios."""
+    """Derive REST routes independently of the stand-in forge and fault scenarios.
+
+    The static forwarding inventory checks only name bindings and declared names,
+    leaves writes through a declared name (subscript, augmented subscript, or attribute)
+    to issue 269, and relies on the runtime transport allow-list to refuse requests
+    outside the declared routes.
+    """
     bindings = url_binding_sites(tree)
     parents = parent_nodes(tree)
     routes = {}
@@ -12451,7 +12505,7 @@ FAULT_SCENARIOS = {
             ARTIFACTS_ROUTE,
             ALLOWLIST_ROUTE,
             ARCHIVE_ROUTE,
-            STORAGE_ROUTE,
+            STORAGE_CASE,
             FILE_CONTENTS_ROUTE,
             "CreateCommit",
             "MergeState",
@@ -12506,6 +12560,30 @@ def fault_request_key(case):
     if not separator:
         return "POST", f"/graphql [{case}]", "direct"
     return method, path, "redirect" if variant == "redirect]" else "direct"
+
+
+def assert_declared_requests(case, forge):
+    """Refuse runtime request keys that lack a declared fault scenario."""
+    covered = {fault_request_key(scenario) for scenario in FAULT_SCENARIOS}
+    assert not (missing := forge.request_ledger - covered), f"{case}: no fault cases for {missing}"
+
+
+def test_transport_runtime_refuses_forwarded_subscript_write(tmp_path):
+    """A URL changed through a declared name is still subject to the runtime allow-list."""
+    source = script()
+    planted = plant_statement(source, "pages", 'env["GITHUB_API_URL"] += "/extra"')
+    assert rest_fault_routes(ast.parse(planted)) == rest_fault_routes(ast.parse(source))
+    forge = Forge(repository())
+    key = ("GET", "/extra/app/installations", "direct")
+    forge.rest_faults[key] = [(200, b"[]")]
+
+    done, _ = train(tmp_path, forge, planted)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.request_ledger == {key}
+    missing = {key}
+    with pytest.raises(AssertionError, match=re.escape(f"no fault cases for {missing}")):
+        assert_declared_requests("pages", forge)
 
 
 def fault_case_caller(case):
@@ -12751,8 +12829,7 @@ def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case):
         code, refusals, _, output, _ = run_fault_scenario(
             clean_path, clean, case, train_mod, patch, capfd
         )
-    covered = {fault_request_key(scenario) for scenario in FAULT_SCENARIOS}
-    assert not (missing := clean.request_ledger - covered), f"{case}: no fault cases for {missing}"
+    assert_declared_requests(case, clean)
     assert code == 0 and not refusals, output
     assert key in clean.request_ledger, f"{case}: clean run never reached {key}"
 
@@ -13191,6 +13268,32 @@ def test_line_shape_byte_cap_plant(line_shape_plant):
         "sys.stdout.buffer.write(b'note: x\\n' * count + b'note: ' + b'x' * extra + b'\\n')"
     )
     subprocess.run([sys.executable, "-c", command, str(count), str(extra)], check=True, timeout=5)
+
+
+def test_line_shape_child_summary_fits_cap(tmp_path):
+    """A 40 KiB file fits when both the child wrapper and teardown snapshot it."""
+    path = tmp_path / "summary.md"
+    env = watch_report_files({"GITHUB_STEP_SUMMARY": str(path)})
+    write = (
+        "import sys; from pathlib import Path; Path(sys.argv[1]).write_bytes(b'note: x\\n' * 5120)"
+    )
+    done = run_train_process(
+        [sys.executable, "-c", write, str(path)], descriptor="train", env=env, timeout=5
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert path.stat().st_size == 40 * 1024
+
+
+def test_line_shape_summary_over_cap_names_destination(tmp_path, caplog):
+    """One oversized file snapshot fails with its destination and full byte count."""
+    path = tmp_path / "summary.md"
+    size = LINE_SHAPE_MAX_BYTES + 1
+    path.write_bytes(b"note: " + b"x" * (size - len(b"note: \n")) + b"\n")
+    capture = LineShapeCapture(lambda: ("", ""), caplog, None)
+    capture.watch_files({"GITHUB_STEP_SUMMARY": str(path)})
+    message = f"GITHUB_STEP_SUMMARY ({path}):1: {size} bytes exceeds the "
+    with pytest.raises(LineShapeError, match=re.escape(message)):
+        capture.check()
 
 
 @pytest.mark.usefixtures("line_shape")

@@ -53,6 +53,10 @@ files for physical line and table shape across the paths the tests exercise.
 The net checks each line per destination and cannot attribute individually valid
 lines to one record, so record-level flattening is tested at `write_records`,
 `annotate` and `note_cell`, with further harness forms tracked in issue 269.
+The static forwarding inventory checks only name bindings and declared names,
+leaves writes through a declared name (subscript, augmented subscript, or attribute)
+to issue 269, and relies on the runtime transport allow-list to refuse requests
+outside the declared routes.
 
 Start the 1,500-second sweep budget after settings validation, including the
 app-key check. Check the budget before every pull-page attempt, including
