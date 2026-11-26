@@ -4394,6 +4394,11 @@ def test_forge_raising_dispatch_discards_pending_redirect():
         assert_faults_consumed(RELEASE_ID_CASE, queued, (), len(forge.fault_requests), 1)
 
 
+# Allow scheduling slack beyond the 0.5-second admission wait while bounding a deadlock.
+OVERLAPPING_DISPATCH_TIMEOUT_SECONDS = 5
+
+
+@pytest.mark.timeout(OVERLAPPING_DISPATCH_TIMEOUT_SECONDS, method="signal")
 def test_forge_rejects_overlapping_dispatch():
     """A second dispatch fails by route while the first request is still being served."""
     forge = Forge(repository())
@@ -4416,6 +4421,15 @@ def test_forge_rejects_overlapping_dispatch():
         AssertionError, match="concurrent stand-in forge request: GET /app/installations"
     ):
         first.dispatch(overlap)
+
+
+def test_overlapping_dispatch_has_signal_timeout(request):
+    """Require pytest-timeout to bound the nested dispatch if admission deadlocks."""
+    assert request.config.pluginmanager.hasplugin("timeout"), "pytest-timeout must be loaded"
+    marks = getattr(test_forge_rejects_overlapping_dispatch, "pytestmark", ())
+    assert [(mark.args, mark.kwargs) for mark in marks if mark.name == "timeout"] == [
+        ((OVERLAPPING_DISPATCH_TIMEOUT_SECONDS,), {"method": "signal"})
+    ], "nested dispatch must have its signal timeout"
 
 
 def test_forge_accepts_request_after_response_sent(monkeypatch):
