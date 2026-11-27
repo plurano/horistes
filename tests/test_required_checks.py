@@ -333,28 +333,92 @@ def test_python_floor_3d(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"),
+    ("raw", "repository", "expected"),
     [
         (
             f"{REPO}/.github/workflows/licence-check.yml@refs/heads/release@2",
+            REPO,
             ".github/workflows/licence-check.yml",
         ),
         (
             f"{REPO}/.github/workflows/licence-check.yml@refs/pull/1/head",
+            "",
             ".github/workflows/licence-check.yml",
         ),
-        (f"{REPO}/.github/workflows/licence-check.yml", ".github/workflows/licence-check.yml"),
-        ("  ", ""),
+        (
+            f"acme/widget/.github/workflows/required-checks-caller.yml@{SHA}",
+            "acme/widget",
+            ".github/workflows/required-checks-caller.yml",
+        ),
+        ("  ", REPO, ""),
     ],
-    ids=["branch-with-at", "pull-ref", "no-ref", "unset"],
+    ids=["branch-with-at", "pull-ref", "consumer-sha-ref", "unset"],
 )
-def test_workflow_ref_path_splits_at_first_at_sign(raw: str, expected: str) -> None:
-    assert required_checks._path_from_workflow_ref(raw) == expected
+def test_workflow_ref_path_splits_at_first_at_sign(
+    raw: str, repository: str, expected: str
+) -> None:
+    assert required_checks._path_from_workflow_ref(raw, repository) == expected
 
 
-def test_workflow_ref_without_path_is_rejected() -> None:
-    with pytest.raises(InputError, match="has no workflow path"):
-        required_checks._path_from_workflow_ref(f"{REPO}@refs/heads/main")
+@pytest.mark.parametrize(
+    ("raw", "repository", "match"),
+    [
+        (f"{REPO}@refs/heads/main", REPO, "has no workflow path"),
+        (f"{REPO}/.github/workflows/licence-check.yml", REPO, "github-workflow-ref:"),
+        (f"{REPO}/.github/workflows/licence-check.yml@", REPO, "github-workflow-ref:"),
+        (f"{REPO}/.github/workflows/licence-check.yml@   ", REPO, "github-workflow-ref:"),
+        (
+            f"{REPO}/.github/workflows/licence-check.yml@refs/heads/bad ref",
+            REPO,
+            "github-workflow-ref:",
+        ),
+        ("//.github/workflows/licence-check.yml@refs/heads/main", "", "github-workflow-ref:"),
+        (
+            "owner/../.github/workflows/licence-check.yml@refs/heads/main",
+            "",
+            "github-workflow-ref:",
+        ),
+        (
+            "other/shared/.github/workflows/required-checks-sweep.yml@refs/heads/main",
+            "acme/widget",
+            "github-workflow-ref:",
+        ),
+    ],
+    ids=[
+        "no-path",
+        "missing-at-ref",
+        "empty-ref",
+        "trailing-space-ref",
+        "whitespace-in-ref",
+        "empty-owner-repo",
+        "dotdot-repo",
+        "foreign-repo-prefix",
+    ],
+)
+def test_workflow_ref_without_path_is_rejected(raw: str, repository: str, match: str) -> None:
+    with pytest.raises(InputError, match=match):
+        required_checks._path_from_workflow_ref(raw, repository)
+
+
+def test_cli_rejects_mismatched_workflow_ref_before_polling(
+    tree: Tree, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, value in tree.forge({}).items():
+        monkeypatch.setenv(name, value)
+    err = io.StringIO()
+    rc = main(
+        ["judge", "--repository", "acme/widget", "--event", "push", "--sha", SHA],
+        env={
+            "REQUIRED_JSON": '["Gate"]',
+            "GITHUB_WORKFLOW_REF": f"{REPO}/.github/workflows/required-checks.yml@refs/heads/main",
+        },
+        out=io.StringIO(),
+        err=err,
+    )
+    assert rc == 2
+    assert "Invalid required-checks input" in err.getvalue()
+    assert "github-workflow-ref:" in err.getvalue()
+    assert tree.forge_calls() == []
 
 
 def test_workflow_inputs_and_permissions_contract() -> None:
@@ -437,6 +501,7 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
         "REF": "refs/heads/main",
         "COMMIT_SHA": SHA,
         "REQUIRED_JSON": '["Gate"]',
+        "GITHUB_WORKFLOW_REF": f"{REPO}/.github/workflows/ci.yml@refs/heads/main",
     }
     cmd_judge = [sys.executable, "-I", "-B", script, "judge"]
     # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed judge argv
@@ -2308,10 +2373,9 @@ def test_pending_replaces_only_a_terminal_status(previous: str | None) -> None:
 
 
 def _expected_capped_sweep_calls(cap: int, setup_calls: int, calls_per_eval: int) -> int:
-    first_pull = setup_calls + calls_per_eval
-    if cap <= first_pull:
+    if cap <= setup_calls:
         return cap
-    rem = (cap - first_pull) % calls_per_eval
+    rem = (cap - setup_calls) % calls_per_eval
     if rem == 0:
         return cap - 2
     if rem == calls_per_eval - 1:
@@ -3293,6 +3357,57 @@ def _competing_push_status() -> dict:
     return status_item(42, PUSH_CONTEXT.upper(), "failure")
 
 
+class ContestedVerificationTransport(ReviewTransport):
+    """Live fake answers, except a newer judge status appears at verification of the first POSTs.
+
+    The default `_post_is_contested` runs unchanged. After an accepted non-pending POST, the
+    very next statuses read (the verification read) also lists a newer contender, which is kept
+    in the fake's history so later snapshots see it too.
+    """
+
+    def __init__(self, contests: int) -> None:
+        super().__init__()
+        self.contests_left = contests
+        self.contested_posts = 0
+        self.verify_next = False
+
+    def __call__(
+        self, path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        verifying = self.verify_next
+        self.verify_next = False
+        reply = super().__call__(path, method, **kwargs)
+        if method == "POST":
+            # A raised POST error never reaches this line, so only accepted writes are verified.
+            self.verify_next = self.contests_left > 0 and kwargs["fields"]["state"] != "pending"
+            return reply
+        if verifying and path.startswith(f"repos/{REPO}/commits/{SHA}/statuses?"):
+            return self._with_contender(path, reply)
+        return reply
+
+    def _with_contender(
+        self, path: str, reply: tuple[int, dict[str, str], bytes]
+    ) -> tuple[int, dict[str, str], bytes]:
+        status, headers, body = reply
+        rows = json.loads(body)
+        own = rows[0]  # the row the fake just created for the accepted POST
+        assert own["id"] == 1000 + len(self.posts), own
+        self.contests_left -= 1
+        self.contested_posts += 1
+        # Same server timestamp as the judge's own write, a newer id, and a different state.
+        contender = status_item(
+            5000 + self.contested_posts,
+            own["context"].upper(),
+            "failure" if own["state"] != "failure" else "success",
+            updated_at=own["created_at"],
+        )
+        rows = [contender, *rows]
+        self.answers[path] = rows
+        # Start the next evidence read after the previous status timestamp.
+        self.clock.current += 2
+        return status, headers, json.dumps(rows).encode()
+
+
 @pytest.mark.parametrize("conclusion", ["success", "failure"])
 def test_contested_post_at_cap_withdraws_only_success(conclusion: str) -> None:
     fake = ReviewTransport()
@@ -3450,6 +3565,83 @@ def test_sweep_keeps_triage_error_when_sweep_stops(
             "::error::Transient GitHub API failure: repository still answers HTTP 502"
         )
     assert fake.posts == []
+
+
+@pytest.mark.parametrize(
+    ("error", "elapsed", "stops_triage"),
+    [
+        (forge.ResponseError("bad gateway", status=502), 420, True),
+        (
+            forge.ResponseError("rate limit", status=429, headers={"retry-after": "20"}),
+            430,
+            True,
+        ),
+        (
+            forge.ResponseError("rate limit", status=429, headers={"retry-after": "360"}),
+            100,
+            True,
+        ),
+        (
+            forge.ResponseError("rate limit", status=429, headers={"retry-after": "19"}),
+            430,
+            False,
+        ),
+        (
+            forge.ResponseError("rate limit", status=429, headers={"retry-after": "301"}),
+            0,
+            False,
+        ),
+    ],
+    ids=[
+        "502-backoff-hits-cutoff",
+        "429-delay-hits-cutoff",
+        "429-long-delay-crosses-cutoff",
+        "429-delay-one-second-before-cutoff",
+        "429-over-wait-budget-before-cutoff",
+    ],
+)
+def test_sweep_triage_retry_delay_crossing_work_deadline_stops_across_heads(
+    error: forge.ResponseError, elapsed: int, stops_triage: bool
+) -> None:
+    first, second, third = "1" * 40, "2" * 40, "3" * 40
+    fake = _review_sweep_transport([first, second, third])
+    first_statuses = STATUSES_URL.replace(SHA, first)
+    second_statuses = STATUSES_URL.replace(SHA, second)
+    third_statuses = STATUSES_URL.replace(SHA, third)
+    seen_second = 0
+
+    def transport(path: str, **kwargs: Any) -> tuple[int, dict[str, str], bytes]:
+        nonlocal seen_second
+        if path == first_statuses and ("GET", first_statuses) not in fake.calls:
+            fake.calls.append(("GET", path))
+            raise forge.ResponseError("missing", status=404)
+        if path == second_statuses and seen_second == 0:
+            seen_second += 1
+            fake.clock.current = REVIEW_EPOCH + elapsed
+            fake.calls.append(("GET", path))
+            raise error
+        return fake(path, **kwargs)
+
+    err = io.StringIO()
+    rc = run_sweep(
+        _review_config(targets="open-pulls", run_number=1),
+        transport=transport,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=io.StringIO(),
+        err=err,
+    )
+    lines = err.getvalue().splitlines()
+    assert rc == 1, lines
+    assert lines[0].startswith(f"::error::Triage status read for {first} failed")
+    if stops_triage:
+        assert fake.clock.now() < REVIEW_EPOCH + required_checks.WORK_DEADLINE_SECONDS
+        assert ("GET", third_statuses) not in fake.calls
+        assert ("GET", f"repos/{REPO}") not in fake.calls
+        assert len(lines) == 2 and f"Triage status read for {second}" not in err.getvalue()
+        assert fake.posts == []
+    else:
+        assert ("GET", third_statuses) in fake.calls
 
 
 def test_sweep_caps_triage_at_exact_retry_attempt_boundary() -> None:
@@ -3679,6 +3871,47 @@ def test_sweep_block_tail_unjudged_in_pass_zero_and_judged_by_pass_s_minus_k() -
         assert rc == 0 and "Sweep API call cap of 250 reached" in err
         later_seen.update(judged)
     assert tails <= later_seen
+
+
+def test_sweep_partial_prefix_bound_at_k_zero_and_k_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = [f"{i:040x}" for i in range(1, 5)]
+    fake_zero = _review_sweep_transport(heads, app="external", conclusion=None)
+    # 1 open-pulls + 4 triage + 2 default-head + 4 default snapshot (no post) = 11 calls -> k = 0.
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", 11)
+    judged_at_k_zero: set[str] = set()
+    for run_number in range(1, (2 + 1) * 2 + 1):
+        rc, judged, err = _sweep_judged_pulls(
+            fake_zero, run_number=run_number, max_targets=2, apps_json='{"Build":"external"}'
+        )
+        assert rc == 0 and "2 target(s) not judged." in err
+        assert judged == []
+        judged_at_k_zero.update(judged)
+    assert judged_at_k_zero == set()
+
+    fake_one = _review_sweep_transport(heads, app="external", conclusion=None)
+    # 11 + 4 calls for the first pull head's snapshot (no post) = 15 calls -> k = 1.
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", 15)
+    judged_at_k_one: set[str] = set()
+    for run_number in range(1, 2 * 2 + 1):
+        rc, judged, err = _sweep_judged_pulls(
+            fake_one, run_number=run_number, max_targets=2, apps_json='{"Build":"external"}'
+        )
+        assert rc == 0 and "1 target(s) not judged." in err
+        assert len(judged) == 1
+        judged_at_k_one.update(judged)
+    assert judged_at_k_one == set(heads)
+
+    adr_text = ADR_PATH.read_text(encoding="utf-8")
+    sweep_line = next(
+        line for line in adr_text.splitlines() if line.startswith("- **Sweep ordering**")
+    )
+    defence_line = next(
+        line for line in adr_text.splitlines() if line.startswith("- **Defence 2.**")
+    )
+    assert "1 <= k <= s" in sweep_line and "k = 0" in sweep_line
+    assert "1 <= k <= s" in defence_line and "k = 0" in defence_line
 
 
 def test_contested_failure_then_contested_success_is_withdrawn() -> None:
@@ -4275,6 +4508,57 @@ def test_sweep_cap_on_refused_post_skips_404_on_next_head(
     assert "::error::" not in err.getvalue() and "404" not in err.getvalue()
     assert "::warning::Sweep API call cap of 18 reached; 3 target(s) not judged." in err.getvalue()
     assert seen_head2 == 1
+
+
+@pytest.mark.parametrize("reserved_left", [1, 2], ids=["one-reserved-call", "two-reserved-calls"])
+def test_sweep_default_branch_reserved_post_cap_stops_before_pulls(
+    reserved_left: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    heads = ["1" * 40, "2" * 40, "3" * 40]
+    fake = _review_sweep_transport(heads)
+    head1_statuses = STATUSES_URL.replace(SHA, heads[0])
+    seen_head1 = 0
+
+    def transport(
+        path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        nonlocal seen_head1
+        if method == "GET" and path == head1_statuses:
+            seen_head1 += 1
+            if seen_head1 >= 2:
+                raise forge.ResponseError("GET statuses: HTTP 404", status=404, message="Not Found")
+        return fake(path, method=method, **kwargs)
+
+    # 1 open-pulls + 3 triage + 2 default-head + 3 default snapshot + 1 preflight = 10 GETs.
+    cap = 10 + reserved_left
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap)
+    err = io.StringIO()
+    rc = run_sweep(
+        _review_config(targets="open-pulls", run_number=1),
+        transport=transport,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=io.StringIO(),
+        err=err,
+    )
+    assert rc == 0, err.getvalue()
+    assert "::error::" not in err.getvalue()
+    assert f"::warning::Sweep API call cap of {cap} reached during post-status." in err.getvalue()
+    assert (
+        f"::warning::Sweep API call cap of {cap} reached; 3 target(s) not judged." in err.getvalue()
+    )
+    assert seen_head1 == 1
+    assert fake.posts == []
+    assert len(fake.calls) == 10
+
+    fake_empty = _review_sweep_transport([])
+    cap_empty = 7 + reserved_left
+    monkeypatch.setattr(required_checks, "SWEEP_MAX_CALLS", cap_empty)
+    rc_empty, err_empty = _review_sweep(fake_empty)
+    assert rc_empty == 0
+    assert f"Sweep API call cap of {cap_empty} reached during post-status." in err_empty
+    assert "not judged" not in err_empty
+    assert len(fake_empty.calls) == 7
 
 
 def test_short_verification_page_missing_own_id_retries_then_withdraws() -> None:
@@ -4888,3 +5172,331 @@ def test_withdrawal_supersedes_concurrent_success_when_ownership_is_ambiguous() 
     assert standing["state"] == "pending"
     assert standing["description"] == "contested write; the next judgment decides"
     assert session.withdrawal_reserved is False
+
+
+@dataclass(frozen=True)
+class _UnconfirmedPostCase:
+    conclusion: str
+    status: int
+    ending: str
+    expect_withdrawal: bool
+
+
+def _configure_warning_ending(fake: ReviewTransport, case: _UnconfirmedPostCase) -> int | None:
+    if case.ending == "cap":
+        # Attempt 1 spends 3 snapshot GETs + 1 preflight GET = 4 calls. The verdict POST
+        # needs 2 reserved calls (4 + 2 < 7), so it is really sent and answered with the
+        # 502/429 (call 5). Attempt 2 then reads statuses (call 6) and the cap stops it at
+        # the checks read (reserved case) or the workflow-run read (unreserved case). A cap
+        # of 6 would refuse the first POST and the injected error would never happen.
+        # The reserved withdrawal is sent with reserve 0 at call 6 < 7.
+        return 7
+    if case.ending == "stale":
+        fake.advance_on_reply[STATUSES_URL] = iter([0, 0, 11, 11])
+        return None
+    # Attempt 1: the injected POST error. Attempts 2 and 3: accepted POST, then the transport
+    # lists a newer contender at verification (see ContestedVerificationTransport).
+    return None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _UnconfirmedPostCase("success", 502, "cap", True),
+        _UnconfirmedPostCase("failure", 502, "cap", False),
+        _UnconfirmedPostCase("success", 429, "cap", False),
+        _UnconfirmedPostCase("success", 502, "contested", True),
+        _UnconfirmedPostCase("failure", 429, "contested", False),
+        _UnconfirmedPostCase("success", 502, "stale", True),
+        _UnconfirmedPostCase("failure", 502, "stale", False),
+    ],
+    ids=[
+        "success-502-then-cap-withdraws",
+        "failure-502-then-cap-no-withdrawal",
+        "success-429-then-cap-no-withdrawal",
+        "success-502-then-contested-withdraws",
+        "failure-429-then-contested-no-withdrawal",
+        "success-502-then-stale-withdraws",
+        "failure-502-then-stale-no-withdrawal",
+    ],
+)
+def test_unconfirmed_retryable_post_failure_preserved_across_warning_exits(
+    case: _UnconfirmedPostCase,
+) -> None:
+    fake = ContestedVerificationTransport(contests=2 if case.ending == "contested" else 0)
+    fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", case.conclusion)]}
+    headers = {"retry-after": "10"} if case.status == 429 else {}
+    fake.post_errors = iter(
+        [forge.ResponseError(f"POST HTTP {case.status}", status=case.status, headers=headers)]
+    )
+    cap = _configure_warning_ending(fake, case)
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=fake,
+        out=io.StringIO(),
+        max_api_calls=cap,
+    )
+    err = io.StringIO()
+    rc = required_checks.evaluate_one(session, _review_config(), io.StringIO(), err)
+    err_text = err.getvalue()
+    sha = _review_config().sha
+    # The injected 502/429 must really have answered the first verdict POST.
+    assert next(fake.post_errors, None) is None
+    verdict_posts = [post for post in fake.posts if post[1] == case.conclusion]
+    assert verdict_posts[0] == (REVIEW_POST_PATH, case.conclusion)
+    assert len(verdict_posts) == {"cap": 1, "stale": 1, "contested": 3}[case.ending]
+    # The contests were really exercised through the default verification read.
+    assert fake.contested_posts == {"cap": 0, "stale": 0, "contested": 2}[case.ending]
+    expected_warning = {
+        "cap": "Sweep API call cap of 7 reached",
+        "stale": f"Posting skipped for {sha}",
+        "contested": f"Status write contested again for {sha}",
+    }[case.ending]
+    assert f"::warning::{expected_warning}" in err_text
+    error_line = f"::error::GitHub API error (post-status): POST HTTP {case.status}"
+    if case.status >= 500:
+        # An unknown 5xx write stays unconfirmed, so the warning exit is a failed judgement.
+        assert rc == 1, err_text
+        assert error_line in err_text
+    else:
+        # A 429 is a definitive non-write: the warning-only exit stays green.
+        assert rc == 0, err_text
+        assert "::error::" not in err_text
+    assert session.withdrawal_reserved is False
+    if case.expect_withdrawal:
+        assert fake.posts[-1] == (REVIEW_POST_PATH, "pending")
+    else:
+        assert (REVIEW_POST_PATH, "pending") not in fake.posts
+
+
+def test_retryable_post_failure_proven_success_and_withdrawal_boundaries() -> None:
+    # Boundary 1: 502 on POST, next attempt contested once, third attempt uncontested -> proven.
+    fake_proven = ContestedVerificationTransport(contests=1)
+    fake_proven.post_errors = iter([forge.ResponseError("POST HTTP 502", status=502)])
+    # Attempt 1: 502. Attempt 2: accepted POST (id 1002), verification lists a contender.
+    # Attempt 3: accepted POST (id 1003), verification is live; the contender is the snapshot's
+    # own prior status and is excluded, so the write is proven.
+    rc_ok, _, err_ok, _ = _review_judge(fake_proven)
+    assert rc_ok == 0 and err_ok == ""
+    assert next(fake_proven.post_errors, None) is None
+    assert fake_proven.contested_posts == 1 and fake_proven.contests_left == 0
+    assert fake_proven.posts == [(REVIEW_POST_PATH, "success")] * 3
+
+    # Boundary 2: failure POST gets 502 with only_if_pending=True while peer writes stale success.
+    fake_peer = ReviewTransport()
+    fake_peer.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", "failure")]}
+    peer_ok = status_item(77, PUSH_CONTEXT, "success")
+    fake_peer.replies[STATUSES_URL] = iter([[], [], [peer_ok], [peer_ok]])
+    fake_peer.post_errors = iter([forge.ResponseError("POST HTTP 502", status=502)])
+    rc_peer, _, err_peer, _ = _review_judge(fake_peer, only_if_pending=True)
+    assert rc_peer == 0 and err_peer == ""
+    # The 502 failure write was really attempted. The retry snapshot then sees the peer's
+    # settled success with no withdrawal reserved, so the only_if_pending shortcut applies
+    # and no second failure is posted.
+    assert next(fake_peer.post_errors, None) is None
+    assert fake_peer.posts == [(REVIEW_POST_PATH, "failure")]
+
+    # Boundary 3: success POST gets 502, retry hits cap, and withdrawal itself fails -> risk error.
+    fake_risk = ReviewTransport()
+    fake_risk.post_errors = iter(
+        [
+            forge.ResponseError("POST HTTP 502", status=502),
+            forge.ResponseError("POST HTTP 403", status=403),
+        ]
+    )
+    session_risk = ApiSession(
+        deadline=fake_risk.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake_risk.clock.now,
+        sleep=fake_risk.clock.sleep,
+        transport=fake_risk,
+        out=io.StringIO(),
+        max_api_calls=7,
+    )
+    err_risk = io.StringIO()
+    assert (
+        required_checks.evaluate_one(session_risk, _review_config(), io.StringIO(), err_risk) == 1
+    )
+    assert "a success may rest on superseded evidence" in err_risk.getvalue()
+
+
+RECURSION_MARKER = b"<recursion-marker-7f3a>"
+
+
+class _BadBodySweep:
+    """Sweep transport serving ``bad_body`` for the second statuses and checks reads."""
+
+    def __init__(self, fake: Any, first: str, second: str, bad_body: bytes) -> None:
+        self.fake = fake
+        self.bad_body = bad_body
+        self.first_statuses = STATUSES_URL.replace(SHA, first)
+        self.second_statuses = STATUSES_URL.replace(SHA, second)
+        self.triage_done = False
+        self.served = 0
+
+    def __call__(
+        self, path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        if path == f"repos/{REPO}":
+            self.triage_done = True
+        if not self.triage_done and path == self.first_statuses:
+            self.fake.calls.append((method, path))
+            raise forge.ResponseError("missing", status=404)
+        if not self.triage_done and path == self.second_statuses:
+            self.fake.calls.append((method, path))
+            self.served += 1
+            return 200, {}, self.bad_body
+        if self.triage_done and path == CHECKS_URL:
+            self.fake.calls.append((method, path))
+            self.served += 1
+            return 200, {}, self.bad_body
+        return self.fake(path, method=method, **kwargs)
+
+
+_BAD_BODY_PARAMS = pytest.mark.parametrize(
+    "bad_body",
+    [RECURSION_MARKER, b"[NaN]", b"{bad"],
+    ids=["deep-json", "nan-json", "malformed-json"],
+)
+
+_SWEEP_SHAS = ("1" * 40, "2" * 40, "3" * 40)
+
+
+class _DecoderProbe:
+    """json.loads stand-in: only the marker payload exhausts the decoder stack.
+
+    Every other input goes to the real decoder with all of its arguments.
+    """
+
+    def __init__(self, real_loads: Any) -> None:
+        self.real_loads = real_loads
+        self.hits = 0
+
+    def __call__(self, s: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(s, str):
+            raw = s.encode("utf-8", "surrogatepass")
+        elif isinstance(s, (bytes, bytearray)):
+            raw = bytes(s)
+        else:
+            raw = b""
+        if RECURSION_MARKER in raw:
+            self.hits += 1
+            raise RecursionError("maximum recursion depth exceeded")
+        return self.real_loads(s, *args, **kwargs)
+
+
+@pytest.fixture
+def decoder_probe(monkeypatch: pytest.MonkeyPatch) -> _DecoderProbe:
+    import json
+
+    probe = _DecoderProbe(json.loads)
+    monkeypatch.setattr(json, "loads", probe)
+    return probe
+
+
+def _assert_decoder_hits(
+    probe: _DecoderProbe, bad_body: bytes, before: int, minimum: int = 1
+) -> None:
+    gained = probe.hits - before
+    if bad_body == RECURSION_MARKER:
+        assert gained >= minimum
+    else:
+        assert gained == 0
+
+
+class _BadPostTransport:
+    """Review transport whose first accepted POST returns ``bad_body``."""
+
+    def __init__(self, fake: Any, bad_body: bytes) -> None:
+        self.fake = fake
+        self.bad_body = bad_body
+        self.served = 0
+
+    def __call__(
+        self, path: str, method: str = "GET", **kwargs: Any
+    ) -> tuple[int, dict[str, str], bytes]:
+        reply = self.fake(path, method=method, **kwargs)
+        if method == "POST" and len(self.fake.posts) == 1:
+            self.served += 1
+            return 201, {}, self.bad_body
+        return reply
+
+
+def _run_bad_sweep(bad_body: bytes) -> tuple[int, str, Any, _BadBodySweep]:
+    first, second, third = _SWEEP_SHAS
+    fake = _review_sweep_transport([first, second, third])
+    fake.answers[CHECKS_URL.replace(SHA, third)] = {
+        "check_runs": [check_item(1, "Build", "failure")]
+    }
+    sweep = _BadBodySweep(fake, first, second, bad_body)
+    err = io.StringIO()
+    rc = run_sweep(
+        _review_config(targets="open-pulls", run_number=1),
+        transport=sweep,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        out=io.StringIO(),
+        err=err,
+    )
+    return rc, err.getvalue(), fake, sweep
+
+
+@_BAD_BODY_PARAMS
+def test_bad_api_json_does_not_stop_sweep_continuation(
+    bad_body: bytes, decoder_probe: _DecoderProbe
+) -> None:
+    first, second, third = _SWEEP_SHAS
+    rc, err_text, fake, sweep = _run_bad_sweep(bad_body)
+    assert rc == 1
+    assert f"Triage status read for {first} failed" in err_text
+    assert f"Triage status read for {second} failed" in err_text
+    assert "GitHub API error (check-runs):" in err_text
+    assert (REVIEW_POST_PATH.replace(SHA, third), "failure") in fake.posts
+    # The bad payload was served on both intended reads (second statuses, checks)
+    # through the normal transport, and reached the decoder.
+    assert sweep.served >= 2
+    _assert_decoder_hits(decoder_probe, bad_body, 0, minimum=sweep.served)
+
+
+@_BAD_BODY_PARAMS
+def test_bad_accepted_post_body_withdraws_success_to_pending(
+    bad_body: bytes, decoder_probe: _DecoderProbe
+) -> None:
+    fake_post = ReviewTransport()
+    transport = _BadPostTransport(fake_post, bad_body)
+    err_post = io.StringIO()
+    rc_post = run_judge(
+        _review_config(),
+        transport=transport,
+        now=fake_post.clock.now,
+        sleep=fake_post.clock.sleep,
+        out=io.StringIO(),
+        err=err_post,
+    )
+    assert rc_post == 1 and "GitHub API error (post-status):" in err_post.getvalue()
+    assert fake_post.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "pending")]
+    assert transport.served == 1
+    _assert_decoder_hits(decoder_probe, bad_body, 0)
+
+
+@_BAD_BODY_PARAMS
+def test_bad_event_json_does_not_suppress_independent_check_failure(
+    bad_body: bytes, tmp_path: Path, decoder_probe: _DecoderProbe
+) -> None:
+    bad_event = tmp_path / "event.json"
+    bad_event.write_bytes(bad_body)
+    fake_pr = ReviewTransport()
+    fake_pr.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", "failure")]}
+    fake_pr.answers[RUNS_URL] = {"workflow_runs": [wf_run(1, "pull_request", head_branch="feat")]}
+    rc_pr = run_judge(
+        _review_config(event_name="pull_request"),
+        transport=fake_pr,
+        now=fake_pr.clock.now,
+        sleep=fake_pr.clock.sleep,
+        out=io.StringIO(),
+        err=io.StringIO(),
+        event_path=str(bad_event),
+    )
+    assert rc_pr == 0 and fake_pr.posts == [(REVIEW_POST_PATH, "failure")]
+    _assert_decoder_hits(decoder_probe, bad_body, 0)

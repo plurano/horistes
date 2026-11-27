@@ -71,6 +71,8 @@ SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 INT_RE = re.compile(r"^-?[0-9]{1,6}$")
 SELF_WORKFLOW_RE = re.compile(r"^\.github/workflows/[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml$")
 HTTPS_URL_RE = re.compile(r"^https://", re.IGNORECASE)
+WORKFLOW_REF_SUFFIX_RE = re.compile(r"[^\s\x00-\x1f\x7f]+")
+MAX_JSON_DIAGNOSTIC = 120
 
 
 class InputError(Exception):
@@ -79,6 +81,10 @@ class InputError(Exception):
 
 class ApiFailureError(Exception):
     """Unrecoverable API error, transient 5xx timeout, or rate-limit bound exceeded."""
+
+
+class WorkDeadlineError(ApiFailureError):
+    """A read, retry or delay cannot finish before the session work cutoff."""
 
 
 class TransportFailureError(ApiFailureError):
@@ -193,12 +199,21 @@ def _reject_constant(token: str) -> None:
     raise ValueError(f"{token} is not valid JSON")
 
 
+def _bounded_reason(err: BaseException) -> str:
+    """One short line describing a decode failure, never echoing the payload."""
+    if isinstance(err, RecursionError):
+        return "nesting too deep"
+    lines = str(err).splitlines()
+    text = lines[0] if lines else type(err).__name__
+    return text[:MAX_JSON_DIAGNOSTIC]
+
+
 def _load_json(label: str, raw: str) -> object:
     """Decode strict JSON for a named input or raise InputError."""
     try:
         return json.loads(raw, parse_constant=_reject_constant)
     except (TypeError, ValueError, RecursionError) as err:
-        raise InputError(f"{label}: invalid JSON ({err})") from err
+        raise InputError(f"{label}: invalid JSON ({_bounded_reason(err)})") from err
 
 
 def _parse_int_range(label: str, raw: str | int, low: int, high: int) -> int:
@@ -254,15 +269,29 @@ def _parse_self_workflow(raw: str) -> str:
     return path
 
 
-def _path_from_workflow_ref(raw: str) -> str:
-    """Workflow path from GITHUB_WORKFLOW_REF, or empty when unset."""
+def _path_from_workflow_ref(raw: str, repository: str = "") -> str:
+    """Workflow path from GITHUB_WORKFLOW_REF, or empty when unset.
+
+    The value is `<owner>/<repo>/<workflow path>@<ref>`. The prefix must be a valid
+    owner/name and, when `repository` is given, name that repository. The ref after the
+    first `@` must be non-empty and free of whitespace and control characters.
+    """
     text = raw.strip()
     if not text:
         return ""
-    path_part = text.split("@", 1)[0]
+    path_part, at, ref = text.partition("@")
     parts = path_part.split("/", 2)
     if len(parts) < 3:
         raise InputError(f"github-workflow-ref: {raw!r} has no workflow path")
+    prefix = f"{parts[0]}/{parts[1]}"
+    if not REPO_RE.fullmatch(prefix) or parts[1] in (".", ".."):
+        raise InputError(f"github-workflow-ref: {raw!r} has an invalid repository prefix")
+    if repository and prefix.casefold() != repository.strip().casefold():
+        raise InputError(
+            f"github-workflow-ref: {raw!r} names {prefix!r}, not repository {repository!r}"
+        )
+    if not at or not WORKFLOW_REF_SUFFIX_RE.fullmatch(ref):
+        raise InputError(f"github-workflow-ref: {raw!r} has a missing or malformed @ref suffix")
     return _parse_self_workflow(parts[2])
 
 
@@ -464,9 +493,9 @@ def parse_config(raw: RawInputs) -> Config:
 
 def _decode_json(label: str, body: bytes) -> object:
     try:
-        return json.loads(body)
-    except ValueError as err:
-        raise ApiFailureError(f"GitHub API error ({label}): {err}") from err
+        return json.loads(body, parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as err:
+        raise ApiFailureError(f"GitHub API error ({label}): {_bounded_reason(err)}") from err
 
 
 def _is_definitive_rejection(err: forge.ResponseError) -> bool:
@@ -511,11 +540,14 @@ class ApiSession:
     def _wait_rate_limit(
         self, label: str, err: forge.ResponseError, delay: int | float, waits: int
     ) -> None:
+        message = (
+            f"GitHub API rate limit: {label} still answers HTTP {err.status}. "
+            "No check result was judged; rerun this job."
+        )
+        if self.now() + delay >= self.work_deadline:
+            raise WorkDeadlineError(message) from err
         if not self._within_rate_limit_bounds(delay, waits):
-            raise ApiFailureError(
-                f"GitHub API rate limit: {label} still answers HTTP {err.status}. "
-                "No check result was judged; rerun this job."
-            ) from err
+            raise ApiFailureError(message) from err
         self._check_api_cap(label)
         self.out.write(f"::warning::{label}: GitHub API HTTP {err.status}, retrying in {delay} s\n")
         self.rate_limit_wait_count += 1
@@ -530,7 +562,7 @@ class ApiSession:
             ) from err
         seconds = API_BACKOFF_SECONDS[attempt]
         if self.now() + seconds >= self.work_deadline:
-            raise ApiFailureError(
+            raise WorkDeadlineError(
                 f"Transient GitHub API failure: {label} still answers HTTP {err.status} "
                 f"at the {WORK_DEADLINE_SECONDS} s session work cutoff. "
                 "No check result was judged; rerun this job."
@@ -551,7 +583,8 @@ class ApiSession:
                 if withdrawal
                 else f"Session deadline work cutoff of {WORK_DEADLINE_SECONDS} s"
             )
-            raise ApiFailureError(
+            error_type = ApiFailureError if withdrawal else WorkDeadlineError
+            raise error_type(
                 f"{bound} reached during {label}. No check result was judged; rerun this job."
             )
         return min(forge.DEADLINE_SECONDS, remaining)
@@ -1318,7 +1351,12 @@ def _report_verdict(config: Config, evaluation: Evaluation, out: TextIO) -> None
 
 
 def _attempt_post(
-    session: ApiSession, config: Config, evaluation: Evaluation, *, can_retry: bool
+    session: ApiSession,
+    config: Config,
+    evaluation: Evaluation,
+    *,
+    can_retry: bool,
+    unconfirmed: list[PostFailureError] | None = None,
 ) -> int | None:
     """Return the created status ID, or None after waiting to retry from fresh evidence."""
     try:
@@ -1326,6 +1364,10 @@ def _attempt_post(
     except PostFailureError as exc:
         if not can_retry:
             raise
+        # A non-definitive failure may or may not have stored a status. Keep it visible
+        # until a later evaluation proves the outcome.
+        if unconfirmed is not None and not _is_definitive_rejection(exc.response):
+            unconfirmed.append(exc)
         session.wait_to_retry_post(exc)
         return None
 
@@ -1340,7 +1382,12 @@ def _report_no_post(config: Config, evaluation: Evaluation, out: TextIO) -> None
 
 
 def _evaluate_attempt(
-    session: ApiSession, config: Config, out: TextIO, *, can_retry_post: bool
+    session: ApiSession,
+    config: Config,
+    out: TextIO,
+    *,
+    can_retry_post: bool,
+    unconfirmed: list[PostFailureError] | None = None,
 ) -> tuple[EvaluationRetry, str] | None:
     """Judge once and return a retry reason if another evaluation is needed."""
     evaluation = _read_and_decide(session, config, out)
@@ -1360,7 +1407,9 @@ def _evaluate_attempt(
         _report_no_post(config, evaluation, out)
         _report_verdict(config, evaluation, out)
         return None
-    status_id = _attempt_post(session, config, evaluation, can_retry=can_retry_post)
+    status_id = _attempt_post(
+        session, config, evaluation, can_retry=can_retry_post, unconfirmed=unconfirmed
+    )
     if status_id is None:
         return EvaluationRetry.POST, ""
     if _post_is_contested(session, config, evaluation, status_id):
@@ -1385,14 +1434,29 @@ def _withdraw_unverified_success(session: ApiSession, config: Config) -> None:
         ) from exc
 
 
-def _evaluate_retries(session: ApiSession, config: Config, out: TextIO) -> str:
-    """Allow one re-evaluation per retry reason."""
+def _evaluate_retries(
+    session: ApiSession,
+    config: Config,
+    out: TextIO,
+    unconfirmed: list[PostFailureError] | None = None,
+) -> str:
+    """Allow one re-evaluation per retry reason.
+
+    An unconfirmed POST failure is cleared only when an evaluation finishes without a
+    retry reason, which proves the outcome.
+    """
     retried: set[EvaluationRetry] = set()
     for _ in range(1 + len(EvaluationRetry)):
         retry = _evaluate_attempt(
-            session, config, out, can_retry_post=EvaluationRetry.POST not in retried
+            session,
+            config,
+            out,
+            can_retry_post=EvaluationRetry.POST not in retried,
+            unconfirmed=unconfirmed,
         )
         if retry is None:
+            if unconfirmed is not None:
+                unconfirmed.clear()
             return ""
         reason, warning = retry
         if reason in retried:
@@ -1403,9 +1467,15 @@ def _evaluate_retries(session: ApiSession, config: Config, out: TextIO) -> str:
     return ""
 
 
-def _evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> None:
+def _evaluate_one(
+    session: ApiSession,
+    config: Config,
+    out: TextIO,
+    err: TextIO,
+    unconfirmed: list[PostFailureError] | None = None,
+) -> None:
     try:
-        warning = _evaluate_retries(session, config, out)
+        warning = _evaluate_retries(session, config, out, unconfirmed)
     except (ApiCapReachedError, ApiFailureError):
         _withdraw_unverified_success(session, config)
         raise
@@ -1416,12 +1486,20 @@ def _evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO)
 
 def evaluate_one(session: ApiSession, config: Config, out: TextIO, err: TextIO) -> int:
     """Read, decide and post for one SHA; return 1 only on an evaluation error."""
+    unconfirmed: list[PostFailureError] = []
     try:
-        _evaluate_one(session, config, out, err)
+        _evaluate_one(session, config, out, err, unconfirmed)
     except ApiCapReachedError as exc:
-        return _warn_api_cap(err, exc)
+        cap_rc = _warn_api_cap(err, exc)
+        if unconfirmed:
+            err.write(f"::error::{unconfirmed[0]}\n")
+            return 1
+        return cap_rc
     except ApiFailureError as exc:
         err.write(f"::error::{exc}\n")
+        return 1
+    if unconfirmed:
+        err.write(f"::error::{unconfirmed[0]}\n")
         return 1
     return 0
 
@@ -1456,6 +1534,8 @@ def _read_triage_statuses(
             statuses, _ = _read_status_page_one(session, replace(config, sha=sha))
         except ApiCapReachedError:
             break
+        except WorkDeadlineError:
+            raise
         except ApiFailureError as exc:
             if session.now() >= session.work_deadline:
                 raise
@@ -1631,6 +1711,11 @@ def run_sweep(
     if _sweep_deadline_passed(session, err, "the default branch"):
         return 1
     result = _sweep_default_branch(session, sweep_cfg, default_head, out, err)
+    if session.cap_reached:
+        # The default branch consumed the quota, including the calls a POST reserves.
+        if to_eval:
+            _warn_unjudged_targets(err, len(to_eval[:MAX_TARGETS_MAX]))
+        return 1 if had_triage_errors else result
     result = _sweep_pull_heads(session, sweep_cfg, to_eval, result, out, err)
     return 1 if had_triage_errors else result
 
@@ -2167,7 +2252,7 @@ def _apply_workflow_ref(config: Config, environ: Mapping[str, str]) -> Config:
     workflow_ref = environ.get("GITHUB_WORKFLOW_REF", "").strip()
     if not workflow_ref:
         return config
-    parsed = _path_from_workflow_ref(workflow_ref)
+    parsed = _path_from_workflow_ref(workflow_ref, config.repository)
     if not parsed:
         return config
     return Config(**{**config.__dict__, "self_workflow": parsed})
