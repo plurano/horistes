@@ -101,6 +101,8 @@ lint-yaml: tools
 
 lint-python: tools
 	$(BIN)/ruff check --config ruff.toml tools tests fuzz
+	# Shipped tools may not rely on assert: python -O strips it (Codacy Bandit B101).
+	$(BIN)/ruff check --config ruff.toml --select S101 tools
 	$(BIN)/ruff format --check --config ruff.toml tools tests fuzz
 
 # actionlint reads .github/workflows by itself; zizmor is given the workflow

@@ -810,7 +810,7 @@ jobs:
 
 
           QUERY = """
-          query($owner: String!, $name: String!, $after: String) {
+          query PullPage($owner: String!, $name: String!, $first: Int!, $after: String) {
             repository(owner: $owner, name: $name) {
               defaultBranchRef { name rules(first: 50) { nodes { type } } }
               autoMergeAllowed
@@ -818,7 +818,7 @@ jobs:
               landerLease: label(name: "merge-train: lander lease") { description }
               releaseConfig: object(expression: "HEAD:release-please-config.json") { oid }
               releaseManifest: object(expression: "HEAD:.release-please-manifest.json") { oid }
-              pullRequests(states: OPEN, first: 25, after: $after,
+              pullRequests(states: OPEN, first: $first, after: $after,
                            orderBy: {field: CREATED_AT, direction: ASC}) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
@@ -873,7 +873,7 @@ jobs:
           """
           # The pull query with the required status context on the head commit (record 0076):
           # one more variable and one more field, so the unset query stays QUERY itself.
-          STATUS_QUERY = QUERY.replace(
+          STATUS_QUERY = QUERY.replace("query PullPage(", "query PullPageWithStatus(", 1).replace(
               "$after: String)", "$after: String, $status: String!)", 1
           ).replace(
               "signature { wasSignedByGitHub }",
