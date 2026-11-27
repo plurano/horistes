@@ -655,8 +655,8 @@ class ApiSession:
             if reserve_withdrawal:
                 self.withdrawal_reserved = True
             raise
-        if reserve_withdrawal is not None:
-            self.withdrawal_reserved = reserve_withdrawal
+        if reserve_withdrawal:
+            self.withdrawal_reserved = True
         return _decode_json(label, body)
 
     def request_json(
@@ -1256,12 +1256,23 @@ def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluatio
     return _post_age_problem(session, evaluation)
 
 
+_WITHDRAWABLE_STATES = frozenset({"failure", "pending"})
+
+
+def _is_status_id(value: object, expected: int) -> bool:
+    """Exact positive integer id match; bool, float, str, None and non-positive ids never match.
+
+    Plain `==` or set membership would let True match 1 and 1.0 match 1.
+    """
+    return expected > 0 and _int_id(value) == expected
+
+
 def _own_contender_cutoff(
     rows: list[dict], key: str, status_id: int, checked_at: float, read_started: float
 ) -> int | None:
     """Map the judge's server `created_at` stamp back by runner elapsed time to the read start."""
     for entry in rows[: forge.PER_PAGE]:
-        if _status_in_context(entry, key) and entry.get("id") == status_id:
+        if _status_in_context(entry, key) and _is_status_id(entry.get("id"), status_id):
             own_created = _iso_epoch(entry.get("created_at"))
             if own_created <= 0:
                 return None
@@ -1295,10 +1306,9 @@ def _excluded_status_ids(
     """Exclude the created status and the judge status the snapshot read, because preflight
     confirmed it was the newest before the POST.
     """
-    prior_id = self_status.get("id") if self_status is not None else None
-    if isinstance(prior_id, int) and not isinstance(prior_id, bool):
-        return frozenset({status_id, prior_id})
-    return frozenset({status_id})
+    prior_id = _int_id(self_status.get("id")) if self_status is not None else 0
+    # Only positive exact ints are excluded, so a malformed row id (0 via _int_id) never matches.
+    return frozenset(i for i in (_int_id(status_id), prior_id) if i > 0)
 
 
 def _has_contender(
@@ -1307,17 +1317,46 @@ def _has_contender(
     for entry in rows[:MAX_STATUSES]:
         if (
             _status_in_context(entry, key)
-            and entry.get("id") not in excluded_ids
+            and _int_id(entry.get("id")) not in excluded_ids
             and _iso_epoch(entry.get("created_at")) >= oldest_contender
         ):
             return True
     return False
 
 
-def _post_is_contested(
-    session: ApiSession, config: Config, evaluation: Evaluation, status_id: int
+def _own_post_is_newest_non_success(
+    rows: list[dict], key: str, status_id: int, state: str, excluded_ids: frozenset[int]
 ) -> bool:
-    """Detect judge writes via server-clock timestamps or status changes across covered pages."""
+    """Whether the posted non-success status is verifiably the newest visible judge status.
+
+    The row must carry the posted integer id and rank newest in the judge context. No other
+    success row may tie or follow it, except the excluded ids.
+    """
+    if state not in _WITHDRAWABLE_STATES:
+        return False
+    own = _all_statuses(rows).get(key)
+    if own is None or not _is_status_id(own.get("id"), status_id) or own.get("state") != state:
+        return False
+    stamp = _status_timestamp(own)
+    for entry in rows[:MAX_STATUSES]:
+        if (
+            _status_in_context(entry, key)
+            and _int_id(entry.get("id")) not in excluded_ids
+            and entry.get("state") == "success"
+            and _status_timestamp(entry) >= stamp
+        ):
+            return False
+    return True
+
+
+def _verify_post(
+    session: ApiSession, config: Config, evaluation: Evaluation, status_id: int
+) -> tuple[bool, bool]:
+    """Return (contested, newest_own_non_success) from server-clock timestamps and covered pages.
+
+    The second flag is True only when the contest is proven harmless to withdrawal: the
+    created failure or pending status is the newest visible judge status.
+    """
     checked_at = session.now()
     rows, complete = _read_status_page_one(session, config)
     key = status_context(config).casefold()
@@ -1325,7 +1364,7 @@ def _post_is_contested(
         rows, key, status_id, checked_at, evaluation.read_started
     )
     if oldest_contender is None:
-        return True
+        return True, False
     owed_keys = _owed_status_keys(config)
     if not complete:
         rows, complete, confirmed = _read_status_pages(
@@ -1336,11 +1375,22 @@ def _post_is_contested(
             lambda read_rows: _statuses_covered(read_rows, owed_keys, oldest_contender),
         )
         if not confirmed:
-            return True
+            return True, False
     if _owed_status_changed(config, evaluation.snapshot, _all_statuses(rows), complete=complete):
-        return True
+        return True, False
     excluded_ids = _excluded_status_ids(status_id, evaluation.snapshot.self_status)
-    return _has_contender(rows, key, excluded_ids, oldest_contender)
+    if not _has_contender(rows, key, excluded_ids, oldest_contender):
+        return False, False
+    return True, _own_post_is_newest_non_success(
+        rows, key, status_id, evaluation.state, excluded_ids
+    )
+
+
+def _post_is_contested(
+    session: ApiSession, config: Config, evaluation: Evaluation, status_id: int
+) -> bool:
+    """Detect judge writes via server-clock timestamps or status changes across covered pages."""
+    return _verify_post(session, config, evaluation, status_id)[0]
 
 
 def _report_verdict(config: Config, evaluation: Evaluation, out: TextIO) -> None:
@@ -1412,7 +1462,12 @@ def _evaluate_attempt(
     )
     if status_id is None:
         return EvaluationRetry.POST, ""
-    if _post_is_contested(session, config, evaluation, status_id):
+    contested, newest_own = _verify_post(session, config, evaluation, status_id)
+    if contested:
+        if newest_own:
+            # A verified visible newest failure or pending status already replaced any
+            # ambiguous success, so no withdrawal call is owed.
+            session.withdrawal_reserved = False
         return EvaluationRetry.CONTESTED, f"Status write contested again for {config.sha}."
     session.withdrawal_reserved = False
     _report_verdict(config, evaluation, out)

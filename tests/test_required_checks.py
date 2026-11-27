@@ -4206,6 +4206,132 @@ def test_success_post_non_json_body_withdraws_and_reports_decode_error() -> None
     assert session.api_calls == 6
 
 
+def test_success_502_then_failure_with_bad_reply_still_withdraws() -> None:
+    fake = ReviewTransport()
+    fake.post_errors = iter([forge.ResponseError("POST HTTP 502", status=502)])
+    fake.post_answers = iter([{}])
+
+    def flip_to_failure() -> None:
+        fake.before_post = None
+        fake.answers[CHECKS_URL] = {"check_runs": [check_item(1, "Build", "failure")]}
+
+    fake.before_post = flip_to_failure
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 1 and "no integer id" in err
+    assert fake.posts == [
+        (REVIEW_POST_PATH, "success"),
+        (REVIEW_POST_PATH, "failure"),
+        (REVIEW_POST_PATH, "pending"),
+    ]
+
+
+@pytest.mark.parametrize("state", ["failure", "pending"])
+def test_non_success_post_keeps_existing_withdrawal_reservation(state: str) -> None:
+    fake = ReviewTransport()
+    session = ApiSession(
+        deadline=fake.clock.now() + SESSION_DEADLINE_SECONDS,
+        now=fake.clock.now,
+        sleep=fake.clock.sleep,
+        transport=fake,
+        out=io.StringIO(),
+        max_api_calls=3,
+    )
+    session.withdrawal_reserved = True
+    required_checks.post_commit_status(session, _review_config(), state, "d")
+    assert session.withdrawal_reserved is True
+    assert fake.posts == [(REVIEW_POST_PATH, state)]
+
+
+def _with_id(row_id: object, state: str = "failure") -> dict:
+    return {**status_item(1, "judge", state), "id": row_id}
+
+
+@pytest.mark.parametrize(
+    ("rows", "status_id", "state", "excluded", "expected"),
+    [
+        ([status_item(7, "judge", "failure")], 7, "failure", {7}, True),
+        ([status_item(7, "judge", "pending")], 7, "pending", {7}, True),
+        ([_with_id(True)], 1, "failure", {1}, False),
+        ([_with_id(1.0)], 1, "failure", {1}, False),
+        ([_with_id("1")], 1, "failure", {1}, False),
+        ([_with_id(None)], 1, "failure", {1}, False),
+        ([status_item(0, "judge", "failure")], 0, "failure", set(), False),
+        (
+            [status_item(7, "judge", "failure"), status_item(6, "judge", "success")],
+            7,
+            "failure",
+            {6, 7},
+            True,
+        ),
+        (
+            [_with_id(1), _with_id(True, "success")],
+            1,
+            "failure",
+            {1},
+            False,
+        ),
+        (
+            [_with_id(1), _with_id(1.0, "success")],
+            1,
+            "failure",
+            {1},
+            False,
+        ),
+        (
+            [
+                status_item(7, "judge", "failure"),
+                status_item(8, "judge", "success", updated_at="2026-11-21T12:05:00Z"),
+            ],
+            7,
+            "failure",
+            {7},
+            False,
+        ),
+        ([], 7, "failure", {7}, False),
+        ([status_item(7, "other", "failure")], 7, "failure", {7}, False),
+        ([status_item(7, "judge", "pending")], 7, "failure", {7}, False),
+        ([status_item(7, "judge", "success")], 7, "success", {7}, False),
+        ([status_item(7, "judge", "error")], 7, "error", {7}, False),
+    ],
+    ids=[
+        "positive-failure",
+        "positive-pending",
+        "bool-id",
+        "float-id",
+        "str-id",
+        "none-id",
+        "zero-id",
+        "excluded-prior-success",
+        "bool-id-success-not-excluded",
+        "float-id-success-not-excluded",
+        "later-competing-success",
+        "missing-row",
+        "other-context",
+        "state-mismatch",
+        "success-state",
+        "unlisted-state",
+    ],
+)
+def test_own_post_newest_non_success_requires_exact_proof(
+    rows: list[dict], status_id: int, state: str, excluded: set[int], expected: bool
+) -> None:
+    result = required_checks._own_post_is_newest_non_success(
+        rows, "judge", status_id, state, frozenset(excluded)
+    )
+    assert result is expected
+
+
+@pytest.mark.parametrize(
+    ("row_id", "expected"),
+    [(True, True), (1.0, True), ("1", True), (None, True), (2, True), (1, False)],
+)
+def test_malformed_id_cannot_vanish_by_equality_with_excluded_id(
+    row_id: object, expected: bool
+) -> None:
+    rows = [_with_id(row_id)]
+    assert required_checks._has_contender(rows, "judge", frozenset({1}), 0) is expected
+
+
 def test_success_post_422_sets_no_reservation_and_posts_no_withdrawal() -> None:
     fake = ReviewTransport()
     fake.post_errors = iter(
