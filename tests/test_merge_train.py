@@ -1253,6 +1253,13 @@ class ForgeRequestRefusalError(AssertionError):
     """A named request refusal to report on the test thread."""
 
 
+def diagnostic_text(value: str) -> str:
+    """Keep printable text without spaces verbatim and escape other text."""
+    if value and (not value.isprintable() or " " in value):
+        return ascii(value)
+    return value
+
+
 class Handler(BaseHTTPRequestHandler):
     """The stand-in forge's HTTP side; what it serves is the Forge on its server."""
 
@@ -1310,7 +1317,8 @@ class Handler(BaseHTTPRequestHandler):
             if pending is None:
                 raise
             _, location, _, issuer = pending
-            target = ascii(self.path) if isinstance(error, ForgeRequestRefusalError) else self.path
+            target = diagnostic_text(self.path)
+            location = diagnostic_text(location)
             reason = str(error).partition("\n")[0]
             raise ForgeRequestRefusalError(
                 f"{self.command} {target}: pending redirect from {issuer} to {location} "
@@ -1404,7 +1412,8 @@ class Handler(BaseHTTPRequestHandler):
                 lambda: forge.pending_response is None, timeout=SERIAL_GRACE_SECONDS
             ):
                 raise ForgeRequestRefusalError(
-                    f"concurrent stand-in forge request: {self.command} {self.path}"
+                    "concurrent stand-in forge request: "
+                    f"{self.command} {diagnostic_text(self.path)}"
                 )
             forge.pending_response = getattr(self, "request", self)
         with forge.request_lock:
@@ -12197,28 +12206,75 @@ def test_storage_refuses_noncanonical_ids_without_authorization(ident):
     assert json.loads(body) == {"message": f"Unknown storage route: {path}"}
 
 
+@pytest.mark.parametrize("pending", [False, True], ids=["direct", "pending"])
 @pytest.mark.parametrize(
     ("path", "position", "escaped"),
     [
         pytest.param("/storage/1\t01", 10, r"'\t'", id="tab"),
         pytest.param("/storage/1\r01", 10, r"'\r'", id="cr"),
         pytest.param("/storage/1\n01", 10, r"'\n'", id="lf"),
+        pytest.param("/storage/1\x0001", 10, r"'\x00'", id="inner-nul"),
         pytest.param("\0/storage/101", 0, r"'\x00'", id="leading-nul"),
         pytest.param(" /storage/101", 0, r"'\x20'", id="leading-space"),
     ],
 )
-def test_storage_refuses_raw_target_before_parsing(path, position, escaped):
-    """The URL parser must never receive a target containing a forbidden character."""
+def test_storage_refuses_raw_target_before_parsing(path, position, escaped, pending):
+    """Refuse a forbidden target before parsing it and escape any redirect context."""
     forge = Forge(repository())
     forge.storage[101] = b"planted artifact"
+    if pending:
+        forge.redirect_location = ("GET", path, None, ARCHIVE_ROUTE)
     handler = storage_handler(forge, path)
     refusal = f"GET request target has invalid character at position {position}: {escaped}"
 
-    with pytest.raises(ForgeRequestRefusalError, match=re.escape(refusal)):
+    with pytest.raises(ForgeRequestRefusalError, match=re.escape(refusal)) as error:
         handler.do_GET()
         status, _, _ = handler.wfile.getvalue().partition(b"\r\n")
         pytest.fail(f"expected {refusal}; got {status!r}, storage reads {forge.storage_reads}")
 
+    message = str(error.value)
+    assert message.isprintable(), ascii(message)
+    if pending:
+        context = f"GET {ascii(path)}: pending redirect from {ARCHIVE_ROUTE} to {ascii(path)} "
+        assert context in message
+    assert forge.request_ledger == set()
+    assert forge.fault_requests == forge.storage_reads == []
+
+
+def test_forge_escapes_pending_location_when_route_asserts():
+    """A printable target can reach the route assertion with a NUL in the staged Location."""
+    forge = Forge(repository())
+    issuer = storage_handler(forge, "/repos/fleet/app/actions/artifacts/101/zip")
+    issuer.route, _ = issuer.normalized_route(None)
+    issuer.send_header("Location", "/storage/1\x0001")
+    issuer.end_headers()
+    handler = storage_handler(forge, "*")
+
+    with pytest.raises(
+        ForgeRequestRefusalError, match=re.escape("unresolved REST URL: *")
+    ) as error:
+        handler.do_GET()
+
+    message = str(error.value)
+    assert message.isprintable(), ascii(message)
+    assert (
+        rf"GET *: pending redirect from {ARCHIVE_ROUTE} to 'http://127.0.0.1/storage/1\x0001' "
+        in message
+    )
+
+
+def test_forge_escapes_raw_target_in_concurrent_refusal():
+    """A held response refuses the next target before parsing and escapes it."""
+    forge = Forge(repository())
+    forge.pending_response = object()
+    handler = storage_handler(forge, "/storage/1\x0001")
+
+    with pytest.raises(ForgeRequestRefusalError) as error:
+        handler.do_GET()
+
+    message = str(error.value)
+    assert message.isprintable(), ascii(message)
+    assert message == r"concurrent stand-in forge request: GET '/storage/1\x0001'"
     assert forge.request_ledger == set()
     assert forge.fault_requests == forge.storage_reads == []
 
