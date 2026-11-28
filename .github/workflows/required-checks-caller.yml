@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Required checks sweep: judge open pull heads and the default branch.
+# Schedule runs only on the default branch (ADR-0108 decision b).
+name: Required checks sweep
+
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: required-checks-sweep
+  cancel-in-progress: false
+
+jobs:
+  required-checks:
+    name: Required checks
+    permissions:
+      contents: read # reads the default branch head when listing open pulls
+      checks: read # lists check runs on each target commit
+      actions: read # lists workflow runs on each target commit
+      pull-requests: read # lists open pull request head SHAs
+      statuses: write # posts the required-checks commit status on each target
+    uses: ./.github/workflows/required-checks-sweep.yml
+    with:
+      runner: ubuntu-26.04
+      required: '["Python 3.12 floor", "Fuzz the result reader", "Verification gate", "CodeQL",
+        "Licence", "Action pins", "Sign-off"]'
+      pull-request-only: '["Sign-off"]'
+      not-owed: '[]'
+      apps: '{}'

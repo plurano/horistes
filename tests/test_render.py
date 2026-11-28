@@ -10,6 +10,7 @@ some of it, and none of it is needed by a caller.
 
 from __future__ import annotations
 
+import json
 import sys
 
 import pytest
@@ -28,6 +29,7 @@ CONTEXT = {
     "Count": 7,
     "Shared": render.SAMPLE["Shared"],
     "Licence": render.SAMPLE["Licence"],
+    "RequiredChecks": render.SAMPLE["RequiredChecks"],
 }
 COMMIT = render.SAMPLE["Shared"]["Commit"]
 REAL = "templates/callers/licence.yml.tmpl"
@@ -83,6 +85,12 @@ exceptions:
 DRAFT_ERROR = (
     'echo "::error title=Gate not run on a draft::The gate did not run because '
     'the pull request is a draft. It runs when the pull request is marked ready for review."'
+)
+TAIL_CONCURRENCY_GROUP = (
+    "required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}"
+)
+RENDERED_REQUIRED = (
+    '["Licence", "Secret scan", "Sign-off", "Workflow check", "Developer\'\'s certificate"]'
 )
 RENDERED = f"""\
 # SPDX-FileCopyrightText: 2026 Owner <owner@example.org>
@@ -148,6 +156,33 @@ jobs:
         run: |
           echo "The licence check did not pass or was skipped on a draft."
           exit 1
+
+  # One-shot tail after the gate result: same-repository pull requests only;
+  # fork heads are judged by the scheduled sweep. Group keys caller and head
+  # SHA so concurrent callers do not cancel one another (ADR-0108).
+  required-checks:
+    name: Required checks
+    needs: result
+    if: >-
+      always()
+      && (github.event_name != 'pull_request'
+      || (github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository))
+    concurrency:
+      group: {TAIL_CONCURRENCY_GROUP}
+      cancel-in-progress: false
+    permissions:
+      contents: read # checks out the required-checks judge at its pinned commit
+      checks: read # lists check runs on the target commit
+      actions: read # lists workflow runs on the target commit
+      statuses: write # posts the required-checks commit status
+    uses: owner/shared/.github/workflows/required-checks.yml@{COMMIT} # v1.2.3
+    with:
+      runner: ubuntu-26.04
+      required: '{RENDERED_REQUIRED}'
+      pull-request-only: '["Sign-off"]'
+      not-owed: '[]'
+      apps: '{{}}'
 """
 
 
@@ -276,6 +311,209 @@ def test_licence_template_renders_into_the_recorded_caller():
     assert rendered_real_template() == RENDERED
 
 
+@pytest.mark.parametrize(
+    "template",
+    [REAL, "templates/callers/required-checks.yml.tmpl"],
+    ids=["licence", "sweep"],
+)
+def test_required_checks_quoted_json_round_trips(template):
+    name = "Developer's certificate"
+    inputs = {
+        "required": [name, "Issuer's review"],
+        "pull-request-only": [name],
+        "not-owed": ["Issuer's review"],
+        "apps": {name: "external-app"},
+    }
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {
+            field: json.dumps(inputs[key])
+            for field, key in zip(
+                ("Required", "PullRequestOnly", "NotOwed", "Apps"), inputs, strict=True
+            )
+        },
+    }
+    source = (ROOT / template).read_text(encoding="utf-8")
+    doc = ciwf.loads(render.render(source, context, template), template)
+    passed = doc["jobs"]["required-checks"]["with"]
+    assert {key: json.loads(passed[key]) for key in inputs} == inputs
+
+
+@pytest.mark.parametrize(
+    ("required", "override", "expected"),
+    [
+        (["Licence", "Sign-off"], {}, ["Sign-off"]),
+        (["Licence"], {}, []),
+        (["Licence", "Sign-off"], {"PullRequestOnly": '["Licence"]'}, ["Licence"]),
+    ],
+    ids=["proposal-only", "absent", "explicit-override"],
+)
+def test_rendered_sign_off_defaults_to_proposals(required, override, expected):
+    producer = "templates/callers/sign-off.yml.tmpl"
+    assert set(ciwf.triggers(ciwf.loads(rendered_real_template(producer), producer))) == {
+        "pull_request",
+        "merge_group",
+    }
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {
+            "Required": json.dumps(required),
+            "NotOwed": "[]",
+            "Apps": "{}",
+            **override,
+        },
+    }
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    doc = ciwf.loads(render.render(source, context, REAL), REAL)
+    passed = doc["jobs"]["required-checks"]["with"]
+    assert json.loads(passed["pull-request-only"]) == expected
+    assert render._tail_problems(doc["jobs"]["required-checks"], doc, ROOT) == []
+
+
+@pytest.mark.parametrize(
+    "required",
+    ["[" + "9" * 5000 + "]", '["Sign-off", NaN]'],
+    ids=["huge-int", "nan-constant"],
+)
+def test_policy_default_reports_json_conversion_errors(required):
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {"Required": required, "NotOwed": "[]", "Apps": "{}"},
+    }
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    with pytest.raises(ciwf.ReadError, match=r"\.RequiredChecks\.Required"):
+        render.render(source, context, REAL)
+
+
+def test_policy_default_reports_mocked_decoder_recursion_error(monkeypatch):
+    """A mocked decoder RecursionError on tiny input surfaces as the named ReadError."""
+
+    def recursing_loads(*args, **kwargs):
+        raise RecursionError("mocked decoder failure")
+
+    monkeypatch.setattr("json.loads", recursing_loads)
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {"Required": "[]", "NotOwed": "[]", "Apps": "{}"},
+    }
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    with pytest.raises(ciwf.ReadError, match=r"\.RequiredChecks\.Required.*nesting too deep"):
+        render.render(source, context, REAL)
+
+
+def _tail_documents(source=RENDERED):
+    doc = ciwf.loads(source, REAL)
+    return doc["jobs"]["required-checks"], doc
+
+
+@pytest.mark.parametrize("value", [7, ["a"], "x", None])
+def test_tail_non_mapping_with_reports_one_problem(value):
+    tail, doc = _tail_documents()
+    tail["with"] = value
+    assert render._tail_problems(tail, doc, ROOT) == [
+        "job required-checks passes a with that is not a mapping"
+    ]
+
+
+def test_tail_empty_with_reports_missing_fields():
+    tail, doc = _tail_documents()
+    tail["with"] = {}
+    problems = render._tail_problems(tail, doc, ROOT)
+    assert all(
+        f"job `required-checks` does not pass `{key}`" in problems for key in render.TAIL_WITH
+    )
+
+
+def test_tail_refuses_non_string_input_keys():
+    tail, doc = _tail_documents()
+    tail["with"].update({"extra": "value", 7: "value"})
+    problems = render._tail_problems(tail, doc, ROOT)
+    assert "job `required-checks` passes `7`, which the tail does not declare" in problems
+    assert "job `required-checks` passes `extra`, which the tail does not declare" in problems
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("required", "not JSON", "required: invalid JSON"),
+        ("apps", "[]", "apps: must be a JSON object"),
+        ("pull-request-only", '["Missing"]', "pull-request-only: unknown context"),
+        ("required", 7, "passes `required` as a non-string policy value"),
+        ("required", "[]", "required: must not be empty"),
+    ],
+)
+def test_tail_reports_invalid_judge_policy(field, value, message):
+    tail, doc = _tail_documents()
+    tail["with"][field] = value
+    problems = render._tail_problems(tail, doc, ROOT)
+    assert len(problems) == 1
+    assert message in problems[0]
+    if isinstance(value, str):
+        assert problems[0].startswith("job required-checks passes a policy the judge refuses: ")
+
+
+@pytest.mark.parametrize("name", ["Build", "Bob's check"])
+def test_tail_accepts_smallest_policy_with_default_proposal_subset(name):
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {"Required": json.dumps([name]), "NotOwed": "[]", "Apps": "{}"},
+    }
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    rendered = render.render(source, context, REAL)
+    tail, doc = _tail_documents(rendered)
+    assert json.loads(tail["with"]["required"]) == [name]
+    assert tail["with"]["pull-request-only"] == "[]"
+    assert render._tail_problems(tail, doc, ROOT) == []
+
+
+def test_tail_accepts_sample_policy():
+    tail, doc = _tail_documents()
+    assert render._tail_problems(tail, doc, ROOT) == []
+
+
+def test_tail_runner_input_requires_string(tree):
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    files = {
+        name: (ROOT / name).read_text(encoding="utf-8")
+        for name in (CALLED, render.TAIL_WORKFLOW, "hosts.toml")
+    }
+    tree.write({**files, "exceptions.yaml": EXCEPTIONS, REAL: source})
+    assert tree.tool("render.py", "check").returncode == 0
+
+    target = "      runner: <% .RunnerTag %>\n      required:"
+    rendered_target = "      runner: ubuntu-26.04\n      required:"
+
+    for blank in ('""', '"   "'):
+        empty_tail, empty_doc = _tail_documents(
+            RENDERED.replace(rendered_target, f"      runner: {blank}\n      required:")
+        )
+        assert render._tail_problems(empty_tail, empty_doc, ROOT) == [
+            "job required-checks passes an empty `runner` value"
+        ]
+        tree.write({REAL: source.replace(target, f"      runner: {blank}\n      required:")})
+        done_empty = tree.tool("render.py", "check")
+        assert done_empty.returncode == 1, done_empty.stdout
+        assert "job required-checks passes an empty `runner` value" in done_empty.stderr
+
+    one_char_tail, one_char_doc = _tail_documents(
+        RENDERED.replace(rendered_target, "      runner: x\n      required:")
+    )
+    assert render._tail_problems(one_char_tail, one_char_doc, ROOT) == []
+    tree.write({REAL: source.replace(target, "      runner: x\n      required:")})
+    assert tree.tool("render.py", "check").returncode == 0
+
+    seq_tail, seq_doc = _tail_documents(
+        RENDERED.replace(rendered_target, "      runner: [ubuntu-26.04]\n      required:")
+    )
+    assert render._tail_problems(seq_tail, seq_doc, ROOT) == [
+        "job required-checks passes `runner` as a non-string value"
+    ]
+    tree.write({REAL: source.replace(target, "      runner: [ubuntu-26.04]\n      required:")})
+    done = tree.tool("render.py", "check")
+    assert done.returncode == 1, done.stdout
+    assert "passes `runner` as a non-string value" in done.stderr
+
+
 def test_scorecard_template_renders_into_the_recorded_caller():
     assert rendered_real_template(REAL_SCORECARD) == RENDERED_SCORECARD
 
@@ -303,17 +541,25 @@ def test_rendered_caller_fails_each_linter_on_its_planted_defect(tree, template,
     """Each linter rejects its planted defect in every rendered caller."""
     text = rendered_real_template(template)
     pin = "@" + render.SAMPLE["Shared"]["Commit"]
-    assert text.count(pin) == 1
+    pin_uses = sum(1 for line in text.splitlines() if "uses:" in line and pin in line)
+    assert pin_uses >= 1
+    assert text.count(pin) == pin_uses
 
-    tree.write({name: text + "bogus-key: 1\n"})
+    tree.write({name: text.rstrip() + "\nbogus-key: 1\n"})
     done = actionlint(tree, name, *ACTIONLINT_CONFIG)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "unexpected key" in done.stdout + done.stderr
 
-    tree.write({name: text.replace(pin, "@main")})
-    done = zizmor(tree)
-    assert done.returncode != 0, done.stdout + done.stderr
-    assert "unpinned-uses" in done.stdout + done.stderr
+    start = 0
+    for _ in range(pin_uses):
+        idx = text.find(pin, start)
+        assert idx != -1
+        planted = text[:idx] + "@main" + text[idx + len(pin) :]
+        tree.write({name: planted})
+        done = zizmor(tree)
+        assert done.returncode != 0, done.stdout + done.stderr
+        assert "unpinned-uses" in done.stdout + done.stderr
+        start = idx + len(pin)
 
 
 def test_good_template_passes(tree):
@@ -429,6 +675,12 @@ PLANTED = [
         GOOD + f"  second:\n{USES}",
         "exactly one job",
         id="two-jobs",
+    ),
+    pytest.param(GOOD + "  stray: {}\n", "job `stray` is not classified", id="stray-job"),
+    pytest.param(
+        GOOD + "  required-checks: null\n",
+        "job `required-checks` is not classified",
+        id="malformed-tail",
     ),
     pytest.param(
         GOOD.replace("on:\n  pull_request:\n", "on: <% hostedGateOn %>\n"),
@@ -904,6 +1156,11 @@ Version = "v1.2.3"
 [Licence]
 CopyrightText = "2026 Owner <owner@example.org>"
 Identifier = "EUPL-1.2"
+
+[RequiredChecks]
+Required = '''["Licence", "Secret scan", "Sign-off", "Workflow check", "Developer's certificate"]'''
+NotOwed = "[]"
+Apps = "{{}}"
 """
 
 

@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Required checks (reusable tail): judge every owed check run and commit status
+# on the target commit and post the aggregated required-checks status once
+# (ADR-0108). The self-test proves acceptance and refusal before judging.
+# The check is reported as "<calling job> / Required checks".
+name: Required checks
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Label of the runner the job runs on.
+        type: string
+        required: false
+        default: ubuntu-26.04
+      required:
+        description: JSON list of required check and commit-status context names.
+        type: string
+        required: true
+      pull-request-only:
+        description: >-
+          JSON list of required contexts owed only on pull_request, pull_request_target and merge_group events.
+        type: string
+        required: false
+        default: "[]"
+      not-owed:
+        description: JSON list of required contexts this event does not owe.
+        type: string
+        required: false
+        default: "[]"
+      apps:
+        description: JSON object mapping context name to expected GitHub App slug.
+        type: string
+        required: false
+        default: "{}"
+
+permissions: {}
+
+jobs:
+  required-checks:
+    name: Required checks
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read # checks out the required-checks judge at its pinned commit
+      checks: read # lists check runs on the target commit
+      actions: read # lists workflow runs on the target commit to exclude foreign events
+      statuses: write # posts the required-checks commit status on the target commit
+    steps:
+      - name: Stop on a draft pull request
+        if: github.event.pull_request.draft == true
+        shell: bash
+        env:
+          TITLE: Gate not run on a draft
+          MESSAGE: >-
+            The gate did not run because the pull request is a draft.
+            It runs when the pull request is marked ready for review.
+        run: |
+          echo "::error title=$TITLE::$MESSAGE"
+          echo "$MESSAGE" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Check out the required-checks judge
+        if: github.event.pull_request.draft != true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: required-checks-source
+          persist-credentials: false
+          sparse-checkout: |
+            tools/forge.py
+            tools/required_checks.py
+            tools/required_checks_config.py
+            tools/required_checks_selftest.py
+            tools/required_checks_session.py
+            tools/required_checks_snapshot.py
+            tools/results.py
+          sparse-checkout-cone-mode: false
+
+      - name: Self-test required-checks on planted cases
+        if: github.event.pull_request.draft != true
+        shell: bash
+        run: python3 -I -B required-checks-source/tools/required_checks.py self-test
+
+      - name: Judge required checks
+        if: github.event.pull_request.draft != true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          COMMIT_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REQUIRED_JSON: ${{ inputs.required }}
+          PULL_REQUEST_ONLY_JSON: ${{ inputs.pull-request-only }}
+          NOT_OWED_JSON: ${{ inputs.not-owed }}
+          APPS_JSON: ${{ inputs.apps }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: python3 -I -B required-checks-source/tools/required_checks.py judge

@@ -5,16 +5,36 @@
 from __future__ import annotations
 
 import difflib
+import json
 import re
 import sys
 
 import pytest
+import yaml
 from conftest import ROOT
 
 sys.path.insert(0, str(ROOT / "tools"))
 import render
 
-CALL_USES = re.compile(r"^    uses: \S+(?: # \S+)?$")
+CALL_USES = re.compile(r"^    uses: (\S+)(?: # \S+)?$")
+REQUIRED_LINE = re.compile(r"^      required: ")
+FOLDED_INDENT = " " * 8
+RULESET = ROOT / ".github/rulesets/main.json"
+OWN_CONTEXT = {
+    **render.SAMPLE,
+    "Licence": {
+        "CopyrightText": "2026 Lusoris <lusoris@pm.me>",
+        "Identifier": "EUPL-1.2",
+    },
+    "RequiredChecks": {
+        "Required": (
+            '["Python 3.12 floor", "Fuzz the result reader", "Verification gate", '
+            '"CodeQL", "Licence", "Action pins", "Sign-off"]'
+        ),
+        "NotOwed": "[]",
+        "Apps": "{}",
+    },
+}
 CALLERS = [
     ("templates/callers/licence.yml.tmpl", ".github/workflows/licence-check.yml"),
     ("templates/callers/scorecard.yml.tmpl", ".github/workflows/scorecard-check.yml"),
@@ -34,11 +54,32 @@ jobs:
     uses: ./.github/workflows/inline.yml
     with:
       runner: ubuntu-26.04
+  tail:
+    uses: ./.github/workflows/other.yml
+    with:
+      required: '["A"]'
 """
 
 
+INLINE_REQUIRED = "required: '[\"A\"]'"
+FOLDED_REQUIRED = 'required: \'["A",\n        "B"]\''
+
+
+def _past_required(lines: list[str], i: int) -> int:
+    """Index after the required line at `i` and the lines its quoted value folds onto."""
+    value = lines[i].split(": ", 1)[1]
+    if not value.startswith("'") or (len(value) > 1 and value.endswith("'")):
+        return i + 1
+    for j in range(i + 1, len(lines)):
+        if not lines[j].startswith(FOLDED_INDENT):
+            return j
+        if lines[j].endswith("'"):
+            return j + 1
+    return len(lines)
+
+
 def comparable(text: str) -> list[str]:
-    """The lines of a caller with three allow-listed parts replaced by markers."""
+    """The lines of a caller with allow-listed copyright, headers, uses, and required."""
     lines = text.splitlines()
     out: list[str] = []
     i = 0
@@ -46,7 +87,6 @@ def comparable(text: str) -> list[str]:
         out.append("# SPDX-FileCopyrightText: <ALLOW-LISTED>")
         i = 1
 
-    replaced_uses = False
     while i < len(lines):
         line = lines[i]
         if line == "---":
@@ -60,10 +100,16 @@ def comparable(text: str) -> list[str]:
                 out.append("# <ALLOW-LISTED-HEADER-COMMENT>")
             continue
 
-        if not replaced_uses and CALL_USES.match(line):
-            out.append("    uses: <ALLOW-LISTED>")
-            replaced_uses = True
+        call = CALL_USES.match(line)
+        if call:
+            leaf = call.group(1).split("/")[-1].split("@")[0]
+            out.append(f"    uses: <ALLOW-LISTED:{leaf}>")
             i += 1
+            continue
+
+        if REQUIRED_LINE.match(line):
+            out.append("      required: <ALLOW-LISTED>")
+            i = _past_required(lines, i)
             continue
 
         out.append(line)
@@ -79,8 +125,19 @@ def comparable(text: str) -> list[str]:
 )
 def test_own_caller_equals_rendered_template(template_path: str, own_path: str) -> None:
     """The repository's own caller matches the rendered template except allow-listed parts."""
+    context = (
+        OWN_CONTEXT
+        if own_path.endswith(("licence-check.yml", "sign-off-check.yml"))
+        else render.SAMPLE
+    )
+    if own_path.endswith("sign-off-check.yml"):
+        # This caller's tail only runs on proposal events.
+        context = {
+            **context,
+            "RequiredChecks": {**context["RequiredChecks"], "PullRequestOnly": "[]"},
+        }
     template_text = (ROOT / template_path).read_text(encoding="utf-8")
-    rendered = render.render(template_text, render.SAMPLE, template_path)
+    rendered = render.render(template_text, context, template_path)
     own = (ROOT / own_path).read_text(encoding="utf-8")
 
     own_lines = comparable(own)
@@ -97,54 +154,100 @@ def test_own_caller_equals_rendered_template(template_path: str, own_path: str) 
     assert own_lines == rendered_lines, f"caller and rendered template differ:\n{diff}"
 
 
+def _ruleset_required_contexts() -> set[str]:
+    data = json.loads(RULESET.read_text(encoding="utf-8"))
+    for rule in data.get("rules", []):
+        if rule.get("type") != "required_status_checks":
+            continue
+        params = rule.get("parameters") or {}
+        checks = params.get("required_status_checks") or []
+        return {
+            str(item["context"]) for item in checks if isinstance(item, dict) and "context" in item
+        }
+    raise AssertionError("ruleset has no required_status_checks rule")
+
+
+@pytest.mark.parametrize(
+    "own_path",
+    [".github/workflows/licence-check.yml", ".github/workflows/sign-off-check.yml"],
+)
+def test_own_tail_required_matches_ruleset(own_path: str) -> None:
+    """Each own required-checks tail lists exactly the ruleset required contexts."""
+    doc = yaml.safe_load((ROOT / own_path).read_text(encoding="utf-8"))
+    tail = doc["jobs"]["required-checks"]
+    listed = set(json.loads(tail["with"]["required"]))
+    assert listed == _ruleset_required_contexts()
+
+
+@pytest.mark.parametrize(
+    "caller",
+    ["licence-check.yml", "required-checks-caller.yml"],
+    ids=["licence", "sweep"],
+)
+def test_own_licence_and_sweep_exempt_sign_off_on_push(caller: str) -> None:
+    doc = yaml.safe_load((ROOT / ".github/workflows" / caller).read_text(encoding="utf-8"))
+    inputs = doc["jobs"]["required-checks"]["with"]
+    assert "Sign-off" in json.loads(inputs["required"])
+    assert json.loads(inputs["pull-request-only"]) == ["Sign-off"]
+
+
 def test_comparable_equal_planted_cases() -> None:
-    """Planted cases where only copyright, header block or uses line differ."""
+    """Planted cases where only copyright, header block, uses or required differ."""
     variant_copyright = BASE_INLINE.replace(
         "# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>",
         "# SPDX-FileCopyrightText: 2026 Other <other@example.org>",
     )
     assert comparable(BASE_INLINE) == comparable(variant_copyright)
-    assert comparable(variant_copyright) == comparable(BASE_INLINE)
 
     variant_header = BASE_INLINE.replace(
         "---\n# Header comment line 1\n# Header comment line 2\n",
         "---\n# Single different header comment\n",
     )
     assert comparable(BASE_INLINE) == comparable(variant_header)
-    assert comparable(variant_header) == comparable(BASE_INLINE)
 
     variant_uses = BASE_INLINE.replace(
-        "    uses: ./.github/workflows/inline.yml",
-        "    uses: owner/shared/.github/workflows/inline.yml@commit # v1.0.0",
+        "./.github/workflows/inline.yml",
+        "owner/shared/.github/workflows/inline.yml@commit # v1.0.0",
     )
     assert comparable(BASE_INLINE) == comparable(variant_uses)
-    assert comparable(variant_uses) == comparable(BASE_INLINE)
+
+    variant_required = BASE_INLINE.replace("required: '[\"A\"]'", "required: '[\"B\"]'")
+    assert comparable(BASE_INLINE) == comparable(variant_required)
+
+    variant_folded = BASE_INLINE.replace(INLINE_REQUIRED, FOLDED_REQUIRED)
+    assert comparable(BASE_INLINE) == comparable(variant_folded)
 
 
 def test_comparable_unequal_planted_cases() -> None:
     """Planted cases where disallowed differences cause inequality in both directions."""
+    folded = BASE_INLINE.replace(INLINE_REQUIRED, FOLDED_REQUIRED)
+    assert comparable(folded) != comparable(folded + "      extra: x\n")
+
+    closed_then_indented = BASE_INLINE.replace(
+        "required: '[\"A\"]'", "required: '[\"A\"]'\n        stray: x"
+    )
+    assert comparable(BASE_INLINE) != comparable(closed_then_indented)
+
     variant_jobs_comment = BASE_INLINE.replace(
         "    # A comment inside jobs",
         "    # A different comment inside jobs",
     )
     assert comparable(BASE_INLINE) != comparable(variant_jobs_comment)
-    assert comparable(variant_jobs_comment) != comparable(BASE_INLINE)
 
     variant_with = BASE_INLINE.replace(
         "      runner: ubuntu-26.04",
         "      runner: ubuntu-24.04",
     )
     assert comparable(BASE_INLINE) != comparable(variant_with)
-    assert comparable(variant_with) != comparable(BASE_INLINE)
 
-    second_uses_base = BASE_INLINE + "  other:\n    uses: ./workflow-a.yml\n"
-    second_uses_variant = BASE_INLINE + "  other:\n    uses: ./workflow-b.yml\n"
-    assert comparable(second_uses_base) != comparable(second_uses_variant)
-    assert comparable(second_uses_variant) != comparable(second_uses_base)
-
-    comment_after_first_non_comment = BASE_INLINE.replace(
-        "name: Inline test\n",
-        "name: Inline test\n# Comment right after first non-comment line\n",
+    variant_tail_if = BASE_INLINE.replace(
+        "  tail:\n    uses:",
+        "  tail:\n    if: always()\n    uses:",
     )
-    assert comparable(BASE_INLINE) != comparable(comment_after_first_non_comment)
-    assert comparable(comment_after_first_non_comment) != comparable(BASE_INLINE)
+    assert comparable(BASE_INLINE) != comparable(variant_tail_if)
+
+    second_uses_variant = BASE_INLINE.replace(
+        "uses: ./.github/workflows/other.yml",
+        "uses: ./.github/workflows/different.yml",
+    )
+    assert comparable(BASE_INLINE) != comparable(second_uses_variant)

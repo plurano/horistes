@@ -1,0 +1,45 @@
+<%- /*
+SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+SPDX-License-Identifier: EUPL-1.2
+
+Scheduled sweep caller of the shared required-checks judge, as a consumer
+keeps it in .github/workflows/required-checks-caller.yml. It posts the
+required-checks commit status on fork pull requests, producers without a
+gating tail, and heads that missed a one-shot tail. Inputs come from
+.RequiredChecks; the reusable call is required-checks-sweep.yml (ADR-0108).
+The render context doubles apostrophes in each single-quoted JSON input.
+*/ -%>
+# SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
+# SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>
+---
+# Required checks sweep: judge open pull heads and the default branch.
+# Schedule runs only on the default branch (ADR-0108 decision b).
+name: Required checks sweep
+
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: required-checks-sweep
+  cancel-in-progress: false
+
+jobs:
+  required-checks:
+    name: Required checks
+    permissions:
+      contents: read # reads the default branch head when listing open pulls
+      checks: read # lists check runs on each target commit
+      actions: read # lists workflow runs on each target commit
+      pull-requests: read # lists open pull request head SHAs
+      statuses: write # posts the required-checks commit status on each target
+    uses: <% .Shared.Repository %>/.github/workflows/required-checks-sweep.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      runner: <% .RunnerTag %>
+      required: '<% .RequiredChecks.Required %>'
+      pull-request-only: '<% .RequiredChecks.PullRequestOnly %>'
+      not-owed: '<% .RequiredChecks.NotOwed %>'
+      apps: '<% .RequiredChecks.Apps %>'

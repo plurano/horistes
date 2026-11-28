@@ -38,6 +38,7 @@ COPIES = [
     (".github/workflows/image-age.yml", "image-age"),
     (".github/workflows/licence.yml", "reuse"),
     (".github/workflows/pins.yml", "pins"),
+    (".github/workflows/required-checks.yml", "required-checks"),
     (".github/workflows/secret-scan.yml", "scan"),
     (".github/workflows/sign-off.yml", "sign-off"),
     (".github/workflows/workflow-check.yml", "check"),

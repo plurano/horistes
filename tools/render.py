@@ -17,6 +17,9 @@ outside it, this tool reads the part of that syntax a thin caller needs:
 Anything else between the delimiters (a function, a pipeline, a condition) is
 refused, and so is a field the context does not hold. The context of `render`
 is a TOML file; `check` renders every template with the sample context below.
+The four `.RequiredChecks` values are JSON text inserted into single-quoted
+YAML, so the render context doubles apostrophes on output. If `PullRequestOnly`
+is omitted, it includes `Sign-off` when `Required` names that check.
 
 `check` then reads the result as a workflow: its one calling job must call a
 workflow file of this repository by a full commit id, pass only inputs that
@@ -25,9 +28,11 @@ and no fewer. An input that switches on a host hosts.toml marks `public_only` is
 passed as the repository's visibility (PUBLIC below) or as false. A caller that
 runs on pull requests also holds the job `result`, in exactly the shape that
 reports the calling job's own name and fails unless the call passed; the forge
-reports a called workflow's checks only as "<calling job> / <called job>". While
-exceptions.yaml holds an entry on the required check's name, the note of every
-template must name that entry's issue.
+reports a called workflow's checks only as "<calling job> / <called job>". Such a
+caller may add one job `required-checks` after `result` that calls
+`.github/workflows/required-checks.yml` with the tail grant and inputs from
+`.RequiredChecks`. While exceptions.yaml holds an entry on the required check's
+name, the note of every template must name that entry's issue.
 
 Exit codes: 0 pass, 1 a template fails the check, 3 input error.
 """
@@ -35,6 +40,7 @@ Exit codes: 0 pass, 1 a template fails the check, 3 input error.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import tomllib
@@ -46,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ciwf
 import exceptions
 import hosts
+import required_checks
 
 TEMPLATES = "templates/callers"
 SUFFIX = ".tmpl"
@@ -65,7 +72,35 @@ CREDENTIAL_REF = re.compile(r"\$\{\{ secrets\.[A-Z][A-Z0-9_]* \}\}")
 # The one job beside the call, read by an allow-list: the forge never reports a
 # called workflow's checks under the calling job's own name, so this job does.
 RESULT = "result"
+TAIL = "required-checks"
 RESULT_KEYS = ("if", "name", "needs", "permissions", "runs-on", "steps", "timeout-minutes")
+TAIL_KEYS = ("concurrency", "if", "name", "needs", "permissions", "uses", "with")
+TAIL_NAME = "Required checks"
+TAIL_IF = (
+    "always() && (github.event_name != 'pull_request' || "
+    "(github.event.pull_request.draft == false && "
+    "github.event.pull_request.head.repo.full_name == github.repository))"
+)
+TAIL_GROUP = (
+    "required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}"
+)
+TAIL_WORKFLOW = ".github/workflows/required-checks.yml"
+TAIL_WITH = (
+    "runner",
+    "required",
+    "pull-request-only",
+    "not-owed",
+    "apps",
+)
+REQUIRED_CHECK_FIELDS = frozenset(
+    {
+        ".RequiredChecks.Required",
+        ".RequiredChecks.PullRequestOnly",
+        ".RequiredChecks.NotOwed",
+        ".RequiredChecks.Apps",
+    }
+)
+WS_FOLD = re.compile(r"\s+")
 STEP_KEYS = ("if", "name", "run", "shell")
 ECHO = re.compile(r'echo "[^"$`\\]*"')
 DRAFT_ECHO = re.compile(r'echo "::error title=[^"$`\\]+?::[^"$`\\]+"')
@@ -83,6 +118,13 @@ SAMPLE = {
         "CopyrightText": "2026 Owner <owner@example.org>",
         "Identifier": "EUPL-1.2",
     },
+    "RequiredChecks": {
+        "Required": json.dumps(
+            ["Licence", "Secret scan", "Sign-off", "Workflow check", "Developer's certificate"]
+        ),
+        "NotOwed": "[]",
+        "Apps": "{}",
+    },
 }
 HEADER = (
     f"# SPDX-FileCopyrightText: {SAMPLE['Licence']['CopyrightText']}\n"
@@ -91,11 +133,29 @@ HEADER = (
 )
 
 
+def _default_pull_request_only(fields: dict, where: str) -> str:
+    """Default Sign-off to proposals because its caller has no push trigger."""
+    required = fields.get("Required")
+    if not isinstance(required, str):
+        raise ciwf.ReadError(f"{where}: .RequiredChecks.Required must be a JSON list")
+    try:
+        names = required_checks._load_json(".RequiredChecks.Required", required)
+    except required_checks.InputError as err:
+        raise ciwf.ReadError(f"{where}: {err}") from err
+    if not isinstance(names, list):
+        raise ciwf.ReadError(f"{where}: .RequiredChecks.Required must be a JSON list")
+    return '["Sign-off"]' if "Sign-off" in names else "[]"
+
+
 def _value(name: str, context: dict, where: str) -> str:
     """The text of one field of the context, as the engine prints it."""
     node: object = context
     for part in name[1:].split("."):
-        if not isinstance(node, dict) or part not in node:
+        if not isinstance(node, dict):
+            raise ciwf.ReadError(f"{where}: the context holds no field {name}")
+        if part not in node:
+            if part == "PullRequestOnly" and name == ".RequiredChecks.PullRequestOnly":
+                return _default_pull_request_only(node, where)
             raise ciwf.ReadError(f"{where}: the context holds no field {name}")
         node = node[part]
     if isinstance(node, bool):
@@ -137,7 +197,10 @@ def _action(text: str, start: int, context: dict, where: str) -> tuple[str, int,
             f"{where}: `{LEFT} {body} {RIGHT}` is neither a field nor a note; this tool renders "
             f"nothing else, the engine will ({ENGINE_ISSUE})"
         )
-    return _value(body, context, where), end + len(RIGHT), trim_before, trim_after
+    value = _value(body, context, where)
+    if body in REQUIRED_CHECK_FIELDS:
+        value = value.replace("'", "''")
+    return value, end + len(RIGHT), trim_before, trim_after
 
 
 def render(text: str, context: dict, name: str) -> str:
@@ -184,7 +247,7 @@ def _with_problems(job: dict, called: dict, path: str, public: set[str]) -> list
     passed = job.get("with") or {}
     problems = [
         f"the job passes `{key}`, which {path} does not declare"
-        for key in sorted(set(passed) - set(inputs))
+        for key in sorted(set(passed) - set(inputs), key=str)
     ]
     for key, spec in sorted(inputs.items()):
         if (spec or {}).get("required") and key not in passed:
@@ -399,6 +462,152 @@ def _result_problems(jobs: dict, key: str, doc: dict) -> list[str]:
     return problems + _step_problems(steps[0], key)
 
 
+def _fold_ws(text: str) -> str:
+    """Collapse YAML folded condition text for comparison."""
+    return WS_FOLD.sub(" ", str(text).strip())
+
+
+def _tail_concurrency_problems(concurrency: object) -> list[str]:
+    """Check that the tail queues by caller and head without cancelling a run."""
+    if not isinstance(concurrency, dict):
+        return [f"job `{TAIL}` has no concurrency block"]
+    problems: list[str] = []
+    if concurrency.get("group") != TAIL_GROUP:
+        problems.append(f"job `{TAIL}` concurrency group must key caller and head commit")
+    if concurrency.get("cancel-in-progress") is not False:
+        problems.append(f"job `{TAIL}` must set `cancel-in-progress: false`")
+    return problems
+
+
+def _tail_workflow_problems(tail: dict, doc: dict, root: Path, *, check_inputs: bool) -> list[str]:
+    """Check the tail's reusable workflow reference, grants and input values."""
+    problems: list[str] = []
+    call = CALL.fullmatch(str(tail.get("uses", "")))
+    if call is None:
+        problems.append(f"job `{TAIL}` does not call a workflow by path and reference")
+    elif call["path"] != TAIL_WORKFLOW:
+        problems.append(f"job `{TAIL}` must call {TAIL_WORKFLOW}")
+    elif call["repository"] != SAMPLE["Shared"]["Repository"]:
+        problems.append(f"job `{TAIL}` calls {call['repository']}, not the shared repository")
+    elif call["ref"] != SAMPLE["Shared"]["Commit"]:
+        problems.append("job `required-checks` is not named by the commit field alone")
+    called = _called(root, TAIL_WORKFLOW) if call else None
+    if called is None:
+        problems.append(f"{TAIL_WORKFLOW} is no reusable workflow of this repository")
+    else:
+        problems += _grant_problems(tail, doc, called, TAIL_WORKFLOW)
+        if check_inputs:
+            problems += _with_problems(
+                tail, called, TAIL_WORKFLOW, _public_inputs(root, TAIL_WORKFLOW)
+            )
+    return problems
+
+
+def _tail_non_string_message(key: str) -> str:
+    kind = "value" if key == "runner" else "policy value"
+    return f"job {TAIL} passes `{key}` as a non-string {kind}"
+
+
+def _tail_policy_problems(passed: dict) -> list[str]:
+    policy_fields = TAIL_WITH[1:]
+    problems = [
+        _tail_non_string_message(key)
+        for key in TAIL_WITH
+        if key in passed and not isinstance(passed[key], str)
+    ]
+    runner = passed.get("runner")
+    if isinstance(runner, str) and not runner.strip():
+        problems.append(f"job {TAIL} passes an empty `runner` value")
+    if any(key not in passed or not isinstance(passed[key], str) for key in policy_fields):
+        return problems
+    try:
+        required_checks.parse_policy(
+            required_json=passed["required"],
+            pull_request_only_json=passed["pull-request-only"],
+            not_owed_json=passed["not-owed"],
+            apps_json=passed["apps"],
+        )
+    except required_checks.InputError as err:
+        problems.append(f"job {TAIL} passes a policy the judge refuses: {err}")
+    return problems
+
+
+def _tail_input_problems(passed: dict) -> list[str]:
+    problems = [f"job `{TAIL}` does not pass `{key}`" for key in TAIL_WITH if key not in passed]
+    extra = sorted(set(passed) - set(TAIL_WITH), key=str)
+    problems += [f"job `{TAIL}` passes `{key}`, which the tail does not declare" for key in extra]
+    problems += _tail_policy_problems(passed)
+    return problems
+
+
+def _tail_problems(tail: dict, doc: dict, root: Path) -> list[str]:
+    """What keeps the required-checks tail job from matching the contract."""
+    if set(tail) != set(TAIL_KEYS):
+        return [f"job `{TAIL}` has keys other than {', '.join(TAIL_KEYS)}"]
+    problems: list[str] = []
+    if tail.get("name") != TAIL_NAME:
+        problems.append(f"job `{TAIL}` has `name: {tail.get('name')}`, not `{TAIL_NAME}`")
+    if tail.get("needs") != RESULT:
+        problems.append(f"job `{TAIL}` has `needs: {tail.get('needs')}`, not `{RESULT}`")
+    folded = _fold_ws(str(tail.get("if", "")))
+    if folded != _fold_ws(TAIL_IF):
+        problems.append(f"job `{TAIL}` has an `if` that does not match the tail contract")
+    problems += _tail_concurrency_problems(tail.get("concurrency"))
+    passed = tail.get("with")
+    mapping = isinstance(passed, dict)
+    problems += _tail_workflow_problems(tail, doc, root, check_inputs=mapping)
+    if not mapping:
+        problems.append(f"job {TAIL} passes a with that is not a mapping")
+    else:
+        problems += _tail_input_problems(passed)
+    return problems
+
+
+def _caller_tail_problems(tail: dict | None, jobs: dict, doc: dict, root: Path) -> list[str]:
+    """Problems of the required-checks tail job, when the caller holds one."""
+    if tail is None:
+        return []
+    triggers = ciwf.triggers(doc)
+    if "pull_request" not in triggers and "pull_request_target" not in triggers:
+        return ["a required-checks tail on a caller without pull_request"]
+    if RESULT not in jobs:
+        return [f"job `{TAIL}` needs `{RESULT}`, which is missing"]
+    return _tail_problems(tail, doc, root)
+
+
+def _classify_caller_jobs(jobs: dict) -> tuple[str, dict | None] | str:
+    """Find the gate key and optional tail, or return the first job shape problem."""
+    for key, job in jobs.items():
+        if key != RESULT and isinstance(job, dict) and "steps" in job and "uses" not in job:
+            return f"job `{key}` has steps of its own; a caller only calls"
+    raw_tail = jobs.get(TAIL)
+    tail = (
+        raw_tail
+        if isinstance(raw_tail, dict) and raw_tail.get("needs") == RESULT and "uses" in raw_tail
+        else None
+    )
+    extra_tails = [
+        key
+        for key, job in jobs.items()
+        if key != TAIL and isinstance(job, dict) and job.get("needs") == RESULT and "uses" in job
+    ]
+    gate_keys = [
+        key
+        for key, job in jobs.items()
+        if isinstance(job, dict)
+        and "uses" in job
+        and "steps" not in job
+        and not (key == TAIL and tail is not None)
+    ]
+    if len(gate_keys) != 1:
+        return f"the result is no workflow with exactly one job besides `{RESULT}`"
+    if extra_tails:
+        return "the caller holds more than one required-checks tail"
+    if isinstance(raw_tail, dict) and raw_tail.get("needs") == RESULT and tail is None:
+        return f"job `{TAIL}` is not a reusable workflow call"
+    return gate_keys[0], tail
+
+
 def caller_problems(text: str, root: Path) -> list[str]:
     """What keeps a rendered text from being a thin caller of a workflow kept in `root`."""
     try:
@@ -406,13 +615,17 @@ def caller_problems(text: str, root: Path) -> list[str]:
     except yaml.YAMLError as err:
         return [f"the result is no YAML: {err}"]
     jobs = doc.get("jobs") if isinstance(doc, dict) else None
-    calls = [key for key in jobs if key != RESULT] if isinstance(jobs, dict) else []
-    if len(calls) != 1:
-        return [f"the result is no workflow with exactly one job besides `{RESULT}`"]
-    job = jobs[calls[0]]
-    if not isinstance(job, dict) or "steps" in job:
-        return ["the job has steps of its own; a caller only calls"]
-    problems = _job_problems(job, doc, root) + _result_problems(jobs, calls[0], doc)
+    if not isinstance(jobs, dict):
+        return ["the result names no jobs"]
+    classification = _classify_caller_jobs(jobs)
+    if isinstance(classification, str):
+        return [classification]
+    gate_key, tail = classification
+    classified = {gate_key, RESULT} if tail is None else {gate_key, RESULT, TAIL}
+    problems = [f"job `{key}` is not classified" for key in jobs if key not in classified]
+    problems += _job_problems(jobs[gate_key], doc, root)
+    problems += _caller_tail_problems(tail, jobs, doc, root)
+    problems += _result_problems(jobs, gate_key, doc)
     if not text.startswith(HEADER):
         problems.append("the rendered caller does not start with the two SPDX header lines")
     if f"@{SAMPLE['Shared']['Commit']} # {SAMPLE['Shared']['Version']}\n" not in text:

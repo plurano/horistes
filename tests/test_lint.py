@@ -194,6 +194,53 @@ def test_ruff_refuses_a_planted_lint_finding(tree):
     assert "F401" in bad.stdout
 
 
+def _check_mccabe(tree, *paths: str):
+    return ruff(
+        tree,
+        "check",
+        "--isolated",
+        "--no-cache",
+        "--select",
+        "C901",
+        "--config",
+        "lint.mccabe.max-complexity=10",
+        "--output-format",
+        "concise",
+        *paths,
+    )
+
+
+def test_owned_files_stay_under_mccabe_cap(tree):
+    """Keep the required-checks judge and its integration within the HISS-04 cap."""
+    owned = (
+        "tools/required_checks.py",
+        "tools/required_checks_config.py",
+        "tools/required_checks_selftest.py",
+        "tools/required_checks_session.py",
+        "tools/required_checks_snapshot.py",
+        "tools/render.py",
+        "tools/forge.py",
+        "tests/test_required_checks.py",
+    )
+    done = _check_mccabe(tree, *(str(ROOT / path) for path in owned))
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize(
+    ("branches", "expected_exit"),
+    [(0, 0), (9, 0), (10, 1)],
+    ids=["plain-function", "at-cap", "above-cap"],
+)
+def test_ruff_mccabe_cap_accepts_and_rejects_planted_functions(tree, branches, expected_exit):
+    """A function over the cap produces a C901 diagnostic naming that function."""
+    decisions = "".join(f"    if value == {i}:\n        return {i}\n" for i in range(branches))
+    tree.write({"sample.py": f"def planted(value):\n{decisions}    return -1\n"})
+    done = _check_mccabe(tree, "sample.py")
+    assert done.returncode == expected_exit, done.stdout + done.stderr
+    if expected_exit:
+        assert "C901 `planted` is too complex (11 > 10)" in done.stdout
+
+
 def test_ruff_isort_force_sort_within_sections_both_directions(tree):
     """The try/except import block passes with false and fails with true."""
     base = (ROOT / "ruff.toml").read_text(encoding="utf-8")

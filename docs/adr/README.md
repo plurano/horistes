@@ -103,6 +103,7 @@ record that supersedes it.
 | [0098](0098-the-release-fan-out-runs-in-its-own-workflow-run.md) | 2026-11-20 | The release fan-out runs in its own workflow run | Accepted |
 | [0100](0100-release-off-follows-a-moved-repository.md) | 2026-11-20 | Release-off follows a moved repository | Accepted |
 | [0105](0105-the-train-asks-the-update-bot-to-recreate-an-unsigned-update.md) | 2026-11-21 | The train asks the update bot to recreate an unsigned update | Accepted |
+| [0108](0108-a-reusable-workflow-judges-the-required-checks.md) | 2026-11-21 | A reusable workflow judges the required checks | Accepted |
 | [0112](0112-the-test-stage-runs-on-parallel-workers.md) | 2026-11-22 | The test stage runs on parallel workers | Accepted |
 | [0114](0114-a-sourcery-budget-skip-yields-to-a-coderabbit-review-on-the-head.md) | 2026-11-22 | A Sourcery budget skip yields to a CodeRabbit review on the head | Accepted |
 | [0115](0115-scorecard-callers-publish-by-visibility.md) | 2026-11-23 | Scorecard callers publish results for public repositories | Accepted |

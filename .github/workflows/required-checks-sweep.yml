@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: 2026 Lusoris <lusoris@pm.me>
+# SPDX-License-Identifier: EUPL-1.2
+---
+# Required checks (reusable sweep): judge open pull heads and the default
+# branch head, posting the required-checks status where tails did not run
+# (ADR-0108). Scheduled callers target open pulls; there is no draft step.
+name: Required checks sweep
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Label of the runner the job runs on.
+        type: string
+        required: false
+        default: ubuntu-26.04
+      required:
+        description: JSON list of required check and commit-status context names.
+        type: string
+        required: true
+      pull-request-only:
+        description: >-
+          JSON list of required contexts owed only on pull_request, pull_request_target and merge_group events.
+        type: string
+        required: false
+        default: "[]"
+      not-owed:
+        description: JSON list of required contexts this event does not owe.
+        type: string
+        required: false
+        default: "[]"
+      apps:
+        description: JSON object mapping context name to expected GitHub App slug.
+        type: string
+        required: false
+        default: "{}"
+
+permissions: {}
+
+jobs:
+  required-checks:
+    name: Required checks
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read # reads the default branch head when listing open pulls
+      checks: read # lists check runs on each target commit
+      actions: read # lists workflow runs on each target commit
+      pull-requests: read # lists open pull request head SHAs
+      statuses: write # posts the required-checks commit status on each target
+    steps:
+      - name: Check out the caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github
+          sparse-checkout-cone-mode: true
+
+      - name: Check out the required-checks judge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: required-checks-source
+          persist-credentials: false
+          sparse-checkout: |
+            tools/forge.py
+            tools/required_checks.py
+            tools/required_checks_config.py
+            tools/required_checks_selftest.py
+            tools/required_checks_session.py
+            tools/required_checks_snapshot.py
+            tools/results.py
+          sparse-checkout-cone-mode: false
+
+      - name: Self-test required-checks on planted cases
+        shell: bash
+        run: python3 -I -B required-checks-source/tools/required_checks.py self-test
+
+      - name: Judge required checks on open pulls
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REQUIRED_JSON: ${{ inputs.required }}
+          PULL_REQUEST_ONLY_JSON: ${{ inputs.pull-request-only }}
+          NOT_OWED_JSON: ${{ inputs.not-owed }}
+          APPS_JSON: ${{ inputs.apps }}
+          REQUIRED_CHECKS_TARGETS: open-pulls
+          REQUIRED_CHECKS_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: python3 -I -B required-checks-source/tools/required_checks.py judge

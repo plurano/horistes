@@ -23,6 +23,12 @@ paths:
   .github/workflows/merge-train.yml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20 category D: lacks job.workflow_*
+  .github/workflows/required-checks.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined' # expires 2027-03-21 category D: lacks job.workflow_*
+  .github/workflows/required-checks-sweep.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined' # expires 2027-03-22 category D: lacks job.workflow_*
   .github/workflows/secret-scan.yml:
     ignore:
       - 'property "workflow_(repository|sha)" is not defined' # expires 2027-01-20 category D: lacks job.workflow_*

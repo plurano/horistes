@@ -31,6 +31,9 @@ written from .Licence (working names, as above), so the consumer's licence
 check accepts it (#3). The empty note inside each field line renders as
 nothing and keeps this repository's licence check from reading the line as a
 tag; no REUSE.toml table and no ignore marker covers the template.
+
+The render context doubles apostrophes in each single-quoted .RequiredChecks
+JSON input.
 */ -%>
 # SPDX-<%/* */%>FileCopyrightText: <% .Licence.CopyrightText %>
 # SPDX-<%/* */%>License-Identifier: <% .Licence.Identifier %>
@@ -95,3 +98,30 @@ jobs:
         run: |
           echo "The licence check did not pass or was skipped on a draft."
           exit 1
+
+  # One-shot tail after the gate result: same-repository pull requests only;
+  # fork heads are judged by the scheduled sweep. Group keys caller and head
+  # SHA so concurrent callers do not cancel one another (ADR-0108).
+  required-checks:
+    name: Required checks
+    needs: result
+    if: >-
+      always()
+      && (github.event_name != 'pull_request'
+      || (github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository))
+    concurrency:
+      group: required-checks-${{ github.workflow }}-${{ github.event.pull_request.head.sha || github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read # checks out the required-checks judge at its pinned commit
+      checks: read # lists check runs on the target commit
+      actions: read # lists workflow runs on the target commit
+      statuses: write # posts the required-checks commit status
+    uses: <% .Shared.Repository %>/.github/workflows/required-checks.yml@<% .Shared.Commit %> # <% .Shared.Version %>
+    with:
+      runner: <% .RunnerTag %>
+      required: '<% .RequiredChecks.Required %>'
+      pull-request-only: '<% .RequiredChecks.PullRequestOnly %>'
+      not-owed: '<% .RequiredChecks.NotOwed %>'
+      apps: '<% .RequiredChecks.Apps %>'
