@@ -1289,28 +1289,39 @@ class Handler(BaseHTTPRequestHandler):
                 self.route,
             )
 
-    def normalized_route(self, pending) -> str:
-        """Name the pending redirect if the incoming route cannot be normalized."""
+    def normalized_route(self, pending) -> tuple[str, str | None]:
+        """Validate the raw target, then return its route key and any canonical storage ID."""
         try:
-            return rest_route(self.command, self.path)
+            for index, character in enumerate(self.path):
+                if not character.isprintable() or character == " ":
+                    escaped = r"'\x20'" if character == " " else ascii(character)
+                    raise ForgeRequestRefusalError(
+                        f"{self.command} request target has invalid character at position "
+                        f"{index}: {escaped}"
+                    )
+            path = urlsplit(self.path).path
+            if path.startswith("/storage/"):
+                if (ident := self.storage_route_id(path)) is not None:
+                    return STORAGE_ROUTE, ident
+                # fault_request_key splits on " [" before extracting the path key.
+                return f"{self.command} {path} [noncanonical storage]", None
+            return rest_route(self.command, self.path), None
         except (AssertionError, ValueError) as error:
             if pending is None:
                 raise
             _, location, _, issuer = pending
+            target = ascii(self.path) if isinstance(error, ForgeRequestRefusalError) else self.path
             reason = str(error).partition("\n")[0]
             raise ForgeRequestRefusalError(
-                f"{self.command} {self.path}: pending redirect from {issuer} to {location} "
+                f"{self.command} {target}: pending redirect from {issuer} to {location} "
                 f"refused: {reason}"
             ) from error
 
-    def storage_route_id(self) -> str | None:
-        """Return the decimal ID of a normalized storage read."""
-        if self.route == STORAGE_ROUTE:
-            ident = urlsplit(self.path).path.removeprefix("/storage/")
-            # A literal {id} also spells the route template after normalization.
-            if ascii_digits(ident):
-                return ident
-        return None
+    def storage_route_id(self, path: str) -> str | None:
+        """Return the canonical decimal ID (ASCII, no leading zero) of a storage GET."""
+        ident = path.removeprefix("/storage/")
+        canonical = ascii_digits(ident) and (ident == "0" or not ident.startswith("0"))
+        return ident if self.command == "GET" and canonical else None
 
     def request_stage(self, pending) -> str:
         """Match the next request to its issuer's method, Location and authorization policy."""
@@ -1398,8 +1409,7 @@ class Handler(BaseHTTPRequestHandler):
             forge.pending_response = getattr(self, "request", self)
         with forge.request_lock:
             pending, forge.redirect_location = forge.redirect_location, None
-            self.route = self.normalized_route(pending)
-            self.storage_id = self.storage_route_id()
+            self.route, self.storage_id = self.normalized_route(pending)
             stage = self.request_stage(pending)
             request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
             operation = graphql_operation(request["query"]) if request is not None else None
@@ -12107,11 +12117,64 @@ def test_storage_redirect_requires_a_canonical_id(
 
 
 @pytest.mark.parametrize(
+    "forward_authorization",
+    [
+        pytest.param(True, id="redirect"),
+        pytest.param(False, id="direct"),
+    ],
+)
+def test_storage_literal_id_leaves_canonical_fault_queued(forward_authorization):
+    """A literal template segment cannot consume either kind of canonical storage fault."""
+    path = "/storage/{id}"
+    forge = Forge(repository())
+    forge.tokens["archive-fixture"] = ("repo", 7, "fleet/app", {"actions": "read"})
+    forge.artifact_redirect_locations[101] = path
+    queued = [418]
+    fault_key = fault_request_key(STORAGE_CASE) if forward_authorization else STORAGE_ROUTE
+    forge.rest_faults[fault_key] = queued
+    headers = {"Authorization": "Bearer archive-fixture"}
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request("GET", "/repos/fleet/app/actions/artifacts/101/zip", headers=headers)
+            redirect = conn.getresponse()
+            assert (redirect.status, redirect.getheader("Location")) == (302, path)
+            redirect.read()
+            conn.request("GET", path, headers=headers if forward_authorization else {})
+            response = conn.getresponse()
+            status, body = response.status, json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert (status, body, queued) == (404, {"message": f"Unknown storage route: {path}"}, [418])
+    assert {fault_request_key(STORAGE_CASE), fault_request_key(STORAGE_ROUTE)}.isdisjoint(
+        forge.request_ledger
+    )
+    assert forge.fault_requests == forge.storage_reads == forge.storage_auth_seen == []
+
+
+def storage_handler(forge, path):
+    """Dispatch a raw target directly, leaving the client and HTTP parser out of the test."""
+    handler = object.__new__(Handler)
+    handler.server = types.SimpleNamespace(forge=forge)
+    handler.command = "GET"
+    handler.path = path
+    handler.headers = {"Host": "127.0.0.1"}
+    handler.requestline = f"GET {path} HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.wfile = io.BytesIO()
+    return handler
+
+
+@pytest.mark.parametrize(
     "ident",
     [
         pytest.param("+101", id="plus"),
         pytest.param("1_01", id="underscore"),
         pytest.param("١٠١", id="arabic-indic"),
+        pytest.param("0101", id="leading-zero"),
     ],
 )
 def test_storage_refuses_noncanonical_ids_without_authorization(ident):
@@ -12125,20 +12188,39 @@ def test_storage_refuses_noncanonical_ids_without_authorization(ident):
         "Bearer archive-fixture",
         ARCHIVE_ROUTE,
     )
-    handler = object.__new__(Handler)
-    handler.server = types.SimpleNamespace(forge=forge)
-    handler.command = "GET"
-    handler.path = path
-    handler.headers = {"Host": "127.0.0.1"}
-    handler.requestline = f"GET {path} HTTP/1.1"
-    handler.request_version = "HTTP/1.1"
-    handler.wfile = io.BytesIO()
+    handler = storage_handler(forge, path)
 
     handler.do_GET()
 
     headers, _, body = handler.wfile.getvalue().partition(b"\r\n\r\n")
     assert (headers.splitlines()[0], forge.storage_reads) == (b"HTTP/1.0 404 Not Found", [])
     assert json.loads(body) == {"message": f"Unknown storage route: {path}"}
+
+
+@pytest.mark.parametrize(
+    ("path", "position", "escaped"),
+    [
+        pytest.param("/storage/1\t01", 10, r"'\t'", id="tab"),
+        pytest.param("/storage/1\r01", 10, r"'\r'", id="cr"),
+        pytest.param("/storage/1\n01", 10, r"'\n'", id="lf"),
+        pytest.param("\0/storage/101", 0, r"'\x00'", id="leading-nul"),
+        pytest.param(" /storage/101", 0, r"'\x20'", id="leading-space"),
+    ],
+)
+def test_storage_refuses_raw_target_before_parsing(path, position, escaped):
+    """The URL parser must never receive a target containing a forbidden character."""
+    forge = Forge(repository())
+    forge.storage[101] = b"planted artifact"
+    handler = storage_handler(forge, path)
+    refusal = f"GET request target has invalid character at position {position}: {escaped}"
+
+    with pytest.raises(ForgeRequestRefusalError, match=re.escape(refusal)):
+        handler.do_GET()
+        status, _, _ = handler.wfile.getvalue().partition(b"\r\n")
+        pytest.fail(f"expected {refusal}; got {status!r}, storage reads {forge.storage_reads}")
+
+    assert forge.request_ledger == set()
+    assert forge.fault_requests == forge.storage_reads == []
 
 
 def test_without_the_cut_cause_a_cut_read_refuses(tmp_path):
