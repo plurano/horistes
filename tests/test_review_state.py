@@ -8,9 +8,17 @@ import re
 from pathlib import Path
 
 import pytest
+from conftest import (
+    REVIEW_COUNT_ZERO,
+    REVIEW_GENERATED,
+    REVIEW_STATUS,
+    completed_head_summary,
+    review_range_block,
+)
 from review_state import (
     MAX_COMMENTS,
     MAX_LINES,
+    MAX_SUMMARY_CHARS,
     is_bot_dependency,
     review_evidence,
     review_incomplete,
@@ -392,6 +400,12 @@ def _allowance_cases():
     cases.append(_case("allowance-later-review-without-head-oid-holds", pr, True))
     reviewed["commit"] = {"oid": pr["headRefOid"]}
     cases.append(_case("allowance-later-review-on-head-clears", pr, False))
+    reviewed["author"] = {"login": "copilot"}
+    cases.append(_case("allowance-later-review-other-login-on-head-holds", pr, True))
+    reviewed["author"] = {"login": "coderabbitai"}
+    reviewed["submittedAt"] = "2026-11-14T20:46:00Z"
+    cases.append(_case("allowance-head-review-older-than-notice-holds", pr, True))
+    reviewed["submittedAt"] = "2026-11-14T20:49:00Z"
     reviewed.pop("commit")
     reviewed["commit"] = {"oid": "c" * 40}
     cases.append(_case("allowance-later-review-old-oid-holds", pr, True))
@@ -589,6 +603,39 @@ def _mixed_pause_allowance_evidence_cases():
     return cases
 
 
+_MIXED_NO_ACTIONABLE = "No actionable comments were generated in the recent review."
+
+
+def _mixed_pause_allowance_zero_action_params():
+    """Mixed pause and allowance notices need zero actions at fixed CodeRabbit positions."""
+    body, head, _, _ = _mixed_pause_allowance_body_parts()
+    actionable = body.replace(_MIXED_NO_ACTIONABLE, "Actionable comments posted: 1")
+    fenced_only = body.replace(
+        _MIXED_NO_ACTIONABLE,
+        "```\nActionable comments posted: 1\n```",
+    )
+    return [
+        pytest.param(body, False, True, id="fixture-zero-action-clears"),
+        pytest.param(actionable, True, False, id="unfenced-actionable-count-holds"),
+        pytest.param(fenced_only, True, False, id="fenced-actionable-only-holds"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("summary", "holds", "on_head"),
+    _mixed_pause_allowance_zero_action_params(),
+)
+def test_mixed_pause_allowance_zero_action(summary, holds, on_head):
+    head = _MIXED_PAUSE_ALLOWANCE_HEAD
+    pr = _mixed_pause_allowance_pr(summary, head)
+    assert bool(adr92_reader().review_incomplete(pr)) is holds
+    evidence = review_evidence(pr)
+    if on_head:
+        assert len(evidence) == 1 and evidence[0][2] is True
+    else:
+        assert not any(entry[2] for entry in evidence)
+
+
 def _thread_and_limit_cases():
     """Keep only the limit half of the gate's thread-and-limit cases."""
     pr = _fixture_golusoris_1266()
@@ -620,34 +667,13 @@ def test_review_incomplete_gate_cases(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
 
 
-@pytest.mark.parametrize(("pr", "on_head"), _mixed_pause_allowance_evidence_cases())
-def test_review_evidence_mixed_pause_allowance(pr, on_head):
-    evidence = review_evidence(pr)
-    if on_head:
-        assert len(evidence) == 1
-        assert evidence[0][2] is True
-        return
-    assert not any(entry[2] for entry in evidence)
-
-
-def test_review_evidence_paused_notice_matches_main():
-    """Pure pause bodies keep the head-evidence shape origin/main already had."""
-    _name, block, head, _expected = bodies[0]
-    pr = _fixture_golusoris_1266()
-    pr["headRefOid"] = head
-    pr["comments"]["nodes"] = [
-        {"author": {"login": "coderabbitai"}, "createdAt": "2026-11-14T04:25:24Z", "body": block}
-    ]
-    evidence = review_evidence(pr)
-    assert len(evidence) == 1 and evidence[0][2] is True
-
-
 @pytest.mark.parametrize("envelope", [False, True], ids=["node", "data-repository-envelope"])
 def test_review_incomplete_pr3507_replay(envelope):
     payload = _fixture("pr3507-review-state.json")
     node = payload["data"]["repository"]["pullRequest"]
     assert review_incomplete(payload if envelope else node) == (
         "review incomplete: coderabbitai limit reached at 2026-11-16T16:40:51Z"
+        "; summary shape unmatched: range block layout"
     )
 
 
@@ -662,6 +688,7 @@ def test_review_incomplete_pr3507_body_replay():
     assert notice["body"].strip() == body.strip()
     assert review_incomplete(node) == (
         "review incomplete: coderabbitai limit reached at 2026-11-16T16:40:51Z"
+        "; summary shape unmatched: range block layout"
     )
 
 
@@ -688,6 +715,37 @@ def adr92_pull(*comments, commits=None, reviews=()):
         "comments": {"nodes": list(comments)},
         "reviews": {"nodes": list(reviews)},
     }
+
+
+@pytest.mark.parametrize(
+    "later_review",
+    [
+        pytest.param(False, id="edited-earlier-review-holds"),
+        pytest.param(True, id="later-empty-review-clears"),
+    ],
+)
+def test_formal_evidence_submission_time(later_review):
+    notice = adr92_comment("0 remain after this review")
+    earlier = {
+        "author": {"login": "coderabbitai"},
+        "state": "COMMENTED",
+        "commit": {"oid": ADR92_HEAD},
+        "body": "Edited review.",
+        "submittedAt": ADR92_COMMIT,
+        "updatedAt": "2026-11-16T17:00:00Z",
+    }
+    reviews = [earlier]
+    if later_review:
+        reviews.append(
+            {
+                "author": earlier["author"],
+                "state": "COMMENTED",
+                "commit": {"oid": ADR92_HEAD},
+                "body": "",
+                "submittedAt": "2026-11-16T18:00:00Z",
+            }
+        )
+    assert bool(review_incomplete(adr92_pull(notice, reviews=reviews))) is (not later_review)
 
 
 def adr92_reader_cases():
@@ -855,6 +913,777 @@ def test_adr92_unfinished_allowance_review_keeps_notice(state):
     assert adr92_reader().review_incomplete(adr92_pull(reviews=[review]))
 
 
+ADR114_BUDGET = (
+    "Sorry @person, you've used your own review budget of 250,000 diff characters "
+    "for the last 7 days."
+)
+ADR114_CR_SUCCESS = "Result: Success - Review completed\n"
+ADR114_SOURCERY_LOGIN = "sourcery-ai[bot]"
+
+NON_GFM_SEPARATORS = {
+    "vt": "\x0b",
+    "ff": "\x0c",
+    "fs": "\x1c",
+    "gs": "\x1d",
+    "rs": "\x1e",
+    "nel": "\x85",
+    "ls": "\u2028",
+    "ps": "\u2029",
+}
+NOTICE_SEPARATORS = {**NON_GFM_SEPARATORS, "cr": "\r"}
+
+
+@pytest.mark.parametrize("separator", NOTICE_SEPARATORS.values(), ids=NOTICE_SEPARATORS)
+def test_notice_after_line_separator(separator):
+    reader = adr92_reader()
+    node = _fixture("pr3507-review-state.json")["data"]["repository"]["pullRequest"]
+    comment = node["comments"]["nodes"][1]
+    node["comments"] = {"nodes": [comment], "totalCount": 1}
+    assert reader.review_incomplete(node)
+    body = comment["body"]
+    notice = reader.LIMIT_NOTICE_RE.search(body)
+    assert notice and notice.start() > 0 and body[notice.start() - 1] == "\n"
+    comment["body"] = body[: notice.start() - 1] + separator + body[notice.start() :]
+    assert reader.review_incomplete(node)
+
+
+@pytest.mark.parametrize("separator", NOTICE_SEPARATORS.values(), ids=NOTICE_SEPARATORS)
+def test_non_allowance_notice_after_separator(separator):
+    reader = adr92_reader()
+    assert reader._non_allowance_notice("Review prose.\n" + ADR114_BUDGET) is True
+    assert reader._non_allowance_notice("Review prose." + separator + ADR114_BUDGET) is True
+
+
+@pytest.mark.parametrize("separator", NOTICE_SEPARATORS.values(), ids=NOTICE_SEPARATORS)
+def test_unread_notice_after_separator(separator):
+    body = "x\n" * MAX_LINES + "Review prose." + separator + ADR114_BUDGET
+    assert review_incomplete(adr92_pull(adr92_comment(body))).endswith(
+        "notice body exceeds the read bound"
+    )
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [pytest.param(sep, id=f"sep-{tag}") for tag, sep in NON_GFM_SEPARATORS.items()]
+    + [pytest.param(None, id="hidden-other-commit")],
+)
+def test_paused_head_separator_proves_nothing(separator):
+    reader = adr92_reader()
+    body, head, _, _ = _mixed_pause_allowance_body_parts()
+    assert reader._paused_head_reviewed(body, head) is True
+    if separator is None:
+        body += "\u2028Last reviewed commit: " + "d" * 40
+    else:
+        heading = "> ## Reviews paused"
+        assert "\n" + heading in body
+        body = body.replace("\n" + heading, separator + heading, 1)
+    assert reader._paused_head_reviewed(body, head) is False
+
+
+def adr114_check_run(name, conclusion, summary, *, status="COMPLETED"):
+    return {"name": name, "status": status, "conclusion": conclusion, "summary": summary}
+
+
+def adr114_head_suite(app_id, slug, runs):
+    return {
+        "app": {"slug": slug, "databaseId": app_id},
+        "checkRuns": {"totalCount": len(runs), "nodes": list(runs)},
+    }
+
+
+def adr114_head_checks(
+    head=ADR92_HEAD,
+    *,
+    coderabbit_runs=None,
+    sourcery_runs=None,
+    sourcery_total=None,
+    oid=None,
+    coderabbit_total=None,
+    commits_total=1,
+):
+    cr_runs = (
+        [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)]
+        if coderabbit_runs is None
+        else list(coderabbit_runs)
+    )
+    sr_runs = (
+        [adr114_check_run("Sourcery review", "SKIPPED", ADR114_BUDGET)]
+        if sourcery_runs is None
+        else list(sourcery_runs)
+    )
+    cr_suites = [adr114_head_suite(347564, "coderabbitai", cr_runs)] if cr_runs else []
+    sr_suites = [adr114_head_suite(48477, "sourcery-ai", sr_runs)] if sr_runs else []
+    commit_oid = head if oid is None else oid
+    return {
+        "totalCount": commits_total,
+        "nodes": [
+            {
+                "commit": {
+                    "oid": commit_oid,
+                    "coderabbit": {
+                        "totalCount": (
+                            len(cr_suites) if coderabbit_total is None else coderabbit_total
+                        ),
+                        "nodes": cr_suites,
+                    },
+                    "sourcery": {
+                        "totalCount": len(sr_suites) if sourcery_total is None else sourcery_total,
+                        "nodes": sr_suites,
+                    },
+                }
+            }
+        ],
+    }
+
+
+def completed_head_run(slug="coderabbitai", conclusion="SUCCESS", status="COMPLETED"):
+    """Legacy check-run dict for parametrized cases; only CodeRabbit maps to headChecks."""
+    return {
+        "__typename": "CheckRun",
+        "status": status,
+        "conclusion": conclusion,
+        "checkSuite": {"app": {"slug": slug}, "commit": {"oid": ADR92_HEAD}},
+    }
+
+
+def _legacy_runs_to_head_checks(runs):
+    """Translate PR headCommit check-run fixtures into ADR-0114 headChecks."""
+    cr_runs = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        suite = run.get("checkSuite") if isinstance(run.get("checkSuite"), dict) else {}
+        app = suite.get("app") if isinstance(suite.get("app"), dict) else {}
+        slug = str(app.get("slug") or "").lower().removesuffix("[bot]")
+        if slug != "coderabbitai":
+            continue
+        conclusion = run.get("conclusion")
+        status = run.get("status") or "QUEUED"
+        summary = (
+            ADR114_CR_SUCCESS
+            if conclusion == "SUCCESS" and status == "COMPLETED"
+            else "Result: Failed\n"
+        )
+        cr_runs.append(
+            adr114_check_run("CodeRabbit", conclusion or "FAILURE", summary, status=status)
+        )
+    return adr114_head_checks(coderabbit_runs=cr_runs)
+
+
+def completed_head_pull(*runs, summary=None, notice_login="coderabbitai", head_checks=None):
+    """Old allowance, newer push, and independent completion evidence on that head."""
+    pr = adr92_pull(
+        adr92_comment("0 remain after this review", "2026-11-15T19:45:04Z", notice_login)
+    )
+    if head_checks is None:
+        head_checks = (
+            _legacy_runs_to_head_checks(runs) if runs else adr114_head_checks(coderabbit_runs=[])
+        )
+    pr["headChecks"] = head_checks
+    if summary is not None:
+        pr["comments"]["nodes"].append(adr92_comment(summary))
+    return pr
+
+
+@pytest.mark.parametrize("form", ["check-run", "summary"])
+def test_completed_head_clears_old_allowance(form):
+    """Reproduce the stale allowance after a push, then plant each completed-head form."""
+    pr = completed_head_pull()
+    assert review_incomplete(pr)
+    if form == "check-run":
+        pr = completed_head_pull(completed_head_run())
+    else:
+        pr = completed_head_pull(summary=completed_head_summary())
+    assert review_incomplete(pr) == ""
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "status", "holds"),
+    [
+        pytest.param("SUCCESS", "COMPLETED", False, id="success"),
+        pytest.param("FAILURE", "COMPLETED", True, id="failure"),
+        pytest.param("NEUTRAL", "COMPLETED", True, id="neutral"),
+        pytest.param("CANCELLED", "COMPLETED", True, id="cancelled"),
+        pytest.param("TIMED_OUT", "COMPLETED", True, id="timed-out"),
+        pytest.param("SKIPPED", "COMPLETED", True, id="skipped"),
+        pytest.param("ACTION_REQUIRED", "COMPLETED", True, id="action-required"),
+        pytest.param("STALE", "COMPLETED", True, id="stale"),
+        pytest.param("STARTUP_FAILURE", "COMPLETED", True, id="startup-failure"),
+        pytest.param(None, "COMPLETED", True, id="none"),
+        pytest.param("SUCCESS", "QUEUED", True, id="queued"),
+        pytest.param("SUCCESS", "IN_PROGRESS", True, id="in-progress"),
+        pytest.param("SUCCESS", None, True, id="missing-status"),
+    ],
+)
+def test_completed_head_run_states(conclusion, status, holds):
+    """Only the completed successful conclusion proves a finished review."""
+    pr = completed_head_pull(completed_head_run(conclusion=conclusion, status=status))
+    assert bool(review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize(
+    ("oid", "holds"),
+    [
+        pytest.param(ADR92_HEAD, False, id="exact-head"),
+        pytest.param("a" * 40, True, id="older-commit"),
+        pytest.param(ADR92_HEAD[:7], True, id="prefix"),
+        pytest.param(ADR92_HEAD + "0", True, id="long"),
+        pytest.param(ADR92_HEAD.upper(), True, id="uppercase"),
+        pytest.param(None, True, id="missing"),
+    ],
+)
+def test_completed_head_check_oid(oid, holds):
+    """A prefix or any other commit cannot cover the PR head."""
+    pr = completed_head_pull(head_checks=adr114_head_checks())
+    if oid is None:
+        pr["headChecks"]["nodes"][0]["commit"].pop("oid", None)
+    else:
+        pr["headChecks"]["nodes"][0]["commit"]["oid"] = oid
+    assert bool(review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize(
+    ("notice_login", "runs", "holds"),
+    [
+        pytest.param("coderabbitai", [completed_head_run("copilot")], True, id="other-listed"),
+        pytest.param(
+            "coderabbitai", [completed_head_run("codacy-production")], True, id="static-analysis"
+        ),
+        pytest.param(
+            "coderabbitai",
+            [completed_head_run(conclusion="NEUTRAL"), completed_head_run("copilot")],
+            True,
+            id="own-neutral-other-success",
+        ),
+        pytest.param(
+            "coderabbitai",
+            [completed_head_run(), completed_head_run("copilot")],
+            False,
+            id="own-and-other-success",
+        ),
+        pytest.param("coderabbitai[bot]", [completed_head_run()], False, id="notice-suffix"),
+        pytest.param(
+            "coderabbitai", [completed_head_run("coderabbitai[bot]")], False, id="app-suffix"
+        ),
+        pytest.param("copilot[bot]", [completed_head_run("copilot")], True, id="copilot-own"),
+        pytest.param("sourcery-ai", [completed_head_run("sourcery-ai")], True, id="sourcery-own"),
+        pytest.param("coderabbitai", [completed_head_run("unlisted")], True, id="unlisted-app"),
+        pytest.param("unlisted", [completed_head_run("unlisted")], True, id="unlisted-own"),
+        pytest.param("unlisted", [completed_head_run()], True, id="unlisted-notice"),
+        pytest.param("coderabbitai", [completed_head_run(None)], True, id="missing-app-slug"),
+    ],
+)
+def test_completed_head_same_check_reviewer(notice_login, runs, holds):
+    """App success belongs only to its own listed reviewer notice."""
+    assert bool(review_incomplete(completed_head_pull(*runs, notice_login=notice_login))) is holds
+
+
+HC_ROOT = ("headChecks",)
+HC_NODES = (*HC_ROOT, "nodes")
+HC_COMMIT = (*HC_NODES, 0, "commit")
+HC_CODERABBIT = (*HC_COMMIT, "coderabbit")
+HC_CR_RUNS = (*HC_CODERABBIT, "nodes", 0, "checkRuns")
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        pytest.param(HC_ROOT, None, id="unread-head"),
+        pytest.param(HC_NODES, [], id="empty-head"),
+        pytest.param(HC_NODES, {}, id="unread-head-nodes"),
+        pytest.param(HC_NODES, [None], id="null-head-node"),
+        pytest.param(HC_COMMIT, None, id="unread-commit"),
+        pytest.param(HC_CODERABBIT, None, id="unread-suites"),
+        pytest.param((*HC_CODERABBIT, "nodes"), {}, id="unread-suite-nodes"),
+        pytest.param((*HC_CODERABBIT, "nodes"), [None], id="null-suite-node"),
+        pytest.param((*HC_CODERABBIT, "nodes"), [], id="suite-count-mismatch"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), None, id="missing-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), True, id="bool-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), "1", id="string-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), -1, id="negative-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), 2, id="truncated-suite-count"),
+        pytest.param((*HC_CODERABBIT, "totalCount"), 6, id="oversized-suite-count"),
+        pytest.param(HC_CR_RUNS, None, id="unread-runs"),
+        pytest.param((*HC_CR_RUNS, "nodes"), {}, id="unread-run-nodes"),
+        pytest.param((*HC_CR_RUNS, "nodes"), [None], id="null-run-node"),
+        pytest.param((*HC_CR_RUNS, "nodes"), [], id="run-count-mismatch"),
+        pytest.param((*HC_CR_RUNS, "totalCount"), None, id="missing-run-count"),
+        pytest.param((*HC_CR_RUNS, "totalCount"), True, id="bool-run-count"),
+        pytest.param((*HC_CR_RUNS, "totalCount"), 6, id="oversized-run-count"),
+        pytest.param((*HC_CR_RUNS, "nodes", 0, "summary"), "Wrong line", id="bad-summary"),
+        pytest.param((*HC_CR_RUNS, "nodes", 0, "name"), "Other", id="bad-name"),
+    ],
+)
+def test_completed_head_unread_check_context(path, value):
+    """Malformed or incomplete check snapshots grant no completion evidence."""
+    pr = completed_head_pull(completed_head_run())
+    node = pr
+    for key in path[:-1][:10]:
+        node = node[key]
+    node[path[-1]] = value
+    assert review_incomplete(pr)
+
+
+@pytest.mark.parametrize("count", [5, 6])
+def test_completed_head_check_context_bound(count):
+    """The exact headChecks run bound qualifies; one extra run invalidates the read."""
+    runs = [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)] * min(count, 5)
+    pr = completed_head_pull(head_checks=adr114_head_checks(coderabbit_runs=runs))
+    conn = pr["headChecks"]["nodes"][0]["commit"]["coderabbit"]["nodes"][0]["checkRuns"]
+    conn["totalCount"] = count
+    assert bool(review_incomplete(pr)) is (count > 5)
+
+
+def _cr_suite(
+    succeeded: bool = True,
+    *,
+    truncated: bool = False,
+    unread_nodes: bool = False,
+    app: tuple[int, str] = (347564, "coderabbitai"),
+) -> dict:
+    """Build one headChecks suite fixture with optional connection defects."""
+    run = (
+        adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)
+        if succeeded
+        else adr114_check_run("CodeRabbit", "FAILURE", "Result: Failed\n")
+    )
+    suite = adr114_head_suite(app[0], app[1], [run])
+    if truncated:
+        suite["checkRuns"]["totalCount"] += 1
+    if unread_nodes:
+        suite["checkRuns"]["nodes"] = {}
+    return suite
+
+
+@pytest.mark.parametrize(
+    ("suites", "holds"),
+    [
+        pytest.param(
+            [_cr_suite(), _cr_suite(False, truncated=True)],
+            True,
+            id="success-then-truncated",
+        ),
+        pytest.param(
+            [_cr_suite(False, truncated=True), _cr_suite()],
+            True,
+            id="truncated-then-success",
+        ),
+        pytest.param(
+            [_cr_suite(), _cr_suite(False, unread_nodes=True)],
+            True,
+            id="success-then-unread-nodes",
+        ),
+        pytest.param(
+            [_cr_suite(False), _cr_suite()],
+            False,
+            id="two-readable-one-success",
+        ),
+        pytest.param(
+            [_cr_suite(), _cr_suite(False)],
+            False,
+            id="two-readable-success-first",
+        ),
+        pytest.param(
+            [_cr_suite(), _cr_suite(False, truncated=True, app=(999999, "other-app"))],
+            False,
+            id="other-app-truncated-ignored",
+        ),
+        pytest.param(
+            [_cr_suite(), _cr_suite(), _cr_suite(), _cr_suite(), _cr_suite(False, truncated=True)],
+            True,
+            id="five-suites-last-truncated",
+        ),
+        pytest.param(
+            [_cr_suite(False), _cr_suite(False), _cr_suite(False), _cr_suite(False), _cr_suite()],
+            False,
+            id="five-suites-all-readable",
+        ),
+    ],
+)
+def test_completed_head_coderabbit_suites(suites: list[dict], holds: bool) -> None:
+    """Every matching CodeRabbit suite must be readable regardless of suite order."""
+    pr = completed_head_pull(head_checks=adr114_head_checks())
+    coderabbit = pr["headChecks"]["nodes"][0]["commit"]["coderabbit"]
+    coderabbit["nodes"] = copy.deepcopy(suites)
+    coderabbit["totalCount"] = len(suites)
+    assert bool(review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize("extra", [None, {}, {"commit": {"oid": ADR92_HEAD}}])
+def test_completed_head_commit_connection_bound(extra):
+    """The query selects exactly one commit; malformed extra nodes cannot be dropped."""
+    pr = completed_head_pull(completed_head_run())
+    pr["headChecks"]["nodes"].append(extra)
+    assert review_incomplete(pr)
+
+
+@pytest.mark.parametrize(
+    ("statement", "holds"),
+    [
+        pytest.param(
+            "No actionable comments were generated in the recent review.",
+            True,
+            id="exact-sentence",
+        ),
+        pytest.param("Actionable comments posted: 0", True, id="zero-count"),
+        pytest.param("**Actionable comments posted:** 0", True, id="bold-label"),
+        pytest.param("**Actionable comments posted: 0**", False, id="bold-line"),
+        pytest.param("Actionable comments posted: **0**", True, id="bold-count"),
+        pytest.param("**Actionable comments posted: 1**", True, id="nonzero"),
+        pytest.param(
+            "Actionable comments posted: 0\nActionable comments posted: 1",
+            True,
+            id="contradictory-count",
+        ),
+        pytest.param(
+            "No actionable comments were generated in the recent review.\n"
+            "Actionable comments posted: 2",
+            True,
+            id="sentence-conflict",
+        ),
+        pytest.param(
+            "> No actionable comments were generated in the recent review.",
+            True,
+            id="quoted-sentence",
+        ),
+        pytest.param("> Actionable comments posted: 0", True, id="quoted-count"),
+        pytest.param("No issues were found.", True, id="unknown-wording"),
+        pytest.param("", True, id="missing-statement"),
+        pytest.param("Actionable comments posted: 0 more expected", True, id="count-prose"),
+    ],
+)
+def test_completed_head_summary_actionable(statement, holds):
+    """Only explicit unquoted zero-action evidence can clear an old separate allowance."""
+    pr = completed_head_pull(summary=completed_head_summary(statement=statement))
+    assert bool(review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize("variant", ["old", "prefix", "two", "duplicate", "quoted"])
+def test_completed_head_summary_ranges(variant):
+    """Reuse the exact range parser; an ambiguous or quoted range proves nothing."""
+    body = completed_head_summary()
+    if variant == "old":
+        body = completed_head_summary("c" * 40)
+    elif variant == "prefix":
+        body = completed_head_summary(ADR92_HEAD[:7])
+    elif variant == "two":
+        body += "\n" + review_range_block("c" * 40)
+    elif variant == "duplicate":
+        body += "\n" + review_range_block(ADR92_HEAD)
+    else:
+        body = "\n".join("> " + line for line in body.split("\n")[:MAX_LINES])
+    assert review_incomplete(completed_head_pull(summary=body))
+
+
+@pytest.mark.parametrize(
+    ("notice_login", "summary_login", "holds"),
+    [
+        ("coderabbitai", "copilot", True),
+        ("coderabbitai", "person", True),
+        ("coderabbitai[bot]", "coderabbitai", False),
+        ("coderabbitai", "coderabbitai[bot]", False),
+        ("unlisted", "unlisted", True),
+    ],
+    ids=["other-listed", "author", "notice-suffix", "summary-suffix", "unlisted-own"],
+)
+def test_completed_head_same_summary_reviewer(notice_login, summary_login, holds):
+    """Summary authors must match the listed notice author's normalized login."""
+    pr = completed_head_pull(summary=completed_head_summary(), notice_login=notice_login)
+    pr["comments"]["nodes"][-1]["author"]["login"] = summary_login
+    assert bool(review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize(
+    "state", ["COMMENTED", "APPROVED", "CHANGES_REQUESTED", "PENDING", "DISMISSED"]
+)
+def test_completed_head_summary_in_review(state):
+    """Completed review bodies qualify without a commit field; pending/dismissed cannot."""
+    pr = completed_head_pull()
+    pr["reviews"]["nodes"] = [adr92_comment(completed_head_summary(), state=state)]
+    assert bool(review_incomplete(pr)) is (state in {"PENDING", "DISMISSED"})
+
+
+@pytest.mark.parametrize("form", ["check-run", "summary"])
+@pytest.mark.parametrize(
+    "notice", ["Rate limit reached.", "## Reviews paused", "Review limit reached."]
+)
+def test_completed_head_keeps_other_limit_rules(form, notice):
+    """Neither new allowance exemption overrides ordinary rate/review/pause notices."""
+    pr = (
+        completed_head_pull(completed_head_run())
+        if form == "check-run"
+        else (completed_head_pull(summary=completed_head_summary()))
+    )
+    pr["comments"]["nodes"][0] = adr92_comment(notice)
+    assert review_incomplete(pr)
+
+
+@pytest.mark.parametrize("lines", [MAX_LINES, MAX_LINES + 1])
+def test_completed_head_summary_line_bound(lines):
+    """Accept a body exactly at the local line bound and reject one additional line."""
+    summary = completed_head_summary()
+    body = summary + "\nblank" * (lines - len(summary.splitlines()))
+    assert len(body.splitlines()) == lines
+    assert bool(review_incomplete(completed_head_pull(summary=body))) is (lines > MAX_LINES)
+
+
+@pytest.mark.parametrize("kind", ["comments", "reviews"])
+@pytest.mark.parametrize("position", [100, 101])
+def test_completed_head_summary_body_bound(kind, position):
+    """Read only the first 100 bodies in either existing connection."""
+    pr = completed_head_pull()
+    pr[kind]["nodes"] = [adr92_comment("ordinary prose")] * (position - 1)
+    pr[kind]["nodes"].append(adr92_comment(completed_head_summary()))
+    if kind == "comments":
+        pr["reviews"]["nodes"] = [adr92_comment("0 remain after this review")]
+    assert bool(review_incomplete(pr)) is (position > 100)
+
+
+def test_completed_head_without_notice_unchanged():
+    """An unreadable check connection creates no new hold when no limit notice exists."""
+    pr = adr92_pull(adr92_comment("Ordinary summary."))
+    pr["headChecks"] = None
+    assert review_incomplete(pr) == ""
+
+
+def test_completed_head_unlisted_notice_barrier():
+    """An unlisted notice stays held even if an evidence producer supplies its login."""
+    reader = adr92_reader()
+    comment = adr92_comment("0 remain after this review", login="unlisted")
+    evidence = ([], [], {"unlisted"})
+    assert reader._notice_holds(comment, ADR92_HEAD, reader._instant(ADR92_COMMIT), evidence, {})
+
+
+def test_completed_head_unlisted_app_barrier():
+    """The check evidence producer excludes an unlisted app before notice binding."""
+    reader = adr92_reader()
+    assert (
+        reader._completed_check_reviewers(
+            completed_head_pull(completed_head_run("unlisted")), ADR92_HEAD
+        )
+        == set()
+    )
+
+
+@pytest.mark.parametrize("form", ["check-run", "summary"])
+def test_completed_head_evidence_without_timestamps(form):
+    """Exact head evidence covers allowance independently of unavailable ordering."""
+    pr = (
+        completed_head_pull(completed_head_run())
+        if form == "check-run"
+        else completed_head_pull(summary=completed_head_summary())
+    )
+    pr["commits"]["nodes"] = []
+    for comment in pr["comments"]["nodes"][:MAX_COMMENTS]:
+        comment.pop("createdAt", None)
+    assert review_incomplete(pr) == ""
+
+
+def test_completed_head_query_contract():
+    """The sole caller selects one head commit and every bounded check-evidence field."""
+    import ast
+
+    source = FIXTURES.parents[2] / "tools/merge_train.py"
+    assignments = [
+        node for node in ast.parse(source.read_text()).body[:200] if isinstance(node, ast.Assign)
+    ]
+    assignment = next(
+        node
+        for node in assignments[:200]
+        if any(
+            isinstance(target, ast.Name) and target.id == "REVIEW_BODIES"
+            for target in node.targets[:10]
+        )
+    )
+    query = " ".join(ast.literal_eval(assignment.value).split())
+    assert "headChecks: commits(last: 1)" in query
+    assert "filterBy: {appId: 347564}" in query
+    assert 'checkRuns(first: 5, filterBy: {checkName: "CodeRabbit"})' in query
+    assert "headCommit" not in query
+    assert "statusCheckRollup" not in query
+    assert "commits(first: 100) { totalCount nodes { commit { message committedDate } } }" in query
+
+
+@pytest.mark.parametrize(
+    ("oid", "other_app", "holds"),
+    [
+        pytest.param(ADR92_HEAD[:7] + "0" * 33, False, True, id="old-suite"),
+        pytest.param(ADR92_HEAD[:7], False, True, id="prefix-suite"),
+        pytest.param(ADR92_HEAD[:7] + "0" * 33, True, True, id="old-suite-other-green"),
+        pytest.param(ADR92_HEAD, False, False, id="exact-suite"),
+        pytest.param(ADR92_HEAD.upper(), False, True, id="uppercase-suite"),
+        pytest.param(None, False, True, id="missing-suite-commit"),
+        pytest.param("z" * 40, False, True, id="nonhex-suite"),
+        pytest.param(ADR92_HEAD + "0", False, True, id="long-suite"),
+        pytest.param(40, False, True, id="nonstring-suite-oid"),
+    ],
+)
+def test_completed_head_suite_commit(oid, other_app, holds):
+    """A successful CodeRabbit run requires the headChecks commit oid to match the head."""
+    if other_app:
+        checks = _legacy_runs_to_head_checks([completed_head_run(), completed_head_run("copilot")])
+    else:
+        checks = adr114_head_checks()
+    if oid is None:
+        checks["nodes"][0]["commit"].pop("oid", None)
+    else:
+        checks["nodes"][0]["commit"]["oid"] = oid
+    assert bool(review_incomplete(completed_head_pull(head_checks=checks))) is holds
+
+
+@pytest.mark.parametrize("commit", [None, {}, "not-a-commit", {"oid": None}])
+def test_completed_head_malformed_suite_commit(commit):
+    """Unreadable headChecks commit objects grant no completion evidence."""
+    checks = adr114_head_checks()
+    if not isinstance(commit, dict):
+        checks["nodes"][0] = commit
+    else:
+        checks["nodes"][0]["commit"] = commit
+    assert review_incomplete(completed_head_pull(head_checks=checks))
+
+
+@pytest.mark.parametrize("size", [65536, 65537, 65748])
+def test_completed_head_summary_character_bound(size):
+    """Exactly 65536 characters qualify; larger summaries cannot clear an allowance."""
+    summary = completed_head_summary(statement=REVIEW_STATUS)
+    body = summary + "\n" + "x" * (size - len(summary) - 1)
+    assert len(body) == size
+    assert bool(review_incomplete(completed_head_pull(summary=body))) is (size > 65536)
+
+
+@pytest.mark.parametrize("kind", ["repeated", "first-line", "ordinary", "last-line-at-bound"])
+def test_notice_body_line_bound(kind):
+    """A cut notice body holds by name; ordinary bodies and the exact bound retain policy."""
+    notice = "0 remain after this review"
+    lines = ["Ordinary review prose."] * (MAX_LINES + 1)
+    if kind == "repeated":
+        lines = [notice] * (MAX_LINES + 1)
+    elif kind == "first-line":
+        lines[0] = notice
+    elif kind == "last-line-at-bound":
+        lines = lines[:MAX_LINES]
+        lines[-1] = notice
+    pr = adr92_pull(adr92_comment("\n".join(lines)))
+    reason = review_incomplete(pr)
+    if kind == "ordinary":
+        assert reason == ""
+    elif kind == "last-line-at-bound":
+        assert reason.startswith("review incomplete: coderabbitai limit reached at ")
+    else:
+        assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
+
+
+def test_notice_body_cut_cannot_be_cleared_by_head_check():
+    """A head success cannot clear a notice whose unread tail could contradict coverage."""
+    pr = completed_head_pull(completed_head_run())
+    pr["comments"]["nodes"][0]["body"] += "\nOrdinary prose." * MAX_LINES
+    assert review_incomplete(pr) == (
+        "review incomplete: coderabbitai notice body exceeds the read bound"
+    )
+
+
+def test_notice_on_line_2001_holds():
+    """A newer bot notice after 2000 ordinary lines must hold with the read-bound reason."""
+    body = "Ordinary prose.\n" * MAX_LINES + "Review limit reached."
+    pr = adr92_pull(adr92_comment(body))
+    assert review_incomplete(pr) == (
+        "review incomplete: coderabbitai notice body exceeds the read bound"
+    )
+
+
+@pytest.mark.parametrize("line", [MAX_LINES, MAX_LINES + 1, 5000])
+def test_notice_line_detection_boundary(line):
+    """Detect notices through line 5000; only the first 2000 lines are readable."""
+    body = "Prose.\n" * (line - 1) + "Review limit reached."
+    assert len(body) < MAX_SUMMARY_CHARS
+    reason = review_incomplete(adr92_pull(adr92_comment(body)))
+    if line <= MAX_LINES:
+        assert reason == f"review incomplete: coderabbitai limit reached at {ADR92_NOTICE}"
+    else:
+        assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
+
+
+@pytest.mark.parametrize(
+    "notice",
+    ["Review limit reached.", "## Reviews paused", "Rate limit reached."],
+)
+@pytest.mark.parametrize("when", [ADR92_NOTICE, "2026-11-16T16:00:00Z", "invalid"])
+def test_unread_notice_time_policy(notice, when):
+    """Old ordinary/rate notices stay stale; old pauses, fresh or unknown times hold unread."""
+    pr = adr92_pull(adr92_comment("Prose.\n" * MAX_LINES + notice, when))
+    reason = review_incomplete(pr)
+    # An old pause waits for its reviewer to prove the head (ADR-0093), read or unread.
+    if when == "2026-11-16T16:00:00Z" and notice != "## Reviews paused":
+        assert reason == review_incomplete(adr92_pull(adr92_comment(notice, when))) == ""
+    else:
+        assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
+
+
+@pytest.mark.parametrize(
+    "notice",
+    ["0 remain after this review", "Review limit reached for commit " + ADR92_HEAD + "."],
+)
+def test_old_unread_notice_head_policy(notice):
+    """Old allowances and notices naming the current head still hold beyond the prefix."""
+    when = "2026-11-16T16:00:00Z"
+    assert review_incomplete(adr92_pull(adr92_comment(notice, when)))
+    body = "Prose.\n" * MAX_LINES + notice
+    assert review_incomplete(adr92_pull(adr92_comment(body, when))) == (
+        "review incomplete: coderabbitai notice body exceeds the read bound"
+    )
+
+
+@pytest.mark.parametrize("size", [MAX_SUMMARY_CHARS, MAX_SUMMARY_CHARS + 1])
+def test_notice_detection_character_ceiling(size):
+    """A notice-free body at the ceiling completes; beyond it detection fails closed."""
+    reason = review_incomplete(adr92_pull(adr92_comment("x" * size)))
+    if size <= MAX_SUMMARY_CHARS:
+        assert reason == ""
+    else:
+        assert reason == "review incomplete: coderabbitai notice body exceeds the read bound"
+
+
+@pytest.mark.parametrize("line_count", [MAX_LINES + 1, 5000])
+def test_long_ordinary_body_has_no_notice(line_count):
+    """Oversized line counts alone do not create a notice within the character ceiling."""
+    body = "Prose.\n" * (line_count - 1) + "Prose."
+    assert len(body) < MAX_SUMMARY_CHARS
+    assert review_incomplete(adr92_pull(adr92_comment(body))) == ""
+
+
+@pytest.mark.parametrize("form", ["check-run", "summary", "pause-block", "reviewed-range"])
+def test_unread_tail_cannot_prove_completion(form):
+    """Neither head success nor evidence in an unread tail exempts its allowance notice."""
+    pr = completed_head_pull(completed_head_run() if form == "check-run" else {})
+    body = "Prose.\n" * MAX_LINES + "0 remain after this review"
+    if form == "summary":
+        body += "\n" + completed_head_summary()
+    elif form == "pause-block":
+        body += "\n## Reviews paused\nLast reviewed commit: " + ADR92_HEAD
+    elif form == "reviewed-range":
+        body += "\n" + completed_head_summary(statement="")
+    pr["comments"]["nodes"][0]["body"] = body
+    assert review_incomplete(pr) == (
+        "review incomplete: coderabbitai notice body exceeds the read bound"
+    )
+
+
+@pytest.mark.parametrize(
+    ("count", "runs", "holds"),
+    [
+        pytest.param(True, 1, True, id="bool"),
+        pytest.param(1.0, 1, True, id="float"),
+        pytest.param(1, 1, False, id="integer-one"),
+    ],
+)
+def test_completed_check_count_integer_only(count, runs, holds):
+    """Refuse bool and float counts even when equal to length; accept integer four."""
+    pr = completed_head_pull(*[completed_head_run()] * runs)
+    runs = pr["headChecks"]["nodes"][0]["commit"]["coderabbit"]["nodes"][0]["checkRuns"]
+    runs["totalCount"] = count
+    assert bool(review_incomplete(pr)) is holds
+
+
 def adr93_second_summary_cases(pr, notice):
     """Only a later same-reviewer pause proving the full head clears the old pause."""
     summary = copy.deepcopy(notice)
@@ -912,13 +1741,7 @@ def adr93_paused_cases():
     }
     pr["comments"]["nodes"].append(summary)
     cases.append(_case("later-table", pr, True))
-    summary["body"] += (
-        "\nReviewing files that changed from the base of the PR and between "
-        + "1" * 40
-        + " and "
-        + pr["headRefOid"]
-        + "."
-    )
+    summary["body"] += "\n" + review_range_block(pr["headRefOid"])
     cases.append(_case("head-range", pr, False))
     pr["comments"]["nodes"] = [notice]
     cases.extend(adr93_second_summary_cases(pr, notice))
@@ -932,69 +1755,26 @@ def test_adr93_paused_notice(pr, me, expected):
     assert bool(adr92_reader().review_incomplete(pr, me)) is expected
 
 
-# ADR-0114: Sourcery budget skip yields when CodeRabbit completed on the head.
-ADR114_BUDGET = (
-    "Sorry @person, you've used your own review budget of 250,000 diff characters "
-    "for the last 7 days."
-)
-ADR114_CR_SUCCESS = "Result: Success - Review completed\n"
-ADR114_SOURCERY_LOGIN = "sourcery-ai[bot]"
+@pytest.mark.parametrize(("pr", "on_head"), _mixed_pause_allowance_evidence_cases())
+def test_review_evidence_mixed_pause_allowance(pr, on_head):
+    evidence = review_evidence(pr)
+    if on_head:
+        assert len(evidence) == 1
+        assert evidence[0][2] is True
+        return
+    assert not any(entry[2] for entry in evidence)
 
 
-def adr114_check_run(name, conclusion, summary, *, status="COMPLETED"):
-    return {"name": name, "status": status, "conclusion": conclusion, "summary": summary}
-
-
-def adr114_head_suite(app_id, slug, runs):
-    return {
-        "app": {"slug": slug, "databaseId": app_id},
-        "checkRuns": {"totalCount": len(runs), "nodes": list(runs)},
-    }
-
-
-def adr114_head_checks(
-    head=ADR92_HEAD,
-    *,
-    coderabbit_runs=None,
-    sourcery_runs=None,
-    sourcery_total=None,
-    oid=None,
-    coderabbit_total=None,
-    commits_total=1,
-):
-    cr_runs = (
-        [adr114_check_run("CodeRabbit", "SUCCESS", ADR114_CR_SUCCESS)]
-        if coderabbit_runs is None
-        else list(coderabbit_runs)
-    )
-    sr_runs = (
-        [adr114_check_run("Sourcery review", "SKIPPED", ADR114_BUDGET)]
-        if sourcery_runs is None
-        else list(sourcery_runs)
-    )
-    cr_suites = [adr114_head_suite(347564, "coderabbitai", cr_runs)] if cr_runs else []
-    sr_suites = [adr114_head_suite(48477, "sourcery-ai", sr_runs)] if sr_runs else []
-    commit_oid = head if oid is None else oid
-    return {
-        "totalCount": commits_total,
-        "nodes": [
-            {
-                "commit": {
-                    "oid": commit_oid,
-                    "coderabbit": {
-                        "totalCount": (
-                            len(cr_suites) if coderabbit_total is None else coderabbit_total
-                        ),
-                        "nodes": cr_suites,
-                    },
-                    "sourcery": {
-                        "totalCount": len(sr_suites) if sourcery_total is None else sourcery_total,
-                        "nodes": sr_suites,
-                    },
-                }
-            }
-        ],
-    }
+def test_review_evidence_paused_notice_matches_main():
+    """Pure pause bodies keep the head-evidence shape origin/main already had."""
+    _name, block, head, _expected = bodies[0]
+    pr = _fixture_golusoris_1266()
+    pr["headRefOid"] = head
+    pr["comments"]["nodes"] = [
+        {"author": {"login": "coderabbitai"}, "createdAt": "2026-11-14T04:25:24Z", "body": block}
+    ]
+    evidence = review_evidence(pr)
+    assert len(evidence) == 1 and evidence[0][2] is True
 
 
 def adr114_budget_pull(*comments, reviews=(), head_checks=None, **fields):
@@ -1176,3 +1956,583 @@ def test_bot_dependency_count_rejects_boolean():
     assert is_bot_dependency(pull, {"dependency": ("renovate/",)}) is False
     authors["totalCount"] = 1
     assert is_bot_dependency(pull, {"dependency": ("renovate/",)}) is True
+
+
+@pytest.mark.parametrize(
+    ("extra_range", "holds"),
+    [
+        pytest.param("", False, id="single-full-range"),
+        pytest.param(
+            "\nReviewing files that changed from the base of the PR and between "
+            + "a" * 40
+            + " and "
+            + ADR92_HEAD[:7]
+            + ".",
+            True,
+            id="second-range-abbreviated-oid",
+        ),
+        pytest.param(
+            "\nReviewing files that changed from the base of the PR and between "
+            + "a" * 40
+            + " and "
+            + "c" * 40
+            + ".",
+            True,
+            id="second-range-full-oid",
+        ),
+        pytest.param(
+            "\n```\n~~~\nReviewing files that changed from the base of the PR and between "
+            + "a" * 40
+            + " and "
+            + "c" * 40
+            + ".\n```",
+            True,
+            id="fenced-second-range-with-tilde",
+        ),
+    ],
+)
+def test_completed_head_second_range_declarations(extra_range, holds):
+    """A second reviewed-range declaration invalidates summary coverage anywhere in the body."""
+    body = completed_head_summary() + extra_range
+    assert bool(adr92_reader().review_incomplete(completed_head_pull(summary=body))) is holds
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(
+            "```\nActionable comments posted: 0\n```",
+            id="fenced-only-zero",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n```\nActionable comments posted: 1\n```",
+            id="standalone-zero-fenced-one",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 0",
+            id="unclosed-fence-before-count",
+        ),
+        pytest.param(
+            "~~~\nActionable comments posted: 0\n~~~",
+            id="tilde-fence",
+        ),
+        pytest.param(
+            "```\n~~~\nActionable comments posted: 0\n```",
+            id="mixed-tilde-inside-backtick",
+        ),
+        pytest.param(
+            "~~~\n```\nActionable comments posted: 0\n~~~",
+            id="mixed-backtick-inside-tilde",
+        ),
+        pytest.param(
+            "````\n```\nActionable comments posted: 0\n````",
+            id="shorter-closer",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n````\nActionable comments posted: 0",
+            id="longer-closer-closes",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n``` x\nActionable comments posted: 0",
+            id="closer-with-text-stays-open",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n```   \nActionable comments posted: 0",
+            id="closer-trailing-spaces-closes",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n```\t\nActionable comments posted: 0",
+            id="closer-trailing-tab-stays-open",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n   ```\nActionable comments posted: 0",
+            id="closer-indent-three-closes",
+        ),
+        pytest.param(
+            "```\nActionable comments posted: 1\n    ```\nActionable comments posted: 0",
+            id="closer-indent-four-stays-open",
+        ),
+        pytest.param(
+            "```a`b\nActionable comments posted: 0",
+            id="backtick-info-with-backtick-opens-nothing",
+        ),
+        pytest.param(
+            "~~~a`b\nActionable comments posted: 0\n~~~",
+            id="tilde-info-with-backtick-opens",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\n  ```\n  code\n\n"
+            "Actionable comments posted: 1",
+            id="nested-unclosed-fence-item-ends-after-blank",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ```\n  code\nActionable comments posted: 1",
+            id="nested-unclosed-fence-item-ends-unindented",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\nlazy\n  ```\n  code\n\n"
+            "Actionable comments posted: 1",
+            id="nested-fence-lazy-line-keeps-item",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n1. item\n   ```\n   code\n\n"
+            "Actionable comments posted: 1",
+            id="nested-fence-ordered-item",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ```\n"
+            "  Actionable comments posted: 1\n  ```",
+            id="nested-closed-fence-hides-count",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ```\n\n  Actionable comments posted: 1",
+            id="nested-fence-blank-then-indented-stays-hidden",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\ntext\n```\nActionable comments posted: 1",
+            id="top-level-unclosed-after-item-closed",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\n ```\nActionable comments posted: 1",
+            id="fence-below-item-column-is-top-level",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n```\nActionable comments posted: 1",
+            id="fence-opener-below-item-column-is-top-level",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ```\n  x\n  ```\nafter\n  ```\n"
+            "Actionable comments posted: 1",
+            id="item-closes-after-nested-fence-closer",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n# Heading\n  ```\n"
+            "Actionable comments posted: 1",
+            id="item-closes-on-atx-heading",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n***\n  ```\nActionable comments posted: 1",
+            id="item-closes-on-thematic-break",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n> quote\n  ```\n"
+            "Actionable comments posted: 1",
+            id="item-closes-on-block-quote",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\n- - -\n  ```\n"
+            "Actionable comments posted: 1",
+            id="thematic-break-dash-is-no-list-item",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  ***\n  ```\n  code\nafter\n"
+            "Actionable comments posted: 1",
+            id="indented-thematic-break-inside-item-keeps-item",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\nlazy\n  ```\n  code\n"
+            "Actionable comments posted: 1",
+            id="lazy-line-after-list-item-keeps-fence-nested",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n  # Heading\n  ```\n  code\n\n"
+            "Actionable comments posted: 1",
+            id="indented-heading-inside-item-keeps-item",
+        ),
+    ],
+)
+def test_completed_head_summary_fenced_code(statement):
+    """Misplaced count phrases keep the allowance hold in all historical fence cases."""
+    body = completed_head_summary(statement=statement)
+    assert adr92_reader().review_incomplete(completed_head_pull(summary=body))
+
+
+@pytest.mark.parametrize(
+    ("notice", "when", "expected"),
+    [
+        pytest.param(
+            "Rate limit reached.",
+            "2026-11-16T16:00:00Z",
+            "",
+            id="old-rate-limit-line-one",
+        ),
+        pytest.param(
+            "Rate limit reached.",
+            ADR92_NOTICE,
+            "review incomplete: coderabbitai notice body exceeds the read bound",
+            id="fresh-rate-limit-line-one",
+        ),
+        pytest.param(
+            "0 remain after this review",
+            "2026-11-16T16:00:00Z",
+            "review incomplete: coderabbitai notice body exceeds the read bound",
+            id="old-allowance-line-one",
+        ),
+    ],
+)
+def test_cut_prefix_notice_time_policy(notice, when, expected):
+    """A notice in the read prefix of a cut body still follows the shared notice time rule."""
+    body = notice + "\n" + "Ordinary prose.\n" * MAX_LINES
+    pr = adr92_pull(adr92_comment(body, when))
+    assert adr92_reader().review_incomplete(pr) == expected
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        pytest.param(
+            "0 remain after this review\nRate limit reached.",
+            "review incomplete: coderabbitai notice body exceeds the read bound",
+            id="mixed-old-allowance-and-rate-limit",
+        ),
+        pytest.param(
+            "Rate limit reached.",
+            "",
+            id="old-rate-limit-alone",
+        ),
+    ],
+)
+def test_unread_tail_mixed_notices(tail, expected):
+    """Any allowance notice in a cut body holds even when paired with a stale rate limit."""
+    body = "Prose.\n" * MAX_LINES + tail
+    pr = adr92_pull(adr92_comment(body, "2026-11-16T16:00:00Z"))
+    assert adr92_reader().review_incomplete(pr) == expected
+
+
+@pytest.mark.parametrize(
+    ("statement", "holds"),
+    [
+        pytest.param("**Actionable comments posted: 1**", True, id="count-one-holds"),
+        pytest.param(REVIEW_COUNT_ZERO, False, id="count-zero-clears"),
+        pytest.param(
+            "```\nActionable comments posted: 1\n```\nActionable comments posted: 0",
+            True,
+            id="fenced-one-standalone-zero-clears",
+        ),
+        pytest.param(
+            "Actionable comments posted: 0\n\n- item\n\n  ```\n  code\n\n"
+            "Actionable comments posted: 1",
+            True,
+            id="nested-unclosed-fence-count-holds",
+        ),
+    ],
+)
+def test_same_body_allowance_zero_action(statement, holds):
+    """An allowance in the summary requires zero actions at fixed CodeRabbit positions."""
+    body = completed_head_summary(statement=statement) + "\n0 remain after this review"
+    pr = adr92_pull(adr92_comment(body))
+    assert bool(adr92_reader().review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize(
+    ("old_notice", "reviewed_head", "holds"),
+    [
+        pytest.param("0 remain after this review", ADR92_HEAD, True, id="allowance-paused-head"),
+        pytest.param("## Reviews paused", ADR92_HEAD, False, id="pause-paused-head"),
+        pytest.param("## Reviews paused", ADR92_HEAD[:7], True, id="pause-paused-short-head"),
+    ],
+)
+def test_paused_block_does_not_clear_allowance(old_notice, reviewed_head, holds):
+    """A later paused block clears an old pause notice on full head, never an allowance."""
+    pr = adr92_pull(
+        adr92_comment(old_notice, "2026-11-15T19:45:04Z"),
+        adr92_comment("## Reviews paused\nLast reviewed commit: " + reviewed_head, ADR92_NOTICE),
+    )
+    assert bool(adr92_reader().review_incomplete(pr)) is holds
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        pytest.param(
+            "no-evidence",
+            "review incomplete: coderabbitai limit reached at 2026-11-16T16:00:00Z",
+            id="old-mixed-no-evidence",
+        ),
+        pytest.param("check-run", "", id="old-mixed-exact-head-check"),
+        pytest.param("formal-review", "", id="old-mixed-later-formal-head-review"),
+        pytest.param(
+            "short-suite-oid",
+            "review incomplete: coderabbitai limit reached at 2026-11-16T16:00:00Z",
+            id="old-mixed-short-suite-oid",
+        ),
+        pytest.param(
+            "fresh-check-run",
+            f"review incomplete: coderabbitai limit reached at {ADR92_NOTICE}",
+            id="fresh-mixed-exact-head-check",
+        ),
+        pytest.param(
+            "pause-names-head",
+            "review incomplete: coderabbitai limit reached at 2026-11-16T16:00:00Z",
+            id="old-pause-and-allowance-names-head",
+        ),
+    ],
+)
+def test_read_body_mixed_notices(case, expected):
+    """A read body mixing allowance with another notice holds while either part holds."""
+    reader = adr92_reader()
+    old = "2026-11-16T16:00:00Z"
+    mixed = "0 remain after this review\nRate limit reached."
+    pr = completed_head_pull()
+    pr["comments"]["nodes"] = [adr92_comment(mixed, old)]
+    if case in {"check-run", "short-suite-oid", "fresh-check-run"}:
+        run = completed_head_run()
+        if case == "short-suite-oid":
+            pr = completed_head_pull(head_checks=adr114_head_checks(oid="a" * 40))
+        else:
+            pr = completed_head_pull(run)
+        when = ADR92_NOTICE if case == "fresh-check-run" else old
+        pr["comments"]["nodes"] = [adr92_comment(mixed, when)]
+    elif case == "formal-review":
+        pr["reviews"]["nodes"] = [
+            adr92_comment(
+                "",
+                "2026-11-16T17:00:00Z",
+                state="COMMENTED",
+                submittedAt="2026-11-16T17:00:00Z",
+                commit={"oid": ADR92_HEAD},
+            )
+        ]
+    elif case == "pause-names-head":
+        pause_mixed = (
+            f"## Reviews paused\nLast reviewed commit: {ADR92_HEAD}\n0 remain after this review"
+        )
+        pr["comments"]["nodes"] = [adr92_comment(pause_mixed, old)]
+    verdict = reader.review_incomplete(pr)
+    if case == "fresh-check-run":
+        pure = completed_head_pull(completed_head_run())
+        pure["comments"]["nodes"] = [adr92_comment("Rate limit reached.", ADR92_NOTICE)]
+        pure_verdict = reader.review_incomplete(pure)
+        assert verdict == pure_verdict == expected
+    assert verdict == expected
+
+
+SHAPE_HEAD = "c" * 40
+SHAPE_BLOCK = review_range_block(SHAPE_HEAD)
+
+
+def _shape_body(statement=None, tail=""):
+    summary = completed_head_summary(SHAPE_HEAD, statement)
+    return summary + "\n\n" + tail if tail else summary
+
+
+def _planted_shape_cases():
+    misplaced = ("count line position",)
+    return [
+        pytest.param(
+            _shape_body(tail="Intro\n2. item\n   ```\nActionable comments posted: 0\n```"),
+            False,
+            misplaced,
+            id="p1-ordered-marker-4690487397",
+        ),
+        pytest.param(
+            _shape_body(
+                REVIEW_COUNT_ZERO,
+                tail="- outer\n  - inner\n  ```\n  code\nActionable comments posted: 1",
+            ),
+            False,
+            ("count line count",),
+            id="p2-outer-item-4690487400",
+        ),
+        pytest.param(
+            _shape_body(tail="```\n```\u2028Actionable comments posted: 0\n```"),
+            False,
+            misplaced,
+            id="p3-u2028-4690487406",
+        ),
+        pytest.param(
+            _shape_body(tail="- item\n    ```\n  Actionable comments posted: 0\n    ```"),
+            False,
+            misplaced,
+            id="p4-fence-indent-4690487414",
+        ),
+        pytest.param(
+            _shape_body(tail="- ~~~\n  Actionable comments posted: 0\n  ~~~"),
+            False,
+            misplaced,
+            id="p5-marker-line-fence-4690487425",
+        ),
+        pytest.param(
+            REVIEW_GENERATED + "\u2028\u2028" + REVIEW_COUNT_ZERO + "\n\n" + SHAPE_BLOCK,
+            False,
+            misplaced,
+            id="p6-u2028-count-line",
+        ),
+    ]
+
+
+def _shape_controls():
+    one = "**Actionable comments posted: 1**"
+    other = _shape_body(REVIEW_COUNT_ZERO).replace("<picture>x</picture> Commits", "Review details")
+    synthetic = SHAPE_BLOCK.split("\n")[6] + "\nActionable comments posted: 0"
+    return [
+        pytest.param(_shape_body(REVIEW_COUNT_ZERO), True, (), id="ok-count-zero"),
+        pytest.param(_shape_body(tail=REVIEW_STATUS), True, (), id="ok-status-none"),
+        pytest.param(
+            _shape_body(REVIEW_COUNT_ZERO, tail=REVIEW_STATUS),
+            True,
+            (),
+            id="ok-count-zero-status-none",
+        ),
+        pytest.param(_shape_body(one), False, (), id="hold-count-one"),
+        pytest.param(
+            _shape_body(one, tail=REVIEW_STATUS), False, (), id="hold-count-one-status-none"
+        ),
+        pytest.param(
+            _shape_body("Actionable comments posted: 0"),
+            False,
+            ("count line position",),
+            id="hold-unbold-count",
+        ),
+        pytest.param(
+            _shape_body(tail=REVIEW_STATUS + "\n\nActionable comments posted: 1"),
+            False,
+            ("count line position",),
+            id="hold-status-with-unplaced-count",
+        ),
+        pytest.param(other, False, ("range block layout",), id="hold-other-summary"),
+        pytest.param(
+            synthetic,
+            False,
+            ("count line position", "range block layout"),
+            id="hold-synthetic-range",
+        ),
+    ]
+
+
+def _misplaced_shape_cases():
+    count = ("count line position",)
+    layout = ("status block layout",)
+    markers = ("status block markers",)
+    start, _, sentence, _, end = REVIEW_STATUS.split("\n")
+    counted = _shape_body(REVIEW_COUNT_ZERO)
+    bad_range = ("range block layout",)
+    return [
+        pytest.param(
+            _shape_body("Intro\n" + REVIEW_COUNT_ZERO),
+            False,
+            count,
+            id="hold-bold-count-off-line-2",
+        ),
+        pytest.param(
+            _shape_body(tail=f"```\n{REVIEW_COUNT_ZERO}\n```"),
+            False,
+            count,
+            id="hold-bold-count-fenced",
+        ),
+        pytest.param(
+            _shape_body(tail=f"{start}\n{sentence}\n{end}"),
+            False,
+            layout,
+            id="hold-status-no-blanks",
+        ),
+        pytest.param(
+            _shape_body(tail=f"> {start}\n>\n> {sentence}\n>\n> {end}"),
+            False,
+            layout,
+            id="hold-status-quoted",
+        ),
+        pytest.param(
+            _shape_body(tail=start + "\n" + REVIEW_STATUS),
+            False,
+            markers,
+            id="hold-status-two-starts",
+        ),
+        pytest.param(
+            _shape_body(tail=REVIEW_STATUS + "\n" + end), False, markers, id="hold-status-two-ends"
+        ),
+        pytest.param(
+            counted.replace("<details>", "<div>"), False, bad_range, id="hold-range-no-details"
+        ),
+        pytest.param(counted.replace("<br>\n", ""), False, bad_range, id="hold-range-lead"),
+        pytest.param(
+            counted.replace("</details>", "</div>"), False, bad_range, id="hold-range-tail"
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "names"),
+    _planted_shape_cases() + _shape_controls() + _misplaced_shape_cases(),
+)
+def test_completed_head_summary_shapes(body, expected, names):
+    reader = adr92_reader()
+    actual = reader._zero_action_summary(body, SHAPE_HEAD)
+    assert actual is expected
+    shape = reader._summary_shape(body)
+    assert shape.unmatched == names
+    assert shape.range_end == ("" if "range block layout" in names else SHAPE_HEAD)
+
+
+@pytest.mark.parametrize("size", [65536, 65537])
+def test_summary_shape_character_bound(size):
+    reader = adr92_reader()
+    summary = _shape_body(REVIEW_COUNT_ZERO)
+    body = summary + "\n" + "x" * (size - len(summary) - 1)
+    assert len(body) == size
+    expected = (
+        reader.SummaryShape(True, SHAPE_HEAD, ())
+        if size == 65536
+        else reader.SummaryShape(False, "", ())
+    )
+    assert reader._summary_shape(body) == expected
+
+
+@pytest.mark.parametrize(
+    ("comment", "formal_only", "paused_head", "expected"),
+    [
+        pytest.param({"body": "x"}, False, True, True, id="ordinary-paused"),
+        pytest.param({"body": "x"}, True, True, False, id="formal-only-paused"),
+        pytest.param(
+            {"state": "COMMENTED", "commit": {"oid": SHAPE_HEAD}},
+            True,
+            False,
+            True,
+            id="formal-only-formal-on-head",
+        ),
+    ],
+)
+def test_head_evidence_paused_scope(comment, formal_only, paused_head, expected):
+    reader = adr92_reader()
+    assert (
+        reader._head_evidence(comment, SHAPE_HEAD, formal_only, paused_head=paused_head) is expected
+    )
+
+
+def test_summary_shape_hold_names():
+    body = (FIXTURES / "cr1976-summary-allowance-6900214744.md").read_text(encoding="utf-8")
+    head = "793a759aea1c963feace48e67e6cf3590a37e3dd"
+    pr = adr92_pull(adr92_comment(body + "\n\n```\nActionable comments posted: 0\n```"))
+    pr["headRefOid"] = head
+    assert review_incomplete(pr).endswith("; summary shape unmatched: count line position")
+    pr["headRefOid"] = "a" * 40
+    pr["comments"]["nodes"] = [adr92_comment(body)]
+    assert (
+        review_incomplete(pr) == "review incomplete: coderabbitai limit reached at " + ADR92_NOTICE
+    )
+
+
+def test_summary_lines_gfm_endings():
+    lines = adr92_reader()._lines
+    assert lines("a\u2028b\rc\r\nd\n") == ["a\u2028b", "c", "d"]
+    assert lines("") == []
+    body = "\n".join(["a"] * 2000)
+    assert len(lines(body)) == len(lines(body + "\n")) == 2000
+
+
+@pytest.mark.parametrize(
+    ("stem", "head"),
+    [
+        ("pr216-review-6051970050", "bc1ec81d57986bde546c80d6efb0593e96052a89"),
+        ("pr257-review-6050460861", "4eb5860e8ff1190af55c98376e48821109163c95"),
+        ("pr264-review-6049769524", "e61bf65d3982f240c0c22b66dfee7d018a463fee"),
+    ],
+    ids=["pr216-review-6051970050", "pr257-review-6050460861", "pr264-review-6049769524"],
+)
+def test_completed_head_summary_live_bodies(stem, head):
+    reader = adr92_reader()
+    body = (FIXTURES / (stem + ".md")).read_text(encoding="utf-8")
+    assert reader._allowance_head_reviewed(body, head)
+    assert not reader._allowance_head_reviewed(body, "f" * 40)
+    assert not reader._zero_action_summary(body, head)
+    assert reader._summary_shape(body).unmatched == ()

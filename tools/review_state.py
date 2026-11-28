@@ -9,15 +9,38 @@ Callers pass a GraphQL pullRequest node or its data/repository envelope.
 
 import re
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 MAX_COMMENTS = 100
 MAX_COMMITS = 100
 MAX_REVIEWS = 100
 MAX_LINES = 2000
+# GitHub comments nominally allow 65536 characters; enforce that ceiling locally
+# for whole-body notice detection as well as bodies proving summary coverage.
+MAX_SUMMARY_CHARS = 65536
 # A markdown row needs only name, status, and explanation; bound hostile wide tables.
 MAX_CELLS = 32
 MAX_SNIPPET = 160
 COMPLETED_STATES = frozenset({"COMMENTED", "APPROVED", "CHANGES_REQUESTED"})
+# Existing review-state fixtures and train body classifiers name these reviewers.
+REVIEWER_BOTS = frozenset({"coderabbitai", "copilot", "sourcery-ai", "codacy-production"})
+LINE_END_RE = re.compile(r"\r\n|\r|\n")
+# Layouts from tests/fixtures/review-state: cr1976, cr234, and the pr216, pr257, pr264 reviews.
+CR_GENERATED = "<!-- coderabbit-ai-generated:v1 -->"
+COUNT_WORDS = "actionable comments posted"
+COUNT_LINE_RE = re.compile(r"\*\*Actionable comments posted: ([0-9]{1,9})\*\*")
+STATUS_START = "<!-- recent_review_status_start -->"
+STATUS_END = "<!-- recent_review_status_end -->"
+NO_ACTION_SENTENCE = "No actionable comments were generated in the recent review."
+NO_ACTION_WORDS = "no actionable comments were generated"
+RANGE_WORDS = "reviewing files that changed from the base of the pr"
+RANGE_LINE_RE = re.compile(
+    r"Reviewing files that changed from the base of the PR and between "
+    r"([0-9a-f]{40}) and ([0-9a-f]{40})\."
+)
+COMMITS_SUMMARY_RE = re.compile(
+    r"<summary>(<strong>)?<picture>.*</picture> Commits(?(1)</strong>)</summary>"
+)
 
 PRE_MERGE_MARKER = re.compile(r"pre[-_ ]merge[-_ ]checks", re.I)
 STATUS_CELL_RE = re.compile(
@@ -48,13 +71,6 @@ PAUSED_HEADING_RE = re.compile(
 LAST_REVIEWED_RE = re.compile(
     r"^[ \t]*(?:>[ \t]*)?(?:-[ \t]+)?Last reviewed commit:[ \t]*(.*?)[ \t]*$",
     re.IGNORECASE,
-)
-# Source: tests/fixtures/review-state/cr1976-summary-allowance-6900214744.md
-# (CodeRabbit's reviewed range).
-REVIEWED_RANGE_RE = re.compile(
-    r"^[ \t]*Reviewing files that changed from the base of the PR and between "
-    r"([0-9a-f]{40}) and ([0-9a-f]{40})\.[ \t]*\r?$",
-    re.IGNORECASE | re.MULTILINE,
 )
 MAX_HEAD_CHECK_SUITES = 5
 MAX_HEAD_CHECK_RUNS = 5
@@ -131,13 +147,31 @@ def _last_commit_at(pr: dict) -> datetime | None:
     return max(times) if times else None
 
 
+def _notice_lines(body: str) -> list[str]:
+    """Split at every str.splitlines() boundary so no separator hides a notice.
+
+    These boundaries include all GFM line endings. Evidence readers use _lines.
+    """
+    return body.splitlines()
+
+
+def _lines(body: str) -> list[str]:
+    """Split only at GFM line endings and retain an overflow item above the bound."""
+    if not body:
+        return []
+    lines = LINE_END_RE.split(body, maxsplit=MAX_LINES)
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def pre_merge_rows(body: str) -> list[tuple[str, str, str]]:
     """[(check_name, status, explanation)] from a Pre-merge checks markdown table."""
     text = str(body or "")
     if not PRE_MERGE_MARKER.search(text):
         return []
     rows = []
-    for raw in text.splitlines()[:MAX_LINES]:
+    for raw in _lines(text)[:MAX_LINES]:
         line = raw.strip()
         if not (line.startswith("|") and line.endswith("|")):
             continue
@@ -208,7 +242,7 @@ def _paused_block(lines: list[str], notice_idx: int) -> list[str]:
 
 def _pause_allowance_notices(body: str) -> tuple[list, bool, bool]:
     """Limit notices in body and whether the body is mixed pause plus allowance only."""
-    lines = body.splitlines()
+    lines = _notice_lines(body)
     if len(lines) > MAX_LINES:
         return [], False, False
     notices = [
@@ -232,13 +266,15 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
     """Exempt only pause notices with unambiguous, block-local evidence for the full head."""
     if not re.fullmatch(r"[0-9a-f]{40}", head):
         return False
+    lines = _lines(body)
+    if _notice_lines(body) != lines:
+        return False
     notices, mixed, foreign = _pause_allowance_notices(body)
     if not notices or foreign:
         return False
     pause_notices = [(idx, match) for idx, match in notices[:MAX_LINES] if match.group("paused")]
     if not pause_notices:
         return False
-    lines = body.splitlines()
     reviewed = {
         match.group(1).lower()
         for line in lines[:MAX_LINES]
@@ -251,80 +287,106 @@ def _paused_head_reviewed(body: str, head: str) -> bool:
         for idx, _match in pause_notices[:MAX_LINES]
     )
     if mixed:
-        return pause_ok and _allowance_head_reviewed(body, head)
+        return pause_ok and _allowance_head_reviewed(body, head) and _zero_action_evidence(body)
     return pause_ok
 
 
+class SummaryShape(NamedTuple):
+    zero: bool
+    range_end: str
+    unmatched: tuple[str, ...]
+
+
+def _summary_count(lines: list[str], lower: str) -> tuple[int | None, str]:
+    occurrences = lower.count(COUNT_WORDS)
+    if occurrences == 0:
+        return None, ""
+    if occurrences != 1:
+        return None, "count line count"
+    if (
+        len(lines) >= 3
+        and lines[:2] == [CR_GENERATED, ""]
+        and (match := COUNT_LINE_RE.fullmatch(lines[2]))
+    ):
+        return int(match[1]), ""
+    return None, "count line position"
+
+
+def _summary_status(lines: list[str], body: str, lower: str) -> tuple[bool, str]:
+    markers = (body.count(STATUS_START), body.count(STATUS_END), lower.count(NO_ACTION_WORDS))
+    if markers == (0, 0, 0):
+        return False, ""
+    if markers != (1, 1, 1):
+        return False, "status block markers"
+    block = [STATUS_START, "", NO_ACTION_SENTENCE, "", STATUS_END]
+    for i, line in enumerate(lines[:MAX_LINES]):
+        if line == STATUS_START and lines[i : i + 5] == block:
+            return True, ""
+    return False, "status block layout"
+
+
+def _summary_range(lines: list[str], lower: str) -> tuple[str, str]:
+    occurrences = lower.count(RANGE_WORDS)
+    if occurrences == 0:
+        return "", ""
+    if occurrences != 1:
+        return "", "range line count"
+    for i, line in enumerate(lines[:MAX_LINES]):
+        if (
+            (match := RANGE_LINE_RE.fullmatch(line))
+            and i >= 6
+            and lines[i - 6] == "<details>"
+            and COMMITS_SUMMARY_RE.fullmatch(lines[i - 5])
+            and lines[i - 4 : i] == ["<dl>", "<dd>", "<br>", ""]
+            and lines[i + 1 : i + 5] == ["", "</dd>", "</dl>", "</details>"]
+        ):
+            return match[2], ""
+    return "", "range block layout"
+
+
+def _summary_shape(body: str) -> SummaryShape:
+    """Read each evidence family independently at fixed CodeRabbit positions."""
+    if len(body) > MAX_SUMMARY_CHARS:
+        return SummaryShape(False, "", ())
+    lines = _lines(body)
+    if len(lines) > MAX_LINES:
+        return SummaryShape(False, "", ())
+    lower = body.lower()
+    count, count_name = _summary_count(lines, lower)
+    status, status_name = _summary_status(lines, body, lower)
+    range_end, range_name = _summary_range(lines, lower)
+    zero = not count_name and not status_name and (count == 0 or (status and count in (None, 0)))
+    return SummaryShape(zero, range_end, tuple(filter(None, (count_name, status_name, range_name))))
+
+
 def _allowance_head_reviewed(body: str, head: str) -> bool:
-    """Require exactly one reviewed range ending at the full head in an allowance summary."""
-    if not re.fullmatch(r"[0-9a-f]{40}", head) or len(body.splitlines()) > MAX_LINES:
+    """Require a reviewed range ending at the full head at fixed CodeRabbit positions."""
+    return bool(re.fullmatch(r"[0-9a-f]{40}", head)) and _summary_shape(body).range_end == head
+
+
+def _zero_action_evidence(body: str) -> bool:
+    """Read zero-action evidence at fixed CodeRabbit positions."""
+    return _summary_shape(body).zero
+
+
+def _zero_action_summary(body: str, head: str) -> bool:
+    """Require the head range and zero actions at fixed CodeRabbit positions."""
+    if _non_allowance_notice(body) or not _allowance_head_reviewed(body, head):
         return False
-    ranges = list(REVIEWED_RANGE_RE.finditer(body))
-    return len(ranges) == 1 and ranges[0].group(2).lower() == head
+    return _zero_action_evidence(body)
 
 
-def _non_allowance_notice(body: str) -> bool:
-    """A skipped review cannot also prove completed review evidence."""
-    return any(
-        not match.group("allowance") for match in list(LIMIT_NOTICE_RE.finditer(body))[:MAX_LINES]
-    )
-
-
-def _head_evidence(comment: dict, head: str) -> bool:
-    """Allow only a completed formal review of the full head or an exact reviewed range."""
-    if not re.fullmatch(r"[0-9a-f]{40}", head):
-        return False
-    commit = comment.get("commit")
-    formal = comment.get("state") in COMPLETED_STATES and isinstance(commit, dict)
-    return bool(formal and commit.get("oid") == head) or _allowance_head_reviewed(
-        str(comment.get("body") or ""), head
-    )
-
-
-def _can_complete(comment: dict) -> bool:
-    """Issue comments or known completed review states may carry completion evidence."""
-    if "state" not in comment:
-        return True
-    state = comment["state"]
-    return isinstance(state, str) and state in COMPLETED_STATES
-
-
-def review_evidence(node: dict, me: str = "") -> list[tuple[str, datetime | None, bool]]:
-    """One scoped evidence reader for both notice clearing and the opt-in head barrier."""
-    answerers = _answerers(node, me)
-    head = str(node.get("headRefOid") or "").strip().lower()
-    evidence = []
-    for comment in _all_comments(node)[: MAX_COMMENTS + MAX_REVIEWS]:
+def _completed_summary_reviewers(pr: dict, head: str) -> set[str]:
+    """Listed bots with one head range and unquoted, uncontradicted zero-action evidence."""
+    reviewers = set()
+    for comment in _all_comments(pr)[: MAX_COMMENTS + MAX_REVIEWS]:
         login = _login(comment).lower().removesuffix("[bot]")
-        if not login or login in answerers:
-            continue
-        if not _can_complete(comment):
+        if login not in REVIEWER_BOTS or not _can_complete(comment):
             continue
         body = str(comment.get("body") or "")
-        paused_head = _paused_head_reviewed(body, head)
-        if _non_allowance_notice(body) and not paused_head:
-            continue
-        on_head = paused_head or _head_evidence(comment, head)
-        if comment.get("state") in COMPLETED_STATES or pre_merge_rows(body) or on_head:
-            evidence.append((login, _body_at(comment), on_head))
-    return evidence
-
-
-def _later_evidence(evidence: list, login: str, notice_at, last_commit, head_only: bool) -> bool:
-    """Unknown instants cannot establish a later completion from the same reviewer."""
-    if notice_at is None or last_commit is None:
-        return False
-    for who, when, on_head in evidence[: MAX_COMMENTS + MAX_REVIEWS]:
-        if who != login or when is None:
-            continue
-        if when > notice_at and when >= last_commit and (on_head or not head_only):
-            return True
-    return False
-
-
-def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
-    """Only the explicit pause block or allowance range can exempt its own notice."""
-    return _paused_head_reviewed(body, head) or (allowance and _allowance_head_reviewed(body, head))
+        if _zero_action_summary(body, head):
+            reviewers.add(login)
+    return reviewers
 
 
 def _bounded_connection(conn, bound: int) -> tuple[list[dict], bool]:
@@ -370,6 +432,16 @@ def _head_checks_commit(head_checks) -> dict | None:
     return commit if isinstance(commit, dict) else None
 
 
+def _head_checks_on_head(node: dict, head: str) -> tuple[object, bool]:
+    """Return headChecks when its sole commit oid equals the full head."""
+    head_checks = node.get("headChecks") if isinstance(node, dict) else None
+    commit = _head_checks_commit(head_checks)
+    if commit is None:
+        return head_checks, False
+    oid = str(commit.get("oid") or "").strip()
+    return head_checks, oid == head
+
+
 def _suite_app_matches(suite: dict, database_id: int, slug: str) -> bool:
     """Whether a check suite names the expected forge app."""
     app = suite.get("app") if isinstance(suite, dict) else None
@@ -382,7 +454,7 @@ def _run_summary_first_line(summary) -> str:
     """First line of a check-run summary; an empty summary has no first line."""
     if not isinstance(summary, str):
         return ""
-    lines = summary.splitlines()
+    lines = _lines(summary)
     return lines[0] if lines else ""
 
 
@@ -394,6 +466,16 @@ def _coderabbit_evidence_on_head(evidence: list) -> bool:
     return False
 
 
+def _coderabbit_run_succeeded(run: dict) -> bool:
+    """Whether a check run is a completed, successful CodeRabbit review."""
+    return (
+        run.get("name") == CODERABBIT_RUN
+        and run.get("status") == "COMPLETED"
+        and run.get("conclusion") == "SUCCESS"
+        and _run_summary_first_line(run.get("summary")) == CODERABBIT_SUCCESS_LINE
+    )
+
+
 def _coderabbit_check_on_head(head_checks) -> bool:
     """Whether headChecks records a successful CodeRabbit check run on the head commit."""
     commit = _head_checks_commit(head_checks)
@@ -402,6 +484,7 @@ def _coderabbit_check_on_head(head_checks) -> bool:
     suites, ok = _bounded_connection(commit.get("coderabbit"), MAX_HEAD_CHECK_SUITES)
     if not ok:
         return False
+    found = False
     for suite in suites[:MAX_HEAD_CHECK_SUITES]:
         if not _suite_app_matches(suite, CODERABBIT_APP_ID, CODERABBIT_SLUG):
             continue
@@ -409,14 +492,9 @@ def _coderabbit_check_on_head(head_checks) -> bool:
         if not runs_ok:
             return False
         for run in runs[:MAX_HEAD_CHECK_RUNS]:
-            if (
-                run.get("name") == CODERABBIT_RUN
-                and run.get("status") == "COMPLETED"
-                and run.get("conclusion") == "SUCCESS"
-                and _run_summary_first_line(run.get("summary")) == CODERABBIT_SUCCESS_LINE
-            ):
-                return True
-    return False
+            if _coderabbit_run_succeeded(run):
+                found = True
+    return found
 
 
 def _sourcery_budget_skip_on_head(head_checks) -> bool:
@@ -450,6 +528,14 @@ def _sourcery_budget_skip_on_head(head_checks) -> bool:
     return found
 
 
+def _completed_check_reviewers(pr: dict, head: str) -> set[str]:
+    """CodeRabbit check-run completion on the exact full head (ADR-0114 reader)."""
+    head_checks, on_head = _head_checks_on_head(pr, head)
+    if not on_head or head_checks is None:
+        return set()
+    return {CODERABBIT_SLUG} if _coderabbit_check_on_head(head_checks) else set()
+
+
 def _sourcery_budget_exempt(comment: dict, head: str, evidence: list, node: dict) -> bool:
     """Drop a Sourcery budget notice when CodeRabbit finished and Sourcery skipped on the head."""
     login = _login(comment).lower().removesuffix("[bot]")
@@ -458,41 +544,178 @@ def _sourcery_budget_exempt(comment: dict, head: str, evidence: list, node: dict
     body = str(comment.get("body") or "")
     if not _budget_notice_only(body) or not re.fullmatch(r"[0-9a-f]{40}", head):
         return False
-    head_checks = node.get("headChecks") if isinstance(node, dict) else None
-    commit = _head_checks_commit(head_checks)
-    if commit is None or str(commit.get("oid") or "").strip().lower() != head:
+    head_checks, on_head = _head_checks_on_head(node, head)
+    if not on_head or head_checks is None:
         return False
     coderabbit = _coderabbit_evidence_on_head(evidence) or _coderabbit_check_on_head(head_checks)
     return bool(coderabbit and _sourcery_budget_skip_on_head(head_checks))
 
 
-def _notice_holds(
-    comment: dict, head: str, last_commit, evidence: list, node: dict | None = None
+def _non_allowance_notice(body: str) -> bool:
+    """A skipped review cannot also prove completed review evidence."""
+    if len(body) > MAX_SUMMARY_CHARS:
+        return True
+    notices = list(LIMIT_NOTICE_RE.finditer("\n".join(_notice_lines(body))))
+    return any(not match.group("allowance") for match in notices[:MAX_LINES])
+
+
+def _head_evidence(
+    comment: dict, head: str, formal_only: bool = False, *, paused_head: bool = False
 ) -> bool:
-    """Apply head coverage, reviewer scope, and instant ordering to one notice body."""
+    """Formal head reviews prove completion. Ordinary evidence may also use a pause or range."""
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return False
+    commit = comment.get("commit")
+    formal = comment.get("state") in COMPLETED_STATES and isinstance(commit, dict)
+    return bool(formal and commit.get("oid") == head) or (
+        not formal_only
+        and (paused_head or _allowance_head_reviewed(str(comment.get("body") or ""), head))
+    )
+
+
+def _can_complete(comment: dict) -> bool:
+    """Issue comments or known completed review states may carry completion evidence."""
+    if "state" not in comment:
+        return True
+    state = comment["state"]
+    return isinstance(state, str) and state in COMPLETED_STATES
+
+
+def review_evidence(
+    node: dict, me: str = "", *, formal_only: bool = False
+) -> list[tuple[str, datetime | None, bool]]:
+    """One scoped evidence reader for both notice clearing and the opt-in head barrier."""
+    answerers = _answerers(node, me)
+    head = str(node.get("headRefOid") or "").strip().lower()
+    evidence = []
+    for comment in _all_comments(node)[: MAX_COMMENTS + MAX_REVIEWS]:
+        login = _login(comment).lower().removesuffix("[bot]")
+        if not login or login in answerers or not _can_complete(comment):
+            continue
+        body = str(comment.get("body") or "")
+        paused_head = _paused_head_reviewed(body, head)
+        if _non_allowance_notice(body) and not paused_head:
+            continue
+        # A paused block proving the head clears a pause notice (ADR-0093), never an allowance.
+        on_head = _head_evidence(comment, head, formal_only, paused_head=paused_head)
+        if comment.get("state") in COMPLETED_STATES or pre_merge_rows(body) or on_head:
+            when = _instant(comment.get("submittedAt")) if formal_only else _body_at(comment)
+            evidence.append((login, when, on_head))
+    return evidence
+
+
+def _later_evidence(evidence: list, login: str, notice_at, last_commit, head_only: bool) -> bool:
+    """Unknown instants cannot establish a later completion from the same reviewer."""
+    if notice_at is None or last_commit is None:
+        return False
+    for who, when, on_head in evidence[: MAX_COMMENTS + MAX_REVIEWS]:
+        if who != login or when is None:
+            continue
+        if when > notice_at and when >= last_commit and (on_head or not head_only):
+            return True
+    return False
+
+
+def _notice_covers_head(body: str, head: str, allowance: bool) -> bool:
+    """Only the explicit pause block or zero-action allowance summary exempts its notice."""
+    return _paused_head_reviewed(body, head) or (allowance and _zero_action_summary(body, head))
+
+
+def _notice_read(body: str) -> tuple[str, bool]:
+    """Read at most 65536 characters and 2000 lines; retain whether any tail is unread."""
+    lines = _notice_lines(body[:MAX_SUMMARY_CHARS])
+    return "\n".join(lines[:MAX_LINES]), len(body) > MAX_SUMMARY_CHARS or len(lines) > MAX_LINES
+
+
+def _notice_time_rule(standing: bool, names_head: bool, when, last_commit) -> bool:
+    """One time rule for a notice, read or beyond the read bound.
+
+    A standing notice (allowance or pause) and a notice that names the head hold; any
+    other holds from the head commit's time on.
+    """
+    return standing or names_head or when >= last_commit
+
+
+def _unread_notice_holds(comment: dict, head: str, last_commit) -> bool:
+    """Detect notices in a cut body's full bounded text without granting tail completion."""
     body = str(comment.get("body") or "")
-    notices = list(LIMIT_NOTICE_RE.finditer(body))[:MAX_LINES]
+    if len(body) > MAX_SUMMARY_CHARS:
+        return True
+    notices = list(LIMIT_NOTICE_RE.finditer("\n".join(_notice_lines(body))))
     if not notices:
         return False
     when = _body_at(comment)
     if when is None or last_commit is None:
         return True
-    allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
-    paused = any(notice.group("paused") for notice in notices[:MAX_LINES])
+    # A match consumes characters; at most MAX_SUMMARY_CHARS matches can exist.
+    allowance = any(notice.group("allowance") for notice in notices[:MAX_SUMMARY_CHARS])
+    paused = any(notice.group("paused") for notice in notices[:MAX_SUMMARY_CHARS])
+    names_head = bool(head and head[:7] in body.lower())
+    return _notice_time_rule(allowance or paused, names_head, when, last_commit)
+
+
+def _notice_part_holds(
+    comment: dict,
+    body: str,
+    head: str,
+    last_commit,
+    evidence: tuple,
+    node: dict,
+    paused: bool,
+    *,
+    allowance: bool,
+) -> bool:
+    """Apply head coverage, reviewer scope, and ordering to one notice class in a read body."""
+    ordinary, formal, completed = evidence
+    login = _login(comment).lower().removesuffix("[bot]")
+    if allowance and login in REVIEWER_BOTS and login in completed:
+        return False
+    when = _body_at(comment)
+    if when is None or last_commit is None:
+        return True
     _notices, mixed, _foreign = _pause_allowance_notices(body)
-    covers = _notice_covers_head(body, head, allowance)
     stale_push = mixed and last_commit > when
-    if _can_complete(comment) and covers and not stale_push:
+    if _can_complete(comment) and _notice_covers_head(body, head, allowance) and not stale_push:
         return False
     names_head = bool(head and head[:7] in body.lower())
-    login = _login(comment).lower().removesuffix("[bot]")
-    if _later_evidence(evidence, login, when, last_commit, allowance or paused or names_head):
+    later = formal if allowance else ordinary
+    if _later_evidence(later, login, when, last_commit, allowance or paused or names_head):
         return False
-    holds = allowance or paused or names_head or when >= last_commit
-    pr = node if isinstance(node, dict) else {}
-    if holds and _sourcery_budget_exempt(comment, head, evidence, pr):
+    holds = _notice_time_rule(allowance or paused, names_head, when, last_commit)
+    if holds and _sourcery_budget_exempt(comment, head, ordinary, node):
         return False
     return holds
+
+
+def _notice_holds(comment: dict, head: str, last_commit, evidence: tuple, node: dict) -> bool:
+    """Apply head coverage, reviewer scope, and ordering to notices in the read prefix."""
+    body = str(comment.get("body") or "")
+    prefix, _cut = _notice_read(body)
+    notices = list(LIMIT_NOTICE_RE.finditer(prefix))[:MAX_LINES]
+    if not notices:
+        return False
+    any_allowance = any(notice.group("allowance") for notice in notices[:MAX_LINES])
+    all_allowance = all(notice.group("allowance") for notice in notices[:MAX_LINES])
+    paused = any(notice.group("paused") for notice in notices[:MAX_LINES])
+    if any_allowance and not all_allowance:
+        return _notice_part_holds(
+            comment, body, head, last_commit, evidence, node, paused, allowance=True
+        ) or _notice_part_holds(
+            comment, body, head, last_commit, evidence, node, paused, allowance=False
+        )
+    return _notice_part_holds(
+        comment, body, head, last_commit, evidence, node, paused, allowance=all_allowance
+    )
+
+
+def _notice_reason(comment: dict, body: str, login: str) -> str:
+    """Name only the unmatched evidence in the comment carrying this notice."""
+    when = _body_at(comment)
+    stamp = when.isoformat().replace("+00:00", "Z") if when is not None else "head"
+    reason = f"review incomplete: {login or 'reviewer'} limit reached at {stamp}"
+    if names := _summary_shape(body).unmatched:
+        return reason + "; summary shape unmatched: " + ", ".join(names)
+    return reason
 
 
 def review_incomplete(pr: dict, me: str = "") -> str:
@@ -501,19 +724,26 @@ def review_incomplete(pr: dict, me: str = "") -> str:
     answerers = _answerers(node, me)
     head = str(node.get("headRefOid") or "").strip().lower()
     last_commit = _last_commit_at(node)
-    evidence = review_evidence(node, me)
+    evidence = (
+        review_evidence(node, me),
+        review_evidence(node, me, formal_only=True),
+        _completed_check_reviewers(node, head) | _completed_summary_reviewers(node, head),
+    )
     comments = sorted(
         _all_comments(node),
         key=lambda c: _body_at(c) or datetime.max.replace(tzinfo=UTC),
         reverse=True,
     )
     for comment in comments[: MAX_COMMENTS + MAX_REVIEWS]:
-        if _login(comment).lower().removesuffix("[bot]") in answerers:
+        login = _login(comment)
+        if login.lower().removesuffix("[bot]") in answerers:
             continue
+        body = str(comment.get("body") or "")
+        _prefix, cut = _notice_read(body)
+        if cut and _unread_notice_holds(comment, head, last_commit):
+            return f"review incomplete: {login or 'reviewer'} notice body exceeds the read bound"
         if _notice_holds(comment, head, last_commit, evidence, node):
-            when = _body_at(comment)
-            stamp = when.isoformat().replace("+00:00", "Z") if when is not None else "head"
-            return f"review incomplete: {_login(comment) or 'reviewer'} limit reached at {stamp}"
+            return _notice_reason(comment, body, login)
     return ""
 
 
