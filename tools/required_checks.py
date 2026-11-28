@@ -22,6 +22,7 @@ from enum import Enum, auto
 from math import ceil, floor
 from pathlib import Path
 from typing import TextIO
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import forge
@@ -85,6 +86,10 @@ class ApiFailureError(Exception):
 
 class WorkDeadlineError(ApiFailureError):
     """A read, retry or delay cannot finish before the session work cutoff."""
+
+
+class ServerBackoffDeadlineError(WorkDeadlineError):
+    """A server-error retry backoff does not fit before the session work cutoff."""
 
 
 class TransportFailureError(ApiFailureError):
@@ -562,7 +567,7 @@ class ApiSession:
             ) from err
         seconds = API_BACKOFF_SECONDS[attempt]
         if self.now() + seconds >= self.work_deadline:
-            raise WorkDeadlineError(
+            raise ServerBackoffDeadlineError(
                 f"Transient GitHub API failure: {label} still answers HTTP {err.status} "
                 f"at the {WORK_DEADLINE_SECONDS} s session work cutoff. "
                 "No check result was judged; rerun this job."
@@ -1247,9 +1252,12 @@ def _status_preflight(session: ApiSession, config: Config, evaluation: Evaluatio
     newest = recent.get(key)
     if newest is None and not complete:
         return "the newest judge status is outside the pre-post status page"
-    if newest != evaluation.snapshot.self_status or (
-        newest is not None and _status_timestamp(newest) > evaluation.read_started
-    ):
+    # The snapshot read the statuses before the checks and this read follows them.
+    # Statuses are immutable and ids grow, so any judge status created in between ranks
+    # newest and differs from the snapshot's. Identity equality proves nothing moved.
+    # Do not compare the forge timestamp with the runner clock: they are different
+    # time domains and the stamp of an existing status is not the server's current time.
+    if newest != evaluation.snapshot.self_status:
         return "the judge status moved during the evidence read"
     if _owed_status_changed(config, evaluation.snapshot, recent, complete=complete):
         return "required commit status evidence changed during the evidence read"
@@ -1517,7 +1525,11 @@ def _evaluate_retries(
         if reason in retried:
             return warning
         retried.add(reason)
-        if reason == EvaluationRetry.CONTESTED:
+        if reason in (EvaluationRetry.CONTESTED, EvaluationRetry.POST):
+            # After an uncertain or contested write, a settled success seen by the
+            # only_if_pending shortcut may be stale. Re-read current Build evidence
+            # before deciding the retry is done. The first pass keeps the fast path,
+            # and the existing retry, call and time caps still bound the loop.
             config = replace(config, only_if_pending=False)
     return ""
 
@@ -1589,6 +1601,11 @@ def _read_triage_statuses(
             statuses, _ = _read_status_page_one(session, replace(config, sha=sha))
         except ApiCapReachedError:
             break
+        except ServerBackoffDeadlineError as exc:
+            if session.now() >= session.work_deadline:
+                raise
+            errors.append(f"Triage status read for {sha} failed; optional triage stopped: {exc}")
+            break
         except WorkDeadlineError:
             raise
         except ApiFailureError as exc:
@@ -1654,7 +1671,8 @@ def _default_branch_head(session: ApiSession, repository: str) -> tuple[str, str
     branch = repo.get("default_branch")
     if not isinstance(branch, str) or not branch.strip():
         raise ApiFailureError("repository has no default_branch")
-    commit = session.request_json("default-commit", f"repos/{repository}/commits/{branch}")
+    segment = quote(branch, safe="")
+    commit = session.request_json("default-commit", f"repos/{repository}/commits/{segment}")
     if not isinstance(commit, dict):
         raise ApiFailureError("default branch commit response was not an object")
     sha = commit.get("sha")

@@ -372,8 +372,8 @@ def test_rendered_sign_off_defaults_to_proposals(required, override, expected):
 
 @pytest.mark.parametrize(
     "required",
-    ["[" + "9" * 5000 + "]", "[" * 100000 + "]" * 100000, '["Sign-off", NaN]'],
-    ids=["huge-int", "deep-nesting", "nan-constant"],
+    ["[" + "9" * 5000 + "]", '["Sign-off", NaN]'],
+    ids=["huge-int", "nan-constant"],
 )
 def test_policy_default_reports_json_conversion_errors(required):
     context = {
@@ -382,6 +382,22 @@ def test_policy_default_reports_json_conversion_errors(required):
     }
     source = (ROOT / REAL).read_text(encoding="utf-8")
     with pytest.raises(ciwf.ReadError, match=r"\.RequiredChecks\.Required"):
+        render.render(source, context, REAL)
+
+
+def test_policy_default_reports_mocked_decoder_recursion_error(monkeypatch):
+    """A mocked decoder RecursionError on tiny input surfaces as the named ReadError."""
+
+    def recursing_loads(*args, **kwargs):
+        raise RecursionError("mocked decoder failure")
+
+    monkeypatch.setattr("json.loads", recursing_loads)
+    context = {
+        **CONTEXT,
+        "RequiredChecks": {"Required": "[]", "NotOwed": "[]", "Apps": "{}"},
+    }
+    source = (ROOT / REAL).read_text(encoding="utf-8")
+    with pytest.raises(ciwf.ReadError, match=r"\.RequiredChecks\.Required.*nesting too deep"):
         render.render(source, context, REAL)
 
 

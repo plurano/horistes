@@ -179,7 +179,7 @@ def _json_message(body: bytes) -> str:
         return ""
     try:
         decoded = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return ""
     msg = decoded.get("message") if isinstance(decoded, dict) else None
     return msg.strip() if isinstance(msg, str) else ""

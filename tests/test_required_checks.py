@@ -494,7 +494,8 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
     fixture_tree = Tree(tmp_path / "forge-standin")
     env = _forge_env(fixture_tree, base_answers(checks=[check_item(1, "Gate")], runs=[wf_run(1)]))
     run_env = {
-        **os.environ,
+        # SYSTEMROOT is the only parent variable kept, because Windows process creation requires it.
+        **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {}),
         **env,
         "REPOSITORY": REPO,
         "EVENT_NAME": "push",
@@ -1979,6 +1980,40 @@ def _mixed_sweep_transport(
     return transport
 
 
+@pytest.mark.parametrize(
+    ("branch", "segment"),
+    [
+        pytest.param("release/2026#rc", "release%2F2026%23rc", id="slash-and-hash"),
+        pytest.param("main", "main", id="main-twin"),
+    ],
+)
+def test_default_branch_head_encodes_branch_as_path_segment(branch: str, segment: str) -> None:
+    seen: list[str] = []
+
+    responses = {
+        f"repos/{REPO}": json.dumps({"default_branch": branch}).encode(),
+        f"repos/{REPO}/commits/{segment}": json.dumps({"sha": SHA}).encode(),
+    }
+
+    def transport(path: str, method: str = "GET", **_: object) -> tuple[int, dict[str, str], bytes]:
+        seen.append(path)
+        body = responses.get(path)
+        if body is None:
+            raise AssertionError(f"unexpected request path: {path}")
+        return 200, {}, body
+
+    start = 3_000_000.0
+    session = ApiSession(
+        deadline=start + required_checks.WITHDRAWAL_RESERVE_SECONDS + 60.0,
+        now=lambda: start,
+        transport=transport,
+        out=io.StringIO(),
+    )
+    result = required_checks._default_branch_head(session, REPO)
+    assert result == (SHA, branch)
+    assert seen == [f"repos/{REPO}", f"repos/{REPO}/commits/{segment}"]
+
+
 def test_sweep_priority_rotates_successes_after_pending_and_failures() -> None:
     start = required_checks._iso_epoch("2026-11-23T12:00:00Z")
     ctx = "required-checks"
@@ -2177,18 +2212,55 @@ def test_sweep_open_pulls_and_default_branch(tree: Tree, monkeypatch: pytest.Mon
     assert len([c for c in tree.forge_calls() if "/pulls?" in c]) == 1
 
 
-def test_forge_post_error_names_method(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fail_post(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed POST argv
+@pytest.fixture
+def stub_gh_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand-in for forge._gh_run that returns a canned 502 response for any request."""
+
+    def fail_gh(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed argv
         return subprocess.CompletedProcess(
-            args, 1, b"HTTP/2.0 502 Bad Gateway\r\n\r\n", b"gh: HTTP 502"
+            args,
+            1,
+            b'HTTP/2.0 502 Bad Gateway\r\nX-Id: 7\r\n\r\n{"message": "tiny"}',
+            b"gh: HTTP 502",
         )
 
-    monkeypatch.setattr(forge, "_gh_run", fail_post)
+    monkeypatch.setattr(forge, "_gh_run", fail_gh)
+
+
+@pytest.mark.usefixtures("stub_gh_502")
+def test_forge_post_error_names_method() -> None:
     with pytest.raises(forge.ResponseError, match="POST"):
         forge.request(
             "repos/x/statuses/sha", method="POST", fields={"state": "success", "context": "x"}
         )
+
+
+class _RecursingDecoder:
+    """Stand-in for the json module whose decoder always raises RecursionError."""
+
+    @staticmethod
+    def loads(*args: object, **kwargs: object) -> object:
+        raise RecursionError("mocked decoder failure")
+
+
+def test_forge_json_message_treats_recursion_error_as_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forge, "json", _RecursingDecoder)
+    assert forge._json_message(b'{"message": "tiny"}') == ""
+
+
+@pytest.mark.usefixtures("stub_gh_502")
+def test_forge_response_error_survives_recursion_error_in_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(forge, "json", _RecursingDecoder)
+    with pytest.raises(forge.ResponseError) as caught:
+        forge.request("repos/x/y")
+    assert caught.value.status == 502
+    assert caught.value.headers == {"x-id": "7"}
+    assert caught.value.message == "gh: HTTP 502"
 
 
 def test_boundary_edge_cases_for_parsers_and_snapshot(
@@ -3335,6 +3407,44 @@ def test_preflight_refuses_at_status_page_bound() -> None:
     assert fake.calls.count(("GET", _status_page(required_checks.STATUS_MAX_PAGES + 1))) == 2
 
 
+_SKEW_OFFSETS = [-3600.0, 0.0, 3600.0]
+_SKEW_IDS = ["server-behind", "server-aligned", "server-ahead"]
+
+
+@pytest.mark.parametrize("offset", _SKEW_OFFSETS, ids=_SKEW_IDS)
+def test_preflight_same_judge_status_version_ignores_clock_skew(offset: float) -> None:
+    fake = ReviewTransport(server_offset=offset)
+    stamp = _iso_seconds(fake.clock.now() + offset)
+    fake.answers[STATUSES_URL] = [status_item(101, PUSH_CONTEXT, "failure", updated_at=stamp)]
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0 and err == "", err
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
+@pytest.mark.parametrize("offset", _SKEW_OFFSETS, ids=_SKEW_IDS)
+def test_preflight_changed_judge_status_version_forces_reread_under_skew(
+    offset: float,
+) -> None:
+    baseline = ReviewTransport(server_offset=offset)
+    base_stamp = _iso_seconds(baseline.clock.now() + offset)
+    baseline.answers[STATUSES_URL] = [
+        status_item(101, PUSH_CONTEXT, "failure", updated_at=base_stamp)
+    ]
+    _review_judge(baseline)
+
+    fake = ReviewTransport(server_offset=offset)
+    stamp = _iso_seconds(fake.clock.now() + offset)
+    first = status_item(101, PUSH_CONTEXT, "failure", updated_at=stamp)
+    newer = status_item(102, PUSH_CONTEXT, "failure", updated_at=stamp)
+    # The snapshot read sees only the first version; later reads see the newer one.
+    fake.answers[STATUSES_URL] = [newer, first]
+    fake.replies[STATUSES_URL] = iter([[first]])
+    rc, _, err, _ = _review_judge(fake)
+    assert rc == 0 and err == "", err
+    assert fake.calls.count(("GET", CHECKS_URL)) > baseline.calls.count(("GET", CHECKS_URL))
+    assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
 def _contested_status_write(
     fake: ReviewTransport, *, cap: int | None = None, conclusion: str = "success"
 ) -> tuple[int, str]:
@@ -3568,32 +3678,34 @@ def test_sweep_keeps_triage_error_when_sweep_stops(
 
 
 @pytest.mark.parametrize(
-    ("error", "elapsed", "stops_triage"),
+    ("error", "elapsed", "outcome"),
     [
-        (forge.ResponseError("bad gateway", status=502), 420, True),
+        (forge.ResponseError("bad gateway", status=502), 420, "triage-stops"),
+        (forge.ResponseError("bad gateway", status=502), 450, "cutoff"),
         (
             forge.ResponseError("rate limit", status=429, headers={"retry-after": "20"}),
             430,
-            True,
+            "stops",
         ),
         (
             forge.ResponseError("rate limit", status=429, headers={"retry-after": "360"}),
             100,
-            True,
+            "stops",
         ),
         (
             forge.ResponseError("rate limit", status=429, headers={"retry-after": "19"}),
             430,
-            False,
+            "continues",
         ),
         (
             forge.ResponseError("rate limit", status=429, headers={"retry-after": "301"}),
             0,
-            False,
+            "continues",
         ),
     ],
     ids=[
-        "502-backoff-hits-cutoff",
+        "502-backoff-skips-triage-then-evaluates",
+        "502-at-actual-work-cutoff",
         "429-delay-hits-cutoff",
         "429-long-delay-crosses-cutoff",
         "429-delay-one-second-before-cutoff",
@@ -3601,7 +3713,7 @@ def test_sweep_keeps_triage_error_when_sweep_stops(
     ],
 )
 def test_sweep_triage_retry_delay_crossing_work_deadline_stops_across_heads(
-    error: forge.ResponseError, elapsed: int, stops_triage: bool
+    error: forge.ResponseError, elapsed: int, outcome: str
 ) -> None:
     first, second, third = "1" * 40, "2" * 40, "3" * 40
     fake = _review_sweep_transport([first, second, third])
@@ -3634,12 +3746,26 @@ def test_sweep_triage_retry_delay_crossing_work_deadline_stops_across_heads(
     lines = err.getvalue().splitlines()
     assert rc == 1, lines
     assert lines[0].startswith(f"::error::Triage status read for {first} failed")
-    if stops_triage:
-        assert fake.clock.now() < REVIEW_EPOCH + required_checks.WORK_DEADLINE_SECONDS
+    cutoff = REVIEW_EPOCH + required_checks.WORK_DEADLINE_SECONDS
+    repo_read = ("GET", f"repos/{REPO}")
+    if outcome in {"stops", "cutoff"}:
+        if outcome == "stops":
+            assert fake.clock.now() < cutoff
+        else:
+            assert fake.clock.now() >= cutoff
         assert ("GET", third_statuses) not in fake.calls
-        assert ("GET", f"repos/{REPO}") not in fake.calls
+        assert repo_read not in fake.calls
         assert len(lines) == 2 and f"Triage status read for {second}" not in err.getvalue()
         assert fake.posts == []
+    elif outcome == "triage-stops":
+        assert fake.clock.now() < cutoff
+        assert lines[1].startswith(f"::error::Triage status read for {second} failed")
+        assert "HTTP 502" in lines[1]
+        assert f"Triage status read for {third}" not in err.getvalue()
+        repo_index = fake.calls.index(repo_read)
+        assert ("GET", third_statuses) not in fake.calls[:repo_index]
+        assert ("GET", third_statuses) in fake.calls[repo_index:]
+        assert len(fake.posts) == 4
     else:
         assert ("GET", third_statuses) in fake.calls
 
@@ -5418,11 +5544,13 @@ def test_retryable_post_failure_proven_success_and_withdrawal_boundaries() -> No
     fake_peer.post_errors = iter([forge.ResponseError("POST HTTP 502", status=502)])
     rc_peer, _, err_peer, _ = _review_judge(fake_peer, only_if_pending=True)
     assert rc_peer == 0 and err_peer == ""
-    # The 502 failure write was really attempted. The retry snapshot then sees the peer's
-    # settled success with no withdrawal reserved, so the only_if_pending shortcut applies
-    # and no second failure is posted.
+    # The 502 failure write was really attempted. The retry must not trust the peer's
+    # settled success through the only_if_pending shortcut. It rereads the current Build
+    # evidence (a second check-runs read), sees the failure, and writes the correct verdict.
     assert next(fake_peer.post_errors, None) is None
-    assert fake_peer.posts == [(REVIEW_POST_PATH, "failure")]
+    check_reads = [c for c in fake_peer.calls if c[0] == "GET" and "/check-runs?" in c[1]]
+    assert len(check_reads) == 2
+    assert fake_peer.posts == [(REVIEW_POST_PATH, "failure")] * 2
 
     # Boundary 3: success POST gets 502, retry hits cap, and withdrawal itself fails -> risk error.
     fake_risk = ReviewTransport()
