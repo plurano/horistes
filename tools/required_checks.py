@@ -1374,7 +1374,8 @@ def _verify_post(
     if oldest_contender is None:
         return True, False
     owed_keys = _owed_status_keys(config)
-    if not complete:
+    if not complete and not _statuses_covered(rows, owed_keys, oldest_contender):
+        initial_rows = list(rows)
         rows, complete, confirmed = _read_status_pages(
             session,
             config,
@@ -1383,6 +1384,9 @@ def _verify_post(
             lambda read_rows: _statuses_covered(read_rows, owed_keys, oldest_contender),
         )
         if not confirmed:
+            return True, False
+        final_page1, final_complete = _read_status_page_one(session, config)
+        if final_complete or final_page1 != initial_rows:
             return True, False
     if _owed_status_changed(config, evaluation.snapshot, _all_statuses(rows), complete=complete):
         return True, False
@@ -1454,7 +1458,7 @@ def _evaluate_attempt(
     should_post = _should_post(
         evaluation.snapshot.self_status, evaluation.state, evaluation.description
     )
-    if should_post or session.withdrawal_reserved:
+    if should_post or session.withdrawal_reserved or unconfirmed:
         stale_reason = _post_age_problem(session, evaluation) or _status_preflight(
             session, config, evaluation
         )

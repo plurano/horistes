@@ -3179,17 +3179,35 @@ def test_review_post_verification_reads_page_once_without_contention() -> None:
     assert fake.calls[post + 1 :] == [("GET", STATUSES_URL)]
 
 
-@pytest.mark.parametrize("own_id_visible", [False, True])
-def test_review_post_verification_checks_full_page_for_own_status(own_id_visible: bool) -> None:
+@pytest.mark.parametrize(
+    ("own_id_visible", "page_changed", "evidence_reads"),
+    [(False, False, 2), (True, False, 1), (True, True, 2)],
+    ids=["own-id-missing", "stable-page", "page-updated"],
+)
+def test_review_post_verification_checks_full_page_for_own_status(
+    own_id_visible: bool, page_changed: bool, evidence_reads: int
+) -> None:
     fake = ReviewTransport()
     foreign = [status_item(i, "other") for i in range(1, forge.PER_PAGE + 1)]
     if own_id_visible:
         foreign[-1] = status_item(1001, PUSH_CONTEXT, "success")
-    fake.replies[STATUSES_URL] = iter([[], [], foreign])
+    # A missing own ID retries immediately. A visible ID confirms the page after the walk.
+    pages = [[], [], foreign]
+    if own_id_visible:
+        confirmation = [status_item(1002, "other"), *foreign[:-1]] if page_changed else foreign
+        pages.append(confirmation)
+    fake.replies[STATUSES_URL] = iter(pages)
     rc, _, err, _ = _review_judge(fake)
     assert rc == 0 and not err, err
     assert fake.posts == [(REVIEW_POST_PATH, "success")]
-    assert fake.calls.count(("GET", CHECKS_URL)) == (1 if own_id_visible else 2)
+    assert fake.calls.count(("GET", CHECKS_URL)) == evidence_reads
+    if own_id_visible and not page_changed:
+        second_page = STATUSES_URL.removesuffix("page=1") + "page=2"
+        assert fake.calls[-3:] == [
+            ("GET", STATUSES_URL),
+            ("GET", second_page),
+            ("GET", STATUSES_URL),
+        ]
 
 
 def test_review_second_contested_failure_warns_without_withdrawal() -> None:
@@ -3418,6 +3436,7 @@ def test_preflight_same_judge_status_version_ignores_clock_skew(offset: float) -
     fake.answers[STATUSES_URL] = [status_item(101, PUSH_CONTEXT, "failure", updated_at=stamp)]
     rc, _, err, _ = _review_judge(fake)
     assert rc == 0 and err == "", err
+    assert fake.calls.count(("GET", CHECKS_URL)) == 1
     assert fake.posts == [(REVIEW_POST_PATH, "success")]
 
 
@@ -4913,12 +4932,12 @@ def test_success_post_502_twice_withdraws_after_retry_and_reports_error() -> Non
 
 
 def _stored_502_case(
-    *, only_if_pending: bool, retry_conclusion: str = "success"
+    *, only_if_pending: bool, retry_conclusion: str = "success", initial_conclusion: str = "success"
 ) -> tuple[int, str, str, ReviewTransport, ApiSession, list[bool]]:
     fake = ReviewTransport()
     fake.replies[CHECKS_URL] = iter(
         [
-            {"check_runs": [check_item(1, "Build", "success")]},
+            {"check_runs": [check_item(1, "Build", initial_conclusion)]},
             {"check_runs": [check_item(2, "Build", retry_conclusion)]},
         ]
     )
@@ -4946,6 +4965,15 @@ def _stored_502_case(
     cfg = _review_config(only_if_pending=only_if_pending)
     rc = required_checks.evaluate_one(session, cfg, out, err)
     return rc, out.getvalue(), err.getvalue(), fake, session, reserved_on_get
+
+
+def test_stored_failure_confirmed_before_no_post_retry_finishes() -> None:
+    rc, _, err, fake, _, _ = _stored_502_case(
+        only_if_pending=False, initial_conclusion="failure", retry_conclusion="failure"
+    )
+    assert rc == 0 and err == "", err
+    assert fake.posts == [(REVIEW_POST_PATH, "failure")]
+    assert fake.calls[-1] == ("GET", STATUSES_URL)
 
 
 def test_success_post_502_stored_by_github_clears_reservation_only_on_fresh_decision() -> None:
