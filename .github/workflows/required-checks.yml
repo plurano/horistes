@@ -73,6 +73,10 @@ jobs:
           sparse-checkout: |
             tools/forge.py
             tools/required_checks.py
+            tools/required_checks_config.py
+            tools/required_checks_selftest.py
+            tools/required_checks_session.py
+            tools/required_checks_snapshot.py
             tools/results.py
           sparse-checkout-cone-mode: false
 

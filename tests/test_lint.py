@@ -214,6 +214,10 @@ def test_owned_files_stay_under_mccabe_cap(tree):
     """Keep the required-checks judge and its integration within the HISS-04 cap."""
     owned = (
         "tools/required_checks.py",
+        "tools/required_checks_config.py",
+        "tools/required_checks_selftest.py",
+        "tools/required_checks_session.py",
+        "tools/required_checks_snapshot.py",
         "tools/render.py",
         "tools/forge.py",
         "tests/test_required_checks.py",

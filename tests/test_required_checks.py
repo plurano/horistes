@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tokenize
 from collections.abc import Callable, Iterator
 from dataclasses import FrozenInstanceError, dataclass, replace
 from datetime import UTC, datetime
@@ -55,6 +56,7 @@ CHECKS_URL = f"repos/{REPO}/commits/{SHA}/check-runs?filter=all&per_page=100&pag
 RUNS_URL = f"repos/{REPO}/actions/runs?head_sha={SHA}&per_page=100&page=1"
 STATUSES_URL = f"repos/{REPO}/commits/{SHA}/statuses?per_page=100&page=1"
 WORKFLOW_PATH = ROOT / ".github/workflows/required-checks.yml"
+SWEEP_WORKFLOW_PATH = ROOT / ".github/workflows/required-checks-sweep.yml"
 TEMPLATE_PATH = ROOT / "templates/callers/required-checks.yml.tmpl"
 ADR_PATH = ROOT / "docs/adr/0108-a-reusable-workflow-judges-the-required-checks.md"
 
@@ -308,14 +310,65 @@ def import_violations(source: str, allowed_siblings: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 
+def _judge_local_modules() -> set[str]:
+    """Local `tools/*.py` modules transitively imported by `tools/required_checks.py`."""
+    seen: set[str] = set()
+    todo = ["required_checks"]
+    for _ in range(32):
+        if not todo:
+            break
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        parsed = ast.parse((ROOT / "tools" / f"{name}.py").read_text(encoding="utf-8"))
+        for node in list(ast.walk(parsed))[:10000]:
+            for mod in _imported_module(node):
+                if (ROOT / "tools" / f"{mod}.py").is_file() and mod not in seen:
+                    todo.append(mod)
+    return {f"tools/{name}.py" for name in seen}
+
+
+def _judge_own_paths() -> tuple[Path, ...]:
+    """Paths of `tools/required_checks*.py` modules."""
+    return tuple(
+        ROOT / rel
+        for rel in sorted(_judge_local_modules())[:16]
+        if Path(rel).stem.startswith("required_checks")
+    )
+
+
+def _workflow_sparse_files(workflow_path: Path) -> list[str]:
+    doc = ciwf.load(workflow_path)
+    steps = doc["jobs"]["required-checks"]["steps"]
+    checkout = next(
+        step for step in steps[:16] if step.get("name") == "Check out the required-checks judge"
+    )
+    with_block = checkout["with"]
+    assert with_block["repository"] == "${{ job.workflow_repository }}"
+    assert with_block["ref"] == "${{ job.workflow_sha }}"
+    assert with_block["persist-credentials"] is False
+    assert with_block["sparse-checkout-cone-mode"] is False
+    return [line.strip() for line in with_block["sparse-checkout"].splitlines() if line.strip()]
+
+
+def _missing_sparse_modules(sparse_files: list[str]) -> set[str]:
+    return _judge_local_modules() - set(sparse_files)
+
+
 def test_required_checks_and_forge_are_stdlib_only() -> None:
+    own_paths = _judge_own_paths()
+    own_names = frozenset(path.stem for path in own_paths)
+    allowed_for_judge = own_names | {"forge"}
+    for path in own_paths:
+        src = path.read_text(encoding="utf-8")
+        assert import_violations(src, allowed_for_judge - {path.stem}) == [], path.name
     rc_src = (ROOT / "tools/required_checks.py").read_text(encoding="utf-8")
     forge_src = (ROOT / "tools/forge.py").read_text(encoding="utf-8")
     results_src = (ROOT / "tools/results.py").read_text(encoding="utf-8")
-    assert import_violations(rc_src, frozenset({"forge"})) == []
     assert import_violations(forge_src, frozenset({"results"})) == []
     assert import_violations(results_src) == []
-    assert import_violations("import yaml\n" + rc_src, frozenset({"forge"})) == [
+    assert import_violations("import yaml\n" + rc_src, allowed_for_judge) == [
         "non-stdlib import: yaml"
     ]
 
@@ -472,14 +525,66 @@ def test_workflow_job_timeout_steps_and_caller_template_contract() -> None:
     assert problems == [] and link_count >= 8
 
 
+def _run_isolated_judge(script: str, run_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    cmd_judge = [sys.executable, "-I", "-B", script, "judge"]
+    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed judge argv
+    return subprocess.run(
+        cmd_judge, capture_output=True, text=True, check=False, timeout=30, env=run_env
+    )
+
+
+def test_both_workflows_sparse_checkout_holds_every_judge_module() -> None:
+    expected = sorted(_judge_local_modules())
+    for workflow_path in (WORKFLOW_PATH, SWEEP_WORKFLOW_PATH):
+        sparse_files = _workflow_sparse_files(workflow_path)
+        assert sparse_files == expected, workflow_path.name
+        assert _missing_sparse_modules(sparse_files) == set()
+        for rel in sparse_files[:16]:
+            assert (ROOT / rel).is_file(), rel
+
+
+def test_planted_dropped_judge_module_is_found() -> None:
+    full = sorted(_judge_local_modules())
+    assert len(full) >= 3
+    for dropped in full[:16]:
+        planted = [rel for rel in full if rel != dropped]
+        assert _missing_sparse_modules(planted) == {dropped}
+
+
+def _assert_isolated_sweep(tmp_path: Path, script: str, sys_env: dict[str, str]) -> None:
+    pull_sha = "1" * 40
+    sweep_tree = Tree(tmp_path / "forge-sweep-standin")
+    sweep_answers = {
+        **base_answers(checks=[check_item(1, "Gate")], runs=[wf_run(1)]),
+        f"repos/{REPO}/pulls?state=open&per_page=100": [{"head": {"sha": pull_sha}}],
+        f"repos/{REPO}": {"default_branch": "main"},
+        f"repos/{REPO}/commits/main": {"sha": SHA},
+        CHECKS_URL.replace(SHA, pull_sha): {"check_runs": [check_item(2, "Gate")]},
+        RUNS_URL.replace(SHA, pull_sha): {"workflow_runs": [wf_run(2, event="pull_request")]},
+        STATUSES_URL.replace(SHA, pull_sha): [],
+    }
+    sweep_env = {
+        **sys_env,
+        **_forge_env(sweep_tree, sweep_answers),
+        "REPOSITORY": REPO,
+        "REQUIRED_JSON": '["Gate"]',
+        "REQUIRED_CHECKS_TARGETS": "open-pulls",
+        "REQUIRED_CHECKS_RUN_NUMBER": "1",
+        "GITHUB_WORKFLOW_REF": (
+            f"{REPO}/.github/workflows/required-checks-caller.yml@refs/heads/main"
+        ),
+    }
+    done_sweep = _run_isolated_judge(script, sweep_env)
+    assert done_sweep.returncode == 0, done_sweep.stdout + done_sweep.stderr
+    assert len(_forge_post_records(sweep_tree)) == 2
+
+
 def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> None:
-    doc = ciwf.load(WORKFLOW_PATH)
-    sparse = doc["jobs"]["required-checks"]["steps"][1]["with"]["sparse-checkout"].splitlines()
-    sparse_files = [line.strip() for line in sparse if line.strip()]
-    assert sparse_files == ["tools/forge.py", "tools/required_checks.py", "tools/results.py"]
+    sparse_files = _workflow_sparse_files(WORKFLOW_PATH)
+    assert _workflow_sparse_files(SWEEP_WORKFLOW_PATH) == sparse_files
 
     isolated = tmp_path / "required-checks-source"
-    for rel in sparse_files[:10]:
+    for rel in sparse_files[:16]:
         dest = isolated / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text((ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
@@ -491,11 +596,12 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
     assert done_self.returncode == 0, done_self.stdout + done_self.stderr
     assert all(line.startswith("ok ") for line in done_self.stdout.splitlines())
 
+    sys_env = {"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {}
     fixture_tree = Tree(tmp_path / "forge-standin")
     env = _forge_env(fixture_tree, base_answers(checks=[check_item(1, "Gate")], runs=[wf_run(1)]))
     run_env = {
         # SYSTEMROOT is the only parent variable kept, because Windows process creation requires it.
-        **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {}),
+        **sys_env,
         **env,
         "REPOSITORY": REPO,
         "EVENT_NAME": "push",
@@ -504,11 +610,7 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
         "REQUIRED_JSON": '["Gate"]',
         "GITHUB_WORKFLOW_REF": f"{REPO}/.github/workflows/ci.yml@refs/heads/main",
     }
-    cmd_judge = [sys.executable, "-I", "-B", script, "judge"]
-    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed judge argv
-    done_judge = subprocess.run(
-        cmd_judge, capture_output=True, text=True, check=False, timeout=30, env=run_env
-    )
+    done_judge = _run_isolated_judge(script, run_env)
     assert done_judge.returncode == 0, done_judge.stdout + done_judge.stderr
     assert "OK (success): Gate" in done_judge.stdout
     posts = _forge_post_records(fixture_tree)
@@ -517,11 +619,20 @@ def test_sparse_checkout_runs_isolated_self_test_and_judge(tmp_path: Path) -> No
     assert posts[0][method + 1 : method + 3] == ["POST", f"repos/{REPO}/statuses/{SHA}"]
     assert "state=success" in posts[0]
 
-    (isolated / "tools/results.py").unlink()
-    # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: fixed self-test argv
-    broken = subprocess.run(cmd_self, capture_output=True, text=True, check=False, timeout=30)
-    assert broken.returncode != 0
-    assert "No module named 'results'" in broken.stderr
+    _assert_isolated_sweep(tmp_path, script, sys_env)
+
+    for missing_rel, missing_mod in (
+        ("tools/results.py", "results"),
+        ("tools/required_checks_config.py", "required_checks_config"),
+    ):
+        removed = isolated / missing_rel
+        saved = removed.read_text(encoding="utf-8")
+        removed.unlink()
+        # nosemgrep: dangerous-subprocess-use-audit expires 2027-03-13 category D: self-test argv
+        broken = subprocess.run(cmd_self, capture_output=True, text=True, check=False, timeout=30)
+        removed.write_text(saved, encoding="utf-8")
+        assert broken.returncode != 0
+        assert f"No module named '{missing_mod}'" in broken.stderr
 
 
 def test_self_test_passes_and_catches_planted_judge_defects(
@@ -3387,12 +3498,43 @@ def test_preflight_reads_short_second_page_when_no_judge_status_exists() -> None
     rc, _, err, _ = _review_judge(fake)
     assert rc == 0 and not err, err
     post_index = fake.calls.index(("POST", REVIEW_POST_PATH))
-    assert fake.calls[post_index - 2 : post_index] == [
+    assert fake.calls[post_index - 3 : post_index] == [
         ("GET", STATUSES_URL),
         ("GET", _status_page(2)),
+        ("GET", STATUSES_URL),
     ]
     assert fake.calls.count(("GET", _status_page(2))) == 3
     assert fake.posts == [(REVIEW_POST_PATH, "success")]
+
+
+def test_paginated_preflight_rejects_changed_first_page(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import required_checks_session
+
+    first_page = _full_unrelated_status_page()
+    changed_page = [status_item(forge.PER_PAGE + 1, PUSH_CONTEXT, "failure"), *first_page[:-1]]
+    replies = iter([(1, first_page, False), (2, [], True), (1, changed_page, False)])
+    pages_read = []
+
+    def read_status_page(session, config, page):
+        pages_read.append(page)
+        expected_page, rows, complete = next(replies)
+        assert page == expected_page
+        return rows, complete
+
+    monkeypatch.setattr(required_checks_session, "_read_status_page", read_status_page)
+    monkeypatch.setattr(required_checks_session, "status_context", lambda config: PUSH_CONTEXT)
+    monkeypatch.setattr(
+        required_checks_session, "_owed_status_changed", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(required_checks_session, "_post_age_problem", lambda *args: "")
+    evaluation = SimpleNamespace(snapshot=SimpleNamespace(self_status=None))
+
+    assert required_checks_session._status_preflight(None, None, evaluation) == (
+        "the first status page changed during the pre-post status read"
+    )
+    assert pages_read == [1, 2, 1]
 
 
 def test_preflight_compares_judge_status_on_second_page() -> None:
@@ -3893,24 +4035,92 @@ def test_sweep_posts_proposal_failure_when_same_sha_passes_push_policy() -> None
     assert fake.posts == [(REVIEW_POST_PATH, "success"), (REVIEW_POST_PATH, "failure")]
 
 
-def _review_judge_function(name: str) -> ast.FunctionDef:
-    source = (ROOT / "tools/required_checks.py").read_text(encoding="utf-8")
-    return next(
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef) and node.name == name
+CODACY_MAX_NON_COMMENT_LINES = 500
+
+
+def _docstring_lines(parsed: ast.Module) -> set[int]:
+    doc_lines: set[int] = set()
+    scopes = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    for node in list(ast.walk(parsed))[:20000]:
+        if not isinstance(node, scopes) or not node.body:
+            continue
+        first = node.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+            and first.end_lineno is not None
+        ):
+            doc_lines.update(range(first.lineno, first.end_lineno + 1))
+    return doc_lines
+
+
+def _non_comment_lines(source: str) -> int:
+    """Count non-blank, non-comment, non-docstring lines as Codacy's file-length rule does."""
+    lines = source.splitlines()
+    reader = io.BytesIO(source.encode("utf-8")).readline
+    comment_lines = {
+        tok.start[0]
+        for tok in itertools.islice(tokenize.tokenize(reader), 100000)
+        if tok.type == tokenize.COMMENT
+    }
+    doc_lines = _docstring_lines(ast.parse(source))
+    return sum(
+        1
+        for idx, line in enumerate(lines[:10000], start=1)
+        if line.strip() and idx not in comment_lines and idx not in doc_lines
     )
 
 
+def _review_judge_function(name: str) -> ast.FunctionDef:
+    for path in _judge_own_paths():
+        source = path.read_text(encoding="utf-8")
+        for node in ast.parse(source).body[:500]:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+    raise LookupError(f"no judge function named {name!r}")
+
+
 def test_review_judge_function_limits() -> None:
-    source = (ROOT / "tools/required_checks.py").read_text(encoding="utf-8")
-    functions = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef)]
     decisions = (ast.If, ast.IfExp, ast.For, ast.While, ast.ExceptHandler)
-    for function in functions:
-        branches = sum(isinstance(node, decisions) for node in ast.walk(function))
-        assert branches <= 9, function.name
-        assert function.end_lineno is not None
-        assert function.end_lineno - function.lineno + 1 <= 60, function.name
+    for path in _judge_own_paths():
+        source = path.read_text(encoding="utf-8")
+        functions = [
+            node
+            for node in list(ast.walk(ast.parse(source)))[:20000]
+            if isinstance(node, ast.FunctionDef)
+        ]
+        for function in functions[:200]:
+            branches = sum(isinstance(node, decisions) for node in list(ast.walk(function))[:5000])
+            assert branches <= 9, f"{path.name}:{function.name}"
+            assert function.end_lineno is not None
+            assert function.end_lineno - function.lineno + 1 <= 60, f"{path.name}:{function.name}"
+
+
+def test_judge_modules_stay_under_codacy_line_cap() -> None:
+    for rel in sorted(_judge_local_modules())[:16]:
+        count = _non_comment_lines((ROOT / rel).read_text(encoding="utf-8"))
+        assert count <= CODACY_MAX_NON_COMMENT_LINES, (
+            f"{rel} has {count} non-comment lines (limit {CODACY_MAX_NON_COMMENT_LINES})"
+        )
+
+
+@pytest.mark.parametrize(
+    ("code_lines", "expected"),
+    [
+        (0, 0),
+        (CODACY_MAX_NON_COMMENT_LINES, CODACY_MAX_NON_COMMENT_LINES),
+        (CODACY_MAX_NON_COMMENT_LINES + 1, CODACY_MAX_NON_COMMENT_LINES + 1),
+    ],
+    ids=["empty-with-comments", "at-cap", "above-cap"],
+)
+def test_non_comment_lines_planted_boundary(code_lines: int, expected: int) -> None:
+    header = '"""Module docstring.\n\nSecond line.\n"""\n# comment\n\n'
+    body = "".join(f"VALUE_{idx} = {idx}\n" for idx in range(code_lines))
+    assert _non_comment_lines(header + body) == expected
+    assert (_non_comment_lines(header + body) <= CODACY_MAX_NON_COMMENT_LINES) == (
+        code_lines <= CODACY_MAX_NON_COMMENT_LINES
+    )
 
 
 def test_review_bool_parser_does_not_assign_token() -> None:
