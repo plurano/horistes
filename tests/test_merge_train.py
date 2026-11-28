@@ -1254,8 +1254,8 @@ class ForgeRequestRefusalError(AssertionError):
 
 
 def diagnostic_text(value: str) -> str:
-    """Keep printable text without spaces verbatim and escape other text."""
-    if value and (not value.isprintable() or " " in value):
+    """Keep printable text verbatim and escape non-printable text with ascii()."""
+    if not value.isprintable():
         return ascii(value)
     return value
 
@@ -1317,7 +1317,12 @@ class Handler(BaseHTTPRequestHandler):
             if pending is None:
                 raise
             _, location, _, issuer = pending
-            target = diagnostic_text(self.path)
+            # A refused target keeps its earlier ascii() form; any other target passed the check.
+            target = (
+                ascii(self.path)
+                if isinstance(error, ForgeRequestRefusalError)
+                else diagnostic_text(self.path)
+            )
             location = diagnostic_text(location)
             reason = str(error).partition("\n")[0]
             raise ForgeRequestRefusalError(
@@ -12219,7 +12224,7 @@ def test_storage_refuses_noncanonical_ids_without_authorization(ident):
     ],
 )
 def test_storage_refuses_raw_target_before_parsing(path, position, escaped, pending):
-    """Refuse a forbidden target before parsing it and escape any redirect context."""
+    """Refuse a forbidden target before parsing; escape it and any non-printable Location."""
     forge = Forge(repository())
     forge.storage[101] = b"planted artifact"
     if pending:
@@ -12235,7 +12240,8 @@ def test_storage_refuses_raw_target_before_parsing(path, position, escaped, pend
     message = str(error.value)
     assert message.isprintable(), ascii(message)
     if pending:
-        context = f"GET {ascii(path)}: pending redirect from {ARCHIVE_ROUTE} to {ascii(path)} "
+        location = path if path.isprintable() else ascii(path)
+        context = f"GET {ascii(path)}: pending redirect from {ARCHIVE_ROUTE} to {location} "
         assert context in message
     assert forge.request_ledger == set()
     assert forge.fault_requests == forge.storage_reads == []
@@ -12261,6 +12267,26 @@ def test_forge_escapes_pending_location_when_route_asserts():
         rf"GET *: pending redirect from {ARCHIVE_ROUTE} to 'http://127.0.0.1/storage/1\x0001' "
         in message
     )
+
+
+def test_forge_keeps_printable_pending_location_when_route_asserts():
+    """Keep a printable Location with a space verbatim after a route assertion."""
+    forge = Forge(repository())
+    issuer = storage_handler(forge, "/repos/fleet/app/actions/artifacts/101/zip")
+    issuer.route, _ = issuer.normalized_route(None)
+    issuer.send_header("Location", "/storage/1 01")
+    issuer.end_headers()
+    handler = storage_handler(forge, "*")
+
+    with pytest.raises(
+        ForgeRequestRefusalError, match=re.escape("unresolved REST URL: *")
+    ) as error:
+        handler.do_GET()
+
+    message = str(error.value)
+    assert message.isprintable(), ascii(message)
+    context = f"GET *: pending redirect from {ARCHIVE_ROUTE} to http://127.0.0.1/storage/1 01 "
+    assert context in message
 
 
 def test_forge_escapes_raw_target_in_concurrent_refusal():
