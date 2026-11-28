@@ -38,10 +38,38 @@ and the first line of the original refusal. If the repository is later refused,
 include the split in its refusal line. If the smallest request fails, report
 its size and cursor and fail the sweep. Mutations still run once.
 
-Check the sweep budget before every pull-page attempt, including splits and
-retries after a backoff. A budget refusal names the document, page size and
-cursor. When the budget stops a retry, it also names the last refusal. A
-request already in flight can finish after the budget is spent.
+Pass report records, workflow annotations and serialized release outputs
+through one writer that flattens each record to one physical line. Escape pipes
+in table cells. Keep the release file as compact JSON without a trailing newline
+and the workflow's `releases=` output as compact JSON on one line.
+
+The static writer tripwire covers listed print, write, serialization, logging and
+file-copy APIs, their import aliases, writable or unresolved opens, and nested
+functions, classes and lambdas in writer bodies. The row check covers table-row
+f-strings. The annotation check covers command literals and colon fragments in
+concatenation, formatting, joins and f-strings. Every merge-train test also
+checks the captured file descriptors, child process output and named report
+files for physical line and table shape across the paths the tests exercise.
+The net checks each line per destination and cannot attribute individually valid
+lines to one record, so record-level flattening is tested at `write_records`,
+`annotate` and `note_cell`, with further harness forms tracked in issue 269.
+The static forwarding inventory checks only name bindings and declared names,
+leaves writes through a declared name (subscript, augmented subscript, or attribute)
+to issue 269, and relies on the runtime transport allow-list to refuse requests
+outside the declared routes.
+After every faulted scenario the runtime allow-list checks its ledger, and the
+stand-in refuses by name a second Location in one response and a pending redirect
+when route normalization raises during dispatch.
+A response counts as sent when its writer clears the slot under the admission lock
+after writing its last byte or bodyless header block carrying `Content-Length: 0`
+outside the lock (at socket close for cuts and drops), and a new admission waits up
+to `SERIAL_GRACE_SECONDS` (0.5 seconds) for a held slot to clear before refusing by name.
+
+Start the 1,500-second sweep budget after settings validation, including the
+app-key check. Check the budget before every pull-page attempt, including
+splits and retries after a backoff. A budget refusal names the document,
+page size and cursor. When the budget stops a retry, it also names the last
+refusal. A request already in flight can finish after the budget is spent.
 
 ## Consequences
 
@@ -56,9 +84,9 @@ request already in flight can finish after the budget is spent.
   cost 5,170 seconds, and a single pass 1,760 seconds. The budget stops it:
   the sweep checks it before each repository and before every pull-page
   attempt. Only one pull-page request can be in flight when the budget is
-  spent. The budget clock starts with the train step. A fleet run spent
-  5 seconds before that step and 4 seconds after it (run 45675358659), inside
-  the 30-minute job limit. Later repositories are listed as unreached.
+  spent. Settings validation uses time from the 30-minute job limit. A fleet
+  run spent 5 seconds before the train step and 4 seconds after it (run
+  45675358659). Later repositories are listed as unreached.
 - If the forge returns short nonfinal pages, each must advance the cursor and
   contribute at least one pull. The absolute bound is 100 pages per pass, or
   902 pull-page calls across three rounds including both splits. The same

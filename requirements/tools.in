@@ -7,6 +7,7 @@ coverage
 defusedxml
 lefthook
 pytest
+pytest-timeout
 pytest-xdist
 pyyaml
 reuse

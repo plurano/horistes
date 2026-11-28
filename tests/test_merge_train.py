@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import email.message
 import errno
 import functools
@@ -27,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -36,11 +38,13 @@ import urllib.error
 import urllib.request
 import weakref
 import zipfile
+from collections import Counter
 from collections.abc import Iterator
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urldefrag, urljoin, urlsplit
 
 import pytest
 from conftest import ROOT, measured
@@ -85,6 +89,8 @@ NOT_MERGEABLE = {
 }
 # A queued REST fault that closes the connection without an answer (RemoteDisconnected).
 DROP = "drop"
+# Leave the refusal time to reach the second client, whose shortest timeout is 2 seconds.
+SERIAL_GRACE_SECONDS = 0.5
 CLIENT_ID = "Iv23planted"
 WRITE = {
     "metadata": "read",
@@ -447,6 +453,34 @@ def repository(
     }
 
 
+# The train documents and their generated variants are checked against these tables below.
+GRAPHQL_MUTATIONS = {
+    "Arm": "enablePullRequestAutoMerge",
+    "CreateCommit": "createCommitOnBranch",
+    "Dequeue": "dequeuePullRequest",
+    "Disarm": "disablePullRequestAutoMerge",
+    "Draft": "convertPullRequestToDraft",
+    "Enqueue": "enqueuePullRequest",
+    "Merge": "mergePullRequest",
+    "Ready": "markPullRequestReadyForReview",
+}
+GRAPHQL_STATUS_SELECTION = dict.fromkeys(
+    (
+        *GRAPHQL_MUTATIONS,
+        "Commits",
+        "FileModes",
+        "LanderLease",
+        "Merged",
+        "MergeState",
+        "PullPage",
+        "RetryHistory",
+        "ReviewBodies",
+    ),
+    False,
+) | {"PullPageWithStatus": True}
+PULL_PAGE_OPERATIONS = {"PullPage", "PullPageWithStatus"}
+
+
 class Forge:
     """What the stand-in forge serves, and every write, token and revocation it saw.
 
@@ -465,6 +499,7 @@ class Forge:
         self.read_calls: list[tuple[str, dict]] = []
         self.pull_page_timeout_above: int | None = None
         self.read_statuses: dict[str, list[int]] = {}
+        self.read_error_bodies: dict[int, bytes] = {}
         self.mutation_statuses: dict[str, list[int]] = {}
         self.merge_state_statuses: list[int] = []
         # GraphQL answers to cut under their full length, per kind ("read" or a mutation name).
@@ -500,8 +535,13 @@ class Forge:
         self.ungranted: set[int] = set()
         self.jobs: dict[int, list[dict]] = {}
         self.jobs_calls: list[int] = []
-        # Faults the REST stand-in answers first, per kind ("jobs", "revoke"): a status or DROP.
-        self.rest_faults: dict[str, list[int | str]] = {}
+        # Queued HTTP faults by REST route or GraphQL operation name.
+        self.rest_faults: dict[str | tuple[str, str, str], list[int | str | tuple[int, bytes]]] = {}
+        self.fault_requests: list[tuple[str, str]] = []
+        self.request_ledger: set[tuple[str, str, str]] = set()
+        self.request_refusals: list[str] = []
+        self.redirect_location: tuple[str, str, str | None, str] | None = None
+        self._init_admission()
         self.label_missing = False
         self.unlabel_status: int | None = None
         self.repository_moves: dict[str, str] = {}
@@ -509,6 +549,12 @@ class Forge:
         self.repository_bodies: dict[str, object] = {}
         self.repository_calls: list[tuple[int, str]] = []
         self.install(7, "fleet", app=list(reads))
+
+    def _init_admission(self) -> None:
+        """Initialize the request serialization and response admission state."""
+        self.request_lock, self.response_lock = threading.Lock(), threading.Lock()
+        self.response_done = threading.Condition(self.response_lock)
+        self.pending_response: object | None = None
 
     def _init_pull_reads(self) -> None:
         self.commits: dict[int, list[tuple[str, int]]] = {}
@@ -658,48 +704,49 @@ class Forge:
         return {"data": {"createCommitOnBranch": {"commit": {"oid": "c" * 40}}}}
 
     def _record_message(self, kind: str, query: str, variables: dict) -> None:
-        headline = variables.get("headline") if "commitHeadline: $headline" in query else None
-        body = variables.get("body") if "commitBody: $body" in query else None
+        """Record variables used as message arguments on the declared mutation field."""
+        args = graphql_mutation_arguments(query, GRAPHQL_MUTATIONS[kind.capitalize()])
+        headline = (
+            variables.get("headline")
+            if graphql_contains(args, "commitHeadline", ":", "$", "headline")
+            else None
+        )
+        body = (
+            variables.get("body")
+            if graphql_contains(args, "commitBody", ":", "$", "body")
+            else None
+        )
         self.messages.append((kind, variables["id"], headline, body))
 
-    def graphql(self, header: str, query: str, variables: dict) -> dict:
+    def graphql(self, header: str, operation: str, query: str, variables: dict) -> dict:
         """Serve one GraphQL call: a mutation needs write rights and is recorded."""
         full, rights = self.repo_of(header)
-        mutations = (
-            "mergePullRequest",
-            "enqueuePullRequest",
-            "dequeuePullRequest",
-            "enablePullRequestAutoMerge",
-            "disablePullRequestAutoMerge",
-            "createCommitOnBranch",
-            "convertPullRequestToDraft",
-            "markPullRequestReadyForReview",
-        )
-        if any(name in query for name in mutations):
+        mutation = GRAPHQL_MUTATIONS.get(operation)
+        if mutation is not None:
             assert rights in (WRITE, {**WRITE, **STATUSES}), rights
-        if "convertPullRequestToDraft" in query:
+        if mutation == "convertPullRequestToDraft":
             self.write(full, ("draft", variables["id"]))
             return {"data": {"convertPullRequestToDraft": {"pullRequest": {"isDraft": True}}}}
-        if "markPullRequestReadyForReview" in query:
+        if mutation == "markPullRequestReadyForReview":
             self.write(full, ("ready", variables["id"]))
             return {"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}}}
-        if "disablePullRequestAutoMerge" in query:
+        if mutation == "disablePullRequestAutoMerge":
             self.write(full, ("disarm", variables["id"]))
             return {
                 "data": {"disablePullRequestAutoMerge": {"pullRequest": {"autoMergeRequest": None}}}
             }
-        if "dequeuePullRequest" in query:
+        if mutation == "dequeuePullRequest":
             self.write(full, ("dequeue", variables["id"]))
             return {
                 "data": {"dequeuePullRequest": {"mergeQueueEntry": {"id": f"MQ_{variables['id']}"}}}
             }
-        if "enqueuePullRequest" in query:
+        if mutation == "enqueuePullRequest":
             self.write(full, ("enqueue", variables["id"], variables["oid"]))
             if self.enqueue_errors:
                 return {"errors": self.enqueue_errors}
             entry = {"state": "QUEUED"} if self.merged else None
             return {"data": {"enqueuePullRequest": {"mergeQueueEntry": entry}}}
-        if "mergePullRequest" in query:
+        if mutation == "mergePullRequest":
             self._record_message("merge", query, variables)
             self.write(full, ("merge", variables["id"], variables["oid"], variables["method"]))
             if (self.active_reads.get(full) or {}).get("mergeQueue"):
@@ -709,44 +756,65 @@ class Forge:
             if self.refuse_merge or full in self.refuse_merge_in:
                 return {"errors": [{"message": self.refuse_merge or "refused here"}]}
             return {"data": {"mergePullRequest": {"pullRequest": {"merged": self.merged}}}}
-        if "enablePullRequestAutoMerge" in query:
+        if mutation == "enablePullRequestAutoMerge":
             self._record_message("arm", query, variables)
             self.write(full, ("arm", variables["id"], variables["oid"], variables["method"]))
             armed = {"autoMergeRequest": {"enabledAt": NOW.isoformat()}}
             return {"data": {"enablePullRequestAutoMerge": {"pullRequest": armed}}}
-        if "createCommitOnBranch" in query:
+        if mutation == "createCommitOnBranch":
             return self._handle_commit_mutation(full, variables)
-        return self._read_graphql(full, query, variables)
+        return self._read_graphql(full, operation, query, variables)
 
-    def _read_graphql(self, full: str, query: str, variables: dict) -> dict:
-        if 'label(name: "merge-train: lander lease")' in query and "pullRequests(" not in query:
+    def _read_graphql(self, full: str, operation: str, query: str, variables: dict) -> dict:
+        if operation == "LanderLease":
             self.lease_calls += 1
             default = {
                 "data": {"repository": {"landerLease": self.active_reads[full]["landerLease"]}}
             }
             return self.lease_read or default
-        if "fragment M on Commit" in query:
+        if operation == "FileModes":
             return self.pull_modes(query, variables)
-        if "HEAD_REF_FORCE_PUSHED_EVENT" in query:
+        if operation == "RetryHistory":
             return self.pull_retry_history(full, variables)
-        if "mergeStateStatus" in query and "pullRequest(" in query:
+        if operation == "MergeState":
             return self.pull_merge_state(full, variables)
-        if "reviews(first: 100)" in query:
+        if operation == "ReviewBodies":
             return self.pull_review_bodies(full, variables)
-        if "pullRequest(" in query:
+        if operation == "Commits":
             return self.pull_commits(full, variables)
-        if "states: MERGED" in query:
+        if operation == "Merged":
             nodes = self.merged_pulls.get(full, [])
             return {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
-        return self.pull_page(full, query, variables)
+        assert operation in PULL_PAGE_OPERATIONS, operation
+        return self.pull_page(full, operation, query, variables)
 
     def pull_modes(self, query: str, variables: dict) -> dict:
-        paths = [value for key, value in variables.items() if re.fullmatch(r"p\d+", key)]
+        paths = [
+            value
+            for key, value in variables.items()
+            if key.startswith("p") and ascii_digits(key[1:])
+        ]
         self.mode_calls.append(paths)
+        tokens = tuple(graphql_tokens(query))
         for index, path in enumerate(paths):
-            assert f"$p{index}: String!" in query
-            assert f"f{index}: file(path: $p{index}) {{ mode }}" in query
-            assert path not in query
+            variable = f"p{index}"
+            assert graphql_contains(tokens, "$", variable, ":", "String", "!")
+            assert graphql_contains(
+                tokens,
+                f"f{index}",
+                ":",
+                "file",
+                "(",
+                "path",
+                ":",
+                "$",
+                variable,
+                ")",
+                "{",
+                "mode",
+                "}",
+            )
+            assert all(path not in token for token in tokens)
         if self.mode_error:
             return {"errors": [{"message": self.mode_error}]}
         return {"data": {"repository": retry_modes(variables, self.modes)}}
@@ -845,10 +913,10 @@ class Forge:
         return None
 
     def _extract_page_nodes(
-        self, nodes: list[dict], start: int, size: int, query: str, variables: dict
+        self, nodes: list[dict], start: int, size: int, operation: str, variables: dict
     ) -> list[dict]:
         """One page of pull requests, the head status resolved by name where the query asks."""
-        selects_status = bool(re.search(r"\bstatus\s*\{", query))
+        selects_status = GRAPHQL_STATUS_SELECTION[operation]
         status_name = variables.get("status")
         page_nodes = []
         for p in nodes[start : min(start + size, len(nodes))]:
@@ -871,7 +939,7 @@ class Forge:
             page_nodes.append(p_copy)
         return page_nodes
 
-    def pull_page(self, full: str, query: str, variables: dict) -> dict:
+    def pull_page(self, full: str, operation: str, query: str, variables: dict) -> dict:
         """Answer the open pull request query: check its variables, return the asked page."""
         owner, name = full.split("/")
         after, size = variables["after"], variables["first"]
@@ -879,7 +947,11 @@ class Forge:
         if "status" in variables:
             expected["status"] = variables["status"]
         assert variables == expected, variables
-        assert "$first: Int!" in query and "pullRequests(states: OPEN, first: $first," in query
+        tokens = tuple(graphql_tokens(query))
+        assert graphql_contains(tokens, "$", "first", ":", "Int", "!")
+        assert graphql_contains(
+            tokens, "pullRequests", "(", "states", ":", "OPEN", "first", ":", "$", "first"
+        )
         if after is None:
             reads = self.reads[full]
             self.active_reads[full] = reads.pop(0) if len(reads) > 1 else reads[0]
@@ -887,39 +959,43 @@ class Forge:
         start = int(after.removeprefix("cursor-")) if after else 0
         nodes = read["pullRequests"]["nodes"]
         end = min(start + size, len(nodes))
-        page_nodes = self._extract_page_nodes(nodes, start, size, query, variables)
+        page_nodes = self._extract_page_nodes(nodes, start, size, operation, variables)
         page = {
             "nodes": page_nodes,
             "pageInfo": {"hasNextPage": end < len(nodes), "endCursor": f"cursor-{end}"},
         }
         return {"data": {"repository": {**read, "pullRequests": page}}}
 
-    def graphql_response(self, header: str, query: str, variables: dict) -> tuple[int, dict]:
+    def graphql_response(
+        self, header: str, query: str, variables: dict
+    ) -> tuple[int, dict | bytes]:
         """HTTP status and body of one GraphQL call; a status read without the right fails."""
-        if not re.match(r"\s*(?:query|mutation)\s+[_A-Za-z]\w*\s*[(\{]", query):
+        operation = graphql_operation(query)
+        if operation is None:
             return 400, {"message": "stand-in forge: anonymous operation"}
         full, rights = self.repo_of(header)
         self.queries.append(query)
-        if re.search(r"\bstatus\s*\{", query) and rights.get("statuses") != "read":
+        if GRAPHQL_STATUS_SELECTION[operation] and rights.get("statuses") != "read":
             return 200, {
                 "errors": [
                     {"type": "FORBIDDEN", "message": "Resource not accessible by integration"}
                 ]
             }
-        if query.lstrip().startswith("mutation"):
-            body = self.graphql(header, query, variables)
-            operation = re.search(r"\b(\w+)\(\s*input:", query)[1]
-            statuses = self.mutation_statuses.get(operation, [])
-        elif "pullRequests(" in query and "states: MERGED" not in query:
+        if mutation := GRAPHQL_MUTATIONS.get(operation):
+            body = self.graphql(header, operation, query, variables)
+            statuses = self.mutation_statuses.get(mutation, [])
+        elif operation in PULL_PAGE_OPERATIONS:
             self.read_calls.append((full, dict(variables)))
             size = variables["first"]
             if size > 25:
                 return 502, {"message": "stand-in forge: read page size exceeds 25"}
             if self.pull_page_timeout_above is not None and size > self.pull_page_timeout_above:
-                return 504, {"message": "stand-in forge: pull page timed out"}
+                return 504, self.read_error_bodies.get(
+                    504, {"message": "stand-in forge: pull page timed out"}
+                )
             statuses = self.read_statuses.get(full, [])
             body = None
-        elif "mergeStateStatus" in query and "pullRequest(" in query:
+        elif operation == "MergeState":
             statuses = self.merge_state_statuses
             body = None
         else:
@@ -927,13 +1003,14 @@ class Forge:
             body = None
         status = statuses.pop(0) if statuses else 200
         if status != 200:
+            if statuses is self.read_statuses.get(full) and status in self.read_error_bodies:
+                return status, self.read_error_bodies[status]
             return status, {"message": f"stand-in forge: queued HTTP {status}"}
-        return status, body or self.graphql(header, query, variables)
+        return status, body or self.graphql(header, operation, query, variables)
 
     def graphql_cut(self, query: str) -> bool:
         """Whether this GraphQL answer is cut: a cut of its kind is still queued."""
-        match = re.search(r"\b(\w+)\(\s*input:", query)
-        kind = match[1] if query.lstrip().startswith("mutation") and match else "read"
+        kind = GRAPHQL_MUTATIONS.get(graphql_operation(query), "read")
         if self.graphql_cuts.get(kind, 0) <= 0:
             return False
         self.graphql_cuts[kind] -= 1
@@ -1035,19 +1112,269 @@ class Forge:
         return 404, {"message": "Not Found"}
 
 
+ARTIFACTS_ROUTE = "GET /repos/{owner}/{repo}/actions/artifacts"
+JOBS_ROUTE = "GET /repos/{owner}/{repo}/actions/runs/{id}/jobs"
+INSTALLATION_REPOSITORIES_ROUTE = "GET /installation/repositories"
+REVOKE_ROUTE = "DELETE /installation/token"
+
+
+def ascii_digits(value):
+    """Match decimal IDs and variable suffixes without parsing them as expressions."""
+    return value.isascii() and value.isdecimal()
+
+
+def repository_route(parts, field, number, *, source):
+    """Normalize the repository suffix, preserving fixed source paths."""
+    match parts:
+        case ["contents", *tail] if (
+            tail and tail != [".github", "generated-files"] and (not source or tail == ["~"])
+        ):
+            return ["contents", "{path}"]
+        case ["compare", refs]:
+            base, sep, head = refs.partition("...")
+            if sep and field(base) and field(head):
+                return ["compare", "{base}...{head}"]
+        case ["collaborators", login, "permission"] if field(login):
+            return ["collaborators", "{login}", "permission"]
+        case ["issues", ident, "labels", label] if number(ident) and field(label):
+            return ["issues", "{id}", "labels", "{label}"]
+        case ["issues" | "pulls", ident, *tail] if number(ident):
+            return [parts[0], "{id}", *tail]
+        case ["actions", "artifacts", ident, "zip"] if number(ident):
+            return ["actions", "artifacts", "{id}", "zip"]
+        case ["actions", "runs", ident, "jobs"] if number(ident):
+            return ["actions", "runs", "{id}", "jobs"]
+    return parts
+
+
+def rest_route(method, url, *, source=False):
+    """Normalize route fields while keeping literal source paths distinct."""
+    path = urlsplit(url).path
+    assert path.startswith("/"), f"unresolved REST URL: {url}"
+    parts = path[1:].split("/")
+
+    def field(value):
+        """Accept a source placeholder or a nonempty runtime field."""
+        return value == "~" if source else bool(value)
+
+    def number(value):
+        """Accept a source placeholder or a decimal runtime identifier."""
+        return field(value) if source else ascii_digits(value)
+
+    match parts:
+        case ["repos", owner, repo, *tail] if field(owner) and field(repo):
+            parts = [
+                "repos",
+                "{owner}",
+                "{repo}",
+                *repository_route(tail, field, number, source=source),
+            ]
+        case ["users", login] if field(login.removesuffix("[bot]") if source else login):
+            parts = ["users", "{login}"]
+        case ["app", "installations", ident, "access_tokens"] if number(ident):
+            parts = ["app", "installations", "{id}", "access_tokens"]
+        case ["repositories" | "storage", ident] if number(ident):
+            parts = [parts[0], "{id}"]
+    path = "/" + "/".join(parts)
+    assert not source or "~" not in path, f"unknown REST route shape: {method} {url}"
+    return f"{method} {path}"
+
+
+GRAPHQL_NAME = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
+GRAPHQL_LEXEME = re.compile(
+    r"(?P<ignored>[ \t\r\n,\ufeff]+|#[^\r\n]*)"
+    r'|(?P<token>"""(?:\\"""|(?!""")[\s\S])*"""|"(?:\\[^\r\n]|[^"\\\r\n])*"'
+    r"|[_A-Za-z][_0-9A-Za-z]*|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+    r"|\.\.\.|[!$():=@\[\]{|}&])"
+    r"|(?P<invalid>.)"
+)
+
+
+def graphql_tokens(query):
+    """Yield GraphQL tokens, skipping comments and keeping strings opaque."""
+    for match in GRAPHQL_LEXEME.finditer(query):
+        if token := match["token"]:
+            yield token
+        elif invalid := match["invalid"]:
+            raise AssertionError(f"invalid stand-in GraphQL token: {invalid!r}")
+
+
+def graphql_operation(query):
+    """Read the declared operation name without matching the document body."""
+    tokens = graphql_tokens(query)
+    kind, name = next(tokens, ""), next(tokens, "")
+    if kind in {"query", "mutation"} and GRAPHQL_NAME.fullmatch(name):
+        return name
+    return None
+
+
+def graphql_level(tokens):
+    """Yield one level of tokens, keeping nested values outside the sequence."""
+    depth = 0
+    for token in tokens:
+        if token in (")", "]", "}"):
+            if not depth:
+                return
+            depth -= 1
+        elif not depth:
+            yield token
+        if token in ("(", "[", "{"):
+            depth += 1
+
+
+def graphql_mutation_arguments(query, mutation):
+    """Read the arguments of the declared mutation's outer field."""
+    tokens = graphql_tokens(query)
+    assert next(tokens, None) == "mutation", mutation
+    assert "{" in graphql_level(tokens), mutation
+    field, following = next(tokens, ""), next(tokens, "")
+    if following == ":":
+        field, following = next(tokens, ""), next(tokens, "")
+    assert field == mutation, (field, mutation)
+    return graphql_input_fields(tokens) if following == "(" else ()
+
+
+def graphql_input_fields(tokens):
+    """Read only the immediate fields of the mutation's input argument."""
+    recent: tuple[str, ...] = ()
+    for token in graphql_level(tokens):
+        recent = (*recent[-2:], token)
+        if recent == ("input", ":", "{"):
+            return tuple(graphql_level(tokens))
+    return ()
+
+
+def graphql_contains(tokens, *pattern):
+    """Match a contiguous token sequence."""
+    return any(tokens[index : index + len(pattern)] == pattern for index in range(len(tokens)))
+
+
+class ForgeRequestRefusalError(AssertionError):
+    """A named request refusal to report on the test thread."""
+
+
+def diagnostic_text(value: str) -> str:
+    """Keep printable text verbatim and escape non-printable text with ascii()."""
+    if not value.isprintable():
+        return ascii(value)
+    return value
+
+
 class Handler(BaseHTTPRequestHandler):
     """The stand-in forge's HTTP side; what it serves is the Forge on its server."""
+
+    response_location: str | None = None
 
     def log_message(self, *args) -> None:
         pass
 
-    def answer(self, code: int, body: dict | list | None) -> None:
-        data = b"" if body is None else json.dumps(body).encode()
+    def request_url(self) -> str:
+        """Return the exact URL used to match this request against issued redirects."""
+        return urldefrag(f"http://{self.headers['Host']}{self.path}").url
+
+    def send_header(self, keyword, value) -> None:
+        """Refuse a second Location before sending the response headers."""
+        if keyword.lower() == "location":
+            if self.response_location is not None:
+                raise ForgeRequestRefusalError(
+                    f"{self.command} {self.path}: second Location {value!r} "
+                    f"after {self.response_location!r}"
+                )
+            self.response_location = value
+        super().send_header(keyword, value)
+
+    def end_headers(self) -> None:
+        """Stage the single Location once the response headers have been sent."""
+        super().end_headers()
+        value, self.response_location = self.response_location, None
+        if value is not None:
+            location, _ = urldefrag(urljoin(self.request_url(), value))
+            self.server.forge.redirect_location = (
+                self.command,
+                location,
+                self.headers.get("Authorization"),
+                self.route,
+            )
+
+    def normalized_route(self, pending) -> tuple[str, str | None]:
+        """Validate the raw target, then return its route key and any canonical storage ID."""
+        try:
+            for index, character in enumerate(self.path):
+                if not character.isprintable() or character == " ":
+                    escaped = r"'\x20'" if character == " " else ascii(character)
+                    raise ForgeRequestRefusalError(
+                        f"{self.command} request target has invalid character at position "
+                        f"{index}: {escaped}"
+                    )
+            path = urlsplit(self.path).path
+            if path.startswith("/storage/"):
+                if (ident := self.storage_route_id(path)) is not None:
+                    return STORAGE_ROUTE, ident
+                # fault_request_key splits on " [" before extracting the path key.
+                return f"{self.command} {path} [noncanonical storage]", None
+            return rest_route(self.command, self.path), None
+        except (AssertionError, ValueError) as error:
+            if pending is None:
+                raise
+            _, location, _, issuer = pending
+            # A refused target keeps its earlier ascii() form; any other target passed the check.
+            target = (
+                ascii(self.path)
+                if isinstance(error, ForgeRequestRefusalError)
+                else diagnostic_text(self.path)
+            )
+            location = diagnostic_text(location)
+            reason = str(error).partition("\n")[0]
+            raise ForgeRequestRefusalError(
+                f"{self.command} {target}: pending redirect from {issuer} to {location} "
+                f"refused: {reason}"
+            ) from error
+
+    def storage_route_id(self, path: str) -> str | None:
+        """Return the canonical decimal ID (ASCII, no leading zero) of a storage GET."""
+        ident = path.removeprefix("/storage/")
+        canonical = ascii_digits(ident) and (ident == "0" or not ident.startswith("0"))
+        return ident if self.command == "GET" and canonical else None
+
+    def request_stage(self, pending) -> str:
+        """Match the next request to its issuer's method, Location and authorization policy."""
+        if pending is None:
+            return "direct"
+        method, location, authorization, issuer = pending
+        storage = issuer == ARCHIVE_ROUTE and self.storage_id is not None
+        followed = (self.command, self.request_url()) == (method, location) and (
+            storage or self.headers.get("Authorization") == authorization
+        )
+        return "redirect" if followed else "direct"
+
+    def send_final(self, write, *args) -> None:
+        """Clear the slot under the admission lock to mark a response sent after writing its
+        last byte or bodyless ``Content-Length: 0`` header block outside the lock (at socket
+        close for cuts and drops), waking admissions that wait up to ``SERIAL_GRACE_SECONDS``
+        for a held slot to clear before refusing by name.
+        """
+        forge = self.server.forge
+        write(*args)
+        with forge.response_lock:
+            forge.pending_response = None
+            forge.response_done.notify_all()
+
+    def send_body(self, data: bytes) -> None:
+        """Complete a length-delimited response at the last body byte or empty header block."""
+        if data:
+            self.end_headers()
+            self.send_final(self.wfile.write, data)
+        else:
+            self.send_final(self.end_headers)
+
+    def answer(self, code: int, body: dict | list | bytes | None) -> None:
+        data = body
+        if not isinstance(body, bytes):
+            data = b"" if body is None else json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self.send_body(data)
 
     def cut_answer(self, code: int, body: dict) -> None:
         """Answer under the full Content-Length with half the body, then close."""
@@ -1062,17 +1389,79 @@ class Handler(BaseHTTPRequestHandler):
     def body(self) -> dict:
         return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
 
-    def fault(self, kind: str) -> bool:
-        """Answer the next queued fault of kind: a status, or DROP closes without an answer."""
-        queued = self.server.forge.rest_faults.get(kind, [])
+    def fault(self, key, legacy_key) -> bool:
+        """Serve the next queued fault, or close without an answer for DROP."""
+        faults = self.server.forge.rest_faults
+        queued = faults.get(key, faults.get(legacy_key, []) if key[2] == "direct" else [])
         if not queued:
             return False
+        self.server.forge.fault_requests.append((self.command, self.path))
         fault = queued.pop(0)
         if fault == DROP:
             self.close_connection = True
+        elif isinstance(fault, tuple):
+            self.answer(*fault)
         else:
             self.answer(int(fault), {"message": f"stand-in forge: queued HTTP {fault}"})
         return True
+
+    def dispatch(self, serve_rest) -> None:
+        """Wait up to ``SERIAL_GRACE_SECONDS`` for a held slot to clear before refusing by name,
+        counting a response as sent when its writer clears the slot under the admission lock
+        after writing its last byte or bodyless ``Content-Length: 0`` header block outside the
+        lock (at socket close for cuts and drops).
+        """
+        forge = self.server.forge
+        with forge.response_lock:
+            if not forge.response_done.wait_for(
+                lambda: forge.pending_response is None, timeout=SERIAL_GRACE_SECONDS
+            ):
+                raise ForgeRequestRefusalError(
+                    "concurrent stand-in forge request: "
+                    f"{self.command} {diagnostic_text(self.path)}"
+                )
+            forge.pending_response = getattr(self, "request", self)
+        with forge.request_lock:
+            pending, forge.redirect_location = forge.redirect_location, None
+            self.route, self.storage_id = self.normalized_route(pending)
+            stage = self.request_stage(pending)
+            request = self.body() if (self.command, self.path) == ("POST", "/graphql") else None
+            operation = graphql_operation(request["query"]) if request is not None else None
+            path = f"/graphql [{operation}]" if operation else self.route.split(" ", 1)[1]
+            key = (self.command, path, stage)
+            forge.request_ledger.add(key)
+            if (
+                self.storage_id is not None
+                and (auth := self.headers.get("Authorization")) is not None
+            ):
+                forge.storage_auth_seen.append(auth)
+                self.answer(400, {"message": "storage URL refuses Authorization header"})
+                return
+            if not self.fault(key, operation or self.route):
+                if request is None:
+                    serve_rest()
+                else:
+                    self._serve_graphql(request)
+
+    def do_GET(self) -> None:
+        """Dispatch a GET through the common fault check."""
+        self.dispatch(self._serve_get)
+
+    def do_POST(self) -> None:
+        """Dispatch a POST through the common fault check."""
+        self.dispatch(self._serve_post)
+
+    def do_PUT(self) -> None:
+        """Dispatch a PUT through the common fault check."""
+        self.dispatch(self._serve_put)
+
+    def do_PATCH(self) -> None:
+        """Dispatch a PATCH through the common fault check."""
+        self.dispatch(self._serve_patch)
+
+    def do_DELETE(self) -> None:
+        """Dispatch a DELETE through the common fault check."""
+        self.dispatch(self._serve_delete)
 
     def app_call(self) -> bool:
         """Refuse a call of the app whose JWT does not hold; True when refused."""
@@ -1115,14 +1504,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(302)
         if loc is not None:
             self.send_header("Location", loc)
-        self.end_headers()
+        self.send_header("Content-Length", "0")
+        self.send_final(self.end_headers)
 
-    def _get_storage(self, path: str) -> None:
-        if self.headers.get("Authorization"):
-            self.server.forge.storage_auth_seen.append(self.headers["Authorization"])
-            self.answer(400, {"message": "storage URL refuses Authorization header"})
-            return
-        art_id = int(path.removeprefix("/storage/"))
+    def _get_storage(self, ident: str) -> None:
+        art_id = int(ident)
         self.server.forge.storage_reads.append(art_id)
         data = self.server.forge.storage.get(art_id)
         if data is None:
@@ -1131,16 +1517,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
         cut = self.server.forge.storage_cut.get(art_id)
         left = self.server.forge.storage_cuts_left.get(art_id)
         if left is not None:
             self.server.forge.storage_cuts_left[art_id] = left - 1
         if cut is not None and (left is None or left > 0):
+            self.end_headers()
             self.wfile.write(data[:cut])
             self.close_connection = True
             return
-        self.wfile.write(data)
+        self.send_body(data)
 
     def _dispatch_app(self, path: str) -> bool:
         if path == "/app":
@@ -1166,7 +1552,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/installation/repositories":
             self.answer(200, self.server.forge.repositories(self.headers["Authorization"]))
             return True
-        if re.fullmatch(r"/(repos/[^/]+/[^/]+|repositories/\d+)", path):
+        if self.route in {RELEASE_NAME_ROUTE, RELEASE_ID_ROUTE}:
             self._get_repository(path)
             return True
         return False
@@ -1196,17 +1582,24 @@ class Handler(BaseHTTPRequestHandler):
             location = str(body).format(api=f"http://{host}:{port}", port=port)
             self.send_response(code)
             self.send_header("Location", location)
-            self.end_headers()
+            self.send_header("Content-Length", "0")
+            self.send_final(self.end_headers)
         elif isinstance(body, bytes):
             self.send_response(code)
             self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_body(body)
         else:
             self.answer(code, body)
 
-    def do_GET(self) -> None:
+    def _serve_get(self) -> None:
+        """Dispatch a REST read after the common fault check."""
         path = urlsplit(self.path).path
+        if self.storage_id is not None:
+            self._get_storage(self.storage_id)
+            return
+        if path.startswith("/storage/"):
+            self.answer(404, {"message": f"Unknown storage route: {path}"})
+            return
         if self._dispatch_app(path):
             return
         if "/compare/" in path and path.startswith("/repos/"):
@@ -1214,7 +1607,7 @@ class Handler(BaseHTTPRequestHandler):
             assert self.headers["Accept"] == "application/vnd.github+json"
             self.answer(*self.server.forge.compare(self.headers["Authorization"], full, refs))
             return
-        if re.fullmatch(r"/repos/[^/]+/[^/]+/collaborators/[^/]+/permission", path):
+        if self.route == PERMISSION_ROUTE:
             self._get_collaborator(path)
         elif "/contents/" in path and path.startswith("/repos/"):
             self._get_contents(path)
@@ -1222,38 +1615,25 @@ class Handler(BaseHTTPRequestHandler):
             self._get_artifacts(path)
         elif "/actions/artifacts/" in path and path.endswith("/zip"):
             self._get_artifact_zip(path)
-        elif path.startswith("/storage/"):
-            self._get_storage(path)
-        elif re.fullmatch(r"/repos/[^/]+/[^/]+/actions/runs/\d+/jobs", path):
+        elif self.route == JOBS_ROUTE:
             full, _, tail = path.removeprefix("/repos/").partition("/actions/runs/")
             run_id = int(tail.removesuffix("/jobs"))
-            if self.fault("jobs"):
-                return
             self.answer(*self.server.forge.run_jobs(self.headers["Authorization"], full, run_id))
         else:
             raise AssertionError(self.path)
 
-    def do_POST(self) -> None:
+    def _serve_post(self) -> None:
+        """Serve REST POST requests after the common fault check."""
         if self.path.startswith("/repos/") and self.path.endswith("/comments"):
             full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
             number = int(tail.removesuffix("/comments"))
             write = ("comment", number, self.body()["body"])
             self.answer(*self.server.forge.issue_write(self.headers["Authorization"], full, write))
             return
-        if re.fullmatch(r"/repos/[^/]+/[^/]+/issues/\d+/labels", self.path):
+        if self.route == ADD_LABEL_ROUTE:
             full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
             write = ("label", int(tail.removesuffix("/labels")), *self.body()["labels"])
             self.answer(*self.server.forge.label_write(self.headers["Authorization"], full, write))
-            return
-        if self.path == "/graphql":
-            request = self.body()
-            forge = self.server.forge
-            header = self.headers["Authorization"]
-            code, body = forge.graphql_response(header, request["query"], request["variables"])
-            if forge.graphql_cut(request["query"]):
-                self.cut_answer(code, body)
-            else:
-                self.answer(code, body)
             return
         prefix, _, tail = self.path.partition("/app/installations/")
         number, _, action = tail.partition("/")
@@ -1261,7 +1641,19 @@ class Handler(BaseHTTPRequestHandler):
         if not self.app_call():
             self.answer(*self.server.forge.mint(int(number), self.body()))
 
-    def do_PUT(self) -> None:
+    def _serve_graphql(self, request) -> None:
+        """Serve a GraphQL request whose operation fault queue was already checked."""
+        forge = self.server.forge
+        query = request["query"]
+        header = self.headers["Authorization"]
+        code, body = forge.graphql_response(header, query, request["variables"])
+        if forge.graphql_cut(query):
+            self.cut_answer(code, body)
+        else:
+            self.answer(code, body)
+
+    def _serve_put(self) -> None:
+        """Serve a branch update after the common fault check."""
         prefix, _, tail = self.path.rpartition("/pulls/")
         number, _, action = tail.partition("/")
         assert prefix.startswith("/repos/") and action == "update-branch", self.path
@@ -1270,13 +1662,15 @@ class Handler(BaseHTTPRequestHandler):
             *self.server.forge.update(self.headers["Authorization"], full, int(number), self.body())
         )
 
-    def do_PATCH(self) -> None:
+    def _serve_patch(self) -> None:
+        """Serve an issue close after the common fault check."""
         full, _, number = self.path.removeprefix("/repos/").partition("/issues/")
         body = self.body()
         write = ("close", int(number), body["state"], body["state_reason"])
         self.answer(*self.server.forge.issue_write(self.headers["Authorization"], full, write))
 
-    def do_DELETE(self) -> None:
+    def _serve_delete(self) -> None:
+        """Serve a label removal or revocation after the common fault check."""
         if "/labels/" in self.path:
             full, _, tail = self.path.removeprefix("/repos/").partition("/issues/")
             number, _, name = tail.partition("/labels/")
@@ -1284,17 +1678,298 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(*self.server.forge.label_write(self.headers["Authorization"], full, write))
             return
         assert self.path == "/installation/token", self.path
-        if self.fault("revoke"):
-            return
         self.server.forge.revoked.append(self.headers["Authorization"].removeprefix("Bearer "))
         self.answer(204, None)
 
 
-def serve(forge: Forge) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.forge = forge
+class ForgeServer(ThreadingHTTPServer):
+    """Report named HTTP worker refusals on the test thread."""
+
+    def __init__(self, forge: Forge) -> None:
+        """Attach the forge and bind to a loopback port."""
+        self.forge = forge
+        super().__init__(("127.0.0.1", 0), Handler)
+
+    def handle_error(self, request, client_address) -> None:
+        """Record named refusals on the HTTP worker error path."""
+        if isinstance(error := sys.exception(), ForgeRequestRefusalError):
+            self.forge.request_refusals.append(str(error))
+        else:
+            super().handle_error(request, client_address)
+
+    def shutdown_request(self, request) -> None:
+        """Complete cuts, drops and aborted answers when the socket signals EOF."""
+        with self.forge.response_lock:
+            super().shutdown_request(request)
+            if self.forge.pending_response is request:
+                self.forge.pending_response = None
+                self.forge.response_done.notify_all()
+
+    def server_close(self) -> None:
+        """Close the server and fail the test with any named request refusals."""
+        super().server_close()
+        if self.forge.request_refusals:
+            raise ForgeRequestRefusalError("\n".join(self.forge.request_refusals))
+
+
+def serve(forge: Forge) -> ForgeServer:
+    server = ForgeServer(forge)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+REPORT_FILES = ("GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT", "TRAIN_RELEASE_FILE")
+REPORT_HEADINGS = {
+    "| Account | Repositories | Landed | Updated | Refused |",
+    "| Pull request | Merge state | Train |",
+}
+REPORT_LINES = re.compile(
+    r"## Merge train sweep|### \S+: .*|review bots: .*|Refused:|"
+    r"Bot pull requests without Signed-off-by, their producers sign them:|"
+    r"- .+|Not reached within .*|No release run, the job matrix holds .*|"
+    r"Release train off: .*|Release pull requests and releases next: .*|"
+    r"Only the 100 oldest open pull requests were read\.|"
+    r"Split open pull request page to .*|Closed issue #.*|note: .*"
+)
+REPORT_ANNOTATION = re.compile(r"::(?:error|warning|notice) title=(?:(?!::).)*::.*")
+TABLE_PIPE = re.compile(r"(?<!\\)\|")
+RECORD_CONTROLS = frozenset("\0\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+# Leave headroom above measured fixture output while bounding each retained destination.
+LINE_SHAPE_MAX_BYTES = 64 * 1024
+LINE_SHAPE_PLANT_PYTEST = "line-shape plant pytest"
+LINE_SHAPE_EXCEPTIONS = {
+    (
+        None,
+        f"{LINE_SHAPE_PLANT_PYTEST} stdout",
+    ): "Nested pytest reports the planted teardown error.",
+    (
+        None,
+        f"{LINE_SHAPE_PLANT_PYTEST} stderr",
+    ): "Nested pytest may report its own diagnostics on stderr.",
+    (None, "ADR-92/93 pytest stdout"): "Nested pytest writes its own progress and failure report.",
+    (None, "ADR-92/93 pytest stderr"): "Nested pytest may report its own diagnostics on stderr.",
+    (
+        "test_planted_dependency_unsigned_note_without_value_error_refusal",
+        "train stderr",
+    ): "The test asserts the deliberately uncaught refusal and its Python traceback.",
+    (
+        "test_anonymous_retry_document_stops_the_run[document-error-RetryHistory]",
+        "train stderr",
+    ): "The test asserts the traceback from refusing a planted anonymous RetryHistory document.",
+    (
+        "test_anonymous_retry_document_stops_the_run[document-error-FileModes]",
+        "train stderr",
+    ): "The test asserts the traceback from refusing a planted anonymous FileModes document.",
+}
+
+
+class LineShapeError(AssertionError):
+    """A captured train destination contained a malformed record."""
+
+
+def compact_json(text):
+    """The release destinations use one compact JSON value."""
+    try:
+        return json.dumps(json.loads(text), separators=(",", ":"), allow_nan=False) == text
+    except (ValueError, RecursionError):
+        return False
+
+
+def table_cells(line):
+    """Count Markdown cells without treating escaped pipes as separators."""
+    if not line.endswith("|"):
+        return -1
+    return len(TABLE_PIPE.findall(line)) - 1
+
+
+def check_report_line(destination, number, line, columns):
+    """Validate a report record and carry the surrounding table's column count."""
+    where = f"{destination}:{number}"
+    if line.startswith("|"):
+        cells = table_cells(line)
+        if line in REPORT_HEADINGS:
+            return cells
+        if columns is None or cells != columns:
+            raise LineShapeError(f"{where}: expected {columns} table cells, got {cells}: {line!r}")
+        return columns
+    if line and not (REPORT_LINES.fullmatch(line) or REPORT_ANNOTATION.fullmatch(line)):
+        raise LineShapeError(f"{where}: unrecognized report record: {line!r}")
+    return None
+
+
+def check_line_shape(destination, text, *, allow_external=False):
+    """Check the physical separators and the record shapes for this destination.
+
+    The net checks each line per destination and cannot attribute individually valid
+    lines to one record. Record-level flattening is tested at write_records,
+    annotate and note_cell. Further harness forms are tracked in issue 269.
+    """
+    columns = None
+    release_records = 0
+    for number, line in enumerate(text.split("\n"), 1):
+        where = f"{destination}:{number}"
+        if RECORD_CONTROLS.intersection(line):
+            raise LineShapeError(f"{where}: forbidden record separator or NUL: {line!r}")
+        if allow_external or destination.startswith("TRAIN_RELEASE_FILE"):
+            continue
+        if destination.startswith("GITHUB_OUTPUT"):
+            if line and not (line.startswith("releases=") and compact_json(line[9:])):
+                raise LineShapeError(f"{where}: expected compact releases= JSON: {line!r}")
+            release_records += bool(line)
+            if release_records > 1:
+                raise LineShapeError(f"{where}: more than one releases= record")
+        elif destination.endswith(" stderr"):
+            if line:
+                raise LineShapeError(f"{where}: unexpected stderr record: {line!r}")
+        else:
+            columns = check_report_line(destination, number, line, columns)
+    if destination.startswith("TRAIN_RELEASE_FILE") and not compact_json(text):
+        raise LineShapeError(f"{destination}:1: expected one compact JSON document")
+
+
+class LineShapeCapture:
+    """Keep the outputs that capfd.readouterr and subprocess PIPEs would otherwise drain."""
+
+    def __init__(self, readouterr, caplog, test_name):
+        """Set up capture buffers and per-destination byte accounting for one test."""
+        self.readouterr = readouterr
+        self.caplog = caplog
+        self.test_name = test_name
+        self.fd_streams = {"fd stdout": [], "fd stderr": []}
+        self.process_streams = []
+        self.files = set()
+        self.sizes = Counter()
+        self.overflow = None
+        self.file_error = None
+
+    def reserve(self, destination, size, *, replace=False):
+        """Track current file sizes or accumulated stream bytes and defer overflow errors."""
+        self.sizes[destination] = size if replace else self.sizes[destination] + size
+        total = self.sizes[destination]
+        if total <= LINE_SHAPE_MAX_BYTES:
+            return True
+        if self.overflow is None:
+            self.overflow = LineShapeError(
+                f"{destination}:1: {total} bytes exceeds the "
+                f"{LINE_SHAPE_MAX_BYTES}-byte capture limit"
+            )
+        return False
+
+    def read_fd(self):
+        """Return captured descriptors to the caller and retain them for teardown."""
+        captured = self.readouterr()
+        for name, text in zip(self.fd_streams, captured, strict=True):
+            if self.reserve(name, len(text.encode("utf-8"))):
+                self.fd_streams[name].append(text)
+        return captured
+
+    def record_process(self, destination, raw):
+        """Retain a child pipe only when the full destination fits its byte allowance."""
+        text = raw.decode("utf-8")
+        if self.reserve(destination, len(raw)):
+            self.process_streams.append((destination, text))
+        return text
+
+    def watch_files(self, env):
+        """Register destinations from an in-process or child train environment."""
+        self.files.update((name, Path(env[name])) for name in REPORT_FILES if env.get(name))
+        return env
+
+    def snapshot_files(self, files):
+        """Validate bounded binary snapshots without keeping copies or translating newlines."""
+        for name, path in sorted(files):
+            if not path.exists():
+                continue
+            destination = f"{name} ({path})"
+            with path.open("rb") as handle:
+                raw = handle.read(LINE_SHAPE_MAX_BYTES + 1)
+                size = len(raw)
+                if size > LINE_SHAPE_MAX_BYTES:
+                    size = max(size, os.fstat(handle.fileno()).st_size)
+            if self.reserve(destination, size, replace=True):
+                try:
+                    check_line_shape(destination, raw.decode("utf-8"))
+                except LineShapeError as error:
+                    if self.file_error is None:
+                        self.file_error = LineShapeError(str(error))
+
+    def check(self):
+        """Check descriptors, process pipes, logs and registered files after the body.
+
+        The net checks each line per destination and cannot attribute individually valid
+        lines to one record. Record-level flattening is tested at write_records,
+        annotate and note_cell. Further harness forms are tracked in issue 269.
+        """
+        self.read_fd()
+        self.snapshot_files(self.files)
+        self.files.clear()
+        streams, self.process_streams = self.process_streams, []
+        descriptors = self.fd_streams
+        self.fd_streams = {"fd stdout": [], "fd stderr": []}
+        logs = self.caplog.get_records("call")
+        self.caplog.clear()
+        self.reserve(
+            "logging stderr", sum(len(record.getMessage().encode("utf-8")) for record in logs)
+        )
+        if self.overflow is not None:
+            raise self.overflow
+        for name, chunks in descriptors.items():
+            check_line_shape(name, "".join(chunks))
+        for name, text in streams:
+            external = (None, name) in LINE_SHAPE_EXCEPTIONS or (
+                self.test_name,
+                name,
+            ) in LINE_SHAPE_EXCEPTIONS
+            check_line_shape(name, text, allow_external=external)
+        if self.file_error is not None:
+            raise self.file_error
+        for number, record in enumerate(logs, 1):
+            if (RECORD_CONTROLS | {"\n"}).intersection(record.getMessage()):
+                raise LineShapeError(
+                    f"logging stderr:{number}: multiline log: {record.getMessage()!r}"
+                )
+
+
+ACTIVE_LINE_SHAPE: ContextVar[LineShapeCapture] = ContextVar("merge_train_line_shape")
+
+
+@pytest.fixture(autouse=True)
+def line_shape(capfd, caplog, request):
+    """Check every train test's fd streams, child pipes and named report destinations.
+
+    The net checks each line per destination and cannot attribute individually valid
+    lines to one record. Record-level flattening is tested at write_records,
+    annotate and note_cell. Further harness forms are tracked in issue 269.
+    """
+    capture = LineShapeCapture(capfd.readouterr, caplog, request.node.name)
+    token = ACTIVE_LINE_SHAPE.set(capture)
+    # Fixture plumbing is separate from patches tracked by the app-key build guard.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(capfd, "readouterr", capture.read_fd)
+        try:
+            yield capture
+        finally:
+            try:
+                capture.check()
+            finally:
+                ACTIVE_LINE_SHAPE.reset(token)
+
+
+def watch_report_files(env):
+    """Register the train's output paths before it can write to them."""
+    return ACTIVE_LINE_SHAPE.get().watch_files(env)
+
+
+def run_train_process(command, *, descriptor, env, timeout, cwd=None):
+    """Capture child output byte-for-byte and retain both pipes for the line-shape check."""
+    done = subprocess.run(
+        command, env=env, capture_output=True, timeout=timeout, check=False, cwd=cwd
+    )
+    capture = ACTIVE_LINE_SHAPE.get()
+    done.stdout = capture.record_process(f"{descriptor} stdout", done.stdout)
+    done.stderr = capture.record_process(f"{descriptor} stderr", done.stderr)
+    capture.snapshot_files((name, Path(env[name])) for name in REPORT_FILES if env.get(name))
+    return done
 
 
 # The step's environment apart from the forge address, the paths and the app key.
@@ -1316,6 +1991,32 @@ TRAIN_DEFAULTS = {
     "TRAIN_SESSION_AUTHORS": "",
     "TRAIN_SESSION_HOLD_HOURS": "4",
 }
+
+
+@contextlib.contextmanager
+def train_environment(tmp_path, forge, settings):
+    """Yield the train step's environment with the stand-in forge running."""
+    forge.workdir = tmp_path
+    private = app_key()[0]
+    server = serve(forge)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        env = measured(
+            TRAIN_DEFAULTS
+            | {
+                "GITHUB_API_URL": url,
+                "GITHUB_GRAPHQL_URL": f"{url}/graphql",
+                "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+                "GITHUB_OUTPUT": str(tmp_path / "output"),
+                "RUNNER_TEMP": str(tmp_path),
+                "TRAIN_APP_KEY": private,
+                **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
+            }
+        )
+        yield watch_report_files(env)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def train(
@@ -1341,34 +2042,10 @@ def train(
         shutil.copyfile(ROOT / "tools/review_state.py", tmp_path / "review_state.py")
         shutil.copyfile(ROOT / "tools/release_workflows.py", tmp_path / "release_workflows.py")
         command = [sys.executable, *flags, str(path)]
-    summary, output = tmp_path / "summary.md", tmp_path / "output"
-    forge.workdir = tmp_path
-    server = serve(forge)
-    url = f"http://127.0.0.1:{server.server_address[1]}"
-    env = measured(
-        TRAIN_DEFAULTS
-        | {
-            "GITHUB_API_URL": url,
-            "GITHUB_GRAPHQL_URL": f"{url}/graphql",
-            "GITHUB_STEP_SUMMARY": str(summary),
-            "GITHUB_OUTPUT": str(output),
-            "RUNNER_TEMP": str(tmp_path),
-            "TRAIN_APP_KEY": app_key()[0],
-            **{f"TRAIN_{key.upper()}": value for key, value in settings.items()},
-        }
-    )
-    try:
-        done = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=120,
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
+    with train_environment(tmp_path, forge, settings) as env:
+        Path(env["GITHUB_OUTPUT"]).unlink(missing_ok=True)  # Each sweep starts a new step.
+        done = run_train_process(command, descriptor="train", env=env, timeout=120)
+    summary = tmp_path / "summary.md"
     written = summary.read_text(encoding="utf-8") if summary.exists() else ""
     return done, written
 
@@ -1649,29 +2326,153 @@ def test_missing_queue_entry_fails(tmp_path):
     assert "no merge queue entry" in done.stdout
 
 
-def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
-    train_mod = load_train(tmp_path, monkeypatch)
-    rules = load_rules(tmp_path)
-    documents = [
+def file_modes_document(train_mod, monkeypatch):
+    """Capture the document generated for a retry diff with one surviving file."""
+    generated = []
+
+    def read_file_modes(_env, query, _variables):
+        """Capture the document and return equal file modes."""
+        generated.append(query)
+        commit = {"f0": {"mode": 33188}}
+        return {"repository": {"before": commit, "after": commit}}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(train_mod, "own_diff", lambda *_: [("path", "patch", "modified")])
+        patch.setattr(train_mod, "read_graphql", read_file_modes)
+        assert train_mod.same_retry_change({"GITHUB_REPOSITORY": "fleet/app"}, "base", "old", "new")
+    (document,) = generated
+    return document
+
+
+def train_graphql_documents(train_mod, rules, generated):
+    """Collect the train's static, rules-module and generated GraphQL documents."""
+    constants = [
         doc
         for key, doc in vars(train_mod).items()
         if key.isupper() and isinstance(doc, str) and re.match(r"\s*(query\b|mutation\b|\{)", doc)
     ]
-    documents.extend([rules.QUERY, rules.STATUS_QUERY])
+    return [*constants, rules.QUERY, rules.STATUS_QUERY, generated]
+
+
+def test_train_graphql_documents_have_unique_names(tmp_path, monkeypatch):
+    train_mod = load_train(tmp_path, monkeypatch)
+    rules = load_rules(tmp_path)
+    generated = file_modes_document(train_mod, monkeypatch)
+    assert train_mod.graphql_name(generated) == "FileModes"
+    documents = functools.partial(train_graphql_documents, train_mod, rules, generated)
 
     def check(docs):
         names = []
         for doc in docs:
             match = re.match(r"\s*(?:query|mutation)\s+([A-Z][A-Za-z0-9]*)\s*[(\{]", doc)
             assert match, "missing PascalCase operation name"
+            assert graphql_operation(doc) == match[1]
             names.append(match[1])
         assert len(set(names)) == len(names), "duplicate operation name"
 
-    check(documents)
-    with pytest.raises(AssertionError, match="duplicate"):
-        check([*documents, rules.QUERY])
+    check(documents())
+    assert {
+        graphql_operation(doc): bool(re.search(r"\bstatus\s*\{", doc)) for doc in documents()
+    } == GRAPHQL_STATUS_SELECTION
+    assert {
+        graphql_operation(doc): doc.split(") {", 1)[1].split("(", 1)[0].strip()
+        for doc in documents()
+        if doc.lstrip().startswith("mutation")
+    } == GRAPHQL_MUTATIONS
     with pytest.raises(AssertionError, match="missing"):
-        check([*documents, "query { viewer { login } }"])
+        check([*documents(), "query { viewer { login } }"])
+    duplicate = train_mod.MERGE_STATE.replace("query MergeState(", "query FileModes(", 1)
+    monkeypatch.setattr(train_mod, "MERGE_STATE", duplicate)
+    with pytest.raises(AssertionError, match="duplicate"):
+        check(documents())
+
+
+def test_forge_operation_key_comes_from_tokens(monkeypatch):
+    """Read declaration tokens with whitespace and delimiters."""
+
+    def reject_match(*args, **kwargs):
+        """Fail if operation dispatch matches a declaration pattern."""
+        pytest.fail("operation dispatch attempted a declaration match")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(re, "match", reject_match)
+        assert graphql_operation(" \r\nquery   OpenPulls($limit: Int) { viewer { login } }") == (
+            "OpenPulls"
+        )
+        assert graphql_operation("mutation Land{ mergePullRequest { clientMutationId } }") == (
+            "Land"
+        )
+        assert graphql_operation("query { viewer { login } }") is None
+
+
+def post_forge_graphql(forge, query, variables):
+    """Send a GraphQL document through the real stand-in HTTP handler."""
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request(
+                "POST",
+                "/graphql",
+                json.dumps({"query": query, "variables": variables}),
+                {"Authorization": "Bearer test-token"},
+            )
+            response = conn.getresponse()
+            body = json.load(response)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    return response.status, body
+
+
+def test_forge_dispatch_uses_declared_operation_over_comment():
+    """A real POST keys the fault ledger and serves the selection after a misleading comment."""
+    forge = Forge(repository())
+    forge.tokens["test-token"] = ("repo", 7, "fleet/app", READ)
+    forge.merge_states[1] = "CLEAN"
+    query = (
+        "# query Other { status { state } }\nquery MergeState { pullRequest { mergeStateStatus } }"
+    )
+    variables = {"owner": "fleet", "name": "app", "number": 1}
+    status, body = post_forge_graphql(forge, query, variables)
+
+    assert forge.request_ledger == {("POST", "/graphql [MergeState]", "direct")}
+    assert status == 200, body
+    assert body == {"data": {"repository": {"pullRequest": {"mergeStateStatus": "CLEAN"}}}}
+
+
+@pytest.mark.parametrize("operation", ["Arm", "Merge"])
+@pytest.mark.parametrize("argument", ["body", "headline"])
+@pytest.mark.parametrize("shape", ["comment", "string", "block-string", "nested", "present"])
+def test_forge_records_only_mutation_message_arguments(operation, argument, shape):
+    """A real mutation POST recognizes only variable arguments on the top-level field."""
+    forge = Forge(repository())
+    forge.tokens["test-token"] = ("repo", 7, "fleet/app", WRITE)
+    name = f"commit{argument.capitalize()}"
+    binding = f"{name}: ${argument}"
+    planted = {
+        "comment": f"# {binding}\n",
+        "string": f'clientMutationId: "quoted \\" {binding}"',
+        "block-string": f'clientMutationId: """block \\""" {binding}\nignored"""',
+        "nested": f"extra: {{ {binding} }}",
+        "present": binding,
+    }[shape]
+    variables = {"id": "PR_1", "oid": "head", "method": "SQUASH", argument: "planted message"}
+    field = GRAPHQL_MUTATIONS[operation]
+    declaration = f", ${argument}: String" if shape in {"nested", "present"} else ""
+    query = (
+        f"mutation {operation}($id: ID!, $oid: GitObjectID!, "
+        f"$method: PullRequestMergeMethod!{declaration}) {{ "
+        f"{field}(input: {{pullRequestId: $id, expectedHeadOid: $oid, "
+        f"mergeMethod: $method, {planted}}}) "
+        "{ clientMutationId } }"
+    )
+    status, result = post_forge_graphql(forge, query, variables)
+    assert status == 200 and field in result["data"], result
+    value = variables[argument] if shape == "present" else None
+    headline, body = (value, None) if argument == "headline" else (None, value)
+    assert forge.messages == [(operation.lower(), "PR_1", headline, body)]
 
 
 def test_anonymous_graphql_document_raises_document_error(tmp_path, monkeypatch):
@@ -1714,9 +2515,9 @@ def test_oversized_pull_page_times_out(tmp_path, split):
     flow = None
     if not split:
         source = script()
-        split_guard = "\n                if not transient(err):"
+        split_guard = "if size <= PULL_PAGE_MIN or not transient(err):"
         assert source.count(split_guard) == 1
-        flow = source.replace(split_guard, "\n                if True:")
+        flow = source.replace(split_guard, "if True:")
         assert flow != source
     done, summary = train(tmp_path, forge, flow)
     sizes = [v["first"] for _, v in forge.read_calls]
@@ -1740,18 +2541,36 @@ def test_oversized_pull_page_times_out(tmp_path, split):
         )
 
 
+MULTILINE_READ_ERROR = b"stand-in forge: first error line\r\nstand-in forge: second error line"
+FLATTENED_READ_ERROR = " ".join(MULTILINE_READ_ERROR.decode().splitlines())
+
+
+def pull_refusal_line(stdout, summary):
+    """Read the pull refusal and require its summary and annotation copies to match."""
+    prefix = "::error title=Merge train refused::"
+    annotations = [
+        line.removeprefix(prefix) for line in stdout.splitlines() if line.startswith(prefix)
+    ]
+    assert len(annotations) == 1
+    assert [line for line in summary.splitlines() if line.startswith("- fleet/app: ")] == [
+        f"- {annotations[0]}"
+    ]
+    return annotations[0]
+
+
 @pytest.mark.parametrize("status", [502, 504])
 def test_exhausted_read_retries_fail_closed(tmp_path, status):
     forge = Forge(repository(pull(1, "CLEAN")))
+    forge.read_error_bodies[status] = MULTILINE_READ_ERROR
     if status == 504:
         forge.pull_page_timeout_above = 0
     else:
         forge.read_statuses["fleet/app"] = [status] * 6
     done, summary = train(tmp_path, forge)
     assert done.returncode == 1, done.stdout + done.stderr
-    refusal = rf"fleet/app: graphql PullPage: .*HTTP {status} .*page size 6, cursor start"
-    assert re.search(r"::error title=Merge train refused::" + refusal, done.stdout)
-    assert re.search(refusal, summary)
+    refusal = pull_refusal_line(done.stdout, summary)
+    assert re.match(r"fleet/app: graphql PullPage: .*page size 6, cursor start:", refusal)
+    assert refusal.endswith(f"HTTP {status} {FLATTENED_READ_ERROR}")
     assert forge.writes == []
     assert [v["first"] for _, v in forge.read_calls] == [25, 12, 6, 6, 6]
     if status == 502:
@@ -1765,7 +2584,7 @@ def test_short_final_page_refusal_names_cursor(tmp_path):
     done, summary = train(tmp_path, forge, required_status="lanes/booked")
     assert done.returncode == 1, done.stdout + done.stderr
     assert re.search(
-        r"fleet/app: graphql PullPageWithStatus: .*HTTP 504 .*page size 4, cursor cursor-96",
+        r"fleet/app: graphql PullPageWithStatus: .*page size 4, cursor cursor-96: .*HTTP 504",
         summary,
     )
     assert [(v["after"], v["first"]) for _, v in forge.read_calls[-3:]] == [("cursor-96", 4)] * 3
@@ -1843,9 +2662,13 @@ def test_split_within_sweep_budget_finishes_and_next_page_refuses(tmp_path, monk
 def test_minimum_pull_page_does_not_retry_past_sweep_budget(tmp_path, guard):
     forge = Forge(repository(*(pull(n, "CLEAN" if n == 26 else "DIRTY") for n in range(1, 27))))
     forge.read_statuses["fleet/app"] = [200, 504, 504, 504]
+    forge.read_error_bodies[504] = MULTILINE_READ_ERROR
     setup = """
+from types import SimpleNamespace
+
 tick = 0.0
 request = graphql
+READ_BACKOFF_SECONDS = 2
 
 def timed_graphql(env, query, variables):
     global tick
@@ -1854,10 +2677,14 @@ def timed_graphql(env, query, variables):
     finally:
         if variables.get("first") == PULL_PAGE // 2:
             tick = SWEEP_SECONDS - 1
-        elif variables.get("first") == PULL_PAGE_MIN:
-            tick = SWEEP_SECONDS + 1
 
-time.monotonic = lambda: tick
+def advance_backoff(seconds):
+    global tick
+    assert seconds == READ_BACKOFF_SECONDS
+    assert tick == SWEEP_SECONDS - 1
+    tick += seconds
+
+time = SimpleNamespace(time=time.time, monotonic=lambda: tick, sleep=advance_backoff)
 graphql = timed_graphql
 """
     entry = 'if __name__ == "__main__":'
@@ -1873,12 +2700,13 @@ graphql = timed_graphql
         assert done.returncode == 1, done.stdout + done.stderr
         assert calls == before_retry
         assert forge.writes == []
-        refusal = (
-            r"fleet/app: graphql PullPage: sweep budget of 1500 s spent "
-            r".*HTTP 504 .*page size 6, cursor cursor-25"
+        refusal = pull_refusal_line(done.stdout, summary)
+        assert re.match(
+            r"fleet/app: graphql PullPage: .*page size 6, cursor cursor-25: "
+            r"sweep budget of 1500 s spent before the read after graphql PullPage: .*HTTP 504",
+            refusal,
         )
-        assert re.search(r"::error title=Merge train refused::" + refusal, done.stdout)
-        assert re.search(refusal, summary)
+        assert refusal.endswith(f"HTTP 504 {FLATTENED_READ_ERROR}")
     else:
         assert done.returncode == 0, done.stdout + done.stderr
         assert calls == [*before_retry, (6, "cursor-25")]
@@ -1889,10 +2717,11 @@ graphql = timed_graphql
 def test_recovered_pull_page_split_is_reported_on_later_refusal(tmp_path, keep_split):
     forge = Forge(repository(*(pull(n, "DIRTY") for n in range(1, 14))))
     forge.read_statuses["fleet/app"] = [504, 200, 500]
+    forge.read_error_bodies[500] = MULTILINE_READ_ERROR
     source = None
     if not keep_split:
         source = script()
-        note = '            err.args = (f"{err} ({split_note})",)'
+        note = "            add_refusal_context(err, split_note)"
         assert source.count(note) == 1
         source = source.replace(note, "            pass")
     done, summary = train(tmp_path, forge, text=source)
@@ -1903,11 +2732,12 @@ def test_recovered_pull_page_split_is_reported_on_later_refusal(tmp_path, keep_s
         (12, "cursor-12"),
     ]
     assert forge.writes == []
-    refusal = r"fleet/app: graphql PullPage: .*HTTP 500[^\n]*"
-    annotation = re.search(r"::error title=Merge train refused::(" + refusal + ")", done.stdout)
-    assert annotation and re.search(r"^- " + re.escape(annotation[1]) + "$", summary, re.M)
+    refusal = pull_refusal_line(done.stdout, summary)
+    assert refusal.startswith("fleet/app: graphql PullPage: ")
+    assert "page size 12, cursor cursor-12:" in refusal
+    assert refusal.endswith(f"HTTP 500 {FLATTENED_READ_ERROR}")
     split = r"Split open pull request page to 12 after graphql PullPage: .*HTTP 504"
-    assert bool(re.search(split, annotation[1])) is keep_split
+    assert bool(re.search(split, refusal)) is keep_split
 
 
 def test_read_500_is_not_retried(tmp_path):
@@ -2639,12 +3469,12 @@ def test_missing_app_credential_stops_before_any_call(tmp_path, key, value):
     assert (forge.minted, forge.where) == ([], [])
 
 
-def load_train(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def load_train(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, source: Path | None = None):
     """The merge train script, imported with its rules module written to RUNNER_TEMP."""
     (tmp_path / "train_rules.py").write_text(module(), encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
-    spec = importlib.util.spec_from_file_location("merge_train", SCRIPT)
+    spec = importlib.util.spec_from_file_location("merge_train", source or SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -3247,21 +4077,15 @@ def plain_open(node):
 
 
 def allowed_report_opens(text):
-    """Exact allow-list of the summary append and release artifact writer sites."""
+    """Pin the only file open and its append-versus-replace modes to the report sink."""
     tree = ast.parse(text)
-    expected = {
-        "append": ast.dump(ast.parse('open(path, "a", encoding="utf-8")', mode="eval").body),
-        "summary": ast.dump(ast.parse('open(path, "w", encoding="utf-8")', mode="eval").body),
-    }
-    sites = [
-        (function.name, ast.dump(node))
-        for function in tree.body
-        if isinstance(function, ast.FunctionDef)
-        for node in ast.walk(function)
-        if plain_open(node)
-    ]
-    all_opens = sum(plain_open(node) for node in ast.walk(tree))
-    return all_opens == len(expected) and sorted(sites) == sorted(expected.items())
+    sink = top_level_functions(tree).get("write_records")
+    expected = ast.parse('open(path, mode, encoding="utf-8")', mode="eval").body
+    sites = [(scope, ast.dump(node)) for scope, node in scoped_nodes(tree) if plain_open(node)]
+    if sites != [(sink, ast.dump(expected))]:
+        return False
+    mode = ast.dump(ast.parse('mode = "w" if replace else "a"').body[0])
+    return any(ast.dump(node) == mode for node in ast.walk(sink))
 
 
 def key_on_disk(text: str) -> list[str]:
@@ -3388,6 +4212,579 @@ def test_release_off_follows_an_absolute_same_origin_redirect(tmp_path, location
     assert (9, "/repos/former/d") in forge.repository_calls
     assert (9, path) in forge.repository_calls
     assert len(forge.revoked) == len(forge.minted)
+
+
+def queue_faults_after_location(forge, key, faults):
+    """Arm a direct-route queue after the old name has issued its Location."""
+    repository_read = forge.repository_read
+
+    def queue_direct_fault(header, path):
+        """Queue a fault once the stand-in responds with a repository Location."""
+        response = repository_read(header, path)
+        if response[0] == 301:
+            forge.rest_faults[key] = faults
+        return response
+
+    forge.repository_read = queue_direct_fault
+
+
+def test_release_off_redirect_then_direct_lookup_at_same_url(tmp_path):
+    """The issued Location stages one lookup, and the later entry uses the direct fault."""
+    forge = release_fault_forge("/repos/other/app")
+    redirected = [404]  # A missing moved repository lets release_off process the next entry.
+    direct = [403]
+    forge.rest_faults[fault_request_key(RELEASE_RENAMED_CASE)] = redirected
+    queue_faults_after_location(forge, fault_request_key(RELEASE_NAME_ROUTE), direct)
+
+    done, summary = train(tmp_path, forge, release_off="former/app other/app")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not redirected and not direct
+    assert forge.fault_requests == [("GET", "/repos/other/app")] * 2
+    assert "release_off entry other/app: HTTP 403" in summary
+    assert "release_off entry former/app:" not in summary
+    assert releases_of(tmp_path) == []
+
+
+def test_release_off_rejected_redirect_cannot_stage_another_installation(tmp_path):
+    """A rejected second Location cannot consume another installation's direct fault."""
+    forge = release_forge()
+    forge.repository_moves.update(
+        {
+            "/repos/former/d": "{api}/repos/other/old-name",
+            "/repos/other/old-name": "{api}/repos/fleet/app",
+        }
+    )
+    direct, redirected = [403], [418]
+    repository_read = forge.repository_read
+
+    def queue_faults(header, path):
+        """Arm both staged queues only after installation 7 reaches the second Location."""
+        response = repository_read(header, path)
+        if (header, path) == ("Bearer list-token-7", "/repos/other/old-name"):
+            forge.rest_faults[fault_request_key(RELEASE_NAME_ROUTE)] = direct
+            forge.rest_faults[fault_request_key(RELEASE_RENAMED_CASE)] = redirected
+        return response
+
+    forge.repository_read = queue_faults
+    done, summary = train(tmp_path, forge, release_off="fleet/app former/d")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (direct, redirected) == ([], [418])
+    assert forge.fault_requests == [("GET", "/repos/fleet/app")]
+    assert (
+        summary.splitlines().count(
+            "::warning title=Merge train::release_off entry former/d: second repository redirect; "
+            "release train off for installation 7"
+        )
+        == 1
+    )
+    assert (
+        summary.splitlines().count(
+            "::warning title=Merge train::release_off entry fleet/app: HTTP 403; "
+            "release train off for installation 9"
+        )
+        == 1
+    )
+    assert "Release train off: fleet/app, other/d" in summary.splitlines()
+    assert releases_of(tmp_path) == []
+
+
+@pytest.mark.parametrize("stage", ["direct", "redirect"])
+def test_release_off_rejected_redirect_cannot_stage_revoke(tmp_path, stage):
+    """A rejected GET Location cannot move a DELETE into the redirect fault queue."""
+    forge = release_fault_forge("/installation/token")
+    forge.installations[0]["repos"].clear()
+    direct_key = fault_request_key(REVOKE_ROUTE)
+    faults = [403]
+    queue_faults_after_location(forge, (*direct_key[:2], stage), faults)
+
+    done, summary = train(tmp_path, forge, release_off="former/app")
+
+    expect_fault = stage == "direct"
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert faults == ([] if expect_fault else [403])
+    assert forge.fault_requests == ([direct_key[:2]] if expect_fault else [])
+    assert forge.revoked == ([] if expect_fault else ["list-token-7"])
+    assert direct_key in forge.request_ledger
+    assert (*direct_key[:2], "redirect") not in forge.request_ledger
+    assert "release_off entry former/app: unsafe repository redirect" in summary
+    warnings = [line for line in done.stdout.splitlines() if "token not revoked" in line]
+    if expect_fault:
+        (warning,) = warnings
+        assert re.search(r"DELETE \S+/installation/token: HTTP 403\b", warning)
+    else:
+        assert warnings == []
+
+
+@pytest.mark.parametrize(
+    ("fragment", "next_token", "stage"),
+    [
+        pytest.param("#moved", "one", "redirect", id="fragment"),
+        pytest.param("", "two", "direct", id="different-token"),
+    ],
+)
+def test_forge_redirect_stage_matches_next_request(fragment, next_token, stage):
+    """A same-origin follow-up drops its fragment and must retain the issuing Authorization."""
+    forge = Forge(repository())
+    forge.tokens.update(one=("list", 7, None), two=("list", 7, None))
+    forge.repository_moves["/repos/former/app"] = f"/repos/fleet/app{fragment}"
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request("GET", "/repos/former/app", headers={"Authorization": "Bearer one"})
+            response = conn.getresponse()
+            assert response.status == 301
+            assert response.getheader("Location") == f"/repos/fleet/app{fragment}"
+            response.read()
+            conn.request(
+                "GET", "/repos/fleet/app", headers={"Authorization": f"Bearer {next_token}"}
+            )
+            assert conn.getresponse().read()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    method, route, _ = fault_request_key(RELEASE_NAME_ROUTE)
+    assert forge.request_ledger == {
+        fault_request_key(RELEASE_NAME_ROUTE),
+        (method, route, stage),
+    }
+
+
+def test_forge_refuses_second_location(tmp_path, monkeypatch):
+    """Reject an ambiguous repository redirect before either destination can be staged."""
+    forge = release_fault_forge()
+    queued = [418]
+    forge.rest_faults[fault_request_key(RELEASE_ID_CASE)] = queued
+
+    class DuplicateLocationHandler(Handler):
+        """Send two Locations in the same answer to the old-name lookup."""
+
+        def _get_repository(self, path):
+            """Plant two redirect destinations on one repository lookup."""
+            if path != "/repos/former/app":
+                return super()._get_repository(path)
+            self.send_response(301)
+            self.send_header("Location", "/repositories/7000")
+            self.send_header("location", "/repositories/8000")
+            self.end_headers()
+
+    monkeypatch.setattr(sys.modules[__name__], "Handler", DuplicateLocationHandler)
+    refusal = (
+        "GET /repos/former/app: second Location '/repositories/8000' after '/repositories/7000'"
+    )
+    with pytest.raises(AssertionError, match=re.escape(refusal)):
+        done, _ = train(tmp_path, forge, release_off="former/app")
+        pytest.fail(
+            f"ambiguous response accepted: exit {done.returncode}, "
+            f"lookups {forge.repository_calls}, redirect faults left {queued}"
+        )
+    assert forge.redirect_location is None
+    assert queued == [418]
+    assert all(path != "/repositories/7000" for _, path in forge.repository_calls)
+
+
+def test_forge_raising_dispatch_discards_pending_redirect():
+    """A request rejected by route normalization cannot leave a redirect for a later GET."""
+    forge = release_fault_forge()
+    forge.tokens["one"] = ("list", 7, None)
+    key = fault_request_key(RELEASE_ID_CASE)
+    queued = [418]
+    forge.rest_faults[key] = queued
+    server = serve(forge)
+    host, port = server.server_address
+    refusal = (
+        f"GET *: pending redirect from {RELEASE_NAME_ROUTE} to http://{host}:{port}"
+        "/repositories/7000 refused: unresolved REST URL: *"
+    )
+
+    reported = None
+    try:
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            headers = {"Authorization": "Bearer one"}
+            conn.request("GET", "/repos/former/app", headers=headers)
+            response = conn.getresponse()
+            assert response.status == 301
+            assert response.getheader("Location") == "/repositories/7000"
+            response.read()
+            conn.request("GET", "*", headers=headers)
+            with pytest.raises(http.client.RemoteDisconnected):
+                conn.getresponse()
+            conn.request("GET", "/repositories/7000", headers=headers)
+            response = conn.getresponse()
+            response.read()
+    finally:
+        server.shutdown()
+        try:
+            server.server_close()
+        except AssertionError as error:
+            reported = str(error)
+
+    assert (response.status, queued) == (200, [418]), (
+        f"{key}: expected an unconsumed redirect fault after GET *, "
+        f"got HTTP {response.status} and queue {queued}"
+    )
+    assert (*key[:2], "direct") in forge.request_ledger
+    assert key not in forge.request_ledger
+    assert reported == refusal
+    with pytest.raises(
+        AssertionError, match=re.escape(f"{RELEASE_ID_CASE}: consumed 0 of 1 faults")
+    ):
+        assert_faults_consumed(RELEASE_ID_CASE, queued, (), len(forge.fault_requests), 1)
+
+
+# Allow scheduling slack beyond the 0.5-second admission wait while bounding a deadlock.
+OVERLAPPING_DISPATCH_TIMEOUT_SECONDS = 5
+
+
+@pytest.mark.timeout(OVERLAPPING_DISPATCH_TIMEOUT_SECONDS, method="signal")
+def test_forge_rejects_overlapping_dispatch():
+    """A second dispatch fails by route while the first request is still being served."""
+    forge = Forge(repository())
+    # Let the nested callback return if the admission guard is removed.
+    forge.request_lock = threading.RLock()
+    first, second = object.__new__(Handler), object.__new__(Handler)
+    first.server = second.server = types.SimpleNamespace(forge=forge)
+    first.command = second.command = "GET"
+    first.path, second.path = "/app", "/app/installations"
+    first.headers = second.headers = {"Host": "127.0.0.1"}
+
+    def overlap():
+        """Arrive during the first request's dispatch callback."""
+        second.dispatch(serve_second)
+
+    def serve_second():
+        """Finish the nested request if the serial guard is missing."""
+
+    with pytest.raises(
+        AssertionError, match="concurrent stand-in forge request: GET /app/installations"
+    ):
+        first.dispatch(overlap)
+
+
+def test_overlapping_dispatch_has_signal_timeout(request):
+    """Require pytest-timeout to bound the nested dispatch if admission deadlocks."""
+    assert request.config.pluginmanager.hasplugin("timeout"), "pytest-timeout must be loaded"
+    marks = getattr(test_forge_rejects_overlapping_dispatch, "pytestmark", ())
+    assert [(mark.args, mark.kwargs) for mark in marks if mark.name == "timeout"] == [
+        ((OVERLAPPING_DISPATCH_TIMEOUT_SECONDS,), {"method": "signal"})
+    ], "nested dispatch must have its signal timeout"
+
+
+def test_forge_accepts_request_after_response_sent(monkeypatch):
+    """A new connection can follow a complete response while its handler is still serving."""
+    forge = Forge(repository())
+    first_sent, first_finished = threading.Event(), threading.Event()
+    second_entered, second_decided = threading.Event(), threading.Event()
+    dispatch, request_lock = Handler.dispatch, forge.request_lock
+
+    class ObservedRequestLock:
+        """Signal admission before the second handler waits for state access."""
+
+        acquire, release = request_lock.acquire, request_lock.release
+
+        def __enter__(self):
+            """Observe the second worker after the admission check."""
+            if second_entered.is_set():
+                second_decided.set()
+            assert self.acquire(timeout=5), "admitted worker could not acquire request_lock"
+
+        def __exit__(self, *_exc):
+            """Release the underlying request lock."""
+            self.release()
+
+    def observe_dispatch(self, serve_rest):
+        """Signal second dispatch entry and preserve any named refusal."""
+        if self.path == "/app/installations":
+            second_entered.set()
+        try:
+            dispatch(self, serve_rest)
+        except ForgeRequestRefusalError:
+            if self.path == "/app/installations":
+                second_decided.set()
+            raise
+
+    def serve_get(self):
+        """Pause the first request after its wire response and check the serialized handoff."""
+        if self.path == "/app/installations":
+            assert first_finished.is_set(), "second worker served before the first finished"
+        self.answer(200, {"path": self.path})
+        if self.path == "/app":
+            first_sent.set()
+            assert second_entered.wait(5), "second worker did not enter dispatch"
+            assert second_decided.wait(5), "second worker did not reach its admission decision"
+            first_finished.set()
+
+    forge.request_lock = ObservedRequestLock()
+    monkeypatch.setattr(Handler, "dispatch", observe_dispatch)
+    monkeypatch.setattr(Handler, "_serve_get", serve_get)
+    server = serve(forge)
+    host, port = server.server_address
+    try:
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as first:
+            first.request("GET", "/app")
+            assert first.getresponse().read() == b'{"path": "/app"}'
+        assert first_sent.wait(5), "first worker did not complete its response"
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as second:
+            second.request("GET", "/app/installations")
+            assert second.getresponse().read() == b'{"path": "/app/installations"}'
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_forge_accepts_request_while_completion_is_published(monkeypatch):
+    """Admit a follow-up sent after the final write and before slot publication."""
+    forge = Forge(repository())
+    admission_started, publish = threading.Event(), threading.Event()
+    send_final, handle_error = Handler.send_final, ForgeServer.handle_error
+
+    class ObservedCompletion(threading.Condition):
+        """Signal when the second worker starts its bounded admission wait."""
+
+        def wait(self, timeout=None):
+            """Let the client release the first writer before waiting for publication."""
+            admission_started.set()
+            return super().wait(timeout)
+
+    def report_refusal(self, request, client_address):
+        """Surface a refusal immediately if admission fails before waiting."""
+        handle_error(self, request, client_address)
+        if isinstance(sys.exception(), ForgeRequestRefusalError):
+            admission_started.set()
+
+    def hold_publication(self, write, *args):
+        """Hold publication after the first final write returns."""
+        if self.path != "/storage/1":
+            return send_final(self, write, *args)
+
+        def write_then_wait(*args):
+            """Wait for the second worker after writing the complete first response."""
+            write(*args)
+            assert publish.wait(5), "first writer did not get permission to publish completion"
+
+        return send_final(self, write_then_wait, *args)
+
+    forge.response_done = ObservedCompletion(forge.response_lock)
+    forge.storage.update({1: b"first", 2: b"second"})
+    monkeypatch.setattr(ForgeServer, "handle_error", report_refusal)
+    monkeypatch.setattr(Handler, "send_final", hold_publication)
+    server = serve(forge)
+    host, port = server.server_address
+    try:
+        with (
+            contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as first,
+            contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as second,
+        ):
+            first.request("GET", "/storage/1")
+            assert first.getresponse().read() == b"first"
+            second.request("GET", "/storage/2")
+            assert admission_started.wait(5), "second worker did not reach admission"
+            publish.set()
+            assert second.getresponse().read() == b"second"
+    finally:
+        publish.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_forge_rejects_request_before_response_sent(monkeypatch):
+    """A second connection is refused by name while the first answer is still pending."""
+    forge = Forge(repository())
+    awaiting_answer, release_answer = threading.Event(), threading.Event()
+
+    def serve_get(self):
+        """Keep the first response unsent until the client has checked the second connection."""
+        if self.path == "/app":
+            awaiting_answer.set()
+            assert release_answer.wait(10)
+        self.answer(200, {"path": self.path})
+
+    monkeypatch.setattr(Handler, "_serve_get", serve_get)
+    server = serve(forge)
+    host, port = server.server_address
+    refusal = "concurrent stand-in forge request: GET /app/installations"
+    reported = None
+    try:
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as first:
+            first.request("GET", "/app")
+            try:
+                assert awaiting_answer.wait(5)
+                with contextlib.closing(
+                    http.client.HTTPConnection(host, port, timeout=5)
+                ) as second:
+                    second.request("GET", "/app/installations")
+                    with pytest.raises(http.client.RemoteDisconnected):
+                        second.getresponse()
+            finally:
+                release_answer.set()
+                assert first.getresponse().read() == b'{"path": "/app"}'
+    finally:
+        server.shutdown()
+        try:
+            server.server_close()
+        except ForgeRequestRefusalError as error:
+            reported = str(error)
+    assert reported == refusal
+
+
+def fill_socket_buffers(sock, data):
+    """Return the unsent body suffix after the TCP socket reports backpressure."""
+    remaining = memoryview(data)
+    sock.setblocking(False)
+    try:
+        for _ in range(32):
+            sent = sock.send(remaining)
+            assert 0 < sent < len(remaining), "first response fit in the socket buffers"
+            remaining = remaining[sent:]
+    except BlockingIOError:
+        return remaining
+    finally:
+        sock.settimeout(10)
+    raise AssertionError("first response did not fill the socket buffers in 32 writes")
+
+
+def assert_blocked_write_refusal(monkeypatch, forge):
+    """Check the named refusal while the first client leaves its response unread."""
+    payload = b"z" * (1024 * 1024)
+    forge.storage.update({1: payload, 2: b"second"})
+    write_blocked, second_checked = threading.Event(), threading.Event()
+    send_final = Handler.send_final
+
+    def observe_final_write(self, write, *args):
+        """Signal backpressure inside the real final write of the large reply."""
+        if self.path != "/storage/1":
+            return send_final(self, write, *args)
+        self.request.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+
+        def write_body(data):
+            """Resume the body write as soon as the first client starts reading."""
+            remaining = fill_socket_buffers(self.request, data)
+            write_blocked.set()
+            write(remaining)
+            assert second_checked.wait(5), "second client did not check the blocked response"
+
+        return send_final(self, write_body, *args)
+
+    monkeypatch.setattr(Handler, "send_final", observe_final_write)
+    server = serve(forge)
+    host, port = server.server_address
+    refusal = "concurrent stand-in forge request: GET /storage/2"
+    reported = None
+    try:
+        with (
+            socket.socket() as receiver,
+            contextlib.closing(http.client.HTTPConnection(host, port, timeout=10)) as first,
+            contextlib.closing(http.client.HTTPConnection(host, port, timeout=2)) as second,
+        ):
+            receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            receiver.settimeout(10)
+            receiver.connect((host, port))
+            first.sock = receiver
+            first.request("GET", "/storage/1")
+            try:
+                assert write_blocked.wait(5), "first response did not reach a blocked write"
+                second.request("GET", "/storage/2")
+                with pytest.raises(http.client.RemoteDisconnected):
+                    second.getresponse()
+            except TimeoutError as error:
+                second.close()
+                raise AssertionError(f"{refusal}: second client timed out") from error
+            finally:
+                second_checked.set()
+                assert first.getresponse().read() == payload
+    finally:
+        server.shutdown()
+        try:
+            server.server_close()
+        except ForgeRequestRefusalError as error:
+            reported = str(error)
+    assert reported == refusal
+
+
+def test_forge_rejects_request_while_final_write_blocked(monkeypatch):
+    """Require both the disconnect and exact refusal during the final write."""
+    assert_blocked_write_refusal(monkeypatch, Forge(repository()))
+
+
+def test_forge_blocked_write_timeout_keeps_named_assertion(monkeypatch):
+    """Report the named assertion when the second client times out awaiting refusal."""
+    forge = Forge(repository())
+    refusal_held, release_refusal = threading.Event(), threading.Event()
+    handle_error = ForgeServer.handle_error
+    read_response = http.client.HTTPConnection.getresponse
+
+    def hold_refusal(self, request, client_address):
+        """Hold the refusal open until the second client's real socket timeout."""
+        if isinstance(sys.exception(), ForgeRequestRefusalError):
+            refusal_held.set()
+            assert release_refusal.wait(5), "fixture did not observe the second client timeout"
+        handle_error(self, request, client_address)
+
+    def getresponse(self):
+        """Release the refusal once the second response read times out."""
+        try:
+            return read_response(self)
+        except TimeoutError:
+            assert refusal_held.is_set(), "second client timed out before the refusal was held"
+            release_refusal.set()
+            raise
+
+    monkeypatch.setattr(ForgeServer, "handle_error", hold_refusal)
+    monkeypatch.setattr(http.client.HTTPConnection, "getresponse", getresponse)
+    with pytest.raises(
+        AssertionError,
+        match="^concurrent stand-in forge request: GET /storage/2: second client timed out$",
+    ):
+        assert_blocked_write_refusal(monkeypatch, forge)
+
+
+@pytest.mark.parametrize(
+    ("path", "token", "status", "location"),
+    [
+        pytest.param(
+            "/repos/fleet/app/actions/artifacts/1/zip", "repo", 302, "/storage/1", id="302"
+        ),
+        pytest.param("/repos/former/app", "list", 301, "/repositories/7000", id="301"),
+    ],
+)
+def test_forge_redirect_empty_body_completes_before_close(
+    monkeypatch, path, token, status, location
+):
+    """Read the empty redirect while the stand-in's HTTP/1.0 shutdown is held open."""
+    forge = release_fault_forge()
+    forge.tokens.update(repo=("repo", 7, "fleet/app", READ), list=("list", 7, None))
+    closing, allow_close = threading.Event(), threading.Event()
+    shutdown_request = ForgeServer.shutdown_request
+
+    def hold_close(self, request):
+        """Withhold EOF until the client completes or fails its read."""
+        closing.set()
+        try:
+            assert allow_close.wait(5), f"HTTP {status}: timed out waiting to close redirect socket"
+        finally:
+            shutdown_request(self, request)
+
+    monkeypatch.setattr(ForgeServer, "shutdown_request", hold_close)
+    server = serve(forge)
+    host, port = server.server_address
+    try:
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=2)) as conn:
+            conn.request("GET", path, headers={"Authorization": f"Bearer {token}"})
+            response = conn.getresponse()
+            assert response.status == status
+            assert response.getheader("Location") == location
+            assert closing.wait(5), f"HTTP {status}: server did not reach redirect shutdown"
+            assert response.getheader("Content-Length") == "0", (
+                f"HTTP {status}: missing empty length"
+            )
+            assert response.read() == b""
+    finally:
+        allow_close.set()
+        server.shutdown()
+        server.server_close()
 
 
 def test_release_off_exact_match_needs_no_repository_lookup(tmp_path):
@@ -10518,33 +11915,56 @@ def test_planted_input_wiring_mutants_are_found(mutator, drop, finding):
 def test_transient_rest_read_is_tried_again(tmp_path, fault):
     """Planted: the jobs read fails once at the gateway or drops; the refresh still runs."""
     forge = stopped_forge()
-    forge.rest_faults["jobs"] = [fault]
+    forge.rest_faults[JOBS_ROUTE] = [fault]
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == refreshed(1)
-    assert forge.rest_faults["jobs"] == []
+    assert forge.rest_faults[JOBS_ROUTE] == []
     assert "### fleet/app: refreshed #1" in summary
 
 
 @pytest.mark.parametrize("fault", [502, DROP])
 def test_exhausted_rest_read_retries_refuse_the_repository(tmp_path, fault):
     forge = stopped_forge()
-    forge.rest_faults["jobs"] = [fault] * 4
+    forge.rest_faults[JOBS_ROUTE] = [fault] * 4
     done, _ = train(tmp_path, forge)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "::error title=Merge train refused::fleet/app: GET " in done.stdout
     assert "Traceback" not in done.stderr
-    assert forge.rest_faults["jobs"] == [fault]
+    assert forge.rest_faults[JOBS_ROUTE] == [fault]
     assert forge.writes == []
+
+
+def test_exhausted_installation_read_refusal_stays_on_one_line(tmp_path):
+    """Three gateway failures refuse the installation and keep both body lines in each report."""
+    forge = Forge(repository(pull(1, "CLEAN")))
+    failure = (502, MULTILINE_READ_ERROR)
+    forge.rest_faults[INSTALLATION_REPOSITORIES_ROUTE] = [failure] * 4
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert forge.rest_faults[INSTALLATION_REPOSITORIES_ROUTE] == [failure]
+    assert forge.writes == []
+    prefix = "::error title=Merge train refused::"
+    (annotation,) = [line for line in done.stdout.splitlines() if line.startswith(prefix)]
+    refusal = annotation.removeprefix(prefix)
+    assert re.fullmatch(
+        r"fleet: GET \S+/installation/repositories\?\S+: HTTP 502 "
+        + re.escape(FLATTENED_READ_ERROR),
+        refusal,
+    )
+    assert [line for line in summary.splitlines() if line.startswith("- fleet: ")] == [
+        f"- {refusal}"
+    ]
 
 
 def test_rest_read_500_is_not_tried_again(tmp_path):
     forge = stopped_forge()
-    forge.rest_faults["jobs"] = [500, 500]
+    forge.rest_faults[JOBS_ROUTE] = [500, 500]
     done, _ = train(tmp_path, forge)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "HTTP 500" in done.stdout
-    assert forge.rest_faults["jobs"] == [500]
+    assert forge.rest_faults[JOBS_ROUTE] == [500]
 
 
 def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
@@ -10553,17 +11973,19 @@ def test_without_the_read_retry_a_gateway_error_refuses(tmp_path):
     old = 'retries = READ_ATTEMPTS - 1 if method == "GET" else 0'
     assert text.count(old) == 1
     forge = stopped_forge()
-    forge.rest_faults["jobs"] = [502]
+    forge.rest_faults[JOBS_ROUTE] = [502]
     done, _ = train(tmp_path, forge, text.replace(old, "retries = 0"))
     assert done.returncode == 1, done.stdout + done.stderr
     assert forge.writes == []
 
 
-@pytest.mark.parametrize("fault", [DROP, 502])
+@pytest.mark.parametrize(
+    "fault", [DROP, 502, pytest.param((502, MULTILINE_READ_ERROR), id="multiline-502")]
+)
 def test_failed_revocation_warns_and_the_sweep_goes_on(tmp_path, fault):
     """Planted: the first revocation drops or fails; every repository is still served."""
     forge = sweep_forge()
-    forge.rest_faults["revoke"] = [fault]
+    forge.rest_faults[REVOKE_ROUTE] = [fault]
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.where == [
@@ -10572,7 +11994,9 @@ def test_failed_revocation_warns_and_the_sweep_goes_on(tmp_path, fault):
         ("other/b", updated(2)),
     ]
     warning = "::warning title=Merge train::token not revoked, it expires within the hour: DELETE "
-    assert warning in done.stdout
+    (line,) = [line for line in done.stdout.splitlines() if line.startswith(warning)]
+    if isinstance(fault, tuple):
+        assert line.endswith(f"HTTP 502 {FLATTENED_READ_ERROR}")
     assert "### fleet/app: landed #1" in summary
     # A revocation is a write: it runs once, so exactly one token stays unrevoked.
     assert len(forge.revoked) == len(forge.tokens) - 1
@@ -10629,6 +12053,256 @@ def test_cut_artifact_body_once_is_downloaded_again(tmp_path):
     assert any(w[0] == "commit" for w in forge.writes)
     assert "body cut" not in summary
     assert forge.storage_reads == [101, 101]
+    assert fault_request_key(f"{STORAGE_ROUTE} [redirect]") in forge.request_ledger
+    assert fault_request_key(STORAGE_ROUTE) in forge.request_ledger
+    assert forge.storage_auth_seen == []
+
+
+def test_storage_redirect_refuses_authorization_before_queued_fault():
+    """A client that forwards its archive header is refused before the redirect fault runs."""
+    forge = Forge(repository())
+    forge.tokens["archive-fixture"] = ("repo", 7, "fleet/app", {"actions": "read"})
+    headers = {"Authorization": "Bearer archive-fixture"}
+    queued = [418]
+    key = fault_request_key(STORAGE_CASE)
+    forge.rest_faults[key] = queued
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request("GET", "/repos/fleet/app/actions/artifacts/101/zip", headers=headers)
+            redirect = conn.getresponse()
+            assert redirect.status == 302
+            location = redirect.getheader("Location")
+            redirect.read()
+            conn.request("GET", location, headers=headers)
+            response = conn.getresponse()
+            status, body = response.status, json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert key in forge.request_ledger
+    assert (status, forge.storage_auth_seen, queued) == (400, [headers["Authorization"]], [418])
+    assert body == {"message": "storage URL refuses Authorization header"}
+    assert forge.fault_requests == []
+
+
+@pytest.mark.parametrize(
+    ("path", "forward_authorization", "expected_status", "expected_reads"),
+    [
+        pytest.param("/storage/+101", True, 404, [], id="noncanonical-with-authorization"),
+        pytest.param("/storage/101", False, 200, [101], id="canonical-without-authorization"),
+    ],
+)
+def test_storage_redirect_requires_a_canonical_id(
+    path, forward_authorization, expected_status, expected_reads
+):
+    """Follow the archive redirect to storage with the supplied header policy."""
+    forge = Forge(repository())
+    forge.tokens["archive-fixture"] = ("repo", 7, "fleet/app", {"actions": "read"})
+    forge.storage[101] = b"planted artifact"
+    forge.artifact_redirect_locations[101] = path
+    headers = {"Authorization": "Bearer archive-fixture"}
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request("GET", "/repos/fleet/app/actions/artifacts/101/zip", headers=headers)
+            redirect = conn.getresponse()
+            assert (redirect.status, redirect.getheader("Location")) == (302, path)
+            redirect.read()
+            conn.request("GET", path, headers=headers if forward_authorization else {})
+            response = conn.getresponse()
+            status, body = response.status, response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert (status, forge.storage_reads, forge.storage_auth_seen) == (
+        expected_status,
+        expected_reads,
+        [],
+    )
+    if expected_status == 404:
+        assert json.loads(body) == {"message": f"Unknown storage route: {path}"}
+    else:
+        assert body == forge.storage[101]
+
+
+@pytest.mark.parametrize(
+    "forward_authorization",
+    [
+        pytest.param(True, id="redirect"),
+        pytest.param(False, id="direct"),
+    ],
+)
+def test_storage_literal_id_leaves_canonical_fault_queued(forward_authorization):
+    """A literal template segment cannot consume either kind of canonical storage fault."""
+    path = "/storage/{id}"
+    forge = Forge(repository())
+    forge.tokens["archive-fixture"] = ("repo", 7, "fleet/app", {"actions": "read"})
+    forge.artifact_redirect_locations[101] = path
+    queued = [418]
+    fault_key = fault_request_key(STORAGE_CASE) if forward_authorization else STORAGE_ROUTE
+    forge.rest_faults[fault_key] = queued
+    headers = {"Authorization": "Bearer archive-fixture"}
+    server = serve(forge)
+    try:
+        host, port = server.server_address
+        with contextlib.closing(http.client.HTTPConnection(host, port, timeout=5)) as conn:
+            conn.request("GET", "/repos/fleet/app/actions/artifacts/101/zip", headers=headers)
+            redirect = conn.getresponse()
+            assert (redirect.status, redirect.getheader("Location")) == (302, path)
+            redirect.read()
+            conn.request("GET", path, headers=headers if forward_authorization else {})
+            response = conn.getresponse()
+            status, body = response.status, json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert (status, body, queued) == (404, {"message": f"Unknown storage route: {path}"}, [418])
+    assert {fault_request_key(STORAGE_CASE), fault_request_key(STORAGE_ROUTE)}.isdisjoint(
+        forge.request_ledger
+    )
+    assert forge.fault_requests == forge.storage_reads == forge.storage_auth_seen == []
+
+
+def storage_handler(forge, path):
+    """Dispatch a raw target directly, leaving the client and HTTP parser out of the test."""
+    handler = object.__new__(Handler)
+    handler.server = types.SimpleNamespace(forge=forge)
+    handler.command = "GET"
+    handler.path = path
+    handler.headers = {"Host": "127.0.0.1"}
+    handler.requestline = f"GET {path} HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.wfile = io.BytesIO()
+    return handler
+
+
+@pytest.mark.parametrize(
+    "ident",
+    [
+        pytest.param("+101", id="plus"),
+        pytest.param("1_01", id="underscore"),
+        pytest.param("١٠١", id="arabic-indic"),
+        pytest.param("0101", id="leading-zero"),
+    ],
+)
+def test_storage_refuses_noncanonical_ids_without_authorization(ident):
+    """Dispatch a follow-up directly so the Unicode target reaches the route parser."""
+    path = f"/storage/{ident}"
+    forge = Forge(repository())
+    forge.storage[101] = b"planted artifact"
+    forge.redirect_location = (
+        "GET",
+        f"http://127.0.0.1{path}",
+        "Bearer archive-fixture",
+        ARCHIVE_ROUTE,
+    )
+    handler = storage_handler(forge, path)
+
+    handler.do_GET()
+
+    headers, _, body = handler.wfile.getvalue().partition(b"\r\n\r\n")
+    assert (headers.splitlines()[0], forge.storage_reads) == (b"HTTP/1.0 404 Not Found", [])
+    assert json.loads(body) == {"message": f"Unknown storage route: {path}"}
+
+
+@pytest.mark.parametrize("pending", [False, True], ids=["direct", "pending"])
+@pytest.mark.parametrize(
+    ("path", "position", "escaped"),
+    [
+        pytest.param("/storage/1\t01", 10, r"'\t'", id="tab"),
+        pytest.param("/storage/1\r01", 10, r"'\r'", id="cr"),
+        pytest.param("/storage/1\n01", 10, r"'\n'", id="lf"),
+        pytest.param("/storage/1\x0001", 10, r"'\x00'", id="inner-nul"),
+        pytest.param("\0/storage/101", 0, r"'\x00'", id="leading-nul"),
+        pytest.param(" /storage/101", 0, r"'\x20'", id="leading-space"),
+    ],
+)
+def test_storage_refuses_raw_target_before_parsing(path, position, escaped, pending):
+    """Refuse a forbidden target before parsing; escape it and any non-printable Location."""
+    forge = Forge(repository())
+    forge.storage[101] = b"planted artifact"
+    if pending:
+        forge.redirect_location = ("GET", path, None, ARCHIVE_ROUTE)
+    handler = storage_handler(forge, path)
+    refusal = f"GET request target has invalid character at position {position}: {escaped}"
+
+    with pytest.raises(ForgeRequestRefusalError, match=re.escape(refusal)) as error:
+        handler.do_GET()
+        status, _, _ = handler.wfile.getvalue().partition(b"\r\n")
+        pytest.fail(f"expected {refusal}; got {status!r}, storage reads {forge.storage_reads}")
+
+    message = str(error.value)
+    assert message.isprintable(), ascii(message)
+    if pending:
+        location = path if path.isprintable() else ascii(path)
+        context = f"GET {ascii(path)}: pending redirect from {ARCHIVE_ROUTE} to {location} "
+        assert context in message
+    assert forge.request_ledger == set()
+    assert forge.fault_requests == forge.storage_reads == []
+
+
+def test_forge_escapes_pending_location_when_route_asserts():
+    """A printable target can reach the route assertion with a NUL in the staged Location."""
+    forge = Forge(repository())
+    issuer = storage_handler(forge, "/repos/fleet/app/actions/artifacts/101/zip")
+    issuer.route, _ = issuer.normalized_route(None)
+    issuer.send_header("Location", "/storage/1\x0001")
+    issuer.end_headers()
+    handler = storage_handler(forge, "*")
+
+    with pytest.raises(
+        ForgeRequestRefusalError, match=re.escape("unresolved REST URL: *")
+    ) as error:
+        handler.do_GET()
+
+    message = str(error.value)
+    assert message.isprintable(), ascii(message)
+    assert (
+        rf"GET *: pending redirect from {ARCHIVE_ROUTE} to 'http://127.0.0.1/storage/1\x0001' "
+        in message
+    )
+
+
+def test_forge_keeps_printable_pending_location_when_route_asserts():
+    """Keep a printable Location with a space verbatim after a route assertion."""
+    forge = Forge(repository())
+    issuer = storage_handler(forge, "/repos/fleet/app/actions/artifacts/101/zip")
+    issuer.route, _ = issuer.normalized_route(None)
+    issuer.send_header("Location", "/storage/1 01")
+    issuer.end_headers()
+    handler = storage_handler(forge, "*")
+
+    with pytest.raises(
+        ForgeRequestRefusalError, match=re.escape("unresolved REST URL: *")
+    ) as error:
+        handler.do_GET()
+
+    message = str(error.value)
+    assert message.isprintable(), ascii(message)
+    context = f"GET *: pending redirect from {ARCHIVE_ROUTE} to http://127.0.0.1/storage/1 01 "
+    assert context in message
+
+
+def test_forge_escapes_raw_target_in_concurrent_refusal():
+    """A held response refuses the next target before parsing and escapes it."""
+    forge = Forge(repository())
+    forge.pending_response = object()
+    handler = storage_handler(forge, "/storage/1\x0001")
+
+    with pytest.raises(ForgeRequestRefusalError) as error:
+        handler.do_GET()
+
+    message = str(error.value)
+    assert message.isprintable(), ascii(message)
+    assert message == r"concurrent stand-in forge request: GET '/storage/1\x0001'"
+    assert forge.request_ledger == set()
+    assert forge.fault_requests == forge.storage_reads == []
 
 
 def test_without_the_cut_cause_a_cut_read_refuses(tmp_path):
@@ -10747,7 +12421,9 @@ def retry_file(**changes):
 
 def retry_modes(variables, modes=None):
     modes = modes or {}
-    paths = [value for key, value in variables.items() if re.fullmatch(r"p\d+", key)]
+    paths = [
+        value for key, value in variables.items() if key.startswith("p") and ascii_digits(key[1:])
+    ]
     return {
         side: {
             f"f{index}": {"mode": modes.get((variables[side], path), 33188)}
@@ -10969,6 +12645,1642 @@ def test_retry_hold_unreadable_holds_or_retries_alone(tmp_path, kind, cause, fol
     assert "held for retry: history unreadable:" in summary
     assert cause in summary
     assert ("retry hold released:" in summary) is not follower
+
+
+def pull_note_cell(text, number, state):
+    """Read the notes cell of one physical row with three Markdown cells."""
+    (row,) = [line for line in text.splitlines() if line.startswith(f"| #{number} |")]
+    cells = re.split(r"(?<!\\)\|", row)
+    assert len(cells) == 5, row
+    assert cells[:3] == ["", f" #{number} ", f" {state} "], row
+    assert cells[-1] == "", row
+    return cells[3].strip()
+
+
+def test_artifact_list_refusal_stays_in_one_notes_cell(tmp_path):
+    """All three artifact-list reads return a short two-line gateway failure."""
+    dep = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep))
+    forge.set_allowlist("fleet/app", "main", ["notices.txt"])
+    forge.rest_faults[ARTIFACTS_ROUTE] = [(502, b"first line\r\nsecond line")] * 3
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.rest_faults[ARTIFACTS_ROUTE] == []
+    assert forge.writes == []
+    for text in (summary, done.stdout):
+        note = pull_note_cell(text, 1, "BLOCKED")
+        assert note.startswith("generated files refused: GET ")
+        assert note.endswith("HTTP 502 first line second line")
+
+
+def test_review_read_refusal_stays_in_one_notes_cell(tmp_path):
+    """A multiline gateway failure holds the reviewed pull and serves its follower."""
+    first = pull(1, "CLEAN", author={"login": "person"})
+    second = pull(2, "CLEAN", author={"login": "person"})
+    forge = Forge(repository(first, second))
+    forge.rest_faults["ReviewBodies"] = [(502, MULTILINE_READ_ERROR)] * 3
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.rest_faults["ReviewBodies"] == []
+    assert forge.writes == [landed(2)]
+    for text in (summary, done.stdout):
+        note = pull_note_cell(text, 1, "CLEAN")
+        assert note.startswith("review body: cannot read: graphql ReviewBodies: POST ")
+        assert note.endswith(f"HTTP 502 {FLATTENED_READ_ERROR}")
+
+
+def test_retry_read_refusal_stays_in_one_notes_cell(tmp_path):
+    """A multiline history failure holds the retry and lets the follower update."""
+    forge = retry_forge("BEHIND")
+    forge.rest_faults["RetryHistory"] = [(502, MULTILINE_READ_ERROR)] * 3
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.rest_faults["RetryHistory"] == []
+    assert forge.writes == [updated(2)]
+    for text in (summary, done.stdout):
+        note = pull_note_cell(text, 1, "BEHIND")
+        assert note.startswith("held for retry: history unreadable: graphql RetryHistory: POST ")
+        assert note.endswith(f"HTTP 502 {FLATTENED_READ_ERROR}")
+
+
+FORGE_FAULT_BODY = b"first line\r\nsecond line"
+FORGE_FAULT_LINE = "first line second line"
+ALLOWLIST_ROUTE = "GET /repos/{owner}/{repo}/contents/.github/generated-files"
+ARCHIVE_ROUTE = "GET /repos/{owner}/{repo}/actions/artifacts/{id}/zip"
+STORAGE_ROUTE = "GET /storage/{id}"
+STORAGE_CASE = f"{STORAGE_ROUTE} [redirect]"
+FILE_CONTENTS_ROUTE = "GET /repos/{owner}/{repo}/contents/{path}"
+COMPARE_ROUTE = "GET /repos/{owner}/{repo}/compare/{base}...{head}"
+PERMISSION_ROUTE = "GET /repos/{owner}/{repo}/collaborators/{login}/permission"
+RELEASE_NAME_ROUTE = "GET /repos/{owner}/{repo}"
+RELEASE_ID_ROUTE = "GET /repositories/{id}"
+RELEASE_RENAMED_CASE = f"{RELEASE_NAME_ROUTE} [redirect]"
+RELEASE_ID_CASE = f"{RELEASE_ID_ROUTE} [redirect]"
+LIST_INSTALLATIONS_ROUTE = "GET /app/installations"
+MINT_ROUTE = "POST /app/installations/{id}/access_tokens"
+ISSUE_COMMENT_ROUTE = "POST /repos/{owner}/{repo}/issues/{id}/comments"
+ISSUE_CLOSE_ROUTE = "PATCH /repos/{owner}/{repo}/issues/{id}"
+ADD_LABEL_ROUTE = "POST /repos/{owner}/{repo}/issues/{id}/labels"
+REMOVE_LABEL_ROUTE = "DELETE /repos/{owner}/{repo}/issues/{id}/labels/{label}"
+
+FORGE_ISSUED_URLS = {
+    ("download_artifact", "art['archive_download_url']"): (ARCHIVE_ROUTE,),
+    ("download_artifact", "redirect.get('location')"): (STORAGE_CASE,),
+    ("release_off_repository_id", "answer['location']"): (RELEASE_RENAMED_CASE, RELEASE_ID_CASE),
+}
+TRANSPORT_URL = {
+    "call": (0, "url"),
+    "pages": (2, "path"),
+    "release_off_get": (0, "url"),
+}
+TRANSPORT_NAMES = {*TRANSPORT_URL, "request_once"}
+OPENER_SETUP = ast.dump(
+    ast.parse(
+        "forge_opener = urllib.request.build_opener() if redirect "
+        "else urllib.request.build_opener(NoRedirect)"
+    ).body[0]
+)
+TRANSPORT_FORWARDS = {
+    ("pages", "call"): (
+        '''f"{env['GITHUB_API_URL']}{path}?per_page=100&page={page}"''',
+        {"env": "parameter", "path": "parameter", "page": "loop"},
+    ),
+    ("release_off_get", "call"): ("url", {"url": "parameter"}),
+    ("call", "request_once"): ("url", {"url": "parameter"}),
+    ("request_once", "urllib.request.Request"): ("url", {"url": "parameter"}),
+    ("request_once", "forge_opener.open"): ("request", {"url": "parameter"}),
+    ("graphql", "call"): ("env['GITHUB_GRAPHQL_URL']", {"env": "parameter"}),
+}
+URL_FRAGMENTS = {
+    "api": "",
+    "env['GITHUB_API_URL']": "",
+    "env['GITHUB_REPOSITORY']": "~/~",
+    "target['full_name']": "~/~",
+    "urllib.parse.quote(entry, safe='/')": "~/~",
+}
+
+
+# These values occupy one dynamic route field. A request URL itself still needs a plain binding.
+URL_RUNTIME_FIELDS = {
+    "apply_dependency_holds": {"number"},
+    "close_issues": {"issue"},
+    "filter_changed_files": {"path"},
+}
+
+
+def scoped_nodes(tree):
+    """Yield nodes with their innermost definition, lambda or module."""
+    scopes = {tree: tree}
+    for node in ast.walk(tree):
+        scope = scopes[node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            scope = node
+        yield scope, node
+        scopes.update(dict.fromkeys(ast.iter_child_nodes(node), scope))
+
+
+def parent_nodes(tree):
+    """Index each AST child by its immediate parent."""
+    return {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+
+def top_level_functions(tree):
+    """Index the module's synchronous functions by name."""
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def call_argument(node, index, name, *, default=None):
+    """Find a positional or keyword argument on a direct call."""
+    if index < len(node.args):
+        return node.args[index]
+    return next((arg.value for arg in node.keywords if arg.arg == name), default)
+
+
+def names_bound_by(node):
+    """Include both explicit name targets and bindings attached to other AST nodes."""
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return node.names
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [name.asname or name.name.split(".")[0] for name in node.names]
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, ast.MatchMapping):
+        return [node.rest] if node.rest else []
+    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return [node.name] if node.name else []
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return [node.name]
+    return []
+
+
+def url_binding_sites(tree):
+    """Index every binding or deletion by name and its enclosing definition."""
+    parents = parent_nodes(tree)
+    scopes = {}
+    sites = {}
+    for scope, node in scoped_nodes(tree):
+        scopes[node] = scope
+        if scope is node and node in parents:
+            scope = scopes[parents[node]]
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            parent = parents[node]
+            binding = (
+                parent if isinstance(parent, ast.Assign) and parent.targets == [node] else node
+            )
+            sites.setdefault(scope, {}).setdefault(node.id, []).append(binding)
+        for name in names_bound_by(node):
+            sites.setdefault(scope, {}).setdefault(name, []).append(node)
+    return sites
+
+
+def url_binding(name, sites):
+    """Allow one single-target plain assignment whose value precedes the name's use."""
+    bindings = sites.get(name.id, [])
+    if not bindings:
+        return None
+    first, *others = sorted(bindings, key=lambda node: (node.lineno, node.col_offset))
+    if not others and isinstance(first, ast.arg):
+        return None  # Function parameters stay opaque inside f-string fields.
+    if (
+        not others
+        and isinstance(first, ast.Assign)
+        and (first.end_lineno, first.end_col_offset) <= (name.lineno, name.col_offset)
+    ):
+        return first.value
+    bad = others[0] if others else first
+    raise AssertionError(f"{SCRIPT}:{bad.lineno}: unsupported URL binding: {name.id}")
+
+
+def expand_url_part(node, bindings, opaque=()):
+    """Expand a local name or an f-string by one level, leaving runtime values opaque."""
+    if isinstance(node, ast.JoinedStr):
+        return node.values
+    if isinstance(node, ast.FormattedValue):
+        return [node.value]
+    if (
+        isinstance(node, ast.Name)
+        and node.id not in opaque
+        and (value := url_binding(node, bindings)) is not None
+    ):
+        return [value]
+    return [node]
+
+
+def url_expression(url, bindings):
+    """Resolve an argument's local name to its defining expression."""
+    for _ in range(len(bindings) + 1):
+        (expression,) = expand_url_part(url, bindings) if isinstance(url, ast.Name) else [url]
+        if expression is url:
+            return url
+        url = expression
+    pytest.fail(f"cyclic transport URL at {SCRIPT}:{url.lineno}: {ast.unparse(url)}")
+
+
+def source_path(url, bindings, opaque):
+    """Fill f-string fields with markers and preserve literal path components."""
+    parts = [url]
+    for _ in range(3 * len(bindings) + 4):
+        expanded = [part for node in parts for part in expand_url_part(node, bindings, opaque)]
+        if expanded == parts:
+            return "".join(
+                str(part.value)
+                if isinstance(part, ast.Constant)
+                else URL_FRAGMENTS.get(ast.unparse(part), "~")
+                for part in parts
+            )
+        parts = expanded
+    pytest.fail(f"unresolved REST URL at {SCRIPT}:{url.lineno}: {ast.unparse(url)}")
+
+
+def rest_call_routes(name, called, node, url, bindings):
+    """Accept only URLs derived from literal, formatted or declared forge values."""
+    expression = url_expression(url, bindings)
+    issued = FORGE_ISSUED_URLS.get((name, ast.unparse(expression)))
+    if issued:
+        return issued
+    assert isinstance(expression, ast.JoinedStr) or (
+        isinstance(expression, ast.Constant) and isinstance(expression.value, str)
+    ), f"{SCRIPT}:{url.lineno}: unsupported {called} URL: {ast.unparse(expression)}"
+    method = call_argument(node, 2, "method", default=ast.Constant("POST"))
+    assert called != "call" or isinstance(method, ast.Constant), (
+        f"{SCRIPT}:{node.lineno}: unsupported transport method: {ast.unparse(method)}"
+    )
+    try:
+        route = rest_route(
+            method.value if called == "call" else "GET",
+            source_path(expression, bindings, URL_RUNTIME_FIELDS.get(name, ())),
+            source=True,
+        )
+    except AssertionError as failure:
+        raise AssertionError(f"{SCRIPT}:{url.lineno}: {failure}") from failure
+    return (route,)
+
+
+def transport_reference(node, parent):
+    """Identify transport references and reject aliases of the underlying urllib module."""
+    if isinstance(node, ast.Name) and node.id in TRANSPORT_NAMES:
+        return node.id
+    if isinstance(node, ast.Attribute) and (
+        node.attr in TRANSPORT_NAMES
+        or (isinstance(node.value, ast.Name) and node.value.id == "forge_opener")
+    ):
+        return ast.unparse(node)
+    if isinstance(node, ast.Name) and node.id == "forge_opener":
+        if isinstance(parent, ast.Attribute) and parent.attr == "open":
+            return None
+        return node.id
+    if (
+        isinstance(node, ast.Name)
+        and node.id == "urllib"
+        and (
+            not isinstance(parent, ast.Attribute)
+            or parent.attr not in {"error", "parse", "request"}
+        )
+    ):
+        return node.id
+    if isinstance(node, ast.Attribute) and ast.unparse(node) == "urllib.request":
+        if not isinstance(parent, ast.Attribute):
+            return "urllib.request"
+        return None
+    if isinstance(node, ast.Attribute) and ast.unparse(node.value) == "urllib.request":
+        return ast.unparse(node)
+    return None
+
+
+def allowed_opener_use(name, ref, node, parents, tree):
+    """Allow only the production request adapter's opener construction and handler class."""
+    parent = parents.get(node)
+    if ref == "urllib.request.HTTPRedirectHandler":
+        return (
+            isinstance(parent, ast.ClassDef)
+            and parent.name == "NoRedirect"
+            and parent in tree.body
+            and node in parent.bases
+        )
+    if name != "request_once":
+        return False
+    if ref == "forge_opener" and isinstance(node.ctx, ast.Store):
+        return isinstance(parent, ast.Assign) and ast.dump(parent) == OPENER_SETUP
+    if (
+        ref == "urllib.request.build_opener"
+        and isinstance(parent, ast.Call)
+        and parent.func is node
+    ):
+        branch = parents[parent]
+        return isinstance(branch, ast.IfExp) and ast.dump(parents[branch]) == OPENER_SETUP
+    return False
+
+
+def transport_calls(tree):
+    """Yield every direct transport call and refuse other transport references."""
+    parents = parent_nodes(tree)
+    top = set(top_level_functions(tree).values())
+    for scope, node in scoped_nodes(tree):
+        name = scope.name if scope in top else "<non-top-level>"
+        parent = parents.get(node)
+        if isinstance(node, ast.Import):
+            assert not any(
+                alias.asname and alias.name in {"urllib", "urllib.request"} for alias in node.names
+            ), f"{SCRIPT}:{node.lineno}: urllib request import alias"
+        if isinstance(node, ast.ImportFrom):
+            assert node.module != "urllib.request" and (
+                node.module != "urllib"
+                or all(alias.name not in {"request", "*"} for alias in node.names)
+            ), f"{SCRIPT}:{node.lineno}: urllib request import alias"
+        ref = transport_reference(node, parent)
+        if ref is None or allowed_opener_use(name, ref, node, parents, tree):
+            continue
+        assert (
+            isinstance(parent, ast.Call)
+            and parent.func is node
+            and not isinstance(scope, (ast.Lambda, ast.ClassDef))
+        ), f"{SCRIPT}:{node.lineno}: unsupported transport reference: {ref}"
+        yield scope, name, ref, parent
+
+
+def forwarding_url(ref, operand, bindings):
+    """Resolve the opener's request object to the URL in its single constructor binding."""
+    if ref != "forge_opener.open":
+        return operand
+    assert isinstance(operand, ast.Name) and operand.id == "request", (
+        f"{SCRIPT}:{operand.lineno}: unsupported forwarding request: {ast.unparse(operand)}"
+    )
+    request = url_binding(operand, bindings)
+    assert (
+        isinstance(request, ast.Call) and ast.unparse(request.func) == "urllib.request.Request"
+    ), f"{SCRIPT}:{operand.lineno}: unsupported forwarding request binding: {operand.id}"
+    return call_argument(request, 0, "url")
+
+
+def forwarding_loop_target(binding, url, parents):
+    """Recognize the simple for target whose body contains the forwarding expression."""
+    loop = parents.get(binding)
+    return (
+        isinstance(loop, ast.For)
+        and loop.target is binding
+        and any(url is item for statement in loop.body for item in ast.walk(statement))
+    )
+
+
+def check_forwarding_name(name, url, kind, parameters, body_bindings, parents):
+    """Check a declared parameter or the single for target that may supply a URL name."""
+    sites = body_bindings[name.id]
+    if kind == "parameter":
+        expected, allowed = None, name.id in parameters
+    else:
+        assert kind == "loop", kind
+        expected = next(
+            (site for site in sites if forwarding_loop_target(site, url, parents)), None
+        )
+        allowed = expected is not None and name.id not in parameters
+    unexpected = next((site for site in sites if site is not expected), None)
+    bad = unexpected if unexpected is not None else name
+    assert allowed and unexpected is None, (
+        f"{SCRIPT}:{bad.lineno}: unsupported forwarding URL binding: {name.id}"
+    )
+
+
+def check_forwarding_site(scope, ref, operand, spec, bindings, parents):
+    """Check all names in the forwarded expression before accepting its declared shape."""
+    template, declared = spec
+    url = forwarding_url(ref, operand, bindings.get(scope, {}))
+    assert url is not None, f"{SCRIPT}:{operand.lineno}: missing forwarding URL"
+    parameters = {
+        part.arg for part in ast.iter_child_nodes(scope.args) if isinstance(part, ast.arg)
+    }
+    body = {item for statement in scope.body for item in ast.walk(statement)}
+    body_bindings = {
+        name: [
+            site
+            for scope_sites in bindings.values()
+            for site in scope_sites.get(name, ())
+            if site in body
+        ]
+        for name in declared
+    }
+    for part in ast.walk(url):
+        if isinstance(part, ast.Name):
+            assert part.id in declared, (
+                f"{SCRIPT}:{part.lineno}: unsupported forwarding URL name: {part.id}"
+            )
+            check_forwarding_name(part, url, declared[part.id], parameters, body_bindings, parents)
+    assert ast.unparse(operand) == template, (
+        f"{SCRIPT}:{operand.lineno}: unsupported forwarding URL: {ast.unparse(operand)}"
+    )
+
+
+def rest_fault_routes(tree):
+    """Derive REST routes independently of the stand-in forge and fault scenarios.
+
+    The static forwarding inventory checks only name bindings and declared names,
+    leaves writes through a declared name (subscript, augmented subscript, or attribute)
+    to issue 269, and relies on the runtime transport allow-list to refuse requests
+    outside the declared routes.
+    After every faulted scenario the runtime allow-list checks its ledger, and the
+    stand-in refuses by name a second Location in one response and a pending redirect
+    when route normalization raises during dispatch.
+    """
+    bindings = url_binding_sites(tree)
+    parents = parent_nodes(tree)
+    routes = {}
+    for scope, name, ref, node in transport_calls(tree):
+        url = call_argument(node, *TRANSPORT_URL.get(ref, (0, "url")))
+        forwarding = TRANSPORT_FORWARDS.get((name, ref))
+        assert url is not None and (forwarding is not None or ref in TRANSPORT_URL), (
+            f"{SCRIPT}:{node.lineno}: unsupported transport call: {ast.unparse(node)}"
+        )
+        if forwarding is not None:
+            check_forwarding_site(scope, ref, url, forwarding, bindings, parents)
+            continue
+        for route in rest_call_routes(name, ref, node, url, bindings.get(scope, {})):
+            routes.setdefault(route, []).append(name)
+    return routes
+
+
+def rest_fault_cases(tree):
+    """Keep distinct call-site fault cases when direct routes are shared."""
+    cases = set()
+    for route, callers in rest_fault_routes(tree).items():
+        if len(callers) == 1:
+            cases.add(route)
+        else:
+            assert len(callers) == len(set(callers)), (route, callers)
+            cases.update(f"{route} [{caller}]" for caller in callers)
+    return cases
+
+
+def test_forge_fault_inventory(tmp_path, monkeypatch):
+    """Require a fault scenario for every source-derived REST route and GraphQL document."""
+    rules = load_rules(tmp_path)
+    train_mod = load_train(tmp_path, monkeypatch)
+    docs = train_graphql_documents(train_mod, rules, file_modes_document(train_mod, monkeypatch))
+    static_cases = rest_fault_cases(ast.parse(script())) | {
+        train_mod.graphql_name(doc) for doc in docs
+    }
+    assert FAULT_SCENARIOS.keys() == static_cases
+
+
+@pytest.mark.parametrize(
+    ("fragment", "message"),
+    [
+        ("api_get = call", "unsupported transport reference: call"),
+        ("alias = pages", "unsupported transport reference: pages"),
+        ("send(release_off_get)", "unsupported transport reference: release_off_get"),
+        ("def get(): return call", "unsupported transport reference: call"),
+        ("functools.partial(call, '/app')", "unsupported transport reference: call"),
+        ("def get(api): return api.call('/app')", r"unsupported transport call: api\.call"),
+        ("run = lambda: call('/app')", "unsupported transport reference: call"),
+        ("def get(url): return call(url)", "unsupported call URL: url"),
+        ("from urllib import request as api", "urllib request import alias"),
+        ("opener = urllib.request.build_opener()", r"unsupported transport call: urllib\.request"),
+        ("urllib.request.urlopen('/app')", r"unsupported transport call: urllib\.request"),
+        ("def get(): return forge_opener", "unsupported transport reference: forge_opener"),
+    ],
+)
+def test_transport_allow_list_refuses_undeclared_uses(fragment, message):
+    """Reject indirect transport references and forwarding through undeclared wrappers."""
+    with pytest.raises(AssertionError, match=rf"merge_train.py:\d+: {message}"):
+        rest_fault_routes(ast.parse(f"{fragment}\n"))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        'url += "/extra"',
+        'if enabled: url = "/app"',
+        'url: str = "/app"',
+        '(url := "/app")',
+        "for url in routes: pass",
+        "with make_url() as url: pass",
+        "try: setup()\n    except Error as url: pass",
+        "url, extra = parts",
+        "global url",
+        "nonlocal url",
+        "del url",
+    ],
+    ids=[
+        "augmented",
+        "branch",
+        "annotated",
+        "walrus",
+        "for",
+        "with",
+        "except",
+        "unpacking",
+        "global",
+        "nonlocal",
+        "delete",
+    ],
+)
+def test_transport_url_binding_refuses_rebinding(mutation):
+    """Inventory refuses any second or non-plain binding by name and source line."""
+    source = f'def get():\n    url = "/app"\n    {mutation}\n    return call(url, method="GET")\n'
+    line = 4 if mutation.startswith("try:") else 3
+    with pytest.raises(
+        AssertionError, match=rf"merge_train.py:{line}: unsupported URL binding: url"
+    ):
+        rest_fault_routes(ast.parse(source))
+
+
+def test_source_route_does_not_match_another_routes_placeholder():
+    """Keep literal contents endpoints intact when deriving source coverage."""
+    source = """def get(api, target):
+    return call(f"{api}/repos/{target['full_name']}/contents/fixed.txt", method="GET")
+"""
+    route = "GET /repos/{owner}/{repo}/contents/fixed.txt"
+    assert rest_fault_cases(ast.parse(source)) == {route}
+    assert route not in FAULT_SCENARIOS
+
+
+@pytest.mark.parametrize(
+    ("statement", "name"),
+    [
+        pytest.param('path += "/extra"', "path", id="augmented"),
+        pytest.param('path = path + "/x"', "path", id="assignment"),
+        pytest.param('(path := path + "/x")', "path", id="walrus"),
+        pytest.param("for path in (): pass", "path", id="for"),
+        pytest.param("del path", "path", id="delete"),
+        pytest.param("page = 1", "page", id="loop-rebinding"),
+        pytest.param(None, "unlisted", id="undeclared-f-string-name"),
+    ],
+)
+def test_transport_forwarding_rejects_undeclared_bindings(statement, name):
+    """Forwarding URL names must come only from the declared binding kind."""
+    source = script()
+    if statement is None:
+        old = "?per_page=100&page={page}"
+        assert source.count(old) == 1
+        planted = source.replace(old, "?per_page=100&page={unlisted}")
+        line = next(
+            line for line, text in enumerate(planted.splitlines(), 1) if "{unlisted}" in text
+        )
+    else:
+        planted = plant_statement(source, "pages", statement)
+        pages = top_level_functions(ast.parse(planted))["pages"]
+        line = pages.body[1].lineno
+    with pytest.raises(
+        AssertionError,
+        match=rf"merge_train.py:{line}: unsupported forwarding URL (?:binding|name): {name}",
+    ):
+        rest_fault_routes(ast.parse(planted))
+
+
+def artifact_fault_forge():
+    """A dependency update with a changed artifact and a live merge-state recheck."""
+    dep = pull(1, "BLOCKED", headRefName="renovate/demo-dep")
+    forge = Forge(repository(dep))
+    regenerable(forge, dep)
+    return forge
+
+
+def pull_fault_forge(state="CLEAN", *, queue=False, **fields):
+    """One pull request in a repository with optional merge queue support."""
+    return Forge(repository(pull(1, state, **fields), queue=queue))
+
+
+def issue_fault_forge():
+    """A recent train merge links to an open issue."""
+    forge = pull_fault_forge("BLOCKED")
+    forge.merged_pulls["fleet/app"] = [merged_pull(5, (3, "OPEN"))]
+    return forge
+
+
+def dependency_hold_fault_forge():
+    """A security update holds an armed dependency update."""
+    return Forge(repository(*held_pair(), rules=LINEAR))
+
+
+def unsigned_label_fault_forge():
+    """An unsigned dependency update asks the update bot to recreate it."""
+    forge = Forge(repository(unsigned_dep_pull(1, "CLEAN")))
+    forge.commits[1] = [("chore(deps): update foo to v2", 1)]
+    return forge
+
+
+def reviewed_fault_forge():
+    """A reviewed pull request and a clean follower can both be served."""
+    return Forge(
+        repository(*(pull(number, "CLEAN", author={"login": "person"}) for number in (1, 2)))
+    )
+
+
+def release_fault_forge(location="/repositories/7000"):
+    """An old name redirects to metadata for a release-enabled repository."""
+    forge = Forge(repository(pull(1, "CLEAN"), release=(True, True)))
+    forge.repository_moves["/repos/former/app"] = location
+    return forge
+
+
+HELD_DRAFT_SCENARIO = functools.partial(
+    pull_fault_forge, headRefName="renovate/go-snaps", isDraft=True, labels=(HOLD,)
+)
+RECREATE_LABEL_CASE = f"{ADD_LABEL_ROUTE} [_ask_update_bot_recreate]"
+
+FAULT_SCENARIOS = {
+    **dict.fromkeys(
+        (
+            "LanderLease",
+            "Merge",
+            "Merged",
+            "Commits",
+            "PullPage",
+            "PullPageWithStatus",
+            LIST_INSTALLATIONS_ROUTE,
+            "GET /app",
+            "GET /users/{login}",
+            INSTALLATION_REPOSITORIES_ROUTE,
+            MINT_ROUTE,
+            REVOKE_ROUTE,
+        ),
+        pull_fault_forge,
+    ),
+    **dict.fromkeys(
+        ("FileModes", "RetryHistory", COMPARE_ROUTE), functools.partial(retry_forge, "BEHIND")
+    ),
+    **dict.fromkeys(
+        (
+            ARTIFACTS_ROUTE,
+            ALLOWLIST_ROUTE,
+            ARCHIVE_ROUTE,
+            STORAGE_CASE,
+            FILE_CONTENTS_ROUTE,
+            "CreateCommit",
+            "MergeState",
+        ),
+        artifact_fault_forge,
+    ),
+    **dict.fromkeys(
+        (
+            JOBS_ROUTE,
+            f"{ADD_LABEL_ROUTE} [toggle_refresh]",
+            f"{REMOVE_LABEL_ROUTE} [toggle_refresh]",
+        ),
+        stopped_forge,
+    ),
+    **dict.fromkeys((ISSUE_COMMENT_ROUTE, ISSUE_CLOSE_ROUTE), issue_fault_forge),
+    **dict.fromkeys(
+        ("Arm", "PUT /repos/{owner}/{repo}/pulls/{id}/update-branch"),
+        functools.partial(pull_fault_forge, "BEHIND"),
+    ),
+    **dict.fromkeys(
+        ("Draft", f"{ADD_LABEL_ROUTE} [apply_dependency_holds]"), dependency_hold_fault_forge
+    ),
+    **dict.fromkeys(
+        ("Ready", f"{REMOVE_LABEL_ROUTE} [apply_dependency_holds]"), HELD_DRAFT_SCENARIO
+    ),
+    "Dequeue": functools.partial(pull_fault_forge, queue=True, isInMergeQueue=True),
+    "Disarm": functools.partial(
+        pull_fault_forge, "BLOCKED", autoMergeRequest=armed_squash("change 1 (#1)")
+    ),
+    "Enqueue": functools.partial(pull_fault_forge, queue=True),
+    "ReviewBodies": reviewed_fault_forge,
+    PERMISSION_ROUTE: functools.partial(_maintainer_forge, comments=(_maintainer_answer(),)),
+    RECREATE_LABEL_CASE: unsigned_label_fault_forge,
+    **dict.fromkeys((RELEASE_NAME_ROUTE, RELEASE_ID_CASE), release_fault_forge),
+    RELEASE_RENAMED_CASE: functools.partial(release_fault_forge, "/repos/fleet/app"),
+}
+FAULT_SETTINGS = {
+    **dict.fromkeys(
+        ("Dequeue", "Disarm", "PullPageWithStatus"), {"required_status": "lanes/booked"}
+    ),
+    **dict.fromkeys(
+        (RELEASE_NAME_ROUTE, RELEASE_RENAMED_CASE, RELEASE_ID_CASE), {"release_off": "former/app"}
+    ),
+    RECREATE_LABEL_CASE: {"min_age_days": "0"},
+}
+
+
+def fault_request_key(case):
+    """Translate a case ID to the forge's method, route and stage key."""
+    route, _, variant = case.partition(" [")
+    method, separator, path = route.partition(" ")
+    if not separator:
+        return "POST", f"/graphql [{case}]", "direct"
+    return method, path, "redirect" if variant == "redirect]" else "direct"
+
+
+def assert_declared_requests(case, forge, *, retry_key=None):
+    """Refuse request keys outside the declared scenarios and this scenario's retry."""
+    covered = {fault_request_key(scenario) for scenario in FAULT_SCENARIOS}
+    if retry_key is not None:
+        covered.add(retry_key)
+    assert not (missing := forge.request_ledger - covered), f"{case}: no fault cases for {missing}"
+
+
+def test_transport_runtime_refuses_forwarded_subscript_write(tmp_path):
+    """A URL changed through a declared name is still subject to the runtime allow-list."""
+    source = script()
+    planted = plant_statement(source, "pages", 'env["GITHUB_API_URL"] += "/extra"')
+    assert rest_fault_routes(ast.parse(planted)) == rest_fault_routes(ast.parse(source))
+    forge = Forge(repository())
+    key = ("GET", "/extra/app/installations", "direct")
+    forge.rest_faults[key] = [(200, b"[]")]
+
+    done, _ = train(tmp_path, forge, planted)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert forge.request_ledger == {key}
+    missing = {key}
+    with pytest.raises(AssertionError, match=re.escape(f"no fault cases for {missing}")):
+        assert_declared_requests("pages", forge)
+
+
+def test_transport_runtime_refuses_faulted_forwarded_subscript_write(
+    tmp_path, monkeypatch, capfd, record_property
+):
+    """Refuse a forwarded URL subscript write reached only while handling a delivered fault."""
+    source = script()
+    planted = plant_statement(
+        source,
+        "pages",
+        'if env.get("PLANTED_FAULT_HANDLING"):\n    env["GITHUB_API_URL"] += "/extra"',
+    )
+    assert rest_fault_routes(ast.parse(planted)) == rest_fault_routes(ast.parse(source))
+    path = tmp_path / "planted_train.py"
+    path.write_text(planted, encoding="utf-8")
+    follow_ups = []
+
+    class FaultFollowUpHandler(Handler):
+        """Serve the planted route only for this test."""
+
+        def _dispatch_app(self, request_path):
+            """Answer the planted GET without consuming another scenario fault."""
+            if request_path != "/extra/app/installations":
+                return super()._dispatch_app(request_path)
+            follow_ups.append((self.command, request_path))
+            self.answer(200, [])
+            return True
+
+    def load(path_to_run, patch):
+        """Load the plant and make a follow-up only after pages receives its refusal."""
+        mod = load_train(path_to_run, patch, source=path)
+        pages = mod.pages
+
+        def pages_with_follow_up(env, token, request_path, key=None):
+            """Follow up on the refused read and preserve its original disposition."""
+            try:
+                return pages(env, token, request_path, key)
+            except mod.RefusedError:
+                pages({**env, "PLANTED_FAULT_HANDLING": True}, token, request_path, key)
+                raise
+
+        mod.pages = pages_with_follow_up
+        return mod
+
+    monkeypatch.setattr(sys.modules[__name__], "Handler", FaultFollowUpHandler)
+    case = LIST_INSTALLATIONS_ROUTE
+    missing = {("GET", "/extra/app/installations", "direct")}
+    with pytest.raises(AssertionError, match=re.escape(f"{case}: no fault cases for {missing}")):
+        run_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case, load=load)
+        pytest.fail(f"faulted sweep accepted undeclared requests: {follow_ups}")
+    assert follow_ups == [("GET", "/extra/app/installations")]
+
+
+def fault_case_caller(case):
+    """Identify the expected caller when several write sites use the same route."""
+    _, _, variant = case.partition(" [")
+    return variant.removesuffix("]") if variant and variant != "redirect]" else None
+
+
+def graphql_fault_attempts(case, train_mod, patch, path):
+    """Use the document's read policy and include both pull-page splits."""
+    docs = train_graphql_documents(
+        train_mod, load_rules(path), file_modes_document(train_mod, patch)
+    )
+    (document,) = (doc for doc in docs if train_mod.graphql_name(doc) == case)
+    if document.lstrip().startswith("mutation"):
+        return 1
+    splits = 2 if case in {"PullPage", "PullPageWithStatus"} else 0
+    return train_mod.READ_ATTEMPTS + splits
+
+
+def observe_rest_fault_callers(train_mod, patch, route):
+    """Record the immediate caller of each final refusal on a shared REST route."""
+    call = train_mod.call
+    callers = []
+
+    def observed(url, token=None, method="POST", *args, **kwargs):
+        """Forward the call and record the source function if the route is refused."""
+        try:
+            return call(url, token, method, *args, **kwargs)
+        except train_mod.RefusedError:
+            if rest_route(method, url) == route:
+                callers.append(sys._getframe(1).f_code.co_name)
+            raise
+
+    patch.setattr(train_mod, "call", observed)
+    return callers
+
+
+def observe_sweep_refusals(train_mod, patch):
+    """Capture the sweep's refusals before the summary and annotation render them."""
+    sweep = train_mod.sweep
+    refusals = []
+
+    def observed(*args):
+        """Forward the sweep result and record the entries it passes to the renderer."""
+        result = sweep(*args)
+        refusals.extend(result[2])
+        return result
+
+    patch.setattr(train_mod, "sweep", observed)
+    return refusals
+
+
+ANNOTATION_COMMAND = re.compile(r"::(?:error|warning|notice)\b")
+
+
+def assert_one_line_fault_output(text):
+    """Reject traces, broken fault bodies and inline or duplicated workflow commands."""
+    assert "Traceback" not in text
+    for line in text.splitlines():
+        if "second line" in line:
+            assert "first line" in line.partition("second line")[0], line
+        if command := ANNOTATION_COMMAND.search(line):
+            assert command.start() == 0 and line.count("::") == 2, line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "note: second line",
+        "| #1 | CLEAN | second line |",
+        "- ::warning title=Merge train::in a report row",
+        "::warning title=Merge train::first ::notice title=Again::second",
+    ],
+)
+def test_fault_output_check_rejects_broken_lines(line):
+    """The scanner rejects broken copies even after an intact diagnostic."""
+    with pytest.raises(AssertionError):
+        assert_one_line_fault_output(f"first line second line\n{line}")
+
+
+def fault_destinations(env, captured):
+    """Read every log and output destination from this sweep."""
+    files = dict(zip(("summary", "output", "release"), REPORT_FILES, strict=True))
+    paths = {name: Path(env[key]) for name, key in files.items() if key in env}
+    return {
+        "stdout": captured.out,
+        "stderr": captured.err,
+        **{
+            name: path.read_text(encoding="utf-8") if path.exists() else ""
+            for name, path in paths.items()
+        },
+    }
+
+
+def assert_fault_diagnostics(destinations, **expected):
+    """Require the complete expected diagnostic lines in each destination, and no extra copies."""
+    for name, text in destinations.items():
+        assert_one_line_fault_output(text)
+        found = [line for line in text.splitlines() if "HTTP 502" in line or "first line" in line]
+        assert found == expected.get(name, []), (name, found, expected)
+
+
+def fault_reason(key, forge, origin):
+    """Reconstruct the HTTP refusal from the last faulted request."""
+    method, path = forge.fault_requests[-1]
+    reason = f"{method} {origin}{path}: HTTP 502 {FORGE_FAULT_LINE}"
+    return f"graphql {key}: {reason}" if path == "/graphql" else reason
+
+
+FAULT_NOTES = {
+    "LanderLease": ("CLEAN", "lander lease unreadable: RefusedError: "),
+    "ReviewBodies": ("CLEAN", "review body: cannot read: "),
+    "RetryHistory": ("BEHIND", "held for retry: history unreadable: "),
+    "FileModes": ("BEHIND", "held for retry: history unreadable: "),
+    COMPARE_ROUTE: ("BEHIND", "held for retry: history unreadable: "),
+    PERMISSION_ROUTE: ("CLEAN", "review body: cannot read the right of maintainer: "),
+    **dict.fromkeys(
+        (ARTIFACTS_ROUTE, ARCHIVE_ROUTE, STORAGE_ROUTE, FILE_CONTENTS_ROUTE),
+        ("BLOCKED", "generated files refused: "),
+    ),
+}
+RELEASE_FAULTS = {RELEASE_NAME_ROUTE, RELEASE_RENAMED_CASE, RELEASE_ID_CASE}
+
+
+def assert_note_disposition(key, forge, reason, destinations):
+    """Verify a held pull or artifact note in both reports and the resulting writes."""
+    state, prefix = FAULT_NOTES[key]
+    note = prefix + reason
+    row = f"| #1 | {state} | {note} |"
+    lines = [row]
+    expected_writes = []
+    if key == "LanderLease":
+        lines.insert(0, f"### fleet/app: {note}")
+    elif key == "ReviewBodies":
+        expected_writes = [landed(2)]
+    elif key in {"RetryHistory", "FileModes", COMPARE_ROUTE}:
+        expected_writes = [updated(2)]
+    assert forge.writes == expected_writes
+    assert_fault_diagnostics(destinations, stdout=lines, summary=lines)
+
+
+def assert_fault_warning(key, forge, reason, destinations):
+    """Verify report warning placement and that the sweep continued as intended."""
+    prefix = "::warning title=Merge train::"
+    assert forge.writes == [landed(1)]
+    if key == REVOKE_ROUTE:
+        warning = f"{prefix}token not revoked, it expires within the hour: {reason}"
+        assert len(forge.revoked) == len(forge.tokens) - 1
+        assert_fault_diagnostics(destinations, stdout=[warning])
+    else:
+        warning = (
+            f"{prefix}release_off entry former/app: HTTP 502; release train off for installation 7"
+        )
+        assert "Release train off: fleet/app" in destinations["summary"].splitlines()
+        assert len(forge.revoked) == len(forge.tokens)
+        assert json.loads(destinations["release"])["releases"] == []
+        assert_fault_diagnostics(destinations, stdout=[warning], summary=[warning])
+
+
+def assert_fatal_fault(case, reason, refusals, destinations):
+    """Check the one error annotation and the matching summary refusal when written."""
+    prefix = "::error title=Merge train refused::"
+    if case == LIST_INSTALLATIONS_ROUTE:
+        assert refusals == []
+        assert not any(destinations[name] for name in ("summary", "output", "release"))
+        assert_fault_diagnostics(destinations, stdout=[prefix + reason])
+        return
+    (refusal,) = refusals
+    assert refusal.splitlines() == [refusal]
+    if case in {"PullPage", "PullPageWithStatus"}:
+        operation, _, request = reason.partition(": ")
+        initial = reason.removesuffix(" second line")
+        reason = (
+            f"{operation}: Split open pull request page to 6 after {initial}: "
+            f"page size 6, cursor start: {request}"
+        )
+    account_faults = {"GET /app", "GET /users/{login}", INSTALLATION_REPOSITORIES_ROUTE, MINT_ROUTE}
+    target = "fleet" if case in account_faults else "fleet/app"
+    if case == RECREATE_LABEL_CASE:
+        reason = f"#1: could not ask the update bot to recreate it: {reason}"
+    assert refusal == f"{target}: {reason}"
+    annotation = prefix + refusal.replace("%", "%25")
+    assert_fault_diagnostics(
+        destinations, stdout=[f"- {refusal}", annotation], summary=[f"- {refusal}"]
+    )
+
+
+def run_fault_scenario(tmp_path, forge, case, train_mod, monkeypatch, capfd, caller=None):
+    """Run a clean or faulted scenario with the same fake clock and transport."""
+    settings = {**FAULT_SETTINGS.get(case, {}), "release_file": str(tmp_path / "releases.json")}
+    with train_environment(tmp_path, forge, settings) as env:
+        clock = types.SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None, time=time.time)
+        monkeypatch.setattr(train_mod, "time", clock)
+        opener = urllib.request.build_opener
+        monkeypatch.setattr(
+            urllib.request,
+            "build_opener",
+            lambda *handlers: opener(urllib.request.ProxyHandler({}), *handlers),
+        )
+        refusals = observe_sweep_refusals(train_mod, monkeypatch)
+        route = case.partition(" [")[0]
+        callers = observe_rest_fault_callers(train_mod, monkeypatch, route) if caller else []
+        code = train_mod.main(env)
+    return (
+        code,
+        refusals,
+        callers,
+        fault_destinations(env, capfd.readouterr()),
+        env["GITHUB_API_URL"],
+    )
+
+
+def assert_fault_disposition(case, forge, code, refusals, output, origin):
+    """Check the scenario's exit, writes, exact diagnostics and release destinations."""
+    route = case.partition(" [")[0]
+    reason = fault_reason(route, forge, origin)
+    if route in FAULT_NOTES or case in RELEASE_FAULTS or case == REVOKE_ROUTE:
+        assert code == 0 and refusals == [], output
+        if route in FAULT_NOTES:
+            assert_note_disposition(route, forge, reason, output)
+        else:
+            assert_fault_warning(case, forge, reason, output)
+    else:
+        assert code == 1, output
+        assert_fatal_fault(case, reason, refusals, output)
+    if case != LIST_INSTALLATIONS_ROUTE:
+        (line,) = output["output"].splitlines()
+        assert line.startswith("releases=")
+        assert (
+            json.loads(line.removeprefix("releases=")) == json.loads(output["release"])["releases"]
+        )
+
+
+def assert_faults_consumed(case, faults, retries, consumed, attempts):
+    """Report any scenario fault that still has a response queued."""
+    assert not faults and not retries and consumed == attempts, (
+        f"{case}: consumed {consumed} of {attempts} faults"
+    )
+
+
+@pytest.mark.parametrize("case", sorted(FAULT_SCENARIOS))
+def test_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case):
+    """Require faults for every clean request, then exhaust this case's fault queue."""
+    run_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case)
+
+
+def run_forge_fault_sweep(tmp_path, monkeypatch, capfd, record_property, case, *, load=load_train):
+    """Run both sides of a sweep with the same train source."""
+    key = fault_request_key(case)
+    clean = FAULT_SCENARIOS[case]()
+    clean_path = tmp_path / "clean"
+    clean_path.mkdir()
+    with monkeypatch.context() as patch:
+        train_mod = load(clean_path, patch)
+        code, refusals, _, output, _ = run_fault_scenario(
+            clean_path, clean, case, train_mod, patch, capfd
+        )
+    assert_declared_requests(case, clean)
+    assert code == 0 and not refusals, output
+    assert key in clean.request_ledger, f"{case}: clean run never reached {key}"
+
+    forge = FAULT_SCENARIOS[case]()
+    train_mod = load(tmp_path, monkeypatch)
+    attempts = train_mod.READ_ATTEMPTS if key[0] == "GET" else 1
+    if key[1].startswith("/graphql ["):
+        attempts = graphql_fault_attempts(case, train_mod, monkeypatch, tmp_path)
+    response = (502, FORGE_FAULT_BODY)
+    faults = [response] * attempts
+    retries = []
+    retry_key = None
+    if key[2] == "redirect":
+        faults = [response]
+        retries = [response] * (attempts - 1)
+        retry_key = (*key[:2], "direct")
+        if retry_key == fault_request_key(RELEASE_NAME_ROUTE):
+            # The old name uses the same route template. Queue retries when it issues Location.
+            queue_faults_after_location(forge, retry_key, retries)
+        else:
+            forge.rest_faults[retry_key] = retries
+    forge.rest_faults[key] = faults
+    caller = fault_case_caller(case)
+    code, refusals, callers, output, origin = run_fault_scenario(
+        tmp_path, forge, case, train_mod, monkeypatch, capfd, caller
+    )
+    assert_declared_requests(case, forge, retry_key=retry_key)
+    consumed = len(forge.fault_requests)
+    record_property("request_key", key)
+    record_property("faults_consumed", consumed)
+    assert_faults_consumed(case, faults, retries, consumed, attempts)
+    assert callers == ([caller] if caller else [])
+    assert_fault_disposition(case, forge, code, refusals, output, origin)
+
+
+def test_report_escapes_pipe_in_notes_cell(tmp_path, monkeypatch):
+    """A literal pipe in the train's note preserves the three table cells."""
+    mod = load_train(tmp_path, monkeypatch)
+    p = pull(1, "CLEAN")
+    records = mod.report("fleet/app", repository(p), [(p, "land")], {1: "left | right"}, "done")
+    assert pull_note_cell("\n".join(records), 1, "CLEAN") == r"left \| right"
+
+
+@pytest.mark.parametrize("suffix", ["", " | tail"], ids=["newline", "newline-and-pipe"])
+def test_pull_page_merge_state_stays_in_one_cell(tmp_path, suffix):
+    """The pull page's multiline merge state renders in one row in both reports."""
+    state = "DIRTY\r\nsecond line" + suffix
+    forge = Forge(repository(pull(1, state)))
+    done, summary = train(tmp_path, forge)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    expected = "DIRTY second line" + suffix.replace("|", r"\|")
+    for text in (done.stdout, summary):
+        assert pull_note_cell(text, 1, expected) == f"merge state {expected}"
+
+
+def test_emit_writes_each_record_on_one_line(tmp_path, monkeypatch, capfd):
+    """Both destinations flatten raw records and preserve account table cells."""
+    mod = load_train(tmp_path, monkeypatch)
+    summary_path = tmp_path / "summary.md"
+    env = watch_report_files({"GITHUB_STEP_SUMMARY": str(summary_path)})
+    accounts = {
+        "active|account": {"repositories": 4, "landed": 3, "updated": 2, "refused": 1},
+        "stopped|account": "suspended\r\nsecond cell |",
+    }
+    records = mod.summary(env, accounts, [], [], [], [], [], [])
+    mod.emit(env, [*records, "note: first line\r\nsecond line", ""])
+    stdout, stderr = capfd.readouterr()
+    assert stderr == ""
+    assert summary_path.read_text(encoding="utf-8") == stdout
+    assert stdout.endswith("note: first line second line\n\n")
+    assert r"| active\|account | 4 | 3 | 2 | 1 |" in stdout.splitlines()
+    assert r"| stopped\|account | suspended second cell \| | | | |" in stdout.splitlines()
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["immediate", "queued"])
+def test_annotation_title_stays_on_one_line(tmp_path, monkeypatch, capfd, queued):
+    """A multiline annotation title remains on the same line as its diagnostic."""
+    mod = load_train(tmp_path, monkeypatch)
+    records = [] if queued else None
+    written = []
+    if not queued:
+        monkeypatch.setattr(mod, "write_records", written.extend)
+
+    mod.annotate("warning", "first line\r\nsecond line", "message", records=records)
+    expected = "::warning title=first line second line::message\n"
+    if not queued:
+        assert written == [expected.removesuffix("\n")]
+        return
+
+    assert records == [expected.removesuffix("\n")]
+    assert capfd.readouterr().out == ""
+    summary = tmp_path / "summary"
+    mod.emit(watch_report_files({"GITHUB_STEP_SUMMARY": str(summary)}), records)
+    assert summary.read_text(encoding="utf-8") == expected
+    captured = capfd.readouterr()
+    assert captured.out == expected
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("field", ["data", "title"])
+def test_annotation_escapes_runner_fields(tmp_path, monkeypatch, capfd, field):
+    """Runner decoding preserves literal escapes and the title's property punctuation."""
+    mod = load_train(tmp_path, monkeypatch)
+    title = "forge:\r\nrefused, retry"
+    message = "literal %0A and %25\r\nsecond line"
+    if field == "title":
+        records = []
+        mod.annotate("warning", title, message, records=records)
+        summary = tmp_path / "summary"
+        mod.emit(watch_report_files({"GITHUB_STEP_SUMMARY": str(summary)}), records)
+    else:
+        mod.annotate("warning", title, message)
+
+    stdout, stderr = capfd.readouterr()
+    assert stderr == ""
+    (line,) = stdout.splitlines()
+    encoded_title, separator, data = line.removeprefix("::warning title=").partition("::")
+    assert separator == "::"
+    encoded = data if field == "data" else encoded_title
+    if field == "title":
+        assert encoded_title == "forge%3A refused%2C retry"
+    for escape, char in (("%0A", "\n"), ("%0D", "\r"), ("%3A", ":"), ("%2C", ","), ("%25", "%")):
+        encoded = encoded.replace(escape, char)
+    assert encoded == mod.refusal_line(message if field == "data" else title)
+    if field == "title":
+        assert summary.read_text(encoding="utf-8") == (
+            "::warning title=forge: refused, retry::literal %0A and %25 second line\n"
+        )
+    assert mod.note_cell(message) == "literal %0A and %25 second line"
+
+
+REPORT_SINK = "write_records"
+PIPE_WRITER = "write_key"  # The app key goes to an openssl pipe.
+RAW_WRITES = {
+    "print",
+    "write",
+    "write_text",
+    "write_bytes",
+    "writelines",
+    "json.dump",
+    "logging.basicConfig",
+    "logging.handlers",
+    "logging.log",
+    "logging.error",
+    "logging.warning",
+    "logging.info",
+    "logging.debug",
+    "logging.critical",
+    "addHandler",
+    "shutil.copy",
+    "shutil.copy2",
+    "shutil.copyfile",
+    "shutil.copyfileobj",
+    "shutil.copytree",
+    "shutil.move",
+    "os.open",
+}
+WRITER_OPENS = {"open", "builtins.open", "io.open", "os.fdopen"}
+WRITER_MODULES = {"builtins", "io", "json", "logging", "os", "shutil"}
+
+
+def raw_writer_name(function):
+    """Recognize sink APIs regardless of whether a reference invokes or aliases them."""
+    name = function.rsplit(".", 1)[-1]
+    return (
+        function in RAW_WRITES
+        or name in RAW_WRITES
+        or (function.startswith("logging.") and name.endswith("Handler"))
+    )
+
+
+def writes_output(node, parent):
+    """Recognize raw output functions and opens with writable or unresolved modes."""
+    if isinstance(node, ast.alias):
+        if isinstance(parent, ast.ImportFrom):
+            module = parent.module or ""
+            return module.split(".")[0] in WRITER_MODULES and (
+                raw_writer_name(f"{module}.{node.name}") or node.name in {"open", "fdopen", "*"}
+            )
+        return bool(node.asname) and node.name.split(".")[0] in WRITER_MODULES
+    if not isinstance(node, (ast.Attribute, ast.Name)):
+        return False
+    function = ast.unparse(node)
+    if raw_writer_name(function):
+        return True
+    name = function.rsplit(".", 1)[-1]
+    if name not in {"open", "fdopen"} or function == "forge_opener.open":
+        return False
+    if not isinstance(parent, ast.Call) or parent.func is not node:
+        return True
+    index = int(function in WRITER_OPENS)
+    mode = call_argument(parent, index, "mode")
+    if mode is None:
+        return any(isinstance(arg, ast.Starred) for arg in parent.args) or any(
+            arg.arg is None for arg in parent.keywords
+        )
+    return not isinstance(mode, ast.Constant) or any(flag in str(mode.value) for flag in "wax+")
+
+
+def annotation_fragment(node, parents):
+    """Reserve workflow command delimiters and split delimiter fragments for annotate."""
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        return False
+    text = node.value
+    parent = parents[node]
+    if (
+        isinstance(parent, ast.Call)
+        and ast.unparse(parent.func) == "re.compile"
+        and not ANNOTATION_COMMAND.search(text)
+    ):
+        text = text.replace("(?::", "(?:")
+    if text == ":":
+        keyword = parents[parent]
+        call = parents.get(keyword)
+        return not (
+            isinstance(parent, ast.Tuple)
+            and isinstance(keyword, ast.keyword)
+            and keyword.arg == "separators"
+            and isinstance(call, ast.Call)
+            and ast.unparse(call.func) == "json.dumps"
+        )
+    return "::" in text or (text.startswith(":") and not text[1].isspace())
+
+
+def writer_violations(tree):
+    """Find writes and command fragments outside their exact top-level definitions."""
+    functions = top_level_functions(tree)
+    writers = {functions[REPORT_SINK], functions[PIPE_WRITER]}
+    writer_body = {
+        node: writer for writer in writers for stmt in writer.body for node in ast.walk(stmt)
+    }
+    annotation = functions["annotate"]
+    annotation_body = {node for stmt in annotation.body for node in ast.walk(stmt)}
+    parents = parent_nodes(tree)
+    found = []
+    for scope, node in scoped_nodes(tree):
+        parent = parents.get(node)
+        name = getattr(scope, "name", type(scope).__name__)
+        writer = writer_body.get(node)
+        if scope is node and writer is not None:
+            found.append((node.lineno, f"nested {name} in {writer.name}"))
+        if writes_output(node, parent) and (
+            writer is not scope
+            or (
+                scope is functions[PIPE_WRITER]
+                and ast.unparse(node) not in {"os.fdopen", "pipe.write"}
+            )
+        ):
+            found.append((node.lineno, f"{name} writes through {ast.unparse(node)}"))
+        if (scope is not annotation or node not in annotation_body) and annotation_fragment(
+            node, parents
+        ):
+            found.append((node.lineno, f"{name} builds a workflow annotation"))
+    return [f"{SCRIPT}:{line}: {message}" for line, message in found]
+
+
+def test_train_writes_only_through_declared_writers():
+    """Tripwire for listed writes, opens, import aliases and nested definitions in the sinks."""
+    assert writer_violations(ast.parse(script())) == []
+
+
+@pytest.mark.parametrize(
+    ("statement", "target", "message"),
+    [
+        ('print("line")', "emit", "emit writes through print"),
+        ('sys.stderr.write("line")', "summary", "summary writes through sys.stderr.write"),
+        ('os.write(1, b"line")', "summary", "summary writes through os.write"),
+        ('Path("file").write_text("line")', "summary", "summary writes through"),
+        ('Path("file").write_bytes(b"line")', "summary", "summary writes through"),
+        ('open("file", "w")', "summary", "summary writes through open"),
+        ('io.open("file", mode)', "summary", "summary writes through io.open"),
+        ('io.open("file", **options)', "summary", "summary writes through io.open"),
+        ('os.fdopen(fd, "a")', "summary", "summary writes through os.fdopen"),
+        ("json.dump(data, handle)", "summary", "summary writes through json.dump"),
+        ("shutil.copyfile(src, dst)", "summary", "summary writes through shutil.copyfile"),
+        ("logging.FileHandler(path)", "summary", "summary writes through logging.FileHandler"),
+        ("from logging import FileHandler as log", "summary", "summary writes through FileHandler"),
+        ('def emit(): sys.stdout.write("line")', "summary", "emit writes through sys.stdout.write"),
+        ('def emit(): return "line"', REPORT_SINK, "nested emit in write_records"),
+        ('action = lambda: "line"', REPORT_SINK, "nested Lambda in write_records"),
+        ("class Writer: pass", PIPE_WRITER, "nested Writer in write_key"),
+        ('sys.stdout.write("line")', PIPE_WRITER, "write_key writes through sys.stdout.write"),
+    ],
+)
+def test_writer_boundary_refuses_raw_writes_and_nested_scopes(statement, target, message):
+    """Tripwire for listed write APIs, aliases, and nested functions, classes and lambdas."""
+    source = script()
+    tree = ast.parse(plant_statement(source, target, statement))
+    assert any(message in error for error in writer_violations(tree))
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        '"::notice title=Train::line"',
+        '":" + ":warning title=Train::line"',
+        '"%s%s%s" % (":", ":", "error title=Train")',
+        '"{}{}notice".format(":", ":")',
+        '"".join((":", ":", "warning"))',
+        "f\"{':' * 2}error\"",
+    ],
+    ids=["literal", "concatenation", "percent", "format", "join", "f-string"],
+)
+def test_annotation_boundary_refuses_command_fragments(expression):
+    """Tripwire for literal commands and colons in concatenation, format, joins and f-strings."""
+    tree = ast.parse(f"{script()}\nCOMMAND = {expression}\n")
+    assert any("Module builds a workflow annotation" in error for error in writer_violations(tree))
+
+
+def raw_table_cells(tree):
+    """Find fields that can introduce a row break or an extra cell."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        literals = "".join(value.value for value in node.values if isinstance(value, ast.Constant))
+        if not literals.startswith("|"):
+            continue
+        for part in node.values:
+            if isinstance(part, ast.FormattedValue) and not (
+                isinstance(part.value, ast.Call)
+                and ast.unparse(part.value.func) == "note_cell"
+                and len(part.value.args) == 1
+                and not part.value.keywords
+                and part.conversion == -1
+                and part.format_spec is None
+            ):
+                found.append(f"{SCRIPT}:{part.value.lineno}: {ast.unparse(part.value)}")
+    return found
+
+
+def test_table_rows_escape_every_cell():
+    """Tripwire for table-row f-strings whose interpolations bypass note_cell."""
+    assert raw_table_cells(ast.parse(script())) == []
+
+
+def plant_statement(source, target, statement, *, after=0):
+    """Insert an executable test statement after a known function-body statement."""
+    function = top_level_functions(ast.parse(source))[target]
+    lines = source.splitlines(keepends=True)
+    lines.insert(
+        function.body[after].end_lineno, "".join(f"    {line}\n" for line in statement.splitlines())
+    )
+    return "".join(lines)
+
+
+TRAIN_LINE_SHAPE_PLANTS = {
+    "inherited-fds": (
+        "summary",
+        (
+            'subprocess.run([sys.executable, "-c", '
+            "\"print('note: first', 'second', sep=chr(10))\"], check=True, timeout=5)"
+        ),
+        r"train stdout:2: unrecognized report record: 'second'",
+        "DIRTY",
+        0,
+    ),
+    "logging": (
+        "summary",
+        'import logging\nlogging.getLogger("x").warning("a\\nb")',
+        r"train stderr:1: unexpected stderr record: 'a'",
+        "DIRTY",
+        0,
+    ),
+    "sink-comprehension": (
+        REPORT_SINK,
+        '[sys.stdout.write("note: first\\nsecond\\n") for raw in (1,)]',
+        r"train stdout:2: unrecognized report record: 'second'",
+        "DIRTY",
+        0,
+    ),
+    "concatenated-row": (
+        "report",
+        (
+            'state = rows[0][0]["mergeStateStatus"]\n'
+            'lines.append("| #1 | " + state + " | no action |")'
+        ),
+        r"train stdout:\d+: expected 3 table cells, got 4",
+        "DIRTY | extra",
+        1,
+    ),
+    "annotation": (
+        "summary",
+        (
+            'marker = ": ".strip() * 2\n'
+            'title = "first\\r\\nsecond"\n'
+            'command = marker + "warning title=" + title + marker + "message\\n"\n'
+            'subprocess.run([sys.executable, "-c", '
+            '"import sys; sys.stdout.write(sys.argv[1])", command], check=True, timeout=5)'
+        ),
+        r"train stdout:1: forbidden record separator or NUL",
+        "DIRTY",
+        0,
+    ),
+}
+
+RELEASE_LINE_SHAPE_PLANTS = {
+    "workflow-output": ("GITHUB_OUTPUT", b"releases=[\n]\n", "1: expected compact releases= JSON"),
+    "two-release-records": (
+        "GITHUB_OUTPUT",
+        b'releases=[]\nreleases=[{"tag":"v1"}]\n',
+        "2: more than one releases= record",
+    ),
+    "spaced-release": (
+        "TRAIN_RELEASE_FILE",
+        b'{"releases": []}',
+        "1: expected one compact JSON document",
+    ),
+    "two-release-documents": (
+        "TRAIN_RELEASE_FILE",
+        b"{}\n{}",
+        "1: expected one compact JSON document",
+    ),
+}
+
+
+@pytest.fixture
+def line_shape_plant(request):
+    """Enable one deliberately failing inner test by its full case name."""
+    if os.environ.get("HORISTES_LINE_SHAPE_PLANT") != request.node.name:
+        pytest.skip("enabled only in the named line-shape plant session")
+
+
+def line_shape_train_source(case):
+    """Build the plant that emits through the actual train subprocess."""
+    target, statement, _, _, after = TRAIN_LINE_SHAPE_PLANTS[case]
+    return plant_statement(script(), target, statement, after=after)
+
+
+@pytest.mark.parametrize("case", TRAIN_LINE_SHAPE_PLANTS)
+def test_line_shape_train_plant(tmp_path, line_shape_plant, case):
+    """Emit output whose writer passes the static tripwires."""
+    state = TRAIN_LINE_SHAPE_PLANTS[case][3]
+    done, _ = train(tmp_path, Forge(repository(pull(1, state))), line_shape_train_source(case))
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_line_shape_fd_stderr_plant(line_shape_plant, capfd):
+    """Write inherited stderr and drain the descriptors during the call phase."""
+    subprocess.run(
+        [sys.executable, "-c", "import sys; sys.stderr.write('a\\nb\\n')"], check=True, timeout=5
+    )
+    capfd.readouterr()
+
+
+def test_line_shape_step_summary_plant(tmp_path, line_shape_plant):
+    """Write a carriage return to the named summary without writing stdout."""
+    path = tmp_path / "any-summary-name"
+    watch_report_files({"GITHUB_STEP_SUMMARY": str(path)})
+    path.write_bytes(b"review bots: first\r\nsecond\n")
+
+
+@pytest.mark.parametrize("case", RELEASE_LINE_SHAPE_PLANTS)
+def test_line_shape_release_output_plant(tmp_path, line_shape_plant, case):
+    """Write the selected malformed payload to its release destination."""
+    name, content, _ = RELEASE_LINE_SHAPE_PLANTS[case]
+    path = tmp_path / "release-output"
+    watch_report_files({name: str(path)})
+    path.write_bytes(content)
+
+
+def test_line_shape_byte_cap_plant(line_shape_plant):
+    """Write one byte over the cap using only valid note records on inherited stdout."""
+    count, extra = divmod(LINE_SHAPE_MAX_BYTES + 1 - len(b"note: \n"), len(b"note: x\n"))
+    command = (
+        "import sys; count, extra = map(int, sys.argv[1:]); "
+        "sys.stdout.buffer.write(b'note: x\\n' * count + b'note: ' + b'x' * extra + b'\\n')"
+    )
+    subprocess.run([sys.executable, "-c", command, str(count), str(extra)], check=True, timeout=5)
+
+
+def test_line_shape_child_summary_fits_cap(tmp_path):
+    """A 40 KiB file fits when both the child wrapper and teardown snapshot it."""
+    path = tmp_path / "summary.md"
+    env = watch_report_files({"GITHUB_STEP_SUMMARY": str(path)})
+    write = (
+        "import sys; from pathlib import Path; Path(sys.argv[1]).write_bytes(b'note: x\\n' * 5120)"
+    )
+    done = run_train_process(
+        [sys.executable, "-c", write, str(path)], descriptor="train", env=env, timeout=5
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert path.stat().st_size == 40 * 1024
+
+
+def test_line_shape_summary_over_cap_names_destination(tmp_path, caplog):
+    """One oversized file snapshot fails with its destination and full byte count."""
+    path = tmp_path / "summary.md"
+    size = LINE_SHAPE_MAX_BYTES + 1
+    path.write_bytes(b"note: " + b"x" * (size - len(b"note: \n")) + b"\n")
+    capture = LineShapeCapture(lambda: ("", ""), caplog, None)
+    capture.watch_files({"GITHUB_STEP_SUMMARY": str(path)})
+    message = f"GITHUB_STEP_SUMMARY ({path}):1: {size} bytes exceeds the "
+    with pytest.raises(LineShapeError, match=re.escape(message)):
+        capture.check()
+
+
+@pytest.mark.usefixtures("line_shape")
+@pytest.mark.parametrize(
+    ("plant", "message"),
+    [
+        *(
+            pytest.param(f"test_line_shape_train_plant[{case}]", plant[2], id=case)
+            for case, plant in TRAIN_LINE_SHAPE_PLANTS.items()
+        ),
+        pytest.param(
+            "test_line_shape_fd_stderr_plant",
+            r"fd stderr:1: unexpected stderr record",
+            id="fd-stderr",
+        ),
+        pytest.param(
+            "test_line_shape_step_summary_plant",
+            r"GITHUB_STEP_SUMMARY .*:1: forbidden record separator",
+            id="step-summary",
+        ),
+        *(
+            pytest.param(
+                f"test_line_shape_release_output_plant[{case}]", rf"{name} .*:{message}", id=case
+            )
+            for case, (name, _, message) in RELEASE_LINE_SHAPE_PLANTS.items()
+        ),
+        pytest.param(
+            "test_line_shape_byte_cap_plant",
+            rf"fd stdout:1: {LINE_SHAPE_MAX_BYTES + 1} bytes exceeds the "
+            rf"{LINE_SHAPE_MAX_BYTES}-byte capture limit",
+            id="byte-cap",
+        ),
+    ],
+)
+def test_line_shape_rejects_unguarded_output(plant, message):
+    """Require the actual autouse teardown to reject a plant that passed its call phase."""
+    if plant.startswith("test_line_shape_train_plant["):
+        case = plant.partition("[")[2].removesuffix("]")
+        tree = ast.parse(line_shape_train_source(case))
+        assert writer_violations(tree) == []
+        assert raw_table_cells(tree) == []
+    env = {**os.environ, "HORISTES_LINE_SHAPE_PLANT": plant, "PYTHONDONTWRITEBYTECODE": "1"}
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-p",
+        "no:cacheprovider",
+        "-vv",
+        "--show-capture=no",
+        f"tests/test_merge_train.py::{plant}",
+    ]
+    done = run_train_process(
+        command, descriptor=LINE_SHAPE_PLANT_PYTEST, env=env, timeout=120, cwd=ROOT
+    )
+    output = done.stdout + done.stderr
+    assert done.returncode == 1, output
+    assert f"::{plant} PASSED" in output, output
+    assert f"ERROR at teardown of {plant}" in output, output
+    assert re.search(r"LineShapeError: " + message, output), output
+    assert "1 passed, 1 error" in output, output
+
+
+@pytest.mark.parametrize(
+    "text", [pytest.param("releases=[]\n", id="one-record"), pytest.param("", id="empty-text")]
+)
+def test_line_shape_accepts_workflow_output(text):
+    """Accept zero or one compact releases= record."""
+    check_line_shape("GITHUB_OUTPUT", text)
+
+
+@pytest.mark.parametrize(
+    "separator", sorted(RECORD_CONTROLS), ids=lambda value: f"U+{ord(value):04X}"
+)
+def test_emit_flattens_record_controls(tmp_path, monkeypatch, capfd, separator):
+    """Check the flattened value in both destinations for every forbidden separator."""
+    mod = load_train(tmp_path, monkeypatch)
+    path = tmp_path / "summary"
+    mod.emit(
+        watch_report_files({"GITHUB_STEP_SUMMARY": str(path)}), [f"note: first{separator}second"]
+    )
+    assert capfd.readouterr().out == "note: first second\n"
+    assert path.read_bytes() == b"note: first second\n"
+
+
+def test_table_cell_guard_refuses_raw_interpolation():
+    """Tripwire for a table-row f-string mixing escaped and raw interpolations."""
+    tree = ast.parse('row = f"| {note_cell(account)} | {raw_tally} |"')
+    assert raw_table_cells(tree) == [f"{SCRIPT}:1: raw_tally"]
 
 
 @pytest.mark.parametrize("operation", ["RetryHistory", "FileModes"])
@@ -11272,17 +14584,32 @@ def test_lander_lease_unchanged_lands_after_one_read(tmp_path, lease):
         ({"errors": [{"message": "lease read refused"}]}, "lease read refused"),
         ({"data": {"repository": {}}}, "landerLease"),
         ({"data": {"repository": None}}, "NoneType"),
+        pytest.param(None, "HTTP 502 first line second line", id="multiline-502"),
     ],
 )
 def test_lander_lease_unreadable_lands_nothing(tmp_path, answer, cause):
     forge = Forge(repository(pull(1, "CLEAN"), pull(2, "CLEAN")))
-    forge.lease_read = answer
+    if answer is None:
+        forge.rest_faults["LanderLease"] = [(502, FORGE_FAULT_BODY)] * 3
+    else:
+        forge.lease_read = answer
     done, summary = train(tmp_path, forge)
     assert done.returncode == 0, done.stdout + done.stderr
     assert forge.writes == []
-    assert "lander lease unreadable" in summary
-    assert cause in summary
-    assert forge.lease_calls == 1
+    for output in (done.stdout, summary):
+        (heading,) = [line for line in output.splitlines() if line.startswith("### fleet/app: ")]
+        assert heading.startswith("### fleet/app: lander lease unreadable: ")
+        assert cause in heading
+        if answer is None:
+            assert re.fullmatch(
+                r"### fleet/app: lander lease unreadable: RefusedError: graphql LanderLease: "
+                r"POST http://127\.0\.0\.1:\d+/graphql: HTTP 502 first line second line",
+                heading,
+            )
+    if answer is None:
+        assert forge.rest_faults["LanderLease"] == []
+    else:
+        assert forge.lease_calls == 1
 
 
 def test_retry_hold_concluded_green_and_pending_app_releases(tmp_path, monkeypatch):
@@ -12222,7 +15549,14 @@ def adr92_followup_mutations():
 
 def adr92_mutation_run(root, selector, log):
     """Run only the named regression files; writes bytecode nowhere."""
-    env = {**os.environ, "HORISTES_READER_SOURCE": str(root), "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {
+        **os.environ,
+        "HORISTES_READER_SOURCE": str(root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "GITHUB_STEP_SUMMARY": str(log.with_suffix(".summary.md")),
+        "GITHUB_OUTPUT": str(log.with_suffix(".output")),
+        "TRAIN_RELEASE_FILE": str(log.with_suffix(".release.json")),
+    }
     command = [
         sys.executable,
         "-m",
@@ -12234,11 +15568,39 @@ def adr92_mutation_run(root, selector, log):
         "-k",
         selector,
     ]
-    done = subprocess.run(
-        command, env=env, capture_output=True, text=True, timeout=120, check=False, cwd=ROOT
-    )
+    done = run_train_process(command, descriptor="ADR-92/93 pytest", env=env, timeout=120, cwd=ROOT)
     log.write_text(done.stdout + done.stderr)
     return done
+
+
+def test_adr92_mutation_run_uses_test_owned_report_paths(tmp_path, monkeypatch):
+    """Capture the child environment without running nested pytest."""
+    parent = tmp_path / "runner"
+    parent.mkdir()
+    inherited = {}
+    for name in REPORT_FILES:
+        path = parent / name
+        path.write_text("## Test results\n", encoding="utf-8")
+        inherited[name] = path
+        monkeypatch.setenv(name, str(path))
+
+    captured = {}
+
+    def capture_process(_command, *, env, **_settings):
+        captured.update((name, Path(env[name])) for name in REPORT_FILES)
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(sys.modules[__name__], "run_train_process", capture_process)
+    work = tmp_path / "mutation-test"
+    work.mkdir()
+    adr92_mutation_run(work / "mutation", "unused", work / "control.log")
+
+    assert set(captured) == set(REPORT_FILES)
+    assert {path.parent for path in captured.values()} == {work}
+    assert len(set(captured.values())) == len(REPORT_FILES)
+    assert all(
+        path.read_text(encoding="utf-8") == "## Test results\n" for path in inherited.values()
+    )
 
 
 @pytest.mark.parametrize(
@@ -12290,15 +15652,18 @@ def test_adr92_readable_connection_count(tmp_path, monkeypatch):
     assert mod.review_body_hold(pull(1, "CLEAN"), detail) is None
 
 
-def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capsys):
+def test_adr92_empty_review_bots_summary(tmp_path, monkeypatch, capfd):
     mod = adr92_train(tmp_path, monkeypatch)
     env = {
         "TRAIN_REVIEW_BOTS": " , \t\n",
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
         "GITHUB_OUTPUT": str(tmp_path / "output"),
     }
-    mod.summary(env, {}, [], [], [], [], [], [])
-    assert capsys.readouterr().out.count("review bots: none set, zero-review hold off") == 1
+    watch_report_files(env)
+    records = mod.summary(env, {}, [], [], [], [], [], [])
+    if records is not None:
+        mod.emit(env, records)
+    assert capfd.readouterr().out.count("review bots: none set, zero-review hold off") == 1
 
 
 @pytest.mark.parametrize("all_bot", [False, True], ids=["person-holds", "bots-land"])
@@ -12466,16 +15831,17 @@ def test_summary_release_file_matches_output(tmp_path, monkeypatch, write_file):
     }
     if write_file:
         env["TRAIN_RELEASE_FILE"] = str(path)
+    watch_report_files(env)
     releases = [{"owner": "a", "name": f"r{i}"} for i in range(mod.MAX_RELEASES + 1)]
-    mod.summary(env, {}, [], [], [], releases, [], [])
+    mod.emit(env, mod.summary(env, {}, [], [], [], releases, [], []))
+    mod.write_release_outputs(env, releases)
+    assert len(releases) == mod.MAX_RELEASES
+    expected = json.dumps(releases, separators=(",", ":"))
+    assert (tmp_path / "output").read_text(encoding="utf-8") == f"releases={expected}\n"
     assert path.exists() == write_file
     if write_file:
-        assert json.loads(path.read_text()) == {
-            "format": 1,
-            "hold_labels": "hold,exact ",
-            "releases": releases_of(tmp_path),
-        }
-        assert len(releases_of(tmp_path)) == mod.MAX_RELEASES
+        payload = {"format": 1, "hold_labels": "hold,exact ", "releases": releases_of(tmp_path)}
+        assert path.read_bytes() == json.dumps(payload, separators=(",", ":")).encode()
 
 
 @pytest.mark.parametrize("mutation", ["extra-open", "wrong-path", "wrong-mode"])
@@ -12485,12 +15851,10 @@ def test_report_writer_open_allow_list_refuses_other_files(mutation):
         source += "\nopen('unexpected.txt', 'w')\n"
     elif mutation == "wrong-path":
         source = source.replace(
-            'open(path, "w", encoding="utf-8")', 'open("unexpected.txt", "w", encoding="utf-8")'
+            'open(path, mode, encoding="utf-8")', 'open("unexpected.txt", mode, encoding="utf-8")'
         )
     else:
-        source = source.replace(
-            'open(path, "a", encoding="utf-8")', 'open(path, "w", encoding="utf-8")'
-        )
+        source = source.replace('mode = "w" if replace else "a"', 'mode = "w"')
     assert not allowed_report_opens(source)
     assert key_on_disk(source) == ["open() outside the summary and release file writers"]
 
