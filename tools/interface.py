@@ -27,11 +27,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ciwf
+from ciwf import NULL_IDS
 
 LOCK = "interface.lock.json"
-# The forge sends the null commit as the state before a push that creates the
-# branch, as on the first push to a new repository; SHA-1 and SHA-256 forms.
-NULL_IDS = frozenset({"0" * 40, "0" * 64})
 
 
 def _inputs(block: object) -> dict:
